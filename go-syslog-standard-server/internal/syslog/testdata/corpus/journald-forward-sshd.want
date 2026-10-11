@@ -1,0 +1,8 @@
+# expected fields for journald-forward-sshd.raw; one key=value per line
+rfc=|3164|
+hostname=||
+app-name=|sshd|
+procid=|4242|
+facility=|4|
+severity=|6|
+msg=|Accepted publickey for root from 10.0.0.5 port 51234 ssh2: ED25519 SHA256:abcDEF|

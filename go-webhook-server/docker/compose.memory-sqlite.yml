@@ -1,0 +1,69 @@
+# ring na RAM  ->  descarga no SQLite
+#
+# Deploy de no unico, sem dependencia externa nenhuma: o binario e um arquivo.
+# Aceitar o evento custa uma copia em memoria; o dreno grava em events.db.
+#
+# Durabilidade: cada lote drenado paga um fsync (synchronous=FULL), entao o que
+# ja' esta' no events.db sobrevive a queda de energia. O que esta' no ring em
+# RAM, nao -- e' o dump de emergencia que cobre esse trecho.
+#
+# Esta e' a forma barata de ter durabilidade em disco: um unico fsync por lote.
+# ring=sqlite + sink=sqlite pagaria dois pelo mesmo evento.
+#
+#   docker compose -f compose.memory-sqlite.yml up -d --build
+
+name: whs-memory-sqlite
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whs-base
+    container_name: whs-memory-sqlite
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whs-memory-sqlite
+
+    environment:
+
+      # --- ring: memoria ----------------------------------------------------
+      WHS_RING_MODE: memory
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (WHS_GOMEMLIMIT e
+      # WHS_MEMORY_LIMIT).
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-256MiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+      WHS_EMERGENCY_ENABLED: "true"
+
+      # --- sink: sqlite -----------------------------------------------------
+      WHS_SINK_TYPE: sqlite
+      # Vazio deriva <data_dir>/events.db; explicito aqui para deixar obvio o
+      # que precisa estar no volume.
+      WHS_SINK_SQLITE_PATH: /data/events.db
+      # none | hourly | daily. Rotacao e' avaliada em UTC.
+      WHS_SINK_SQLITE_ROTATE: ${WHS_SINK_SQLITE_ROTATE:-daily}
+      # 0 nunca apaga nada. Ajuste junto com o tamanho do volume.
+      WHS_SINK_SQLITE_KEEP_FILES: ${WHS_SINK_SQLITE_KEEP_FILES:-14}
+      # FULL sobrevive a queda de energia e amarra o p99 ao disco.
+      # NORMAL e' aceitavel com WAL se voce tolera perder o ultimo commit.
+      WHS_SINK_SQLITE_SYNCHRONOUS: ${WHS_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      WHS_SINK_SQLITE_BUSY_TIMEOUT: ${WHS_SINK_SQLITE_BUSY_TIMEOUT:-5s}
+
+      # SQLite serializa escritores: mais de um worker so' produziria
+      # SQLITE_BUSY. O servidor forca 1 de qualquer jeito -- explicito aqui
+      # para nao emitir o warning de boot.
+      WHS_SINK_WORKERS: "1"
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8081}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9111}:9101"
+
+    volumes:
+      - whs-data:/data
+
+volumes:
+  whs-data:

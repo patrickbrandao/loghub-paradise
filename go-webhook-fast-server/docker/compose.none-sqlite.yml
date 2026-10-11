@@ -1,0 +1,57 @@
+# sem ring (escrita sincrona)  ->  SQLite
+#
+# Modo sem buffer com destino local: o handler faz o COMMIT em events.db e so'
+# entao responde. Um 200 aqui significa "esta' no disco, com fsync feito".
+#
+# E' a configuracao mais conservadora possivel, e tambem a de menor vazao: o
+# SQLite serializa escritores, entao a taxa de aceitacao fica limitada a um
+# commit por vez. Faz sentido para volume baixo em que perder um evento e' pior
+# do que recusa-lo, e nao ha' infraestrutura externa disponivel.
+#
+# Se a vazao nao fechar, o proximo passo NAO e' afrouxar o synchronous: e'
+# compose.memory-sqlite.yml, que mantem o mesmo fsync por lote e devolve o 200
+# antes -- trocando "ja' esta' no disco" por "foi aceito e o dump de emergencia
+# cobre o resto".
+#
+#   docker compose -f compose.none-sqlite.yml up -d --build
+
+name: whf-none-sqlite
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-none-sqlite
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-none-sqlite
+
+    environment:
+
+      # --- ring: none -------------------------------------------------------
+      WHS_RING_MODE: none
+      # Mais baixo que nos outros modos de proposito: com o SQLite serializando
+      # escritores, um semaforo largo so' acumularia goroutines na fila do
+      # mesmo lock. Cheio responde 429, que e' a resposta honesta.
+      WHS_RING_MAX_INFLIGHT: ${WHS_RING_MAX_INFLIGHT:-256}
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite -----------------------------------------------------
+      WHS_SINK_TYPE: sqlite
+      WHS_SINK_SQLITE_PATH: /data/events.db
+      WHS_SINK_SQLITE_ROTATE: ${WHS_SINK_SQLITE_ROTATE:-daily}
+      WHS_SINK_SQLITE_KEEP_FILES: ${WHS_SINK_SQLITE_KEEP_FILES:-14}
+      WHS_SINK_SQLITE_SYNCHRONOUS: ${WHS_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      WHS_SINK_SQLITE_BUSY_TIMEOUT: ${WHS_SINK_SQLITE_BUSY_TIMEOUT:-5s}
+      WHS_SINK_WORKERS: "1"
+
+    ports:
+      - "${WHS_HTTP_PORT:-8087}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9117}:9101"
+
+    volumes:
+      - whf-data:/data
+
+volumes:
+  whf-data:

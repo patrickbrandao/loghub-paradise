@@ -1,0 +1,7 @@
+# expected fields for rsyslog-forwardformat.raw; one key=value per line
+rfc=|3164|
+hostname=|web-01|
+app-name=|systemd|
+procid=|1|
+msg-ts-source=|rfc5424|
+msg=|Started Session 42 of user root.|

@@ -1,0 +1,5 @@
+# expected fields for ipv6-hostname.raw; one key=value per line
+rfc=|3164|
+hostname=|2001:db8::1|
+app-name=|app|
+msg=|via v6|

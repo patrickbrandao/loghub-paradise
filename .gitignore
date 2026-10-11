@@ -1,0 +1,28 @@
+.DS_Store
+*.exe
+*.test
+*.out
+.mcp.json
+.env
+.env.*
+.env-*
+!.env.example
+*.log
+/bin/
+node_modules/
+dist/
+dist-web/
+coverage/
+tasks/
+sync.sh
+run-build.sh
+run-buildx.sh
+run-builder.sh
+run-local.sh
+run-prod.sh
+
+# Material de referência local (a página do LangWizard usada no redesign)
+tmp/
+
+# Servidores de smoke test do Claude Code (portas e banco descartáveis locais)
+.claude/launch.json

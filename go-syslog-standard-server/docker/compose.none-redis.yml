@@ -1,0 +1,85 @@
+# sem ring  ->  Redis Streams
+#
+# Garantia: o receptor escreve no destino e so' confirma depois. E' o modo
+#   lento por definicao, e o unico em que o parse completo roda na recepcao.
+#
+#   docker compose -f compose.none-redis.yml up -d --build
+#
+# Publicado no host: syslog 5148/udp e 5148/tcp, RELP 20608/tcp, admin
+# 127.0.0.1:19108. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-none-redis
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-none-redis
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    environment:
+      SYSLOG_NODE_ID: sls-none-redis
+
+      # --- ring: none ---------------------------------------------------------
+      SYSLOG_RING_MODE: none
+      # Escritas sincronas simultaneas. Cheio, vale o mesmo backpressure dos outros
+      # modos.
+      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-2048}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: redis ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: redis
+      SYSLOG_SINK_REDIS_ADDRS: redis:6379
+      # Stream proprio, separado do webhooks:in: volume, retencao e consumidores
+      # diferentes (docs/SPEC.md 3.3).
+      SYSLOG_SINK_REDIS_STREAM: ${SYSLOG_SINK_REDIS_STREAM:-syslog:in}
+      SYSLOG_SINK_REDIS_DB: ${SYSLOG_SINK_REDIS_DB:-0}
+      SYSLOG_SINK_REDIS_USERNAME: ${SYSLOG_SINK_REDIS_USERNAME:-}
+      SYSLOG_SINK_REDIS_PASSWORD: ${SYSLOG_SINK_REDIS_PASSWORD:-}
+      # 0 desliga o trim. MAXLEN descartaria mensagens antigas em silencio.
+      SYSLOG_SINK_REDIS_MAXLEN: ${SYSLOG_SINK_REDIS_MAXLEN:-0}
+      SYSLOG_SINK_WORKERS: ${SYSLOG_SINK_WORKERS:-8}
+      SYSLOG_SINK_BATCH: ${SYSLOG_SINK_BATCH:-256}
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5148}:1514/udp"
+      - "${SYSLOG_PORT:-5148}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20608}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19108}:9102"
+
+    volumes:
+      - sls-data:/data
+
+  redis:
+    image: ${SYSLOG_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: sls-none-redis-redis
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1s de stream num crash.
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${SYSLOG_REDIS_PORT:-16308}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  sls-data:
+  redis-data:

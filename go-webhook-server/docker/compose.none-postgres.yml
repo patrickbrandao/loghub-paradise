@@ -1,0 +1,102 @@
+# sem ring (escrita sincrona)  ->  PostgreSQL
+#
+# Modo sem buffer: o handler faz o INSERT e so' entao responde. Um 200 aqui
+# significa "o servidor de banco confirmou o commit" -- e o que "confirmou"
+# vale e' o synchronous_commit DELE (docs/SPEC.md 8.5.6, 16.1). E' a unica
+# combinacao da matriz cuja durabilidade depende de configuracao fora do
+# processo; por isso o valor fica explicito abaixo, no servico postgres.
+#
+# Diferente do Redis, aqui nao ha' coalescencia: cada requisicao ocupa uma
+# conexao do pool durante o seu INSERT, e a vazao fica presa a
+# pool_size / latencia de commit. ring.max_inflight acima do pool nao amplia
+# nada -- o excedente espera conexao DENTRO do pool, fora da contabilidade do
+# ring (SPEC 7.5). Os dois valores abaixo andam juntos por isso.
+#
+#   docker compose -f compose.none-postgres.yml up -d --build
+
+name: whs-none-postgres
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whs-base
+    container_name: whs-none-postgres
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whs-none-postgres
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: none -------------------------------------------------------
+      WHS_RING_MODE: none
+      # Casado com o pool: cada escrita em voo e' uma conexao. Subir so' este
+      # valor cria uma fila escondida dentro do pool e o boot avisa.
+      WHS_RING_MAX_INFLIGHT: ${WHS_RING_MAX_INFLIGHT:-32}
+      # capacity_items / max_bytes / high_water nao se aplicam: nao ha' fila.
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: postgres ---------------------------------------------------
+      WHS_SINK_TYPE: postgres
+      WHS_SINK_POSTGRES_ADDR: postgres:5432
+      WHS_SINK_POSTGRES_USERNAME: ${WHS_SINK_POSTGRES_USERNAME:-webhook}
+      WHS_SINK_POSTGRES_PASSWORD: ${WHS_SINK_POSTGRES_PASSWORD:-webhook}
+      WHS_SINK_POSTGRES_DATABASE: ${WHS_SINK_POSTGRES_DATABASE:-webhook}
+      WHS_SINK_POSTGRES_TABLE: ${WHS_SINK_POSTGRES_TABLE:-loghub.inbox}
+      # Explicito e igual ao max_inflight: quem escreve e' o handler, nao os
+      # workers, entao o "workers + 1" derivado nao faria sentido aqui.
+      WHS_SINK_POSTGRES_POOL_SIZE: ${WHS_SINK_POSTGRES_POOL_SIZE:-32}
+      WHS_SINK_POSTGRES_TLS: ${WHS_SINK_POSTGRES_TLS:-false}
+      # Nao ha' dreno em background neste modo: workers/batch ficam sem efeito
+      # sobre o caminho da requisicao.
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8091}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9121}:9101"
+
+    volumes:
+      - whs-data:/data
+
+  postgres:
+    image: ${WHS_POSTGRES_IMAGE:-postgres:18-alpine}
+    container_name: whs-none-postgres-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${WHS_SINK_POSTGRES_USERNAME:-webhook}
+      POSTGRES_PASSWORD: ${WHS_SINK_POSTGRES_PASSWORD:-webhook}
+      POSTGRES_DB: ${WHS_SINK_POSTGRES_DATABASE:-webhook}
+    command:
+      - postgres
+      # A garantia do 200 desta combinacao mora nesta linha.
+      - -c
+      - synchronous_commit=on
+      # 32 escritas em voo + health + folga para psql e ferramentas.
+      - -c
+      - max_connections=${WHS_POSTGRES_MAX_CONNECTIONS:-100}
+    volumes:
+      # A imagem 18 guarda os dados em /var/lib/postgresql/18/docker e recusa
+      # um volume montado no antigo /var/lib/postgresql/data.
+      - postgres-data:/var/lib/postgresql
+      - ./postgres/inbox.sql:/docker-entrypoint-initdb.d/001-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${WHS_POSTGRES_PORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WHS_SINK_POSTGRES_USERNAME:-webhook} -d ${WHS_SINK_POSTGRES_DATABASE:-webhook}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whs-data:
+  postgres-data:

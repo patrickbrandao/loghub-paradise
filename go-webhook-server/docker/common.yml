@@ -1,0 +1,139 @@
+# Fragmento compartilhado por todos os compose deste diretorio.
+#
+# NAO suba este arquivo sozinho: ele define apenas o servico-base `whs-base`,
+# que os arquivos compose.<ring>-<sink>.yml herdam via `extends`. Tudo que e'
+# identico entre as combinacoes mora aqui; o que distingue uma combinacao da
+# outra (ring.mode, sink.type, portas, volumes, dependencias) fica visivel no
+# arquivo de cada combinacao.
+#
+# Regra de heranca do Compose: `environment` e `healthcheck` sao mapas e o filho
+# sobrescreve chave a chave; `ports` e' sequencia e concatena (por isso as
+# portas ficam so' no filho); `depends_on` NAO e' herdado por `extends`.
+
+services:
+  whs-base:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${WHS_VERSION:-dev}
+        COMMIT: ${WHS_COMMIT:-none}
+        GO_VERSION: ${WHS_GO_VERSION:-1.25}
+        ALPINE_VERSION: ${WHS_ALPINE_VERSION:-3.22}
+    image: ${WHS_IMAGE:-go-webhook-server}:${WHS_IMAGE_TAG:-local}
+
+    restart: unless-stopped
+
+    # Precisa cobrir shutdown.pre_stop_delay + shutdown.drain_timeout +
+    # sink.op_timeout (o lote em voo de um worker) e o proprio dump: com os
+    # padroes, 0s + 30s + 5s. Os 10s do Docker matariam o processo no meio do
+    # dreno do ring -- ou seja, perderiam eventos ja' aceitos com 200.
+    stop_grace_period: 45s
+    stop_signal: SIGTERM
+
+    environment:
+      # --- rede -----------------------------------------------------------
+      # 0.0.0.0 dentro do container; a exposicao real e' decidida em `ports`.
+      WHS_SERVER_BIND: 0.0.0.0:8080
+      WHS_SERVER_LISTENERS: ${WHS_SERVER_LISTENERS:-1}
+
+      # O admin precisa escutar em 0.0.0.0 para ser publicavel, mas cada
+      # compose publica em 127.0.0.1 do host. O servidor emite um warning de
+      # boot sobre isso; e' esperado e esta' explicado no README.
+      WHS_ADMIN_ENABLED: "true"
+      WHS_ADMIN_BIND: 0.0.0.0:9101
+
+      # --- proxy e limites -------------------------------------------------
+      # Fail-closed por padrao: nenhum header de encaminhamento e' acreditado.
+      # Atras de um proxy/ingress, defina WHS_PROXY_TRUSTED com os CIDRs dele
+      # ANTES de ligar o rate limit.
+      WHS_PROXY_TRUSTED: ${WHS_PROXY_TRUSTED:-127.0.0.0/8,::1}
+      WHS_RATELIMIT_ENABLED: ${WHS_RATELIMIT_ENABLED:-false}
+      WHS_RATELIMIT_RATE: ${WHS_RATELIMIT_RATE:-100}
+      WHS_RATELIMIT_BURST: ${WHS_RATELIMIT_BURST:-200}
+      WHS_SERVER_MAX_BODY_BYTES: ${WHS_SERVER_MAX_BODY_BYTES:-5MiB}
+
+      # --- identidade LogHub (go-loghub-ident, SPEC §3.5) ------------------
+      # AGENT_NAME vem da imagem; DATADIR e' exportado pelo proprio servidor a
+      # partir de ring.data_dir (/data). WORKSPACE e' o TENANT, nao o ambiente:
+      # vira o `space` de todo envelope e o subject/stream
+      # loghub.<space>.webhook.request -- o stream de nats/stream.json cobre so'
+      # "default"; quem trocar um troca o outro. HOSTNAME vem do `hostname:` de
+      # cada servico. AGENT_UUID e MACHINE_ID sao gerados e persistidos em /data
+      # na primeira subida: um volume por instancia, nunca compartilhado.
+      # Lido de WHS_WORKSPACE, nunca de WORKSPACE: o shell de CI (Jenkins)
+      # exporta WORKSPACE com o caminho do job, e o compose o interpolaria.
+      WORKSPACE: ${WHS_WORKSPACE:-default}
+
+      # --- dados -----------------------------------------------------------
+      # /data e' a UNICA area gravavel do container, e essa e' a regra de TODA
+      # imagem do loghub-paradise (docs/SPEC.md 13.6). ring.db, events.db,
+      # emergency/ e a identidade (agent_uuid, machine_id) derivam daqui. A imagem ja' traz este mesmo valor; fica
+      # explicito porque e' o caminho que os `volumes:` de cada compose montam.
+      WHS_RING_DATA_DIR: /data
+
+      # --- observabilidade --------------------------------------------------
+      WHS_LOG_FORMAT: ${WHS_LOG_FORMAT:-json}
+      WHS_LOG_LEVEL: ${WHS_LOG_LEVEL:-info}
+      WHS_LOG_ACCESS: ${WHS_LOG_ACCESS:-false}
+
+      # --- desligamento ------------------------------------------------------
+      WHS_SHUTDOWN_PRE_STOP_DELAY: ${WHS_SHUTDOWN_PRE_STOP_DELAY:-0s}
+      WHS_SHUTDOWN_DRAIN_TIMEOUT: ${WHS_SHUTDOWN_DRAIN_TIMEOUT:-30s}
+
+      # --- memoria -------------------------------------------------------------
+      # SPEC 12.4: o servidor NAO define GOMEMLIMIT sozinho e avisa no boot se ele
+      # faltar. Sem ele o GC do Go nao sabe do teto do container e o OOM killer
+      # chega antes do GC -- e com ring=memory leva o backlog junto, porque o dump
+      # de emergencia nao roda num processo morto pelo kernel. Com ring=memory o
+      # valor precisa cobrir ring.max_bytes vezes dois (por isso os compose de
+      # memoria usam 256MiB de ring) e ficar abaixo do limite do container, logo
+      # abaixo, para o GC trabalhar antes de o kernel matar.
+      GOMEMLIMIT: ${WHS_GOMEMLIMIT:-512MiB}
+
+    # /healthz e' liveness pura: responde 200 enquanto o processo consegue
+    # responder, e de proposito nao olha o sink -- reiniciar o container nao
+    # conserta um Redis inalcancavel. Quem quer saber se o servico deve receber
+    # trafego usa /readyz (publicado junto, na mesma porta admin).
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9101/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+    # A imagem roda como 65532 e nao escreve fora de /data. O read_only e' o que
+    # transforma essa regra em garantia: um caminho apontado para fora do volume
+    # falha no boot (exit 1 ou 3) em vez de gravar na camada efemera do
+    # container -- onde a escrita FUNCIONA e some no proximo `docker rm`, sem
+    # erro nenhum para avisar.
+    #
+    # O /tmp em tmpfs e' rede de seguranca do read_only, nao area de trabalho:
+    # o servidor nao escreve nele, e o que caisse ali seria volatil de qualquer
+    # forma.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    # Teto do container, ACIMA do GOMEMLIMIT: a folga e' o que o GC usa para
+    # trabalhar antes de o kernel matar. O Compose v2 honra
+    # deploy.resources.limits sem Swarm.
+    deploy:
+      resources:
+        limits:
+          memory: ${WHS_MEMORY_LIMIT:-768M}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

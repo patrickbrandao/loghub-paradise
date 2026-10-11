@@ -1,0 +1,9 @@
+{
+ "format": "rfc3164",
+ "host.hostname": "mymachine",
+ "appname": "patrick",
+ "message": "hello world",
+ "_absent": [
+  "procid"
+ ]
+}

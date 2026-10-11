@@ -1,0 +1,50 @@
+# ring em disco (ring.db)  ->  descarte (benchmark)
+#
+# Garantia: NENHUMA. O COMMIT com fsync no /data/ring.db acontece antes de
+#   voltar a ler, mas o que sai do ring e' convertido, serializado e
+#   DESCARTADO (SPEC §10.8, §19: "qualquer + none" perde tudo). Mede o custo do
+#   ring em disco sem I/O de destino. Nao guarde log com isto.
+#
+#   docker compose -f compose.sqlite-none.yml up -d --build
+#
+# Publicado no host: syslog 5151/udp e 5151/tcp (SYSLOG_PORT), TLS 16511
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19111 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-sqlite-none
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-sqlite-none
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-sqlite-none
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: none --------------------------------------------------------
+      SYSLOG_SINK_TYPE: none
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5151}:1514/udp"
+      - "${SYSLOG_PORT:-5151}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16511}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19111}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+volumes:
+  sls-data:

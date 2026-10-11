@@ -1,0 +1,8 @@
+{
+ "format": "rfc5424",
+ "host.hostname": "WIN-SRV01",
+ "appname": "Microsoft-Windows-Security-Auditing",
+ "procid": "4624",
+ "structured-data.NXLOG@14506.EventID": "4624",
+ "message": "An account was successfully logged on."
+}

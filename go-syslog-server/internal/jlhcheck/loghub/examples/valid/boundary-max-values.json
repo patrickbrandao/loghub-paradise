@@ -1,0 +1,15 @@
+{
+  "uuid": "e677d21f-dbff-73e7-be78-a68def33391e",
+  "from": "ffffffff-ffff-8fff-bfff-ffffffffffff",
+  "space": "service.tenant.91282.region-sa-east-1.cluster-07.shard-0042.zn-a",
+  "type": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "level": 15,
+  "sid": 9007199254740991,
+  "step": 32,
+  "event": {
+    "uts": 253402300799,
+    "sub": 999999999,
+    "iso": "9999-12-31T23:59:59.999Z"
+  },
+  "payload": {}
+}

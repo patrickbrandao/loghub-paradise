@@ -1,0 +1,97 @@
+# ring na RAM  ->  Redis Streams
+#
+# Garantia: a mensagem esta' na RAM deste no'. SIGTERM nao perde (dreno);
+#   FATAL do sink nao perde (dump de emergencia); SIGKILL e OOM perdem o backlog.
+#
+# Combinacao de referencia e padrao de docker-compose.yml.
+#
+#   docker compose -f compose.memory-redis.yml up -d --build
+#
+# Publicado no host: syslog 514/udp e 514/tcp, RELP 20514/tcp, admin
+# 127.0.0.1:9102. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-memory-redis
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-memory-redis
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    environment:
+      SYSLOG_NODE_ID: sls-memory-redis
+
+      # --- ring: memory ---------------------------------------------------------
+      SYSLOG_RING_MODE: memory
+      # Tetos do ring. Estourar qualquer um dos dois aplica o backpressure de cada
+      # transporte (docs/SPEC.md 2.3): o TCP para de ler, o RELP responde 500, o
+      # UDP descarta e conta. Nunca "aceito e descartado".
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (SYSLOG_GOMEMLIMIT e
+      # SYSLOG_MEMORY_LIMIT).
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-256MiB}
+      SYSLOG_RING_HIGH_WATER: ${SYSLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte. E' a escrita em disco que
+      # obriga o volume mesmo nesta combinacao.
+      SYSLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: redis ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: redis
+      SYSLOG_SINK_REDIS_ADDRS: redis:6379
+      # Stream proprio, separado do webhooks:in: volume, retencao e consumidores
+      # diferentes (docs/SPEC.md 3.3).
+      SYSLOG_SINK_REDIS_STREAM: ${SYSLOG_SINK_REDIS_STREAM:-syslog:in}
+      SYSLOG_SINK_REDIS_DB: ${SYSLOG_SINK_REDIS_DB:-0}
+      SYSLOG_SINK_REDIS_USERNAME: ${SYSLOG_SINK_REDIS_USERNAME:-}
+      SYSLOG_SINK_REDIS_PASSWORD: ${SYSLOG_SINK_REDIS_PASSWORD:-}
+      # 0 desliga o trim. MAXLEN descartaria mensagens antigas em silencio.
+      SYSLOG_SINK_REDIS_MAXLEN: ${SYSLOG_SINK_REDIS_MAXLEN:-0}
+      SYSLOG_SINK_WORKERS: ${SYSLOG_SINK_WORKERS:-8}
+      SYSLOG_SINK_BATCH: ${SYSLOG_SINK_BATCH:-256}
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-514}:1514/udp"
+      - "${SYSLOG_PORT:-514}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20514}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-9102}:9102"
+
+    volumes:
+      - sls-data:/data
+
+  redis:
+    image: ${SYSLOG_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: sls-memory-redis-redis
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1s de stream num crash.
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${SYSLOG_REDIS_PORT:-16300}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  sls-data:
+  redis-data:

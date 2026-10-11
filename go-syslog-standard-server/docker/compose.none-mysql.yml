@@ -1,0 +1,106 @@
+# sem ring  ->  MySQL (destino compartilhado)
+#
+# Garantia: o receptor escreve no destino e so' confirma depois. E' o modo
+#   lento por definicao, e o unico em que o parse completo roda na recepcao.
+#
+# ATENCAO: a durabilidade da confirmacao e' a do servidor MySQL: com
+#   innodb_flush_log_at_trx_commit em 0 ou 2 ela sai antes de o redo log estar
+#   em disco (docs/SPEC.md 10.7.5). Este compose fixa 1.
+#
+# O servidor NUNCA cria a tabela (docs/SPEC.md 10.7): a imagem oficial do MySQL
+# executa ./mysql/schema.sql uma vez, na criacao do volume, e o syslog valida no
+# boot o motor, as colunas, o indice unico, o INSERT e o UPDATE (sonda numa
+# transacao revertida) e o max_allowed_packet -- e sai com codigo 3 na hora se
+# algo faltar.
+#
+#   docker compose -f compose.none-mysql.yml up -d --build
+#
+# Publicado no host: syslog 5156/udp e 5156/tcp, RELP 20616/tcp, admin
+# 127.0.0.1:19116. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-none-mysql
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-none-mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+    environment:
+      SYSLOG_NODE_ID: sls-none-mysql
+
+      # --- ring: none ---------------------------------------------------------
+      SYSLOG_RING_MODE: none
+      # Escritas sincronas simultaneas. Cheio, vale o mesmo backpressure dos outros
+      # modos.
+      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-2048}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: mysql ----------------------------------------------------------
+      SYSLOG_SINK_TYPE: mysql
+      SYSLOG_SINK_MYSQL_ADDR: mysql:3306
+      SYSLOG_SINK_MYSQL_USERNAME: ${SYSLOG_SINK_MYSQL_USERNAME:-syslog}
+      SYSLOG_SINK_MYSQL_PASSWORD: ${SYSLOG_SINK_MYSQL_PASSWORD:-syslog}
+      SYSLOG_SINK_MYSQL_DATABASE: ${SYSLOG_SINK_MYSQL_DATABASE:-syslog}
+      SYSLOG_SINK_MYSQL_TABLE: ${SYSLOG_SINK_MYSQL_TABLE:-events}
+      SYSLOG_SINK_MYSQL_POOL_SIZE: ${SYSLOG_SINK_MYSQL_POOL_SIZE:-0}
+      # Rede interna do compose: sem TLS. Contra um banco gerenciado, ligue
+      # SYSLOG_SINK_MYSQL_TLS e monte a CA em /etc/syslog (somente leitura).
+      SYSLOG_SINK_MYSQL_TLS: ${SYSLOG_SINK_MYSQL_TLS:-false}
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5156}:1514/udp"
+      - "${SYSLOG_PORT:-5156}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20616}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19116}:9102"
+
+    volumes:
+      - sls-data:/data
+
+  mysql:
+    image: ${SYSLOG_MYSQL_IMAGE:-mysql:8.4}
+    container_name: sls-none-mysql-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SYSLOG_MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${SYSLOG_SINK_MYSQL_DATABASE:-syslog}
+      # A imagem concede ALL em MYSQL_DATABASE.* a este usuario, o que cobre o
+      # INSERT e o UPDATE que o ON DUPLICATE KEY exige (docs/SPEC.md 10.7.4).
+      MYSQL_USER: ${SYSLOG_SINK_MYSQL_USERNAME:-syslog}
+      MYSQL_PASSWORD: ${SYSLOG_SINK_MYSQL_PASSWORD:-syslog}
+    command:
+      - mysqld
+      # O que "INSERT confirmado" significa mora nesta linha (docs/SPEC.md
+      # 10.7.5): com 1, o INSERT so' retorna depois do fsync do redo log. O
+      # syslog nao le nem altera este valor.
+      - --innodb_flush_log_at_trx_commit=1
+      # A maior linha que o syslog pode aceitar com os frames padrao de 16 MiB
+      # passa de 160 MiB (linha crua, envelope no pior caso e colunas de texto),
+      # e 7/8 do pacote precisa comporta-la, ou o boot sai com codigo 3
+      # (docs/SPEC.md 3.9, 10.7.4). Quem baixar SYSLOG_TCP_MAX_FRAME_BYTES pode
+      # baixar isto junto.
+      - --max_allowed_packet=256M
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # Executado UMA vez pela imagem oficial, ao criar o volume, dentro de
+      # MYSQL_DATABASE. Depois disso o esquema e' seu.
+      - ./mysql/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "127.0.0.1:${SYSLOG_MYSQL_PORT:-13316}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  sls-data:
+  mysql-data:

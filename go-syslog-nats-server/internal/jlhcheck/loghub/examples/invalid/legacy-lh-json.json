@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-04-26T03:43:36.623Z",
+  "event": [
+    1777175016,
+    623123136
+  ],
+  "uuid": "019dc7e2-b4af-707b-888f-e96dffd6e718",
+  "type": "order.created",
+  "level": 6,
+  "space": "com.acme.store",
+  "step": 0,
+  "from": {
+    "name": "order-api",
+    "hostname": "api-1.acme.internal",
+    "machine": "79fb72c3199f4b85978420223a389b94",
+    "uuid": "62594d56-07bc-40b4-ae05-c57e7541d8a8",
+    "address": "10.20.0.14"
+  },
+  "path": [],
+  "payload": {
+    "order_id": 4512
+  }
+}

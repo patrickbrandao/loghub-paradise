@@ -1,0 +1,48 @@
+# sem ring  ->  descarte (benchmark)
+#
+# Garantia: o receptor escreve no destino e so' confirma depois. E' o modo
+#   lento por definicao, e o unico em que o parse completo roda na recepcao.
+#
+# ATENCAO: BENCHMARK PURO DE TRANSPORTE. Nada e' escrito em lugar nenhum.
+#
+#   docker compose -f compose.none-none.yml up -d --build
+#
+# Publicado no host: syslog 5151/udp e 5151/tcp, RELP 20611/tcp, admin
+# 127.0.0.1:19111. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-none-none
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-none-none
+
+    environment:
+      SYSLOG_NODE_ID: sls-none-none
+
+      # --- ring: none ---------------------------------------------------------
+      SYSLOG_RING_MODE: none
+      # Escritas sincronas simultaneas. Cheio, vale o mesmo backpressure dos outros
+      # modos.
+      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-2048}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: none ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: none
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5151}:1514/udp"
+      - "${SYSLOG_PORT:-5151}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20611}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19111}:9102"
+
+    volumes:
+      - sls-data:/data
+
+volumes:
+  sls-data:

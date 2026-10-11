@@ -1,0 +1,59 @@
+# ring persistente em SQLite  ->  SQLite (destino final)
+#
+# Garantia: COMMIT em disco antes da confirmacao. So' faz sentido com TCP e
+#   RELP: no UDP o fsync garante o que a rede talvez ja' tenha descartado.
+#
+# ATENCAO: paga DOIS fsync por mensagem. memory+sqlite da' a mesma
+#   durabilidade no destino pela metade do custo, salvo com os dois arquivos em
+#   discos diferentes.
+#
+#   docker compose -f compose.sqlite-sqlite.yml up -d --build
+#
+# Publicado no host: syslog 5145/udp e 5145/tcp, RELP 20605/tcp, admin
+# 127.0.0.1:19105. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-sqlite-sqlite
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-sqlite-sqlite
+
+    environment:
+      SYSLOG_NODE_ID: sls-sqlite-sqlite
+
+      # --- ring: sqlite ---------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      # FULL faz fsync a cada group commit: sobrevive a queda de energia, e a
+      # latencia de confirmacao fica presa ao disco.
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      # Sem efeito com ring=sqlite: os itens ja' estao em disco.
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: sqlite
+      SYSLOG_SINK_SQLITE_SYNCHRONOUS: ${SYSLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_SINK_SQLITE_ROTATE: ${SYSLOG_SINK_SQLITE_ROTATE:-daily}
+      # 0 nunca apaga nada. Recarregavel por SIGHUP.
+      SYSLOG_SINK_SQLITE_KEEP_FILES: ${SYSLOG_SINK_SQLITE_KEEP_FILES:-0}
+      # SQLite serializa escritores: mais de 1 worker so' geraria SQLITE_BUSY.
+      SYSLOG_SINK_WORKERS: "1"
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5145}:1514/udp"
+      - "${SYSLOG_PORT:-5145}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20605}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19105}:9102"
+
+    volumes:
+      - sls-data:/data
+
+volumes:
+  sls-data:

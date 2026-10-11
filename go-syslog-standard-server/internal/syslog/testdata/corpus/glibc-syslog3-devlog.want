@@ -1,0 +1,6 @@
+# expected fields for glibc-syslog3-devlog.raw; one key=value per line
+rfc=|3164|
+hostname=||
+app-name=|systemd|
+procid=|1|
+msg=|Started Session 42.|

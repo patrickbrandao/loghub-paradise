@@ -1,0 +1,116 @@
+# ring na RAM  ->  descarga no Redis Streams
+#
+# Combinacao de referencia e a mais rapida: aceitar o evento custa uma copia em
+# memoria, e o dreno vai para o Redis em lotes com varios workers em paralelo.
+#
+# Durabilidade: o evento so' existe na RAM ate' o XADD confirmar. Uma queda
+# abrupta do processo (SIGKILL, OOM, falta de energia) perde o backlog. O que
+# cobre o caso previsivel -- sink permanentemente inutilizavel -- e' o dump de
+# emergencia: em FATAL o ring inteiro vai para disco e e' reingerido no proximo
+# boot. Por isso emergency.enabled fica ligado e o volume e' obrigatorio, mesmo
+# num deploy que "nao usa disco".
+#
+#   docker compose -f compose.memory-redis.yml up -d --build
+
+name: whf-memory-redis
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-memory-redis
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-memory-redis
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: memoria ----------------------------------------------------
+      WHS_RING_MODE: memory
+      # Tetos do ring. Estourar qualquer um dos dois responde 429 ao cliente --
+      # que e' o comportamento desejado: backpressure explicita, nunca descarte
+      # silencioso.
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (WHS_GOMEMLIMIT e
+      # WHS_MEMORY_LIMIT).
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-256MiB}
+      # Acima desta fracao de ocupacao o /readyz falha e o balanceador tira
+      # esta instancia da rotacao antes de ela comecar a devolver 429.
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+
+      # Rede de seguranca do ring em RAM: em FATAL, despeja o backlog em
+      # /data/emergency e reingere no boot seguinte. E' a unica escrita em disco
+      # desta combinacao -- e por isso que ela tambem monta o volume.
+      WHS_EMERGENCY_ENABLED: "true"
+
+      # --- sink: redis ------------------------------------------------------
+      WHS_SINK_TYPE: redis
+      WHS_SINK_REDIS_ADDRS: redis:6379
+      WHS_SINK_REDIS_STREAM: ${WHS_SINK_REDIS_STREAM:-loghub.{space}.{type}}
+      WHS_SINK_REDIS_DB: ${WHS_SINK_REDIS_DB:-0}
+      WHS_SINK_REDIS_USERNAME: ${WHS_SINK_REDIS_USERNAME:-}
+      WHS_SINK_REDIS_PASSWORD: ${WHS_SINK_REDIS_PASSWORD:-}
+      # maxlen=0 desliga o trim. Ligar MAXLEN faria o Redis descartar eventos
+      # antigos em silencio, que e' exatamente o oposto da backpressure que
+      # este servidor implementa.
+      WHS_SINK_REDIS_MAXLEN: ${WHS_SINK_REDIS_MAXLEN:-0}
+
+      # Redis aguenta escrita concorrente: varios workers valem a pena aqui.
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-8}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8080}:8080"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9101}:9101"
+
+    # /data: unico ponto gravavel da imagem, aqui so' para os dumps de
+    # emergencia. Sem o volume, um dump feito durante um incidente iria para a
+    # camada efemera do container e sumiria no restart -- exatamente o que ele
+    # existe para impedir.
+    volumes:
+      - whf-data:/data
+
+  redis:
+    image: ${WHS_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: whf-memory-redis-redis
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1s de stream num crash.
+      # RDB desligado (--save "") porque o AOF ja' cobre a durabilidade e o
+      # fork do snapshot causa picos de latencia no XADD.
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${WHS_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whf-data:
+  redis-data:

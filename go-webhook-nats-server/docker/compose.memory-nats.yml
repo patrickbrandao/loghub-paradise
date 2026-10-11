@@ -1,0 +1,159 @@
+# ring na RAM  ->  publicacao num stream JetStream do NATS (a unica combinacao)
+#
+# Aceitar o evento custa uma copia em memoria; o dreno publica em lote
+# (PublishMsgAsync) e espera um PubAck por mensagem, com Nats-Msg-Id para que
+# uma redelivery dentro da janela de desduplicacao do stream (10 min em
+# ./nats/stream.json) nao duplique.
+#
+# O webhook NUNCA cria o stream (docs/SPEC.md 8.7.5): o servico nats-init o
+# cria a partir de ./nats/stream.json uma vez, e o webhook valida no boot que
+# ele existe, que cobre loghub.<space>.webhook, que nao captura o plano de
+# controle (loghub._ctl.beacon), que nao esta' selado nem com no_ack, e que o
+# max_payload comporta a maior mensagem -- e sai com codigo 3 na hora se algo
+# faltar, sem esperar sink.boot_timeout.
+#
+# SEM TLS (docs/SPEC.md 8.7.9): o cliente e' sempre texto claro, e um
+# nats-server que exige TLS e' recusado no boot. A rede interna do compose e' a
+# rede confiavel que isso pede.
+#
+# Durabilidade: o PubAck significa que o stream gravou a mensagem conforme a
+# configuracao DELE (storage file, replicas, sync_interval; SPEC 8.7.4). O dump
+# de emergencia (JSON Lines em /data/emergency, SPEC 9) cobre o trecho em RAM.
+#
+# O heartbeat beacon (SPEC 8.7.10) sai por NATS core em loghub._ctl.beacon, na
+# conexao, em cada reconexao e a cada LOGHUB_BEACON_INTERVAL:
+#
+#   nats --server nats://127.0.0.1:14301 sub 'loghub._ctl.beacon'
+#
+# Portas do host diferentes das do go-webhook-fast-server (8080-8100,
+# 9101-9130, 4222-4224) e do go-webhook-pg-server (8200, 9201, 55432), para
+# os tres poderem rodar lado a lado na mesma maquina.
+#
+#   docker compose -f compose.memory-nats.yml up -d --build
+
+name: whn-memory-nats
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whn-base
+    container_name: whn-memory-nats
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao. Entra no nome do cliente NATS
+    # (whs/<AgentName>@<Hostname>, visivel no connz) e no beacon.
+    hostname: whn-memory-nats
+
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+
+    environment:
+
+      # --- ring: memoria (o unico; ring.mode nao precisa ser dito) ----------
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (WHS_GOMEMLIMIT e
+      # WHS_MEMORY_LIMIT).
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-256MiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL, o backlog vai para
+      # /data/emergency (um .jsonl, uma linha por envelope) e volta no boot
+      # seguinte.
+      WHS_EMERGENCY_ENABLED: "true"
+
+      # --- sink: nats (o unico; sink.type nao precisa ser dito) -------------
+      # Alternativa da convencao LogHub: no .env, LOGHUB_EB_URL=nats://... (so'
+      # nats://) e WHS_SINK_NATS_URLS= vazio. Um valor vazio nao compete com a
+      # URL; um valor de verdade e' uma segunda fonte e encerra o boot
+      # (SPEC 8.7.11). Por isso o "-" sem ":" abaixo: vazio no .env fica vazio.
+      LOGHUB_EB_URL: ${LOGHUB_EB_URL:-}
+      WHS_SINK_NATS_URLS: ${WHS_SINK_NATS_URLS-nats://nats:4222}
+      # jetstream (PubAck por mensagem) ou core (best effort: o servidor NATS
+      # recebeu; sem assinante, some).
+      WHS_SINK_NATS_MODE: ${WHS_SINK_NATS_MODE:-jetstream}
+      # Se trocar o nome do stream, troque tambem em ./nats/stream.json; outro
+      # WORKSPACE pede o subject dele la'.
+      WHS_SINK_NATS_STREAM: ${WHS_SINK_NATS_STREAM:-LOGHUB_WEBHOOK}
+      # Rede interna do compose: sem autenticacao. Contra um NATS fora daqui,
+      # UMA forma: usuario e senha, token, ou um .creds montado em
+      # /etc/webhook (somente leitura). TLS nao existe neste servidor.
+      WHS_SINK_NATS_USERNAME: ${WHS_SINK_NATS_USERNAME:-}
+      WHS_SINK_NATS_PASSWORD: ${WHS_SINK_NATS_PASSWORD:-}
+      WHS_SINK_NATS_TOKEN: ${WHS_SINK_NATS_TOKEN:-}
+      WHS_SINK_NATS_CREDENTIALS: ${WHS_SINK_NATS_CREDENTIALS:-}
+
+      # Uma conexao multiplexada por todos os workers.
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-8}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+      # --- plano de controle (nomes fixados pela skill LogHub) --------------
+      LOGHUB_BEACON_INTERVAL: ${LOGHUB_BEACON_INTERVAL:-15}
+      LOGHUB_CTL_NAMESPACE: ${LOGHUB_CTL_NAMESPACE:-loghub._ctl}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8300}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9301}:9101"
+
+    # /data so' para a identidade e os dumps de emergencia. UM volume por
+    # instancia: duas replicas no mesmo volume publicariam o mesmo `from`.
+    volumes:
+      - whn-data:/data
+
+  nats:
+    image: ${WHS_NATS_IMAGE:-nats:2.11-alpine}
+    container_name: whn-memory-nats-nats
+    restart: unless-stopped
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    # O arquivo montado liga o JetStream em /data e sobe max_payload para 8 MB
+    # (ver ./nats/nats-server.conf), sem TLS.
+    volumes:
+      - whn-nats-data:/data
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      # Cliente e monitor so' no loopback do host: para o `nats` CLI e o connz.
+      - "127.0.0.1:${WHS_NATS_PORT:-14301}:4222"
+      - "127.0.0.1:${WHS_NATS_MONITOR_PORT:-18301}:8222"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Cria o stream UMA vez, de forma idempotente: `stream info` responde se ele
+  # ja' existe; senao `stream add` o cria a partir do arquivo canonico. Contra
+  # um NATS de producao esse papel e' de quem administra o servidor -- o
+  # webhook nunca cria nem altera um stream (docs/SPEC.md 8.7.5).
+  nats-init:
+    image: ${WHS_NATS_BOX_IMAGE:-natsio/nats-box:0.20.0}
+    container_name: whn-memory-nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    volumes:
+      - ./nats/stream.json:/etc/nats/stream.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        nats --server nats://nats:4222 stream info ${WHS_SINK_NATS_STREAM:-LOGHUB_WEBHOOK} >/dev/null 2>&1
+        || nats --server nats://nats:4222 stream add ${WHS_SINK_NATS_STREAM:-LOGHUB_WEBHOOK} --config /etc/nats/stream.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whn-data:
+  whn-nats-data:

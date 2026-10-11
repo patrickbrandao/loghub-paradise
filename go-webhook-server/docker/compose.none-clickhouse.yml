@@ -1,0 +1,113 @@
+# sem ring (escrita sincrona)  ->  ClickHouse
+#
+# Modo sem buffer: o handler faz o INSERT e so' entao responde. Um 200 aqui
+# significa "o ClickHouse respondeu o INSERT" -- e o que isso vale e' o perfil
+# do usuario DELE: com async_insert=0 (padrao), a parte foi escrita; com
+# async_insert=1 e wait_for_async_insert=0, o dado esta' so' no buffer em
+# memoria do servidor (docs/SPEC.md 8.8.6, 16.1). O webhook nao le nem altera
+# esses valores; o padrao da imagem fica como esta'.
+#
+# Cada requisicao e' um INSERT de uma linha, ou seja, uma parte no disco do
+# servidor: sob carga vem 252 TOO_MANY_PARTS (retentado). Quem quer vazao
+# aqui liga async_insert no perfil do usuario (com wait_for_async_insert=1,
+# para o 200 ainda esperar a escrita). ring.max_inflight acima do pool nao
+# amplia nada -- o excedente espera conexao DENTRO do pool (SPEC 7.5).
+#
+#   docker compose -f compose.none-clickhouse.yml up -d --build
+
+name: whs-none-clickhouse
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whs-base
+    container_name: whs-none-clickhouse
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whs-none-clickhouse
+
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: none -------------------------------------------------------
+      WHS_RING_MODE: none
+      # Casado com o pool: cada escrita em voo e' uma conexao. Subir so' este
+      # valor cria uma fila escondida dentro do pool e o boot avisa.
+      WHS_RING_MAX_INFLIGHT: ${WHS_RING_MAX_INFLIGHT:-32}
+      # capacity_items / max_bytes / high_water nao se aplicam: nao ha' fila.
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: clickhouse -------------------------------------------------
+      WHS_SINK_TYPE: clickhouse
+      # Protocolo nativo (9000; 9440 com TLS), nao o HTTP (8123).
+      WHS_SINK_CLICKHOUSE_ADDRS: clickhouse:9000
+      WHS_SINK_CLICKHOUSE_USERNAME: ${WHS_SINK_CLICKHOUSE_USERNAME:-webhook}
+      # A senha padrao serve ao ambiente de desenvolvimento. Em producao, .env.
+      WHS_SINK_CLICKHOUSE_PASSWORD: ${WHS_SINK_CLICKHOUSE_PASSWORD:-webhook}
+      WHS_SINK_CLICKHOUSE_DATABASE: ${WHS_SINK_CLICKHOUSE_DATABASE:-webhook}
+      WHS_SINK_CLICKHOUSE_TABLE: ${WHS_SINK_CLICKHOUSE_TABLE:-inbox}
+      # Explicito e igual ao max_inflight: quem escreve e' o handler, nao os
+      # workers, entao o "workers + 1" derivado nao faria sentido aqui.
+      WHS_SINK_CLICKHOUSE_POOL_SIZE: ${WHS_SINK_CLICKHOUSE_POOL_SIZE:-32}
+      # Rede interna do compose: sem TLS. Contra um servidor gerenciado, ligue
+      # WHS_SINK_CLICKHOUSE_TLS (porta 9440) e monte a CA em /etc/webhook.
+      WHS_SINK_CLICKHOUSE_TLS: ${WHS_SINK_CLICKHOUSE_TLS:-false}
+      # Nao ha' dreno em background neste modo: workers/batch ficam sem efeito
+      # sobre o caminho da requisicao.
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8100}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9130}:9101"
+
+    volumes:
+      - whs-data:/data
+
+  clickhouse:
+    image: ${WHS_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8}
+    container_name: whs-none-clickhouse-clickhouse
+    restart: unless-stopped
+    environment:
+      # A imagem cria o banco e o usuario. O mesmo usuario serve ao webhook
+      # neste ambiente de desenvolvimento; em producao ele precisa so' de
+      # INSERT na tabela e de um perfil com readonly = 0 (SPEC 8.8.5).
+      CLICKHOUSE_DB: ${WHS_SINK_CLICKHOUSE_DATABASE:-webhook}
+      CLICKHOUSE_USER: ${WHS_SINK_CLICKHOUSE_USERNAME:-webhook}
+      CLICKHOUSE_PASSWORD: ${WHS_SINK_CLICKHOUSE_PASSWORD:-webhook}
+    # async_insert, wait_for_async_insert e fsync_after_insert ficam no padrao
+    # da imagem (async_insert = 0): a garantia do 200 com ring=none mora no
+    # perfil do usuario, e o webhook nao a le nem altera (SPEC 8.8.6).
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      # inbox.sql fica fora do initdb.d: a imagem rodaria um .sql de la' no
+      # banco default. O init.sh o aplica UMA vez, na criacao do volume,
+      # dentro de CLICKHOUSE_DB. Depois disso o esquema e' seu.
+      - ./clickhouse/inbox.sql:/etc/whs/inbox.sql:ro
+      - ./clickhouse/init.sh:/docker-entrypoint-initdb.d/001-inbox.sh:ro
+    ports:
+      - "127.0.0.1:${WHS_CLICKHOUSE_PORT:-9002}:9000"
+    healthcheck:
+      # Saudavel so' quando a TABELA existe: o servidor responde antes de o
+      # init.sh terminar, e o webhook sairia com 3 numa tabela ausente.
+      test: ["CMD-SHELL", "test \"$$(clickhouse-client -u $${CLICKHOUSE_USER} --password $${CLICKHOUSE_PASSWORD} -q \"EXISTS TABLE $${CLICKHOUSE_DB}.inbox\")\" = 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whs-data:
+  clickhouse-data:

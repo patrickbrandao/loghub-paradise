@@ -1,0 +1,7 @@
+# expected fields for rsyslog-protocol23.raw; one key=value per line
+rfc=|5424|
+hostname=|web-01|
+app-name=|systemd|
+procid=|1|
+msgid=||
+msg=| Started Session 42 of user root.|

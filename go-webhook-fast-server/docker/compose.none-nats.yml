@@ -1,0 +1,116 @@
+# sem ring (escrita sincrona)  ->  publicacao num stream JetStream (NATS)
+#
+# Modo sem buffer: o handler publica e so' responde depois do PubAck. Um 200
+# aqui significa "o stream gravou" -- com a durabilidade que a configuracao
+# DO STREAM der (storage, replicas, sync_interval; docs/SPEC.md 8.7.4, 16.1).
+# E' uma das linhas da matriz cuja durabilidade depende de configuracao fora
+# do processo.
+#
+# A publicacao e' assincrona por baixo mesmo aqui: a biblioteca agrupa as
+# mensagens de varios handlers numa saida so', entao a vazao nao fica presa a
+# um round-trip por requisicao. O teto de escritas em voo e' de memoria, nao de
+# conexoes.
+#
+#   docker compose -f compose.none-nats.yml up -d --build
+
+name: whf-none-nats
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-none-nats
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-none-nats
+
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+
+    environment:
+
+      # --- ring: none -------------------------------------------------------
+      WHS_RING_MODE: none
+      # Uma conexao multiplexada e publicacao assincrona: o teto e' de memoria
+      # (cada escrita em voo segura um corpo), nao de conexoes.
+      WHS_RING_MAX_INFLIGHT: ${WHS_RING_MAX_INFLIGHT:-512}
+      # capacity_items / max_bytes / high_water nao se aplicam: nao ha' fila.
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: nats -------------------------------------------------------
+      WHS_SINK_TYPE: nats
+      WHS_SINK_NATS_URLS: nats://nats:4222
+      # Se trocar o nome do stream, troque tambem os subjects em ./nats/stream.json.
+      WHS_SINK_NATS_STREAM: ${WHS_SINK_NATS_STREAM:-LOGHUB_WEBHOOK}
+      WHS_SINK_NATS_SUBJECT: ${WHS_SINK_NATS_SUBJECT:-loghub.{space}.{type}}
+      # Rede interna do compose: sem autenticacao nem TLS. Contra um NATS
+      # gerenciado, monte um arquivo .creds em /etc/webhook (somente leitura) e
+      # aponte WHS_SINK_NATS_CREDENTIALS para ele; ligue WHS_SINK_NATS_TLS.
+      WHS_SINK_NATS_USERNAME: ${WHS_SINK_NATS_USERNAME:-}
+      WHS_SINK_NATS_PASSWORD: ${WHS_SINK_NATS_PASSWORD:-}
+      WHS_SINK_NATS_TLS: ${WHS_SINK_NATS_TLS:-false}
+      # Nao ha' dreno em background neste modo: workers/batch ficam sem efeito
+      # sobre o caminho da requisicao.
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8094}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9124}:9101"
+
+    volumes:
+      - whf-data:/data
+
+  nats:
+    image: ${WHS_NATS_IMAGE:-nats:2.11-alpine}
+    container_name: whf-none-nats-nats
+    restart: unless-stopped
+    # A imagem oficial ja' roda `nats-server --config /etc/nats/nats-server.conf`;
+    # o arquivo montado por cima liga o JetStream em /data e sobe max_payload
+    # para 8 MB (ver ./nats/nats-server.conf).
+    volumes:
+      - nats-data:/data
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      - "127.0.0.1:${WHS_NATS_PORT:-4224}:4222"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Cria o stream UMA vez, de forma idempotente: `stream info` responde se ele
+  # ja' existe; senao `stream add` o cria a partir do arquivo canonico. Contra
+  # um NATS de producao esse papel e' de quem administra o servidor -- o
+  # webhook nunca cria nem altera um stream (docs/SPEC.md 8.7.5).
+  nats-init:
+    image: ${WHS_NATS_BOX_IMAGE:-natsio/nats-box:latest}
+    container_name: whf-none-nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    volumes:
+      - ./nats/stream.json:/etc/nats/stream.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        nats --server nats://nats:4222 stream info ${WHS_SINK_NATS_STREAM:-LOGHUB_WEBHOOK} >/dev/null 2>&1
+        || nats --server nats://nats:4222 stream add ${WHS_SINK_NATS_STREAM:-LOGHUB_WEBHOOK} --config /etc/nats/stream.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whf-data:
+  nats-data:

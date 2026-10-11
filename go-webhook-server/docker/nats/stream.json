@@ -1,0 +1,19 @@
+{
+  "name": "LOGHUB_WEBHOOK_REQUEST",
+  "description": "go-webhook-server: JLH type=webhook.request of space default (SPEC 3.8, 8.7.5). The exact subject of the workspace; never loghub.> (it would capture the control plane, loghub._ctl). Another workspace needs its own subject here.",
+  "subjects": ["loghub.default.webhook.request"],
+  "retention": "limits",
+  "storage": "file",
+  "num_replicas": 1,
+  "max_consumers": -1,
+  "max_msgs": -1,
+  "max_msgs_per_subject": -1,
+  "max_bytes": -1,
+  "max_age": 0,
+  "max_msg_size": -1,
+  "duplicate_window": 600000000000,
+  "discard": "old",
+  "sealed": false,
+  "deny_delete": false,
+  "deny_purge": false
+}

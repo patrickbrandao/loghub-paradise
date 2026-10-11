@@ -1,0 +1,52 @@
+# sem ring  ->  SQLite (destino final)
+#
+# Garantia: o receptor escreve no destino e so' confirma depois. E' o modo
+#   lento por definicao, e o unico em que o parse completo roda na recepcao.
+#
+#   docker compose -f compose.none-sqlite.yml up -d --build
+#
+# Publicado no host: syslog 5149/udp e 5149/tcp, RELP 20609/tcp, admin
+# 127.0.0.1:19109. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-none-sqlite
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-none-sqlite
+
+    environment:
+      SYSLOG_NODE_ID: sls-none-sqlite
+
+      # --- ring: none ---------------------------------------------------------
+      SYSLOG_RING_MODE: none
+      # Escritas sincronas simultaneas. Cheio, vale o mesmo backpressure dos outros
+      # modos.
+      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-2048}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: sqlite
+      SYSLOG_SINK_SQLITE_SYNCHRONOUS: ${SYSLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_SINK_SQLITE_ROTATE: ${SYSLOG_SINK_SQLITE_ROTATE:-daily}
+      # 0 nunca apaga nada. Recarregavel por SIGHUP.
+      SYSLOG_SINK_SQLITE_KEEP_FILES: ${SYSLOG_SINK_SQLITE_KEEP_FILES:-0}
+      # SQLite serializa escritores: mais de 1 worker so' geraria SQLITE_BUSY.
+      SYSLOG_SINK_WORKERS: "1"
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5149}:1514/udp"
+      - "${SYSLOG_PORT:-5149}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20609}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19109}:9102"
+
+    volumes:
+      - sls-data:/data
+
+volumes:
+  sls-data:

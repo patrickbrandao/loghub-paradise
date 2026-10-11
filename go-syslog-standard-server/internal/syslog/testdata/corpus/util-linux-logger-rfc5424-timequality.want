@@ -1,0 +1,8 @@
+# expected fields for util-linux-logger-rfc5424-timequality.raw; one key=value per line
+rfc=|5424|
+hostname=|mymachine|
+app-name=|patrick|
+procid=|1234|
+sd:timeQuality:tzKnown=|1|
+sd:timeQuality:syncAccuracy=|170000|
+msg=|hello world|

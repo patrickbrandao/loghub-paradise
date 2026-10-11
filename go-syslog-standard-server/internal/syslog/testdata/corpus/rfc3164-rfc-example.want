@@ -1,0 +1,8 @@
+# expected fields for rfc3164-rfc-example.raw; one key=value per line
+rfc=|3164|
+pri=|34|
+hostname=|mymachine|
+app-name=|su|
+procid=||
+msg-ts-source=|rfc3164|
+msg=|'su root' failed for lonvick on /dev/pts/8|

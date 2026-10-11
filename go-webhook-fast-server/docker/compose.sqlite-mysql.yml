@@ -1,0 +1,120 @@
+# ring duravel em disco  ->  descarga no MySQL
+#
+# Retencao local maxima com destino compartilhado: o 200 so' sai depois do
+# COMMIT com fsync no ring.db, entao uma queda abrupta do processo nao perde
+# nada -- o backlog e' drenado no boot seguinte, antes de a porta publica
+# abrir. O dreno insere no MySQL em lotes, com ON DUPLICATE KEY UPDATE uuid = uuid.
+#
+# Cada evento paga um fsync local E o commit sincrono do banco. E' a
+# combinacao para quando o banco pode ficar indisponivel por longos periodos e
+# nada pode ser perdido nem recusado nesse intervalo: a fila local absorve.
+#
+# O servidor NUNCA cria a tabela (docs/SPEC.md 8.5.1, 8.6); ./mysql/inbox.sql
+# e' aplicado pela imagem oficial na criacao do volume e validado no boot.
+#
+#   docker compose -f compose.sqlite-mysql.yml up -d --build
+
+name: whf-sqlite-mysql
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-sqlite-mysql
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-sqlite-mysql
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: sqlite -----------------------------------------------------
+      WHS_RING_MODE: sqlite
+      # Vazio deriva <data_dir>/ring.db; explicito para deixar obvio o que
+      # precisa estar no volume.
+      WHS_RING_SQLITE_PATH: /data/ring.db
+      # FULL sobrevive a queda de energia e amarra o p99 ao disco.
+      WHS_RING_SQLITE_SYNCHRONOUS: ${WHS_RING_SQLITE_SYNCHRONOUS:-FULL}
+      WHS_RING_SQLITE_COMMIT_BATCH: ${WHS_RING_SQLITE_COMMIT_BATCH:-256}
+      WHS_RING_SQLITE_COMMIT_MAX_DELAY: ${WHS_RING_SQLITE_COMMIT_MAX_DELAY:-5ms}
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-65536}
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-512MiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+      # Sem efeito com ring=sqlite: os itens ja' estao em disco.
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: mysql ------------------------------------------------------
+      WHS_SINK_TYPE: mysql
+      WHS_SINK_MYSQL_ADDR: mysql:3306
+      WHS_SINK_MYSQL_USERNAME: ${WHS_SINK_MYSQL_USERNAME:-webhook}
+      # A senha padrao serve ao ambiente de desenvolvimento. Em producao, .env.
+      WHS_SINK_MYSQL_PASSWORD: ${WHS_SINK_MYSQL_PASSWORD:-webhook}
+      WHS_SINK_MYSQL_DATABASE: ${WHS_SINK_MYSQL_DATABASE:-webhook}
+      WHS_SINK_MYSQL_TABLE: ${WHS_SINK_MYSQL_TABLE:-inbox}
+      # 0 deriva sink.workers + 1: uma conexao por worker e uma para o health.
+      WHS_SINK_MYSQL_POOL_SIZE: ${WHS_SINK_MYSQL_POOL_SIZE:-0}
+      # Rede interna do compose: sem TLS. Contra um banco gerenciado, ligue
+      # WHS_SINK_MYSQL_TLS e monte a CA em /etc/webhook (somente leitura).
+      WHS_SINK_MYSQL_TLS: ${WHS_SINK_MYSQL_TLS:-false}
+
+      # Explicito para nao emitir o aviso de padrao rebaixado. Cada worker e'
+      # uma conexao no servidor; some as instancias antes de subir isto.
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-4}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8096}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9126}:9101"
+
+    # /data guarda o ring.db, a fonte da verdade desta combinacao.
+    volumes:
+      - whf-data:/data
+
+  mysql:
+    image: ${WHS_MYSQL_IMAGE:-mysql:8.4}
+    container_name: whf-sqlite-mysql-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${WHS_MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${WHS_SINK_MYSQL_DATABASE:-webhook}
+      MYSQL_USER: ${WHS_SINK_MYSQL_USERNAME:-webhook}
+      MYSQL_PASSWORD: ${WHS_SINK_MYSQL_PASSWORD:-webhook}
+    command:
+      - mysqld
+      # A garantia do 200 desta combinacao mora nesta linha (SPEC 8.6.5): com 1,
+      # o INSERT so' retorna depois do fsync do redo log. O webhook nao le nem
+      # altera este valor.
+      - --innodb_flush_log_at_trx_commit=1
+      # Corpo maximo (5 MiB) mais envelope precisa caber num pacote, e o boot
+      # confere (SPEC 8.6.4). O padrao do 8.x ja' e' 64M; explicito para nao
+      # depender da versao.
+      - --max_allowed_packet=64M
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # Executado UMA vez pela imagem oficial, ao criar o volume, dentro de
+      # MYSQL_DATABASE. Depois disso o esquema e' seu: migre com a ferramenta
+      # que administrar o banco.
+      - ./mysql/inbox.sql:/docker-entrypoint-initdb.d/001-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${WHS_MYSQL_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whf-data:
+  mysql-data:

@@ -1,0 +1,10 @@
+# Combinacao padrao: ring=memory -> sink=nats (JetStream), o eventbus do LogHub.
+#
+#   docker compose up -d --build
+#
+# As demais combinacoes estao em compose.<ring>-<sink>.yml (README.md).
+
+name: sls-memory-nats
+
+include:
+  - compose.memory-nats.yml

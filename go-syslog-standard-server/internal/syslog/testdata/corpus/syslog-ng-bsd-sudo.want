@@ -1,0 +1,7 @@
+# expected fields for syslog-ng-bsd-sudo.raw; one key=value per line
+rfc=|3164|
+hostname=|gw01|
+app-name=|sudo|
+facility=|10|
+severity=|6|
+msg=| patrick : TTY=pts/0 ; PWD=/home/patrick ; USER=root ; COMMAND=/bin/ls|

@@ -1,0 +1,82 @@
+# ring persistente em SQLite  ->  PostgreSQL (destino compartilhado)
+#
+# Garantia: COMMIT em disco antes da confirmacao. So' faz sentido com TCP e
+#   RELP: no UDP o fsync garante o que a rede talvez ja' tenha descartado.
+#
+#   docker compose -f compose.sqlite-postgres.yml up -d --build
+#
+# Publicado no host: syslog 5146/udp e 5146/tcp, RELP 20606/tcp, admin
+# 127.0.0.1:19106. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-sqlite-postgres
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-sqlite-postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      SYSLOG_NODE_ID: sls-sqlite-postgres
+
+      # --- ring: sqlite ---------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      # FULL faz fsync a cada group commit: sobrevive a queda de energia, e a
+      # latencia de confirmacao fica presa ao disco.
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      # Sem efeito com ring=sqlite: os itens ja' estao em disco.
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: postgres ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: postgres
+      SYSLOG_SINK_POSTGRES_ADDR: postgres:5432
+      SYSLOG_SINK_POSTGRES_USERNAME: ${SYSLOG_SINK_POSTGRES_USERNAME:-syslog}
+      SYSLOG_SINK_POSTGRES_PASSWORD: ${SYSLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      SYSLOG_SINK_POSTGRES_DATABASE: ${SYSLOG_SINK_POSTGRES_DATABASE:-syslog}
+      SYSLOG_SINK_POSTGRES_TABLE: ${SYSLOG_SINK_POSTGRES_TABLE:-events}
+      SYSLOG_SINK_POSTGRES_POOL_SIZE: ${SYSLOG_SINK_POSTGRES_POOL_SIZE:-0}
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5146}:1514/udp"
+      - "${SYSLOG_PORT:-5146}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20606}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19106}:9102"
+
+    volumes:
+      - sls-data:/data
+
+  postgres:
+    # 17 fixado: a imagem 18 mudou o diretorio de dados que este volume monta.
+    image: ${SYSLOG_POSTGRES_IMAGE:-postgres:17-alpine}
+    container_name: sls-sqlite-postgres-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SYSLOG_SINK_POSTGRES_USERNAME:-syslog}
+      POSTGRES_PASSWORD: ${SYSLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      POSTGRES_DB: ${SYSLOG_SINK_POSTGRES_DATABASE:-syslog}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # O servidor NUNCA cria a tabela (docs/SPEC.md 10.5.1). Aqui quem cria e' a
+      # imagem oficial, no primeiro boot do volume, a partir do schema canonico.
+      - ./postgres/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "127.0.0.1:${SYSLOG_POSTGRES_PORT:-15406}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SYSLOG_SINK_POSTGRES_USERNAME:-syslog} -d ${SYSLOG_SINK_POSTGRES_DATABASE:-syslog}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  sls-data:
+  postgres-data:

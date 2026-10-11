@@ -1,0 +1,62 @@
+# ring na RAM  ->  SQLite (destino final)
+#
+# Garantia: a mensagem esta' na RAM deste no'. SIGTERM nao perde (dreno);
+#   FATAL do sink nao perde (dump de emergencia); SIGKILL e OOM perdem o backlog.
+#
+#   docker compose -f compose.memory-sqlite.yml up -d --build
+#
+# Publicado no host: syslog 5141/udp e 5141/tcp, RELP 20601/tcp, admin
+# 127.0.0.1:19101. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-memory-sqlite
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-memory-sqlite
+
+    environment:
+      SYSLOG_NODE_ID: sls-memory-sqlite
+
+      # --- ring: memory ---------------------------------------------------------
+      SYSLOG_RING_MODE: memory
+      # Tetos do ring. Estourar qualquer um dos dois aplica o backpressure de cada
+      # transporte (docs/SPEC.md 2.3): o TCP para de ler, o RELP responde 500, o
+      # UDP descarta e conta. Nunca "aceito e descartado".
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (SYSLOG_GOMEMLIMIT e
+      # SYSLOG_MEMORY_LIMIT).
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-256MiB}
+      SYSLOG_RING_HIGH_WATER: ${SYSLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte. E' a escrita em disco que
+      # obriga o volume mesmo nesta combinacao.
+      SYSLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: sqlite ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: sqlite
+      SYSLOG_SINK_SQLITE_SYNCHRONOUS: ${SYSLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_SINK_SQLITE_ROTATE: ${SYSLOG_SINK_SQLITE_ROTATE:-daily}
+      # 0 nunca apaga nada. Recarregavel por SIGHUP.
+      SYSLOG_SINK_SQLITE_KEEP_FILES: ${SYSLOG_SINK_SQLITE_KEEP_FILES:-0}
+      # SQLite serializa escritores: mais de 1 worker so' geraria SQLITE_BUSY.
+      SYSLOG_SINK_WORKERS: "1"
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5141}:1514/udp"
+      - "${SYSLOG_PORT:-5141}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20601}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19101}:9102"
+
+    volumes:
+      - sls-data:/data
+
+volumes:
+  sls-data:

@@ -1,0 +1,347 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loghub/schemas/jlh-webhook.schema.json",
+  "title": "JLH webhook.* — envelopes webhook.request, webhook.commit e webhook.reply",
+  "description": "Envelopes da família webhook: webhook.request (servidor HTTP injeta a requisição no eventbus), webhook.commit (worker gravou para processamento futuro) e webhook.reply (processamento concluído, com ou sem documento de resposta). Compatível com jlh-envelope.schema.json.",
+  "$comment": "Regras que JSON Schema não expressa, verificadas por scripts/validate.py: content.length = bytes do corpo decodificado; url coerente com schema, host, path e query; event.iso = uts+sub truncado em ms; em webhook.request os 48 bits de ms do uuid = event; content.type = cabeçalho content-type. Entre envelopes (fora do alcance de um schema): commit/reply copiam space e sid do request, usam step = request.step + 1 e payload.ref = uuid do request.",
+  "type": "object",
+  "required": ["uuid", "from", "space", "type", "level", "sid", "step", "event", "payload"],
+  "properties": {
+    "uuid": { "description": "UUIDv7 minúsculo da mensagem. No webhook.request é o UUID devolvido ao cliente; commit e reply geram um uuid novo.", "$ref": "#/$defs/uuidv7" },
+    "from": { "description": "AgentUUID do emissor: o servidor HTTP no request, o worker no commit e no reply.", "$ref": "#/$defs/uuidv7" },
+    "space": { "description": "Space da rota (tenant) ou, na falta, o Workspace da identidade. Commit e reply copiam o do request.", "type": "string", "pattern": "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$", "default": "default" },
+    "type": { "description": "Família webhook, grafia com ponto (não usar webhook-request).", "enum": ["webhook.request", "webhook.commit", "webhook.reply"] },
+    "level": { "description": "9 = data-channel (request; reply com documento); 8 = data-signal (commit; reply sem dados).", "enum": [8, 9] },
+    "sid": { "description": "PID do servidor HTTP (padrão) ou hash de 53 bits da conexão; nunca aleatório. Commit e reply copiam o do request.", "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "step": { "description": "0 no request emitido pelo servidor HTTP; request.step + 1 em commit, reply e cópias de forward.", "type": "integer", "minimum": 0, "maximum": 65535 },
+    "event": { "$ref": "#/$defs/event" },
+    "payload": { "description": "Política definida por type (ver allOf).", "type": "object" }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "description": "webhook.request: level 9, payload com a requisição completa.",
+      "if": { "properties": { "type": { "const": "webhook.request" } } },
+      "then": { "properties": { "level": { "const": 9 }, "payload": { "$ref": "#/$defs/webhookRequestPayload" } } }
+    },
+    {
+      "description": "Regra: cópia de forward (webhook.request com step >= 1) não carrega forward, para não haver fan-out em cascata.",
+      "if": { "properties": { "type": { "const": "webhook.request" }, "step": { "minimum": 1 } } },
+      "then": { "properties": { "payload": { "not": { "required": ["forward"] } } } }
+    },
+    {
+      "description": "webhook.commit: level 8, emitido por worker (step >= 1), payload só com ref.",
+      "if": { "properties": { "type": { "const": "webhook.commit" } } },
+      "then": { "properties": { "level": { "const": 8 }, "step": { "minimum": 1 }, "payload": { "$ref": "#/$defs/refPayload" } } }
+    },
+    {
+      "description": "webhook.reply: emitido por worker (step >= 1); level 8 = só ref (cliente recebe 200 OK), level 9 = documento de resposta.",
+      "if": { "properties": { "type": { "const": "webhook.reply" } } },
+      "then": {
+        "properties": { "step": { "minimum": 1 } },
+        "if": { "properties": { "level": { "const": 8 } } },
+        "then": { "properties": { "payload": { "$ref": "#/$defs/refPayload" } } },
+        "else": { "properties": { "payload": { "$ref": "#/$defs/webhookReplyDataPayload" } } }
+      }
+    }
+  ],
+
+  "$defs": {
+    "uuidv7": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "httpMethod": { "description": "Método HTTP em maiúsculas (GET, POST, PUT...).", "type": "string", "pattern": "^[A-Z]+$" },
+
+    "event": {
+      "description": "Request: instante de chegada da requisição. Commit/reply: instante da emissão. UTC.",
+      "type": "object",
+      "required": ["uts", "sub", "iso"],
+      "properties": {
+        "uts": { "description": "Unix timestamp em segundos.", "type": "integer", "minimum": 0 },
+        "sub": { "description": "Nanossegundos dentro do segundo.", "type": "integer", "minimum": 0, "maximum": 999999999 },
+        "iso": { "description": "yyyy-MM-ddTHH:mm:ss.SSSZ com os ms de sub truncados.", "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" }
+      },
+      "additionalProperties": false
+    },
+
+    "webhookMode": {
+      "description": "Compromisso do servidor HTTP: fast = confirma após gerar o UUID; bucket = após persistir localmente; commit = após webhook.commit; full = após webhook.reply.",
+      "enum": ["fast", "bucket", "commit", "full"]
+    },
+
+    "network": {
+      "description": "Conexão do cliente original. Dados de cabeçalhos de proxy só valem se o par TCP for proxy confiável.",
+      "type": "object",
+      "required": ["ip", "l4", "sec", "meta"],
+      "properties": {
+        "ip": {
+          "type": "object",
+          "required": ["version", "src", "dst"],
+          "properties": {
+            "version": { "description": "4 ou 6; IPv4 mapeado em IPv6 vira IPv4.", "enum": [4, 6] },
+            "src": { "description": "IP do cliente original.", "type": "string" },
+            "dst": { "description": "IP que o cliente alvejou (proxy ou o próprio servidor); desconhecido = 0.0.0.0 ou ::.", "type": "string" }
+          },
+          "additionalProperties": false,
+          "if": { "properties": { "version": { "const": 4 } } },
+          "then": { "properties": { "src": { "format": "ipv4" }, "dst": { "format": "ipv4" } } },
+          "else": { "properties": { "src": { "format": "ipv6" }, "dst": { "format": "ipv6" } } }
+        },
+        "l4": {
+          "description": "Portas da conexão TCP cliente<->proxy (ou cliente<->servidor).",
+          "type": "object",
+          "required": ["sport", "dport"],
+          "properties": {
+            "sport": { "$ref": "#/$defs/port" },
+            "dport": { "$ref": "#/$defs/port" },
+            "mss": { "description": "MSS TCP, só se conhecido.", "$ref": "#/$defs/port" }
+          },
+          "additionalProperties": false
+        },
+        "sec": {
+          "description": "Onde o TLS terminou: proxy, direct (no próprio servidor) ou none (HTTP puro).",
+          "type": "object",
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["proxy", "direct", "none"] },
+            "fp2": { "description": "Fingerprint HTTP/2.", "type": "string" },
+            "fp3": { "description": "Fingerprint JA3.", "type": "string" },
+            "fp4": { "description": "Fingerprint JA4.", "type": "string" }
+          },
+          "additionalProperties": false,
+          "if": { "properties": { "mode": { "const": "none" } } },
+          "then": { "description": "Regra: sem TLS não há JA3/JA4.", "not": { "anyOf": [{ "required": ["fp3"] }, { "required": ["fp4"] }] } }
+        },
+        "meta": {
+          "description": "Lista livre de pares chave/valor.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "value"],
+            "properties": { "key": { "type": "string", "minLength": 1 }, "value": {} },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "headerList": {
+      "description": "Cabeçalhos, um item por linha (repetidos preservados), nome minúsculo, sem hop-by-hop nem pseudo-cabeçalhos.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "value"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[!#$%&'*+.^_`|~0-9a-z-]+$",
+            "not": { "enum": ["connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"] }
+          },
+          "value": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+
+    "paramsMap": { "description": "Parâmetros da rota (ex.: /hooks/{provider}/{hook}); {} sem parâmetros.", "type": "object", "additionalProperties": { "type": "string" } },
+
+    "queryMap": {
+      "description": "Query string decodificada; chave repetida vira array na ordem de chegada; {} sem query.",
+      "type": "object",
+      "additionalProperties": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" }, "minItems": 2 }] }
+    },
+
+    "content": {
+      "description": "Corpo cru (sem parse nem reformatação, para preservar assinaturas HMAC).",
+      "type": "object",
+      "required": ["length", "type", "body"],
+      "properties": {
+        "length": { "description": "Bytes do corpo cru, antes do base64.", "type": "integer", "minimum": 0 },
+        "type": { "description": "Content-Type como recebido; \"\" se ausente.", "type": "string" },
+        "encoding": { "description": "utf-8 se os bytes são UTF-8 válido, senão base64. Ausente = utf-8.", "enum": ["utf-8", "base64"], "default": "utf-8" },
+        "body": { "type": "string" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "Regra: com encoding=base64 o body é base64 padrão com padding (RFC 4648 §4).",
+          "if": { "required": ["encoding"], "properties": { "encoding": { "const": "base64" } } },
+          "then": { "properties": { "body": { "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$" } } }
+        },
+        {
+          "description": "Regra: sem corpo (length 0) o body é \"\".",
+          "if": { "properties": { "length": { "const": 0 } } },
+          "then": { "properties": { "body": { "maxLength": 0 } } }
+        }
+      ]
+    },
+
+    "callback": {
+      "description": "Chamadas de saída executadas por um worker bridge-out no commit e/ou no reply. Da configuração da rota, nunca do cliente.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "method": { "$ref": "#/$defs/httpMethod", "default": "POST" },
+          "url": { "type": "string", "format": "uri", "pattern": "^https?://" },
+          "event": { "enum": ["commit", "reply", "both"], "default": "reply" }
+        },
+        "additionalProperties": false
+      }
+    },
+
+    "forward": {
+      "description": "Clonagem do payload para outros servidores de webhook, da configuração da rota. Cópias não herdam forward; callback é herdado por padrão.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "method": { "$ref": "#/$defs/httpMethod", "default": "POST" },
+          "url": { "type": "string", "format": "uri", "pattern": "^https?://" }
+        },
+        "additionalProperties": false
+      }
+    },
+
+    "webhookRequestPayload": {
+      "description": "Payload de webhook.request: a requisição HTTP recebida (esquema LH-HTTP) + mode, callback e forward. Obrigatórios vazios continuam presentes ([], {}, \"\").",
+      "type": "object",
+      "required": ["mode", "network", "method", "schema", "host", "path", "url", "headers", "params", "query", "content"],
+      "properties": {
+        "mode": { "$ref": "#/$defs/webhookMode" },
+        "network": { "$ref": "#/$defs/network" },
+        "method": { "$ref": "#/$defs/httpMethod" },
+        "schema": { "description": "Protocolo visto pelo cliente (o campo se chama schema, não scheme).", "enum": ["http", "https"] },
+        "host": { "description": "Host efetivo, minúsculo, sem porta e sem colchetes.", "type": "string", "minLength": 1 },
+        "path": { "description": "Caminho como recebido, percent-encoding preservado, sem query.", "type": "string", "pattern": "^/" },
+        "url": { "description": "schema://host[:porta]path[?query]; porta omitida quando padrão (443/80).", "type": "string", "format": "uri", "pattern": "^https?://" },
+        "headers": { "$ref": "#/$defs/headerList" },
+        "params": { "$ref": "#/$defs/paramsMap" },
+        "query": { "$ref": "#/$defs/queryMap" },
+        "content": { "$ref": "#/$defs/content" },
+        "callback": { "$ref": "#/$defs/callback" },
+        "forward": { "$ref": "#/$defs/forward" }
+      },
+      "patternProperties": { "^x-[A-Za-z0-9._-]+$": { "description": "Extensões próprias (convenção x- do LogHub)." } },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "Regra: schema=https quando o TLS terminou no proxy ou no servidor; http quando sec.mode=none.",
+          "if": { "properties": { "network": { "properties": { "sec": { "properties": { "mode": { "const": "none" } } } } } } },
+          "then": { "properties": { "schema": { "const": "http" } } },
+          "else": { "properties": { "schema": { "const": "https" } } }
+        }
+      ]
+    },
+
+    "refPayload": {
+      "description": "Payload de webhook.commit e de webhook.reply level 8: só a correlação com o request.",
+      "type": "object",
+      "required": ["ref"],
+      "properties": { "ref": { "description": "uuid do webhook.request.", "$ref": "#/$defs/uuidv7" } },
+      "patternProperties": { "^x-[A-Za-z0-9._-]+$": { "description": "Extensões próprias (convenção x- do LogHub)." } },
+      "additionalProperties": false
+    },
+
+    "webhookReplyDataPayload": {
+      "description": "Payload de webhook.reply level 9: documento de resposta que o servidor HTTP devolve ao cliente (modo full).",
+      "type": "object",
+      "required": ["ref", "status", "content"],
+      "properties": {
+        "ref": { "description": "uuid do webhook.request.", "$ref": "#/$defs/uuidv7" },
+        "status": { "description": "Status HTTP a devolver ao cliente.", "type": "integer", "minimum": 100, "maximum": 599, "default": 200 },
+        "headers": { "$ref": "#/$defs/headerList" },
+        "content": { "$ref": "#/$defs/content" }
+      },
+      "patternProperties": { "^x-[A-Za-z0-9._-]+$": { "description": "Extensões próprias (convenção x- do LogHub)." } },
+      "additionalProperties": false
+    }
+  },
+
+  "examples": [
+    {
+      "uuid": "01a1039f-6d6d-71e2-a4c9-3b7d5f1a0c84",
+      "from": "019a7c2e-5b10-7d3a-8f42-6e1c9b0a7d55",
+      "space": "default",
+      "type": "webhook.request",
+      "level": 9,
+      "sid": 48213,
+      "step": 0,
+      "event": { "uts": 1791062142, "sub": 317482913, "iso": "2026-10-03T21:15:42.317Z" },
+      "payload": {
+        "mode": "commit",
+        "network": {
+          "ip": { "version": 4, "src": "200.142.19.183", "dst": "45.255.128.9" },
+          "l4": { "sport": 8412, "dport": 443, "mss": 1430 },
+          "sec": { "mode": "proxy", "fp3": "771,4865-4866-4867-49195,0-23-65281-10-11,29-23-24,0", "fp4": "t13d1516h2_8daaf6152771_02713d6af862" },
+          "meta": []
+        },
+        "method": "POST",
+        "schema": "https",
+        "host": "hooks.acme.com.br",
+        "path": "/hooks/github/deploy",
+        "url": "https://hooks.acme.com.br/hooks/github/deploy?env=prod&tag=a&tag=b",
+        "headers": [
+          { "name": "host", "value": "hooks.acme.com.br" },
+          { "name": "user-agent", "value": "GitHub-Hookshot/7f3a2c1" },
+          { "name": "content-type", "value": "application/json" },
+          { "name": "content-length", "value": "81" },
+          { "name": "x-github-event", "value": "push" },
+          { "name": "x-github-delivery", "value": "5b1e3c70-8a2f-11f0-9b4e-2c7d1a9e4f10" },
+          { "name": "x-hub-signature-256", "value": "sha256=3c9a1f0e7d2b4a6c8e1f3a5b7c9d0e2f4a6b8c0d1e3f5a7b9c1d3e5f7a9b1c3d" },
+          { "name": "x-forwarded-for", "value": "200.142.19.183" },
+          { "name": "x-forwarded-proto", "value": "https" }
+        ],
+        "params": { "provider": "github", "hook": "deploy" },
+        "query": { "env": "prod", "tag": ["a", "b"] },
+        "content": {
+          "length": 81,
+          "type": "application/json",
+          "encoding": "utf-8",
+          "body": "{\"ref\":\"refs/heads/main\",\"after\":\"9f1c2e7\",\"repository\":{\"full_name\":\"acme/api\"}}"
+        },
+        "callback": [{ "method": "POST", "url": "https://wh.acme.io/feedback", "event": "reply" }]
+      }
+    },
+    {
+      "uuid": "01a1039f-6d85-7d0f-b1e6-8c24a9f3e017",
+      "from": "019a7c31-0c88-7a19-b3d6-2f8e4a61c0e7",
+      "space": "default",
+      "type": "webhook.commit",
+      "level": 8,
+      "sid": 48213,
+      "step": 1,
+      "event": { "uts": 1791062142, "sub": 341207511, "iso": "2026-10-03T21:15:42.341Z" },
+      "payload": { "ref": "01a1039f-6d6d-71e2-a4c9-3b7d5f1a0c84" }
+    },
+    {
+      "uuid": "01a1039f-6fb6-7072-9c3d-41e8b2a6f5d9",
+      "from": "019a7c31-0c88-7a19-b3d6-2f8e4a61c0e7",
+      "space": "default",
+      "type": "webhook.reply",
+      "level": 8,
+      "sid": 48213,
+      "step": 1,
+      "event": { "uts": 1791062142, "sub": 902114350, "iso": "2026-10-03T21:15:42.902Z" },
+      "payload": { "ref": "01a1039f-6d6d-71e2-a4c9-3b7d5f1a0c84" }
+    },
+    {
+      "uuid": "01a1039f-6fb6-7072-9c3d-41e8b2a6f5d9",
+      "from": "019a7c31-0c88-7a19-b3d6-2f8e4a61c0e7",
+      "space": "default",
+      "type": "webhook.reply",
+      "level": 9,
+      "sid": 48213,
+      "step": 1,
+      "event": { "uts": 1791062142, "sub": 902114350, "iso": "2026-10-03T21:15:42.902Z" },
+      "payload": {
+        "ref": "01a1039f-6d6d-71e2-a4c9-3b7d5f1a0c84",
+        "status": 202,
+        "headers": [{ "name": "content-type", "value": "application/json" }],
+        "content": { "length": 35, "type": "application/json", "encoding": "utf-8", "body": "{\"deploy\":\"queued\",\"id\":\"dpl_7Q2k\"}" }
+      }
+    }
+  ]
+}

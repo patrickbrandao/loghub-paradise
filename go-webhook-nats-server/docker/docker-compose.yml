@@ -1,0 +1,13 @@
+# Entrada padrao: `docker compose up -d --build` dentro desta pasta.
+#
+# Nao duplica nada -- apenas inclui a unica combinacao deste servidor (ring na
+# RAM, publicacao num stream JetStream do NATS). O `name` abaixo e' o mesmo do
+# arquivo incluido, entao estes dois comandos operam a MESMA stack:
+#
+#   docker compose up -d --build
+#   docker compose -f compose.memory-nats.yml up -d --build
+
+name: whn-memory-nats
+
+include:
+  - compose.memory-nats.yml

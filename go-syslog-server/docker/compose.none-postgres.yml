@@ -1,0 +1,96 @@
+# ring sem ring  ->  PostgreSQL compartilhado (fila loghub.inbox)
+#
+# Garantia (TCP/TLS): a escrita no destino terminou antes de voltar a ler.
+#   O modo lento por definicao: a conversao roda na recepcao.
+#
+#   docker compose -f compose.none-postgres.yml up -d --build
+#
+# Publicado no host: syslog 5155/udp e 5155/tcp (SYSLOG_PORT), TLS 16515
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19115 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-none-postgres
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-none-postgres
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-none-postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- ring: none --------------------------------------------------------
+      SYSLOG_RING_MODE: none
+      # Igual ao pool (sink.workers 4 + 1): sem ring a escrita e' sincrona, e um
+      # max_inflight acima do pool so' cria fila escondida dentro dele (SPEC
+      # §9.6; o boot avisa). Quem subir o pool sobe este junto.
+      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-5}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: postgres ----------------------------------------------------
+      SYSLOG_SINK_TYPE: postgres
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao de um orcamento que a frota inteira divide
+      # (SPEC §10.5). Acima de 16 tambem e' WARN.
+      SYSLOG_SINK_WORKERS: "4"
+      SYSLOG_SINK_POSTGRES_TABLE: ${SYSLOG_SINK_POSTGRES_TABLE:-loghub.inbox}
+      # 0 deriva sink.workers + 1 = 5.
+      SYSLOG_SINK_POSTGRES_POOL_SIZE: ${SYSLOG_SINK_POSTGRES_POOL_SIZE:-0}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README); a URL leva a senha do servico postgres abaixo
+      # (postgres://syslog:syslog@postgres:5432/syslog). Usuario e banco sem
+      # valor so' entram se definidos no .env ou no shell; sem eles vale o
+      # padrao do servidor, syslog/syslog, o mesmo do servico postgres.
+      SYSLOG_SINK_POSTGRES_ADDR: postgres:5432
+      SYSLOG_SINK_POSTGRES_PASSWORD: ${SYSLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      SYSLOG_SINK_POSTGRES_USERNAME:
+      SYSLOG_SINK_POSTGRES_DATABASE:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5155}:1514/udp"
+      - "${SYSLOG_PORT:-5155}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16515}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19115}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+  postgres:
+    image: ${SYSLOG_POSTGRES_IMAGE:-postgres:18-alpine}
+    container_name: sls-none-postgres-postgres
+    hostname: sls-none-postgres-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SYSLOG_SINK_POSTGRES_USERNAME:-syslog}
+      POSTGRES_PASSWORD: ${SYSLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      POSTGRES_DB: ${SYSLOG_SINK_POSTGRES_DATABASE:-syslog}
+    volumes:
+      # A imagem 18 guarda os dados em /var/lib/postgresql/18/docker e recusa
+      # um volume montado no antigo /var/lib/postgresql/data.
+      - postgres-data:/var/lib/postgresql
+      # O servidor nunca faz DDL (SPEC §10.5): a fila loghub.inbox vem daqui,
+      # na criacao do volume (DDL literal da skill, SPEC §3.7.1).
+      - ./postgres/inbox.sql:/docker-entrypoint-initdb.d/10-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${SYSLOG_POSTGRES_PORT:-15415}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SYSLOG_SINK_POSTGRES_USERNAME:-syslog} -d ${SYSLOG_SINK_POSTGRES_DATABASE:-syslog}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  sls-data:
+  postgres-data:

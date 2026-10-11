@@ -1,0 +1,6 @@
+# expected fields for util-linux-logger-rfc3164.raw; one key=value per line
+rfc=|3164|
+hostname=|mymachine|
+app-name=|patrick|
+procid=||
+msg=|hello world|

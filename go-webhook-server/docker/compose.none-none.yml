@@ -1,0 +1,49 @@
+# sem ring  ->  sem sink
+#
+# MODO DE BENCHMARK PURO DE HTTP. Toda requisicao e' respondida 200 e DESCARTADA
+# sem tocar em ring nem em destino. O numero que sai daqui e' o teto absoluto da
+# maquina: aceitar corpo, montar envelope, responder. Nenhuma configuracao vai
+# superar isto -- serve como linha de base para medir quanto cada combinacao
+# real esta' custando.
+#
+# NUNCA em producao, em nenhuma circunstancia. Nao existe reprocessamento: o
+# evento simplesmente nao existiu. O servidor emite o warning mais enfatico do
+# boot para esta combinacao.
+#
+#   docker compose -f compose.none-none.yml up -d --build
+
+name: whs-none-none
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whs-base
+    container_name: whs-none-none
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whs-none-none
+
+    environment:
+
+      WHS_RING_MODE: none
+      WHS_RING_MAX_INFLIGHT: ${WHS_RING_MAX_INFLIGHT:-8192}
+      WHS_EMERGENCY_ENABLED: "false"
+
+      WHS_SINK_TYPE: none
+
+      # Num benchmark de teto, o log por requisicao e' justamente o que se quer
+      # medir com e sem. Ligue com WHS_LOG_ACCESS=true para ver o custo.
+      WHS_LOG_LEVEL: ${WHS_LOG_LEVEL:-warn}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8088}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9118}:9101"
+
+    # Sem ring e sem sink nada e' escrito em disco; o volume existe so' para
+    # manter o servico identico aos outros em tudo que nao e' a combinacao.
+    volumes:
+      - whs-data:/data
+
+volumes:
+  whs-data:

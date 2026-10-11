@@ -1,0 +1,50 @@
+# ring sem ring  ->  SQLite local (/data/events.db, tabela syslog_events)
+#
+# Garantia (TCP/TLS): a escrita no destino terminou antes de voltar a ler.
+#   O modo lento por definicao: a conversao roda na recepcao.
+#
+#   docker compose -f compose.none-sqlite.yml up -d --build
+#
+# Publicado no host: syslog 5154/udp e 5154/tcp (SYSLOG_PORT), TLS 16514
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19114 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-none-sqlite
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-none-sqlite
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-none-sqlite
+    environment:
+      # --- ring: none --------------------------------------------------------
+      SYSLOG_RING_MODE: none
+      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-2048}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite ------------------------------------------------------
+      SYSLOG_SINK_TYPE: sqlite
+      SYSLOG_SINK_SQLITE_SYNCHRONOUS: ${SYSLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_SINK_SQLITE_ROTATE: ${SYSLOG_SINK_SQLITE_ROTATE:-daily}
+      # Quantos rotacionados manter (keep_files) e' recarregavel: conf/syslog.ini.
+      SYSLOG_SINK_WORKERS: "1"
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5154}:1514/udp"
+      - "${SYSLOG_PORT:-5154}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16514}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19114}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+volumes:
+  sls-data:

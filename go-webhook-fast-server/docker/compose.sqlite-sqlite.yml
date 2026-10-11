@@ -1,0 +1,94 @@
+# ring no SQLite  ->  descarga no SQLite
+#
+# LEIA ANTES DE USAR. Esta combinacao paga DOIS fsyncs por evento: um para
+# entrar no ring.db, outro para sair no events.db. Para a esmagadora maioria dos
+# deploys, ring.mode=memory + sink.type=sqlite entrega a mesma durabilidade do
+# que ja' foi gravado pela metade do custo -- e e' isso que voce provavelmente
+# quer (veja compose.memory-sqlite.yml). O servidor emite esse mesmo aviso no
+# boot.
+#
+# O caso em que esta combinacao se justifica: os dois arquivos em discos
+# FISICAMENTE DIFERENTES, para que a perda de um disco nao leve fila e destino
+# juntos. Por isso os dois volumes abaixo sao declarados separados -- aponte
+# cada um para um device distinto (veja o exemplo comentado no fim do arquivo).
+#
+# Os dois caminhos precisam ser arquivos diferentes: o ring e' uma fila (le e
+# apaga) e o events e' destino append-only. Apontar os dois para o mesmo arquivo
+# faz o servidor recusar o boot.
+#
+#   docker compose -f compose.sqlite-sqlite.yml up -d --build
+
+name: whf-sqlite-sqlite
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-sqlite-sqlite
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-sqlite-sqlite
+
+    environment:
+
+      # --- ring: sqlite (volume ring) ---------------------------------------
+      WHS_RING_MODE: sqlite
+      WHS_RING_SQLITE_PATH: /data/ring/ring.db
+      WHS_RING_SQLITE_SYNCHRONOUS: ${WHS_RING_SQLITE_SYNCHRONOUS:-FULL}
+      WHS_RING_SQLITE_COMMIT_BATCH: ${WHS_RING_SQLITE_COMMIT_BATCH:-256}
+      WHS_RING_SQLITE_COMMIT_MAX_DELAY: ${WHS_RING_SQLITE_COMMIT_MAX_DELAY:-5ms}
+      WHS_RING_SQLITE_BUSY_TIMEOUT: ${WHS_RING_SQLITE_BUSY_TIMEOUT:-5s}
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-1000000}
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-8GiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite (volume events) -------------------------------------
+      WHS_SINK_TYPE: sqlite
+      WHS_SINK_SQLITE_PATH: /data/events/events.db
+      WHS_SINK_SQLITE_ROTATE: ${WHS_SINK_SQLITE_ROTATE:-daily}
+      WHS_SINK_SQLITE_KEEP_FILES: ${WHS_SINK_SQLITE_KEEP_FILES:-14}
+      WHS_SINK_SQLITE_SYNCHRONOUS: ${WHS_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      WHS_SINK_SQLITE_BUSY_TIMEOUT: ${WHS_SINK_SQLITE_BUSY_TIMEOUT:-5s}
+      WHS_SINK_WORKERS: "1"
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8084}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9114}:9101"
+
+    # Dois volumes, ambos SOB /data: a raiz gravavel e' a mesma de sempre
+    # (docs/SPEC.md 13.6), so' que subdividida para separar fila de destino.
+    # /data/ring e /data/events ja' existem na imagem com dono 65532; um ponto
+    # de montagem inexistente seria criado como root e o processo nao
+    # conseguiria escrever nele.
+    volumes:
+      - whf-ring:/data/ring
+      - whf-events:/data/events
+
+# Dois volumes separados exatamente para poderem morar em discos diferentes.
+# Enquanto forem volumes locais padrao, os dois ficam no mesmo device e a
+# combinacao nao entrega vantagem nenhuma sobre memory-sqlite.
+#
+# Para separar de verdade, troque por bind mounts em pontos de montagem
+# distintos:
+#
+#   whf-ring:
+#     driver: local
+#     driver_opts:
+#       type: none
+#       o: bind
+#       device: /mnt/nvme0/whf-ring
+#   whf-events:
+#     driver: local
+#     driver_opts:
+#       type: none
+#       o: bind
+#       device: /mnt/nvme1/whf-events
+#
+# Os diretorios precisam existir e pertencer ao uid 65532.
+volumes:
+  whf-ring:
+  whf-events:

@@ -1,0 +1,20 @@
+{
+  "name": "LOGHUB_WEBHOOK",
+  "description": "go-webhook-nats-server: JLH type=webhook of space default (SPEC 3.8, 8.7.5). Only the exact subject loghub.default.webhook; never loghub.> (it would capture the control plane, loghub._ctl.beacon). Another workspace needs its own subject here.",
+  "subjects": ["loghub.default.webhook"],
+  "retention": "limits",
+  "storage": "file",
+  "num_replicas": 1,
+  "max_consumers": -1,
+  "max_msgs": -1,
+  "max_msgs_per_subject": -1,
+  "max_bytes": -1,
+  "max_age": 0,
+  "max_msg_size": -1,
+  "duplicate_window": 600000000000,
+  "discard": "old",
+  "no_ack": false,
+  "sealed": false,
+  "deny_delete": false,
+  "deny_purge": false
+}

@@ -1,0 +1,60 @@
+# ring em disco (ring.db)  ->  SQLite local (/data/events.db, tabela syslog_events)
+#
+# Garantia (TCP/TLS): COMMIT com fsync no /data/ring.db antes de voltar a ler;
+#   zero perda sob crash do processo.
+#
+# WARN esperado no boot: "ring.mode=sqlite with sink.type=sqlite: every message
+#   pays TWO fsyncs" (SPEC §9.7). Aqui ring.db e events.db estao no MESMO
+#   volume, que e' o caso caro: compose.memory-sqlite.yml da' a mesma
+#   durabilidade no destino pela metade do custo. Esta combinacao so' compensa
+#   com os dois arquivos em discos distintos, sem sair da raiz /data (SPEC
+#   §16.6): por exemplo SYSLOG_SINK_SQLITE_PATH=/data/disco2/events.db com um
+#   segundo volume montado em /data/disco2.
+#
+#   docker compose -f compose.sqlite-sqlite.yml up -d --build
+#
+# Publicado no host: syslog 5148/udp e 5148/tcp (SYSLOG_PORT), TLS 16508
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19108 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-sqlite-sqlite
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-sqlite-sqlite
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-sqlite-sqlite
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite ------------------------------------------------------
+      SYSLOG_SINK_TYPE: sqlite
+      SYSLOG_SINK_SQLITE_SYNCHRONOUS: ${SYSLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_SINK_SQLITE_ROTATE: ${SYSLOG_SINK_SQLITE_ROTATE:-daily}
+      # Quantos rotacionados manter (keep_files) e' recarregavel: conf/syslog.ini.
+      SYSLOG_SINK_WORKERS: "1"
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5148}:1514/udp"
+      - "${SYSLOG_PORT:-5148}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16508}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19108}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+volumes:
+  sls-data:

@@ -1,0 +1,6 @@
+# expected fields for kubernetes-fluentbit-rfc5424.raw; one key=value per line
+rfc=|5424|
+hostname=|node-3|
+app-name=|kube-apiserver|
+sd:k8s:pod=|api-7d9f|
+msg=|{"level":"info","msg":"ok"}|

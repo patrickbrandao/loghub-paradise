@@ -1,0 +1,151 @@
+# Fragmento compartilhado: o servico-base `slnats-base`, que o docker-compose.yml
+# herda via `extends`. NAO suba este arquivo sozinho.
+#
+# Fica aqui o que nao depende do destino; o que e' do NATS (conexao, modo,
+# stream, beacon), as portas publicadas, o volume /data e o hostname ficam no
+# docker-compose.yml.
+#
+# Regra de heranca do Compose: `environment` e `healthcheck` sao mapas e o filho
+# sobrescreve chave a chave; `ports` e' sequencia e concatena (por isso as portas
+# ficam so' no filho); `volumes` junta por destino (o de config fica aqui, o
+# /data no filho); `depends_on` NAO e' herdado por `extends`.
+#
+# Config em dois lugares, de proposito (SPEC §16.1, §16.3):
+#   - env (aqui e no docker-compose.yml): SO' chaves que exigem restart. Env
+#     vence o INI e nao muda num container de pe'.
+#   - conf/syslog.ini, montado em /etc/syslog: SO' as recarregaveis (log.level,
+#     log.access, log.access_sample). Edite o arquivo e mande
+#     `docker kill -s HUP slnats`.
+
+services:
+  slnats-base:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${SYSLOG_VERSION:-dev}
+        COMMIT: ${SYSLOG_COMMIT:-none}
+        GO_VERSION: ${SYSLOG_GO_VERSION:-1.25}
+        ALPINE_VERSION: ${SYSLOG_ALPINE_VERSION:-3.22}
+    image: ${SYSLOG_IMAGE:-go-syslog-nats-server}:${SYSLOG_IMAGE_TAG:-local}
+
+    restart: unless-stopped
+
+    # Precisa ser maior que shutdown.pre_stop_delay + shutdown.drain_timeout,
+    # ou o Docker mata o processo no meio do dreno do ring (SPEC §13.4) -- e o
+    # que sobra nem chega ao dump de emergencia.
+    stop_grace_period: 45s
+    stop_signal: SIGTERM
+
+    environment:
+      # --- identidade LogHub (go-loghub-ident, SPEC §13.1) ------------------
+      # DATADIR e AGENT_NAME ja' vem da imagem. WORKSPACE e' o TENANT, nao o
+      # ambiente: prod e staging nao sao tenants. Ele vira o `space` de todo
+      # envelope e o subject loghub.<space>.syslog (o stream de nats/stream.json
+      # cobre loghub.default.syslog; outro WORKSPACE exige trocar os subjects dele
+      # junto, ou o boot sai com 3). HOSTNAME vem do `hostname:`
+      # do servico. AGENT_UUID e MACHINE_ID sao gerados e persistidos em /data
+      # na primeira subida.
+      # Lido de SYSLOG_WORKSPACE, nunca de WORKSPACE: o shell de CI (Jenkins)
+      # exporta WORKSPACE com o caminho do job, e o compose o interpolaria.
+      WORKSPACE: ${SYSLOG_WORKSPACE:-default}
+
+      # --- transportes -------------------------------------------------------
+      # Dentro do container as portas sao 1514, nunca 514 (SPEC §4.1). 0.0.0.0
+      # e' o que recebe as portas publicadas. Nao ha TLS (SPEC §1.2): quem
+      # precisa de syslog cifrado poe um terminador na frente, com PROXY
+      # protocol para manter o src-ip.
+      SYSLOG_LISTEN_UDP: 0.0.0.0:1514
+      SYSLOG_LISTEN_TCP: 0.0.0.0:1514
+      SYSLOG_LISTEN_UDP_LISTENERS: ${SYSLOG_LISTEN_UDP_LISTENERS:-1}
+      # O parametro mais importante do UDP. O teto real e' net.core.rmem_max do
+      # HOST; o valor efetivo aparece em syslog_udp_read_buffer_bytes.
+      SYSLOG_LISTEN_UDP_READ_BUFFER: ${SYSLOG_LISTEN_UDP_READ_BUFFER:-8MiB}
+      # PROXY protocol (SPEC §4.6), so' no TCP: so' com um balanceador na frente.
+      SYSLOG_PROXY_PROTOCOL: ${SYSLOG_PROXY_PROTOCOL:-off}
+      SYSLOG_PROXY_TRUSTED: ${SYSLOG_PROXY_TRUSTED:-127.0.0.1/32,::1/128}
+
+      SYSLOG_ADMIN_ENABLED: "true"
+      SYSLOG_ADMIN_BIND: 0.0.0.0:9102
+
+      # --- conversao (SPEC §6; exigem restart) -------------------------------
+      # Todo o [syslog]: nomes fixados pela skill loghub-type-syslog-schema.
+      # Um dump de emergencia ja' guarda o JLH pronto e volta sem conversao:
+      # trocar estas chaves entre duas subidas nao muda um dump pendente
+      # (SPEC §3.5, §12.2).
+      SYSLOG_MAX_MESSAGE_BYTES: ${SYSLOG_MAX_MESSAGE_BYTES:-64KiB}
+      SYSLOG_RFC3164_TIMEZONE: ${SYSLOG_RFC3164_TIMEZONE:-UTC}
+      SYSLOG_PAYLOAD_RAW: ${SYSLOG_PAYLOAD_RAW:-true}
+      SYSLOG_LEGACY_CHARSET: ${SYSLOG_LEGACY_CHARSET:-}
+      SYSLOG_ACCEPT_MALFORMED: ${SYSLOG_ACCEPT_MALFORMED:-true}
+      SYSLOG_DEFAULT_PRIORITY: ${SYSLOG_DEFAULT_PRIORITY:-13}
+      SYSLOG_SD_MAX_ELEMENTS: ${SYSLOG_SD_MAX_ELEMENTS:-32}
+      SYSLOG_SD_MAX_PARAMS: ${SYSLOG_SD_MAX_PARAMS:-64}
+
+      # --- chaves recarregaveis: conf/syslog.ini -------------------------------
+      # log.level, log.access e log.access_sample NAO entram no env: env vence o
+      # INI e nunca muda num container de pe', e o `docker kill -s HUP` nao
+      # mudaria nada. Edite conf/syslog.ini e mande o HUP. O caminho e' fixo; a
+      # pasta vem do volume abaixo.
+      SYSLOG_CONFIG: /etc/syslog/syslog.ini
+
+      # --- observabilidade -----------------------------------------------------
+      SYSLOG_LOG_FORMAT: ${SYSLOG_LOG_FORMAT:-json}
+
+      # --- desligamento --------------------------------------------------------
+      SYSLOG_SHUTDOWN_PRE_STOP_DELAY: ${SYSLOG_SHUTDOWN_PRE_STOP_DELAY:-0s}
+      SYSLOG_SHUTDOWN_DRAIN_TIMEOUT: ${SYSLOG_SHUTDOWN_DRAIN_TIMEOUT:-30s}
+
+      # --- memoria (SPEC §15.4) ------------------------------------------------
+      # Sem GOMEMLIMIT o GC nao sabe do teto do container e o OOM killer chega
+      # antes. Precisa cobrir 2 x ring.max_bytes; o limite do container fica
+      # ACIMA dele.
+      GOMEMLIMIT: ${SYSLOG_GOMEMLIMIT:-512MiB}
+
+    # /healthz e' liveness pura: 200 enquanto o processo vive. /readyz NAO e'
+    # o healthcheck de proposito: ele da' 503 com o NATS fora, com o ring
+    # acima de ring.high_water e durante a reingestao de dumps no boot, e
+    # marcar o container unhealthy por isso (ou reinicia-lo, num orquestrador
+    # que o faca) nao conserta um NATS inalcancavel -- so' troca o ring em RAM
+    # por um dump e uma reingestao. /readyz e' para o balanceador e para o
+    # operador (README, "Saude").
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9102/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+    # So' leitura. O /data gravavel e' um volume nomeado POR INSTANCIA,
+    # declarado no docker-compose.yml.
+    volumes:
+      # conf/syslog.ini: as chaves recarregaveis. A PASTA, nao o arquivo: um
+      # bind de arquivo prende o inode, e o editor que salva por rename deixaria
+      # o container lendo a versao antiga para sempre.
+      - ./conf:/etc/syslog:ro
+
+    # read_only transforma "so' /data e' gravavel" em garantia: um caminho de
+    # escrita fora do volume falha no boot em vez de gravar na camada efemera.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    deploy:
+      resources:
+        limits:
+          memory: ${SYSLOG_MEMORY_LIMIT:-768M}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

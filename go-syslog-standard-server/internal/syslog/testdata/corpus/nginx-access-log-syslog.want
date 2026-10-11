@@ -1,0 +1,7 @@
+# expected fields for nginx-access-log-syslog.raw; one key=value per line
+rfc=|3164|
+hostname=|web-01|
+app-name=|nginx|
+facility=|23|
+severity=|6|
+msg=|10.0.0.5 - - [13/Sep/2026:10:00:00 -0300] "GET / HTTP/1.1" 200 612|

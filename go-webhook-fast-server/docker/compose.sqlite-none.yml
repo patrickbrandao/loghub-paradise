@@ -1,0 +1,53 @@
+# ring no SQLite  ->  sink descartado
+#
+# MODO DE BENCHMARK. Mede o custo do caminho de ingestao duravel -- HTTP,
+# envelope e o fsync do group commit no ring.db -- sem nenhum destino. E' assim
+# que se descobre quanto do p99 e' disco e quanto e' o sink, rodando este e
+# depois compose.sqlite-redis.yml na mesma maquina.
+#
+# NUNCA em producao: o evento e' gravado no ring, lido pelo dreno e DESCARTADO.
+# O cliente ja' recebeu 200. O servidor avisa isso no boot.
+#
+#   docker compose -f compose.sqlite-none.yml up -d --build
+
+name: whf-sqlite-none
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-sqlite-none
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-sqlite-none
+
+    environment:
+
+      # --- ring: sqlite -----------------------------------------------------
+      WHS_RING_MODE: sqlite
+      WHS_RING_SQLITE_PATH: /data/ring.db
+      # Rode o benchmark tambem com NORMAL: a diferenca entre os dois numeros e'
+      # exatamente o que a durabilidade do ring esta' custando.
+      WHS_RING_SQLITE_SYNCHRONOUS: ${WHS_RING_SQLITE_SYNCHRONOUS:-FULL}
+      WHS_RING_SQLITE_COMMIT_BATCH: ${WHS_RING_SQLITE_COMMIT_BATCH:-256}
+      WHS_RING_SQLITE_COMMIT_MAX_DELAY: ${WHS_RING_SQLITE_COMMIT_MAX_DELAY:-5ms}
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-1000000}
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-8GiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: none -------------------------------------------------------
+      WHS_SINK_TYPE: none
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-8}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8085}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9115}:9101"
+
+    volumes:
+      - whf-data:/data
+
+volumes:
+  whf-data:

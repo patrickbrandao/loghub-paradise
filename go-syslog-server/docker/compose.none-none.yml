@@ -1,0 +1,48 @@
+# ring sem ring  ->  descarte (benchmark de transporte)
+#
+# Garantia: NENHUMA. A conversao roda na recepcao e o envelope e' DESCARTADO
+#   (SPEC §10.8, §19: "qualquer + none" perde tudo); sem semaforo de
+#   max_inflight (SPEC §9.6). Mede recepcao, moldura, conversao e serializacao
+#   sem ring e sem destino. Nao guarde log com isto.
+#
+#   docker compose -f compose.none-none.yml up -d --build
+#
+# Publicado no host: syslog 5157/udp e 5157/tcp (SYSLOG_PORT), TLS 16517
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19117 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-none-none
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-none-none
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-none-none
+    environment:
+      # --- ring: none --------------------------------------------------------
+      SYSLOG_RING_MODE: none
+      # Sem ring.max_inflight: com sink=none o semaforo e' dispensado (SPEC §9.6).
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: none --------------------------------------------------------
+      SYSLOG_SINK_TYPE: none
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5157}:1514/udp"
+      - "${SYSLOG_PORT:-5157}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16517}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19117}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+volumes:
+  sls-data:

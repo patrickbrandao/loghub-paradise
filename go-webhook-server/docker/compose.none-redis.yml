@@ -1,0 +1,92 @@
+# sem ring (escrita sincrona)  ->  Redis Streams
+#
+# Modo sem buffer: o handler faz o XADD e so' entao responde. Um 200 aqui
+# significa "o Redis confirmou", nao "foi aceito para entrega" -- e' a garantia
+# mais forte que este servidor oferece ao cliente, e a unica em que ele pode
+# reagir a uma falha de entrega (recebe 5xx e reenvia).
+#
+# O throughput continua alto porque o rueidis funde as chamadas concorrentes de
+# varias goroutines num unico syscall de escrita: nao ha' um round trip por
+# requisicao. A contrapartida e' que a latencia do cliente passa a incluir a do
+# Redis, e uma queda do Redis vira 5xx imediato em vez de backlog.
+#
+#   docker compose -f compose.none-redis.yml up -d --build
+
+name: whs-none-redis
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whs-base
+    container_name: whs-none-redis
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whs-none-redis
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: none -------------------------------------------------------
+      WHS_RING_MODE: none
+      # Unico teto que existe neste modo: escritas concorrentes. Sem ele, um
+      # destino lento deixaria o numero de goroutines bloqueadas crescer sem
+      # limite, cada uma segurando um corpo de ate' max_body_bytes. Semaforo
+      # cheio responde 429, igual aos outros modos.
+      WHS_RING_MAX_INFLIGHT: ${WHS_RING_MAX_INFLIGHT:-2048}
+      # capacity_items / max_bytes / high_water nao se aplicam: nao ha' fila.
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: redis ------------------------------------------------------
+      WHS_SINK_TYPE: redis
+      WHS_SINK_REDIS_ADDRS: redis:6379
+      WHS_SINK_REDIS_STREAM: ${WHS_SINK_REDIS_STREAM:-loghub.{space}.{type}}
+      WHS_SINK_REDIS_DB: ${WHS_SINK_REDIS_DB:-0}
+      WHS_SINK_REDIS_USERNAME: ${WHS_SINK_REDIS_USERNAME:-}
+      WHS_SINK_REDIS_PASSWORD: ${WHS_SINK_REDIS_PASSWORD:-}
+      WHS_SINK_REDIS_MAXLEN: ${WHS_SINK_REDIS_MAXLEN:-0}
+      # Nao ha' dreno em background neste modo: quem escreve e' o handler.
+      # workers/batch ficam sem efeito sobre o caminho da requisicao.
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8086}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9116}:9101"
+
+    volumes:
+      - whs-data:/data
+
+  redis:
+    image: ${WHS_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: whs-none-redis-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${WHS_REDIS_PORT:-6386}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whs-data:
+  redis-data:

@@ -1,0 +1,56 @@
+# ring na RAM  ->  SQLite local (/data/events.db, tabela syslog_events)
+#
+# Garantia (TCP/TLS): a mensagem esta' na RAM deste no'. SIGTERM nao perde
+#   (dreno); FATAL do sink nao perde (dump); SIGKILL e OOM perdem o backlog.
+#
+#   docker compose -f compose.memory-sqlite.yml up -d --build
+#
+# Publicado no host: syslog 5142/udp e 5142/tcp (SYSLOG_PORT), TLS 16502
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19102 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-memory-sqlite
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-memory-sqlite
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-memory-sqlite
+    environment:
+      # --- ring: memory ------------------------------------------------------
+      SYSLOG_RING_MODE: memory
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-256MiB}
+      SYSLOG_RING_HIGH_WATER: ${SYSLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte (SPEC §12).
+      SYSLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: sqlite ------------------------------------------------------
+      SYSLOG_SINK_TYPE: sqlite
+      SYSLOG_SINK_SQLITE_SYNCHRONOUS: ${SYSLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_SINK_SQLITE_ROTATE: ${SYSLOG_SINK_SQLITE_ROTATE:-daily}
+      # Quantos rotacionados manter (keep_files) e' recarregavel: conf/syslog.ini.
+      SYSLOG_SINK_WORKERS: "1"
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5142}:1514/udp"
+      - "${SYSLOG_PORT:-5142}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16502}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19102}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+volumes:
+  sls-data:

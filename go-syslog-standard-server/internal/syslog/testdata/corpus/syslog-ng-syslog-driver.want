@@ -1,0 +1,6 @@
+# expected fields for syslog-ng-syslog-driver.raw; one key=value per line
+rfc=|5424|
+hostname=|gw01|
+app-name=|sudo|
+sd:meta:sequenceId=|7|
+msg=|patrick : TTY=pts/0|

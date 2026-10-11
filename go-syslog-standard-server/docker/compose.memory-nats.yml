@@ -1,0 +1,122 @@
+# ring na RAM  ->  stream JetStream (NATS)
+#
+# Garantia: a mensagem esta' na RAM deste no'. SIGTERM nao perde (dreno);
+#   FATAL do sink nao perde (dump de emergencia); SIGKILL e OOM perdem o backlog.
+#
+# O syslog NUNCA cria o stream (docs/SPEC.md 10.8.5): o servico nats-init o cria
+# a partir de ./nats/stream.json uma vez, e o syslog valida no boot que ele
+# existe, que o subject pertence a ele, que nao esta' selado e que o maior
+# evento cabe no max_payload -- e sai com codigo 3 na hora se algo faltar.
+#
+#   docker compose -f compose.memory-nats.yml up -d --build
+#
+# Publicado no host: syslog 5153/udp e 5153/tcp, RELP 20613/tcp, admin
+# 127.0.0.1:19113. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-memory-nats
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-memory-nats
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+
+    environment:
+      SYSLOG_NODE_ID: sls-memory-nats
+
+      # --- ring: memory ---------------------------------------------------------
+      SYSLOG_RING_MODE: memory
+      # Tetos do ring. Estourar qualquer um dos dois aplica o backpressure de cada
+      # transporte (docs/SPEC.md 2.3): o TCP para de ler, o RELP responde 500, o
+      # UDP descarta e conta. Nunca "aceito e descartado".
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (SYSLOG_GOMEMLIMIT e
+      # SYSLOG_MEMORY_LIMIT).
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-256MiB}
+      SYSLOG_RING_HIGH_WATER: ${SYSLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte. E' a escrita em disco que
+      # obriga o volume mesmo nesta combinacao.
+      SYSLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: nats -----------------------------------------------------------
+      SYSLOG_SINK_TYPE: nats
+      SYSLOG_SINK_NATS_URLS: nats://nats:4222
+      # Stream proprio, separado do WEBHOOKS. Se trocar o nome, troque tambem os
+      # subjects em ./nats/stream.json.
+      SYSLOG_SINK_NATS_STREAM: ${SYSLOG_SINK_NATS_STREAM:-SYSLOG}
+      SYSLOG_SINK_NATS_SUBJECT: ${SYSLOG_SINK_NATS_SUBJECT:-syslog.in}
+      # Rede interna do compose: sem autenticacao nem TLS. Contra um NATS
+      # gerenciado, monte um arquivo .creds em /etc/syslog (somente leitura),
+      # aponte SYSLOG_SINK_NATS_CREDENTIALS para ele e ligue SYSLOG_SINK_NATS_TLS.
+      SYSLOG_SINK_NATS_USERNAME: ${SYSLOG_SINK_NATS_USERNAME:-}
+      SYSLOG_SINK_NATS_PASSWORD: ${SYSLOG_SINK_NATS_PASSWORD:-}
+      SYSLOG_SINK_NATS_TLS: ${SYSLOG_SINK_NATS_TLS:-false}
+      # O maior evento e' a linha crua mais o envelope no pior caso, sete vezes o
+      # teto de frame (docs/SPEC.md 3.9). Com 1 MiB ele fica em 7 MiB e cabe nos
+      # 8 MB de max_payload de ./nats/nats-server.conf; com os 16 MiB padrao o
+      # boot sai com codigo 3. Ainda muito acima de qualquer emissor real (o
+      # rsyslog trunca em 8 KiB por padrao).
+      SYSLOG_TCP_MAX_FRAME_BYTES: ${SYSLOG_TCP_MAX_FRAME_BYTES:-1MiB}
+      SYSLOG_RELP_MAX_FRAME_BYTES: ${SYSLOG_RELP_MAX_FRAME_BYTES:-1MiB}
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5153}:1514/udp"
+      - "${SYSLOG_PORT:-5153}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20613}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19113}:9102"
+
+    volumes:
+      - sls-data:/data
+
+  nats:
+    image: ${SYSLOG_NATS_IMAGE:-nats:2.11-alpine}
+    container_name: sls-memory-nats-nats
+    restart: unless-stopped
+    # A imagem oficial ja' roda `nats-server --config /etc/nats/nats-server.conf`;
+    # o arquivo montado por cima liga o JetStream em /data e sobe max_payload
+    # para 8 MB (ver ./nats/nats-server.conf).
+    volumes:
+      - nats-data:/data
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      - "127.0.0.1:${SYSLOG_NATS_PORT:-14213}:4222"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # Cria o stream UMA vez, de forma idempotente: `stream info` responde se ele ja'
+  # existe; senao `stream add` o cria a partir do arquivo canonico. Contra um NATS
+  # de producao esse papel e' de quem administra o servidor -- o syslog nunca cria
+  # nem altera um stream (docs/SPEC.md 10.8.5).
+  nats-init:
+    image: ${SYSLOG_NATS_BOX_IMAGE:-natsio/nats-box:latest}
+    container_name: sls-memory-nats-nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    volumes:
+      - ./nats/stream.json:/etc/nats/stream.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        nats --server nats://nats:4222 stream info ${SYSLOG_SINK_NATS_STREAM:-SYSLOG} >/dev/null 2>&1
+        || nats --server nats://nats:4222 stream add ${SYSLOG_SINK_NATS_STREAM:-SYSLOG} --config /etc/nats/stream.json
+
+volumes:
+  sls-data:
+  nats-data:

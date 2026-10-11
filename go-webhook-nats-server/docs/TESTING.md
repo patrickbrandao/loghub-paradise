@@ -1,0 +1,414 @@
+# go-webhook-nats-server — Procedimentos de teste
+
+Companheiro operacional de `SPEC.md` §15. As suítes vieram do
+`go-webhook-pg-server` em 2026-10-10, com as do destino trocadas pelas do NATS:
+as do `go-syslog-nats-server` (sink, beacon, configuração NATS e
+`LOGHUB_EB_URL`) e as do `go-webhook-fast-server` (o `cover` de um subject de
+outro `space`, o ciclo de vida da app contra o NATS). O histórico de §9 é o
+deles no que vale para o código daqui. Este documento diz **como rodar**, **o
+que cada suíte prova** e **o que ainda não é provado**.
+
+---
+
+## 1. Suíte rápida (todo commit)
+
+```bash
+cd go-webhook-nats-server
+gofmt -l .            # deve ser vazio
+go vet ./...
+go test -race ./...
+```
+
+Tempo: ~45 s sem NATS, ~50 s com ele (2026-10-10, macOS M-series). O `-race`
+**não é opcional**: os bugs de perda de dados deste projeto vivem em caminhos
+concorrentes, e a liberação dupla de buffer (SPEC §12.3) só é detectável assim.
+
+Sem `WHS_TEST_NATS_URL`, os testes que precisam de um NATS **pulam**; o ciclo de
+vida inteiro (boot, dreno, DOWN, FATAL, dump, reingestão, `SIGHUP`) roda mesmo
+assim, contra o destino falso de `internal/app/fakesink_test.go` (SPEC §15.3),
+e os testes de unidade do sink rodam contra um servidor NATS **falso** de
+`internal/sink/nats_test.go` (o que pede TLS).
+
+## 2. Cobertura real
+
+Cobertura por pacote engana: a suíte de `internal/app` exercita `server`,
+`ring` e `sink` sem que isso seja atribuído a eles. Use `-coverpkg`:
+
+```bash
+WHS_TEST_NATS_URL=nats://127.0.0.1:14222 WHS_TEST_NATS_NOJS_URL=nats://127.0.0.1:14223 \
+  go test -coverpkg=./internal/... -coverprofile=cov.out ./... && go tool cover -func=cov.out | tail -1
+```
+
+Referência (2026-10-10, com os dois NATS, depois da revisão independente):
+**91,6 %**. No `sink/nats.go`, o menos coberto é `writeCore` (83,3 %: o erro de
+`PublishMsg` que não é `ErrMaxPayload` exige um cliente desconectado no meio do
+lote).
+
+## 3. Fuzzing (SPEC §15.2, obrigatório)
+
+Antes de qualquer release, **10 minutos cada** (60 s no dia a dia):
+
+```bash
+go test ./internal/clientip/  -run=XXX -fuzz=FuzzResolve      -fuzztime=10m
+go test ./internal/emergency/ -run=XXX -fuzz=^FuzzRead$       -fuzztime=10m
+go test ./internal/emergency/ -run=XXX -fuzz=FuzzGateAdmitsTheWriter -fuzztime=10m
+go test ./internal/envelope/  -run=XXX -fuzz=^FuzzEnvelope$   -fuzztime=10m
+go test ./internal/server/    -run=XXX -fuzz=FuzzServeHTTP    -fuzztime=10m
+```
+
+Não há `FuzzJSONBSafe`: a troca do NUL era da cópia para o `jsonb` do P.
+
+O que cada um prova:
+
+- `FuzzResolve` — o único parser de entrada hostil estruturada; um bug ali é
+  spoofing de IP.
+- `FuzzRead` — o leitor do dump JSON Lines (SPEC §9.2), em memória: todo item
+  recuperado é um JLH **deste servidor** (cabeçalho estrito, `type=webhook`,
+  `level=9`, `step=0`, payload aberto por `{"mode":"fast",` — a porta que impede
+  o NATS de publicar o que não leu), JSON e UTF-8 válidos, sem `0x0A`, com o
+  `uuid` como id, e aprovado por um oráculo que a porta não compartilha
+  (`jlhcheck.ValidateEnvelopeSchema`: o schema JLH e um decodificador que vê
+  chave repetida em qualquer profundidade); todo byte da entrada é contado
+  exatamente uma vez; o que foi recuperado reescreve e relê igual.
+- `FuzzGateAdmitsTheWriter` — a outra metade do contrato da porta: todo
+  envelope que o `envelope.AppendWebhook` escreve, com path, query, valores de
+  cabeçalho, tipo e corpo hostis (nomes de cabeçalho só como *token* HTTP, que
+  é o que o `net/http` deixa passar), passa no `checkLine`. Uma porta mais
+  estreita que o escritor quarentenaria eventos reais, respondidos com `200`.
+  Achou na primeira execução que o próprio alvo passava nomes de cabeçalho que
+  o `net/http` recusa — o escritor os emite sem escape, de propósito.
+- `FuzzEnvelope` e `FuzzServeHTTP` — todo envelope passa no contrato, o
+  `ParseHead` o lê de volta, e **nenhum tem `0x0A` cru** (SPEC §9.1).
+
+Rodados por 60 s cada em 2026-10-10, sem achado; o `FuzzRead` de novo, 60 s,
+e o `FuzzGateAdmitsTheWriter`, 60 s (2 milhões de execuções), depois da porta
+nova da revisão independente.
+
+### 3.1 Contrato LogHub (SPEC §3, §15.1)
+
+O oráculo `internal/jlhcheck` valida todo envelope que um teste lê de volta —
+do handler, do destino falso, do dump e do stream — contra as cópias dos
+schemas em `internal/jlhcheck/loghub/` e as regras do `validate.py` da skill. A
+mensagem NATS é fiel ao byte, então o envelope lido do stream é comparado
+também byte a byte com o que foi publicado. O beacon passa por
+`jlhcheck.ValidateEnvelopeSchema` (só o envelope: não há schema de payload de
+`beacon` aqui). `jlhcheck.ValidateJSONBCopy` ficou do P, sem uso, pela paridade
+do `diff`.
+
+## 4. Integração sem NATS (SPEC §15.3)
+
+`internal/app` monta a mesma aplicação do binário (`runContext`) e troca só o
+destino, pelo campo `App.sinkOverride`. O destino falso (`memSink`) guarda uma
+**cópia** de cada envelope confirmado e pode ser posto DOWN ou FATAL no meio do
+teste:
+
+| Cenário | Teste |
+|---|---|
+| Todo `200` chega ao destino, e nada além | `TestEveryAcceptedEventIsDelivered` |
+| Ring cheio é `429`, nunca `200` com descarte | `TestRingFullReturns429` |
+| Superfície HTTP, h2c, admin, histogramas | `TestHTTPSurface`, `TestH2CPriorKnowledge`, `TestAdminEndpoints`, `TestHistogramInvariants` |
+| Seletores de compatibilidade, URL não `nats://` e chaves retiradas | `TestInvalidConfigRefusesToStart` |
+| NATS inalcançável: porta pública fechada, `exit 3` após `boot_timeout` | `TestUnreachableSinkExitsWithoutOpeningPublicPort` (não precisa de servidor: a porta morta é o ponto) |
+| Recusa fatal no boot: `exit 3` na hora, e o log diz "refused this server permanently" | `TestFatalBootRefusalIsLoggedAsSuch` |
+| A ligação de `[sink.nats]`/`[loghub]` ao sink: prazos, `workers × batch`, maior envelope, nome do cliente | `TestNATSConfigCarriesTheDeadlinesAndCeilings` |
+| `SIGHUP` real ignorado, com `WARN` | `TestSIGHUPIsIgnored`, `TestIgnoreSIGHUPWarnsOnEachSignal` |
+| `SIGTERM` com ring cheio: dreno completo, `exit 0` | `TestGracefulShutdownDrainsAFullRing` |
+| Segundo sinal: `exit 130` | `TestSecondSignalExits130` |
+| Destino cai e volta: `503`, nada perdido | `TestSinkDownThenBackLosesNothing` |
+| Destino FATAL: dump JSON Lines lido **à mão**, reingestão no boot seguinte | `TestFatalSinkDumpsAndTheNextBootReingests` |
+| `emergency.enabled=false`: `exit 3`, nenhum arquivo | `TestFatalSinkWithoutEmergencyExitsThreeAndWritesNothing` |
+| Dump com linhas danificadas no meio e no fim: íntegras entregues, `.corrupt` | `TestDamagedEmergencyDumpIsQuarantined` |
+| Lote que o destino recusa inteiro como `logic` (sem `Delivered`): refeito item a item, `.corrupt`, boot segue | `TestALineTheDestinationRefusesIsQuarantinedNotFatal` |
+| Dump que não se escreve: perda contada uma vez, em `emergency_failed` | `TestFailedDumpIsCountedOnceAsEmergencyFailed` |
+| Primeiro sinal durante um shutdown por FATAL: o dump continua | `TestFirstSignalDuringAFatalShutdownKeepsTheDump` |
+| `emg-*.bin` do fast: intocado; o `.jsonl` ao lado é reingerido | `TestFastBinaryDumpIsLeftAlone` |
+| Reingestão entregue em parte (`Delivered`): as guardadas contam como escritas, as recusadas ficam no `.corrupt` | `TestReingestPartialDelivery` |
+| `SIGTERM` no meio da reingestão: `130`, dump mantido | `TestSIGTERMDuringReingestKeepsTheDump` |
+| O temporário gêmeo de um dump é removido; o de um dump interrompido fica, informado num `WARN` que não diz "contados como perda" e ensina a reingerir | `TestBootRemovesTheTwinOfADumpAndKeepsAnInterruptedOne` |
+| *Gauges* de emergência depois do dump: a soma, sem reler o diretório | `TestEmergencyGaugesCountTheDumpWithoutReReading` |
+| Upload lento e destino que não responde no shutdown: o dump começa em um `drain_timeout`, não em dois | `TestShutdownDrainTimeoutBoundsConnectionsAndRingTogether` |
+| Upload que termina depois do último `Drain` do shutdown: `503`, nunca `200` (ring selado). O ring do teste (`App.wrapRing`) completa o upload **dentro** do `Drain`, então um `Seal` depois do `Drain` também falha | `TestUploadFinishingAfterTheDrainIsRefused` |
+
+No pacote `sink`, sem servidor: a tabela de classificação, a forma da mensagem
+(cabeçalhos com o nome literal, `Data` como o próprio slice do item), o teto do
+bloco de headers (exatamente 257 B), os subjects por `space` com cache, o
+`subjectCovers`, o contrato de `docker/nats/stream.json`, as recusas da
+validação (inclusive os três tetos de tamanho), as opções que nunca pedem TLS
+(e `ReconnectBufSize(-1)`, `MaxReconnects(-1)`), um servidor falso com
+`tls_required` que nunca recebe um byte, o veredito de permissão negada, a
+amostragem dos erros assíncronos, os **workers com entrega parcial**
+(`TestWorkersPartialDeliveryDropsOnlyTheRefused`, que também confere que o ring
+vazio não conta byte nenhum), os logs de conexão e reconexão sem token nem senha
+(`TestNATSConnectLogsNoCredentials`), a publicação negada em `core` fatal no
+próprio lote e nada publicado depois (`TestNATSCoreDeniedPublishIsFatalAtOnce`),
+o `WARN` único por subject de outro `space` em `core`
+(`TestNATSCoreWarnsOnceAboutAForeignSubject`), e "sem respondedores" na
+primeira checagem fatal sem perguntar `$JS.API.INFO` nem guardar veredito,
+contra o servidor falso que responde `503` a todo pedido e nega
+`$JS.API.INFO` (`TestNATSNoRespondersNeverProbesTheAccount`). No pacote `ring`,
+o `Seal` como barreira contra o `Enqueue` (`TestMemorySealIsABarrierForEnqueue`).
+
+## 5. NATS real — suíte automatizada
+
+Os testes pulam sem um servidor, e o servidor não cria o stream: a suíte cria
+os dela, cada um com um nome e um `space` únicos, a partir do stream canônico
+(`natsCanonicalStream` no sink, `docker/nats/stream.json` na app). Um segundo
+servidor, **sem** JetStream, prova o FATAL imediato de SPEC §8.7.5.
+
+```bash
+mkdir -p /tmp/whs-nats
+cat > /tmp/whs-nats.conf <<'EOF'
+port: 14222
+max_payload: 8MB
+jetstream { store_dir: "/tmp/whs-nats" }
+EOF
+go run github.com/nats-io/nats-server/v2@v2.14.6 -c /tmp/whs-nats.conf &
+go run github.com/nats-io/nats-server/v2@v2.14.6 -p 14223 &       # sem JetStream
+WHS_TEST_NATS_URL=nats://127.0.0.1:14222 WHS_TEST_NATS_NOJS_URL=nats://127.0.0.1:14223 \
+  go test -race -timeout 900s ./internal/sink/ ./internal/control/ ./internal/app/
+```
+
+O `max_payload` de 8 MB não é exigido: a suíte da app baixa os tetos de corpo e
+cabeçalho para caber no 1 MiB padrão, e a do sink lê o `max_payload` do
+servidor.
+
+O que prova:
+
+- **sink** (`internal/sink/nats_integration_test.go`): o JLH no stream byte a
+  byte com os cinco cabeçalhos e o subject do `space`; redelivery deduplicada e
+  contada; oito escritores numa conexão; a maior mensagem que o boot admite
+  cabe, e um byte a mais é recusado; uma mensagem acima do `max_payload`
+  recusada **sozinha** (jetstream e core), e uma acima do `max_msg_size`
+  também, com `Delivered`; um envelope que não é deste servidor recusado
+  sozinho; cada recusa da validação (stream ausente, de outro `space`, só
+  `webhook.>`, capturando o plano de controle, selado, `no_ack`, os tetos)
+  fatal, com controles aceitos que escrevem; `10060` fatal e com o lote
+  contaminado; subject de outro `space` fatal até o stream cobri-lo, e então
+  publicado e lembrado; stream apagado depois do boot fatal; `core` entregando a
+  um assinante; os ganchos de conexão (inclusive numa reconexão forçada), o
+  `PublishCore` e o `ServerAddr` do beacon; workers de ponta a ponta;
+  JetStream desligado fatal em segundos; uma recusa `logic` que não deixa bytes
+  contados no ring, nos dois modos (`TestNATSLogicRefusalFreesTheRingBytes`); o
+  stream editado depois do boot — subjects estreitados, `no_ack` ligado — fatal
+  na checagem seguinte (`TestNATSStreamEditedAtRuntimeIsFatal`); um subject de
+  outro `space` retirado depois do dreno esquecido, sink UP, e a publicação
+  seguinte nele fatal nomeando-o
+  (`TestNATSForeignSubjectDroppedAfterTheDrainIsForgotten`).
+- **control** (`beacon_integration_test.go`): o beacon da primeira conexão,
+  pedido antes do `Start`, chega em `<ctl>.beacon` pelo NATS real.
+- **app** (`internal/app/nats_test.go`): todo `uuid` aceito chega ao stream e
+  nada além; corpo binário, `%00` e UTF-8 inválido no path ida e volta; cada
+  recusa de stream (e o servidor sem JetStream) ⇒ `exit 3` **imediato**, porta
+  pública fechada; destino cai (proxy TCP) ⇒ `503`, volta ⇒ nada perdido, uma
+  reconexão contada; FATAL ⇒ dump ⇒ reingestão; dump de outro Workspace ⇒
+  `exit 3` imediato até o stream cobrir o subject, e então entregue — e o
+  stream estreitado de volta com a instância rodando não a derruba; o beacon na
+  conexão e no periódico, com o `meta`, fora do stream; `core` entregando a um
+  assinante.
+
+Se você mexeu em `internal/sink/`, `internal/control/`, na validação de
+`config` ou em `docker/nats/`, **rode esta suíte**.
+
+### 5.1 Teste de fumaça do compose (feito em 2026-10-10)
+
+```bash
+cd docker && docker compose up -d --build
+for i in $(seq 1 20); do curl -s -o /dev/null -X POST "localhost:8300/hook?i=$i" -d "{\"n\":$i}"; done
+docker run --rm --network whn-memory-nats_default natsio/nats-box:0.20.0 \
+  nats --server nats://nats:4222 stream info LOGHUB_WEBHOOK
+docker run --rm --network whn-memory-nats_default natsio/nats-box:0.20.0 \
+  nats --server nats://nats:4222 sub 'loghub._ctl.beacon' --count=1
+docker compose down -v
+```
+
+Exercitado: boot e validação do stream (a maior mensagem dos padrões,
+8 022 995 B, contra o `max_payload` de 8 MiB), entrega de 20 eventos com os
+cabeçalhos de SPEC §3.8, beacon em `loghub._ctl.beacon` com o `meta`, `SIGHUP`
+ignorado com `WARN`, `docker pause` do NATS ⇒ DOWN ⇒ FATAL após 10 checagens ⇒
+dump de 15 eventos ⇒ `exit 3`, e no boot seguinte a reingestão dos 15. O NATS
+congelado gravou, ao voltar, 8 publicações que estavam no buffer TCP; a
+reingestão as viu como duplicatas (`whs_sink_nats_duplicates_total 8`) e o
+stream terminou com os 35 únicos.
+
+## 6. Carga (SPEC §15.4)
+
+```bash
+# keep-alive: mede o pipeline
+bombardier -c 256 -d 60s -m POST -b '{"k":"v"}' http://127.0.0.1:8300/hook
+# conexão nova por request: mede accept + handshake
+bombardier -c 256 -d 60s -m POST -b '{"k":"v"}' --disableKeepAlives http://127.0.0.1:8300/hook
+# h2c
+h2load -n 1000000 -c 64 -m 32 -d body.json http://127.0.0.1:8300/hook
+```
+
+## 7. Critérios de aceite (SPEC §15.5) — **não aferidos**
+
+Nenhuma medição de vazão ou latência foi feita neste servidor. A meta numérica
+de `ring=memory` + `sink=nats` só existe depois da primeira medição válida.
+
+## 8. Lacunas conhecidas
+
+Registradas por honestidade, não por esquecimento. As lacunas de prova estão
+aqui; os defeitos que o código ainda tem estão em SPEC §18.1.
+
+1. **Um `ErrPermissionViolation` real** não é provocado contra um servidor com
+   contas e permissões; o veredito é provado pela unidade
+   (`TestNATSPermissionViolationOnTheDataPathIsFatal`), com o texto que o
+   `nats.go` v1.53.1 produz.
+2. **Um servidor que passa a exigir TLS depois do boot** (o
+   `ReconnectErrHandler`) só é coberto pela leitura; o boot contra um servidor
+   que exige TLS é provado pelo servidor falso.
+3. **Várias URLs**: o veredito do boot (`fatal` ou `network`) pode depender da
+   ordem aleatória em que o cliente tenta os servidores (herdado do
+   `go-syslog-nats-server`).
+4. **`writeCore` com o cliente desconectado no meio do lote** não tem teste: o
+   `PublishMsg` falha com `network`, o lote volta inteiro, e uma parte pode ter
+   saído antes (best effort, duplicata possível).
+5. **A contaminação depois de um erro de futuro** é provada para o `10060`
+   (`TestNATSExpectedStreamMismatchIsFatalOnWrite`); a de um prazo estourado,
+   pela regra dos workers.
+6. **`kill -9`** perde o ring por desenho (SPEC §16.1); não há o que testar
+   além de documentar.
+7. **A regra do `/data` (SPEC §13.6) não tem teste automatizado**; quem a
+   sustenta é o `read_only: true` do compose:
+
+   ```bash
+   docker compose exec webhook grep ' / ' /proc/mounts   # deve conter "ro,"
+   ```
+
+8. **Um envelope com `0x0A` cru** nunca foi produzido pelo serializador; a
+   defesa do dump é provada com um envelope forjado
+   (`TestWriteLeavesOutAnEnvelopeWithARawNewline`).
+9. **Linha do dump acima do teto da configuração atual** é pulada e o arquivo
+   vira `.corrupt`; provado pela unidade, não por um ciclo de dois boots.
+10. **Um sistema de arquivos sem *hard link* de verdade** não é usado: o
+    fallback é provado trocando o `link` por um que falha
+    (`TestWriteOnAFileSystemWithoutHardLinks`). O revisor reproduziu a falha
+    original numa imagem FAT (`hdiutil -fs MS-DOS`).
+11. **`server.listeners > 1`** só é testado no que é portável.
+12. **A corrida do `Dequeue` contra o contexto cancelado** é provada por
+    repetição (`TestWorkersNeverLoseAnAbandonedBatch`), não por construção.
+13. **A forma de cada objeto aninhado do payload** (as chaves de `network`, de
+    `content`) não é conferida pela porta do dump: só as de topo. Ela não
+    envenena leitor nenhum, e conferi-la seria reescrever o schema em Go.
+14. **Código morto herdado**, mantido pela paridade do `diff` com o P e o fast:
+    `envelope.Item.RowID`, `Item.Done/Ack`, `obs.Logger.SetLevel`,
+    `jlhcheck.ValidateJSONBCopy`.
+15. **O dump é lido inteiro por arquivo** na reingestão (SPEC §9.2, "Memória"):
+    um dump de uma vida com `ring.max_bytes` muito maior que o atual pede a
+    memória da antiga.
+16. **Fuzz de 10 minutos e medição de carga** pendentes (60 s por alvo feitos).
+17. **Recusas de autenticação no `CONNECT`** ("User Authentication Expired" e
+    afins) são provadas pela tabela de classificação, com o texto que o
+    `nats.go` v1.53.1 devolve; um servidor com JWT expirado não foi montado (um
+    real responde "Authorization Violation", que já era fatal).
+18. **A janela da contabilidade do aborto** entre o `ring.Drain()` e o
+    `atRisk.Store` (herdada do P): um segundo sinal exatamente ali conta a
+    menos. A atualização das métricas de emergência deixou de reler o diretório
+    no caminho do dump, o que encurtou a janela; não foi fechada.
+19. **Mutante equivalente conhecido**: dar à fase 3 do shutdown o seu próprio
+    `drain_timeout` não muda nada, porque o prazo único é calculado no mesmo
+    instante; o teste do prazo único mata a mutação da fase 4.
+20. **Uma brecha deixada no parser de flags** (SPEC §13.2): a cauda de um valor
+    que o shell partiu num espaço, quando começa com traço e vem depois de um
+    valor não vazio (`--sink.nats.password=a -b`), sai como parâmetro
+    desconhecido, com o nome. Escondê-la esconderia todo erro de digitação de
+    uma flag depois de outra.
+
+## 9. Histórico: bugs que os testes encontraram
+
+O histórico do P e do fast está em `../go-webhook-pg-server/docs/TESTING.md`
+§9 e `../go-webhook-fast-server/docs/TESTING.md` §9; o do sink NATS e do beacon,
+em `../go-syslog-nats-server/docs/TESTING.md` §9. Os que valem para o código
+que ficou aqui, e já vieram corrigidos:
+
+| Bug | De onde | Consequência se não corrigido |
+|---|---|---|
+| Lote retido evaporava no shutdown, ou era sobrescrito no `held[id]` | fast | Eventos com `200` sumiam sem dump |
+| Liberação dupla de buffer não era atômica | fast | Corpo de um cliente dentro do evento de outro |
+| No shutdown por FATAL, o primeiro `SIGTERM` jogava o dump fora | P | Eventos do ring perdidos justamente no caminho que os salva |
+| Linha do dump que passa em `json.Valid` mas não é do serializador (`0xFF`, `\ud800`) | P | Lá, todo boot saía com 3; aqui, o NATS a publicaria |
+| O `nats.go` se promove a TLS sozinho diante de `tls_required` | SN | Um `ClientHello` com as raízes do sistema num servidor "sem TLS" |
+| Permissão negada só chega assíncrona, e nunca virava FATAL | SN (herdado do S) | Publish negado retentado para sempre com o sink UP |
+| Uma mensagem acima do `max_payload` encerrava o lote | SN (o fast tinha o mesmo até 2026-10-11) | As seguintes nunca publicadas e confirmadas; as anteriores contadas como perdidas |
+| Senha com `%`, `/` ou `#` sem escape na URL | SN | A senha em cada log, até o `boot_timeout` |
+| Dump escrito sob o nome final | SN (o P tinha o mesmo até 2026-10-11) | Cortado numa fronteira de linha, lia limpo e era removido entregue em parte |
+| Subject de um backlog de outro Workspace publicado às cegas | fast | "no responders" até o `boot_timeout`, em laço, sem nomear a causa |
+
+### Rodada de 2026-10-10 (criação deste módulo)
+
+| Achado | Como | Consequência sem a correção |
+|---|---|---|
+| Numa recusa fatal no boot, o log dizia "sink did not become reachable within sink.boot_timeout" (herdado do P) | O log do `TestNATSStreamMismatchExitsThreeImmediately` | O operador ia olhar a rede quando o stream ou a credencial estavam errados. Corrigido aqui; portado ao P, ao fast e ao W em 2026-10-11 |
+| A validação lia `nc.MaxPayload()` de dentro, e o teste de unidade do caminho aceito derrubava com ponteiro nulo | `TestNATSValidateRefusals` | Só teste; a validação passou a receber o `max_payload` como valor, testável sem conexão |
+
+### Revisão independente de 2026-10-10
+
+Três revisores somente-leitura, um por área, cada um com cópia de rascunho e
+testes descartáveis; nada foi editado por eles. Cada achado real virou SPEC,
+código e teste, e cada correção foi revertida numa cópia (mutação) para provar
+que o teste a pega — todas morreram, menos o mutante equivalente de §8 item 19.
+
+| Achado | Área | Consequência sem a correção | Teste |
+|---|---|---|---|
+| Recusa `logic`: `Release` antes do `ring.Commit` (o SN já corrigira; P e fast tinham até 2026-10-11) | sink | Em `core`, o ring contava os bytes do lote para sempre e acabava recusando tudo como cheio | `TestNATSLogicRefusalFreesTheRingBytes`, `TestWorkersPartialDeliveryDropsOnlyTheRefused` |
+| Em `core`, o `Write` não lia o veredito de permissão | sink | Lotes negados confirmados, contados como escritos e perdidos até a próxima checagem | `TestNATSCoreDeniedPublishIsFatalAtOnce` |
+| O contrato do stream só era conferido no boot | sink | Stream editado por baixo: `network` para sempre, sink UP, ring enchendo, `429` eterno | `TestNATSStreamEditedAtRuntimeIsFatal` |
+| `max_bytes` com `discard: new` menor que uma mensagem passava no boot | sink | `10077` fatal no primeiro evento grande e em toda reingestão, em laço | `TestNATSValidateRefusals` |
+| "User Authentication Expired/Revoked" no `CONNECT` era `network` | sink | O boot esperava o `boot_timeout` e saía com o motivo errado | `TestClassifyNATS` |
+| `sizedItemIn` tirava uma amostra do relógio por passada | teste | 1 em 20 execuções falhava sem bug nenhum | `-count=20` limpo |
+| A porta do dump aceitava o que o escritor nunca escreve (chave repetida, `1e999999`, 9000 níveis, `\u0041`, `uuid` de outro instante) | emergência | Publicado e confirmado; veneno para `jsonb`, decodificadores de `float` e leitores recursivos | `TestGateRefusesWhatTheWriterNeverWrites`, `TestGateAdmitsEverythingTheWriterWrites`, `FuzzGateAdmitsTheWriter` |
+| Sem *hard link* (vfat, exFAT, FUSE), todo dump falhava | emergência | O ring inteiro perdido onde a escrita no lugar funcionava | `TestWriteOnAFileSystemWithoutHardLinks` |
+| Diretório que não abria para o `fsync` apagava o dump pronto | emergência | Dump completo removido, erro com o nome temporário | `TestWriteKeepsTheDumpWhenTheDirectoryCannotBeOpened` |
+| FIFO ou *symlink* com nome de dump era listado | emergência | Boot travado sem atender `SIGTERM`; leitura sem fim de `/dev/zero` | `TestListSkipsWhatIsNotARegularFile` |
+| Temporários de dumps cortados nunca eram informados | emergência | Um dump interrompido invisível; o gêmeo de um entregue, confundível com ele | `TestLeftovers`, `TestBootRemovesTheTwinOfADumpAndKeepsAnInterruptedOne` |
+| Um `drain_timeout` por fase no shutdown (herdado do P) | ciclo de vida | Dump só em 2× `drain_timeout`, depois do `stop_grace_period`: `SIGKILL` levava o ring | `TestShutdownDrainTimeoutBoundsConnectionsAndRingTogether` |
+| As métricas de emergência reliam o diretório inteiro depois do dump (herdado do P) | ciclo de vida | Pico de memória do tamanho do dump sob um `GOMEMLIMIT` de 2× o ring | leitura na revisão; desde o porte de volta (2026-10-11), `TestEmergencyGaugesCountTheDumpWithoutReReading`, com o diretório sem permissão de listagem: uma releitura deixaria os *gauges* em zero |
+| Em `core`, dump de outro Workspace publicado às cegas e em silêncio | sink | Perda provável sem aviso | `TestNATSCoreWarnsOnceAboutAForeignSubject` |
+| Token da URL no log "nats connected"/"nats reconnected" | config | O token no log INFO de todo boot e no WARN de toda reconexão | `TestNATSConnectLogsNoCredentials` |
+| O erro de URL que não parseia citava o trecho que o `net/url` cita | config | A senha até a primeira `/`, `#`, `?` ou `,` no stderr do container | `TestConfigReviewFindings` |
+| O procedimento documentado do `LOGHUB_EB_URL` no Docker não funcionava | docker | Exit 1 por conflito com as variáveis vazias do compose; `LOGHUB_EB_URL`, token e `.creds` nunca chegavam ao container | `TestConfigReviewFindings`, `docker compose config` |
+| `NaN` passava em `high_water` e `access_sample` (o SN recusa) | config | O portão de saturação do `/readyz` desligado em silêncio | `TestConfigReviewFindings` |
+| O dump de config não relia valores com espaço nas pontas ou entre aspas (o SN tem `quoteINI`) | config | `stream = 'LOGHUB_X'` relido apontava para outro stream | `TestConfigReviewFindings` |
+| `sink.nats.urls` aceitava caminho, consulta e fragmento | config | `nats://u:1234/5678@h` discava `u:1234` sem credencial até o `boot_timeout` | `TestConfigReviewFindings` |
+| Parsers de INI e de flags ecoavam a linha e o argumento | config | `password: x` ou `sink.nats.password=x` no stderr | `TestConfigReviewFindings` |
+| `admin.bind` vazio era só aviso (o SN recusa) | config | `/metrics` em toda interface, numa porta aleatória | `TestConfigReviewFindings` |
+
+### Porte de volta das correções dos irmãos (2026-10-11)
+
+A revisão independente do porte do N para o P, o fast, o W, o SN e o SP achou
+defeitos que o N também tinha; foram corrigidos lá primeiro e trazidos para cá
+depois (SPEC primeiro, código, teste, mutação). Cada correção foi revertida
+numa cópia de rascunho do módulo, com o teste verde sem a reversão como
+controle: 20 mutantes, 20 mortos, contando os da revisão abaixo (SPEC §10.3,
+§8.7.5, §13.2, §9.1).
+
+| Achado | De onde | Consequência sem a correção | Teste |
+|---|---|---|---|
+| Um upload que terminava depois do último `Drain` do shutdown entrava no ring | P, fast, W (o N tinha o mesmo) | `200` para um evento fora do stream e do dump, sem contagem, e exit 0. O ring agora é selado (`Seal`, `RWMutex` contra o `Enqueue`) antes do `Drain` | `TestUploadFinishingAfterTheDrainIsRefused`, `TestMemorySealIsABarrierForEnqueue` |
+| A sonda `AccountInfo` depois de "sem respondedores" na primeira checagem | fast, W, SN | Não distinguia nada (o `jetstream` traduz "sem respondedores" para "não habilitado"); o pedido a `$JS.API.INFO`, negado a um papel mínimo, virava veredito de permissão permanente com a causa errada, depois de esperar o `health_timeout` | `TestNATSNoRespondersNeverProbesTheAccount` (servidor falso que responde `503` a todo pedido e nega `$JS.API.INFO`), `TestNATSValidateRefusals`, `TestNATSJetStreamDisabledIsFatal` |
+| Subject de outro `space` retirado do stream depois do dreno era FATAL | fast, W (veio do N) | Estreitar o stream, como o erro do `cover` manda, derrubava um processo saudável: FATAL, dump do ring, exit 3. Agora é esquecido, e a próxima publicação nele pergunta de novo | `TestNATSForeignSubjectDroppedAfterTheDrainIsForgotten`, `TestNATSForeignWorkspaceDumpIsFatalUntilCovered`, `TestNATSValidateRefusals` |
+| Flag sem valor engolia a flag seguinte; valor depois de um espaço passado o `=` virava argumento citado | SN | `--sink.workers --sink.nats.password=x` e `--sink.nats.password= x` imprimiam a senha no stderr | `TestConfigReviewFindings` |
+| O `WARN` do dump interrompido dizia "contados como perda" em todo caso | P, SN, SP | Só um aborto por segundo sinal os conta; depois de um `SIGKILL` ninguém os contou, e o operador apagava um dump que podia estar inteiro. O `WARN` e a SPEC dizem como reingeri-lo | `TestBootRemovesTheTwinOfADumpAndKeepsAnInterruptedOne` (agora confere o `WARN`) |
+
+Vieram junto, pela mesma forma: o teste dos *gauges* de emergência somados sem
+reler o diretório (`TestEmergencyGaugesCountTheDumpWithoutReReading`, que a
+correção do N já cumpria) e o `WARN` "drain deadline reached" com o
+`drain_timeout` configurado em vez do resto do prazo da fase 4, como nos
+irmãos — este sem teste (é a chave de um log).
+
+**Revisão independente do porte de volta** (um revisor somente-leitura, numa
+cópia): a suíte e os testes novos passaram, e cinco achados, todos corrigidos:
+
+| Achado | Consequência sem a correção | Teste |
+|---|---|---|
+| O teste do `Seal` não provava a **ordem**: o gancho `afterDrain` rodava depois do `Drain`, e um `Seal` movido para entre os dois sobrevivia (o do P tem o mesmo) | A ordem, que é o ponto da correção, sem guarda | `TestUploadFinishingAfterTheDrainIsRefused` com o ring do teste agindo dentro do `Drain`; o mutante agora morre |
+| Três caminhos de flag ainda imprimiam o segredo (iguais no P, no fast e no SN): `--sink.nats.password --x` nomeava "a flag `--x`" (regressão do porte); `--sink.nats.password= -x` saía como parâmetro desconhecido; a cauda de um valor partido pelo shell (`--sink.nats.password=$P`) saía como argumento solto | O segredo no stderr do contêiner | `TestConfigReviewFindings` (casos novos, e controles: um erro de digitação depois de um valor continua nomeado) |
+| SPEC §8.7.7 dizia que a validação roda "uma vez" | A SPEC contradizia o código e §8.7.5 | — (texto) |
+| O comentário do `Leftovers` ainda dizia "contados como perda" | Comentário contra a correção 5 | — (texto) |
+| A linha da revisão de 2026-10-10 dizia que a soma dos *gauges* não tinha teste | Documento desatualizado | — (texto) |
+
+E um achado da última passada de mutação, depois da revisão: o
+`TestMemorySealIsABarrierForEnqueue` herdado do P (300 rodadas) matava o
+`Enqueue` sem trava só em 11 de 20 execuções sem `-race` (20 de 20 com ele). Com
+3000 rodadas, 20 de 20 sem `-race`, em ~1 s.

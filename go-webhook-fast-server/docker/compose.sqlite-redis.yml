@@ -1,0 +1,106 @@
+# ring no SQLite  ->  descarga no Redis Streams
+#
+# Ring duravel com destino remoto. O evento e' gravado (e fsync-ado) em ring.db
+# ANTES de o 200 sair, entao um crash do processo, do container ou da maquina
+# nao perde nada: no boot seguinte o ring.db ainda tem a fila e o dreno
+# continua de onde parou.
+#
+# O preco e' latencia: aceitar um evento passa a custar um fsync. O group commit
+# (commit_batch / commit_max_delay) amortiza isso entre requisicoes concorrentes
+# -- com pouca concorrencia, o p99 e' o tempo de fsync do disco.
+#
+# Escolha esta combinacao quando perder eventos e' inaceitavel E o Redis pode
+# ficar fora do ar por mais tempo do que a RAM aguentaria segurar.
+#
+#   docker compose -f compose.sqlite-redis.yml up -d --build
+
+name: whf-sqlite-redis
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-sqlite-redis
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-sqlite-redis
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: sqlite -----------------------------------------------------
+      WHS_RING_MODE: sqlite
+      WHS_RING_SQLITE_PATH: /data/ring.db
+      # FULL e' o unico valor que honra a promessa acima. NORMAL/OFF trocam a
+      # durabilidade do ring por latencia -- se e' isso que voce quer, use
+      # ring.mode=memory, que e' mais rapido e nao mente sobre o custo.
+      WHS_RING_SQLITE_SYNCHRONOUS: ${WHS_RING_SQLITE_SYNCHRONOUS:-FULL}
+      # Quantas requisicoes concorrentes compartilham um fsync, e quanto uma
+      # requisicao espera por companhia antes de commitar sozinha.
+      WHS_RING_SQLITE_COMMIT_BATCH: ${WHS_RING_SQLITE_COMMIT_BATCH:-256}
+      WHS_RING_SQLITE_COMMIT_MAX_DELAY: ${WHS_RING_SQLITE_COMMIT_MAX_DELAY:-5ms}
+      WHS_RING_SQLITE_BUSY_TIMEOUT: ${WHS_RING_SQLITE_BUSY_TIMEOUT:-5s}
+      WHS_RING_SQLITE_WAL_AUTOCHECKPOINT: ${WHS_RING_SQLITE_WAL_AUTOCHECKPOINT:-1000}
+
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-1000000}
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-8GiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+
+      # Irrelevante com ring em disco: o proprio ring.db ja' e' o dump.
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: redis ------------------------------------------------------
+      WHS_SINK_TYPE: redis
+      WHS_SINK_REDIS_ADDRS: redis:6379
+      WHS_SINK_REDIS_STREAM: ${WHS_SINK_REDIS_STREAM:-loghub.{space}.{type}}
+      WHS_SINK_REDIS_DB: ${WHS_SINK_REDIS_DB:-0}
+      WHS_SINK_REDIS_USERNAME: ${WHS_SINK_REDIS_USERNAME:-}
+      WHS_SINK_REDIS_PASSWORD: ${WHS_SINK_REDIS_PASSWORD:-}
+      WHS_SINK_REDIS_MAXLEN: ${WHS_SINK_REDIS_MAXLEN:-0}
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-8}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8083}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9113}:9101"
+
+    volumes:
+      - whf-data:/data
+
+  redis:
+    image: ${WHS_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: whf-sqlite-redis-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${WHS_REDIS_PORT:-6383}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whf-data:
+  redis-data:

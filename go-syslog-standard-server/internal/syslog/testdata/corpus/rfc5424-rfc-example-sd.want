@@ -1,0 +1,7 @@
+# expected fields for rfc5424-rfc-example-sd.raw; one key=value per line
+rfc=|5424|
+app-name=|evntslog|
+msgid=|ID47|
+sd:exampleSDID@32473:eventID=|1011|
+sd:exampleSDID@32473:eventSource=|Application|
+msg=|﻿An application event log entry...|

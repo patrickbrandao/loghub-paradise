@@ -1,0 +1,7 @@
+# expected fields for windows-nxlog-bom.raw; one key=value per line
+rfc=|5424|
+hostname=|WIN-SRV01|
+app-name=|Microsoft-Windows-Security-Auditing|
+procid=|4624|
+sd:NXLOG@14506:EventID=|4624|
+msg=|﻿An account was successfully logged on.|

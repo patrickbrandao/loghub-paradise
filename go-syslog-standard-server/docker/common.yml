@@ -1,0 +1,127 @@
+# Fragmento compartilhado por todos os compose deste diretorio.
+#
+# NAO suba este arquivo sozinho: ele define apenas o servico-base `sls-base`,
+# que os arquivos compose.<ring>-<sink>.yml herdam via `extends`. Tudo que e'
+# identico entre as combinacoes mora aqui; o que distingue uma combinacao da
+# outra (ring.mode, sink.type, portas, volumes, dependencias) fica visivel no
+# arquivo de cada combinacao.
+#
+# Regra de heranca do Compose: `environment` e `healthcheck` sao mapas e o filho
+# sobrescreve chave a chave; `ports` e' sequencia e concatena (por isso as portas
+# ficam so' no filho); `depends_on` NAO e' herdado por `extends`.
+
+services:
+  sls-base:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${SYSLOG_VERSION:-dev}
+        COMMIT: ${SYSLOG_COMMIT:-none}
+        GO_VERSION: ${SYSLOG_GO_VERSION:-1.25}
+        ALPINE_VERSION: ${SYSLOG_ALPINE_VERSION:-3.22}
+    image: ${SYSLOG_IMAGE:-go-syslog-server}:${SYSLOG_IMAGE_TAG:-local}
+
+    restart: unless-stopped
+
+    # Precisa ser maior que shutdown.pre_stop_delay + shutdown.drain_timeout.
+    # Com o padrao 0s + 30s, os 10s do Docker matariam o processo no meio do dreno
+    # do ring -- e mensagens ja' confirmadas por RELP sumiriam.
+    stop_grace_period: 45s
+    stop_signal: SIGTERM
+
+    environment:
+      # --- transportes -----------------------------------------------------
+      # 0.0.0.0 dentro do container; a exposicao real e' decidida em `ports`.
+      # As portas de dentro sao 1514 e 20514, nunca 514: a imagem roda como uid
+      # 65532 e nao abre porta privilegiada (docs/SPEC.md §4.1). O `ports` de
+      # cada combinacao publica 514 do host na 1514 do container.
+      SYSLOG_LISTEN_UDP: 0.0.0.0:1514
+      SYSLOG_LISTEN_TCP: 0.0.0.0:1514
+      SYSLOG_LISTEN_RELP: 0.0.0.0:20514
+      SYSLOG_LISTEN_UDP_LISTENERS: ${SYSLOG_LISTEN_UDP_LISTENERS:-1}
+      # O parametro mais importante do UDP: o que nao couber aqui o kernel
+      # descarta antes de o processo existir. Dentro do container o teto real e'
+      # net.core.rmem_max do HOST; sem subi-lo, este valor e' silenciosamente
+      # reduzido e o boot avisa.
+      SYSLOG_LISTEN_UDP_READ_BUFFER: ${SYSLOG_LISTEN_UDP_READ_BUFFER:-8MiB}
+
+      # O admin escuta em 0.0.0.0 para ser publicavel, mas cada compose publica
+      # so' em 127.0.0.1 do host. 9102 e nao 9101: roda ao lado do webhook.
+      SYSLOG_ADMIN_ENABLED: "true"
+      SYSLOG_ADMIN_BIND: 0.0.0.0:9102
+
+      # --- filtro e limites ------------------------------------------------
+      # Recarregaveis por SIGHUP: `docker kill -s HUP <container>`.
+      SYSLOG_FILTER_MIN_SEVERITY: ${SYSLOG_FILTER_MIN_SEVERITY:-debug}
+      SYSLOG_FILTER_FACILITIES: ${SYSLOG_FILTER_FACILITIES:-}
+      SYSLOG_RATELIMIT_ENABLED: ${SYSLOG_RATELIMIT_ENABLED:-false}
+      SYSLOG_RATELIMIT_RATE: ${SYSLOG_RATELIMIT_RATE:-1000}
+      SYSLOG_RATELIMIT_BURST: ${SYSLOG_RATELIMIT_BURST:-2000}
+      SYSLOG_TCP_MAX_FRAME_BYTES: ${SYSLOG_TCP_MAX_FRAME_BYTES:-16MiB}
+
+      # --- dados -----------------------------------------------------------
+      # /data e' a UNICA area gravavel do container, regra de TODA imagem do
+      # loghub-paradise (docs/SPEC.md §15.6). ring.db, events.db e emergency/
+      # derivam daqui.
+      SYSLOG_RING_DATA_DIR: /data
+
+      # --- observabilidade --------------------------------------------------
+      SYSLOG_LOG_FORMAT: ${SYSLOG_LOG_FORMAT:-json}
+      SYSLOG_LOG_LEVEL: ${SYSLOG_LOG_LEVEL:-info}
+      # Desligado: aqui log de acesso e' literalmente logar log.
+      SYSLOG_LOG_ACCESS: ${SYSLOG_LOG_ACCESS:-false}
+
+      # --- desligamento ------------------------------------------------------
+      SYSLOG_SHUTDOWN_PRE_STOP_DELAY: ${SYSLOG_SHUTDOWN_PRE_STOP_DELAY:-0s}
+      SYSLOG_SHUTDOWN_DRAIN_TIMEOUT: ${SYSLOG_SHUTDOWN_DRAIN_TIMEOUT:-30s}
+
+      # --- memoria -------------------------------------------------------------
+      # SPEC §14.4: o servidor NAO define GOMEMLIMIT sozinho e avisa no boot se ele
+      # faltar. Sem ele o GC do Go nao sabe do teto do container e o OOM killer
+      # chega antes do GC -- e com ring=memory leva o backlog junto, porque o dump
+      # de emergencia nao roda num processo morto pelo kernel. Com ring=memory o
+      # valor precisa cobrir ring.max_bytes vezes dois (por isso os compose de
+      # memoria usam 256MiB de ring) e ficar abaixo do limite do container, logo
+      # abaixo, para o GC trabalhar antes de o kernel matar.
+      GOMEMLIMIT: ${SYSLOG_GOMEMLIMIT:-512MiB}
+
+    # /healthz e' liveness pura: de proposito nao olha o sink -- reiniciar o
+    # container nao conserta um Redis inalcancavel.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9102/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+    # A imagem roda como 65532 e nao escreve fora de /data. O read_only e' o que
+    # transforma essa regra em garantia: um caminho de escrita fora do volume
+    # falha no boot em vez de gravar na camada efemera, onde a escrita FUNCIONA e
+    # some no proximo `docker rm`.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    # Teto do container, ACIMA do GOMEMLIMIT: a folga e' o que o GC usa para
+    # trabalhar antes de o kernel matar. O Compose v2 honra
+    # deploy.resources.limits sem Swarm.
+    deploy:
+      resources:
+        limits:
+          memory: ${SYSLOG_MEMORY_LIMIT:-768M}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

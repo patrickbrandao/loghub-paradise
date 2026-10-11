@@ -1,0 +1,6 @@
+# expected fields for postfix-slash-tag.raw; one key=value per line
+rfc=|3164|
+hostname=|mx1|
+app-name=|postfix/smtpd|
+procid=|9876|
+msg=|connect from unknown[10.0.0.9]|

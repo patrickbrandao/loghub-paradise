@@ -1,0 +1,52 @@
+# ring persistente em SQLite  ->  descarte (benchmark)
+#
+# Garantia: COMMIT em disco antes da confirmacao. So' faz sentido com TCP e
+#   RELP: no UDP o fsync garante o que a rede talvez ja' tenha descartado.
+#
+# ATENCAO: BENCHMARK. Paga o fsync do ring e descarta: mede o ring persistente
+#   isolado.
+#
+#   docker compose -f compose.sqlite-none.yml up -d --build
+#
+# Publicado no host: syslog 5147/udp e 5147/tcp, RELP 20607/tcp, admin
+# 127.0.0.1:19107. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: sls-sqlite-none
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-sqlite-none
+
+    environment:
+      SYSLOG_NODE_ID: sls-sqlite-none
+
+      # --- ring: sqlite ---------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      # FULL faz fsync a cada group commit: sobrevive a queda de energia, e a
+      # latencia de confirmacao fica presa ao disco.
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      # Sem efeito com ring=sqlite: os itens ja' estao em disco.
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: none ---------------------------------------------------------
+      SYSLOG_SINK_TYPE: none
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5147}:1514/udp"
+      - "${SYSLOG_PORT:-5147}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20607}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19107}:9102"
+
+    volumes:
+      - sls-data:/data
+
+volumes:
+  sls-data:

@@ -1,0 +1,5 @@
+# Ponto de montagem de ../../tls (README.md): nada daqui e' lido nem versionado,
+# muito menos uma chave privada copiada para o lugar errado.
+*
+!.gitignore
+!README.md

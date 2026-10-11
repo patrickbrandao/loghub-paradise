@@ -1,0 +1,5 @@
+# expected fields for rfc5424-rfc-example-multi-sd-no-msg.raw; one key=value per line
+rfc=|5424|
+sd:examplePriority@32473:class=|high|
+sd:exampleSDID@32473:iut=|3|
+msg=||

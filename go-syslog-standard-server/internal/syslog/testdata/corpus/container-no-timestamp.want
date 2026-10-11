@@ -1,0 +1,7 @@
+# expected fields for container-no-timestamp.raw; one key=value per line
+rfc=|3164|
+hostname=||
+app-name=|myapp|
+procid=|123|
+msg-ts-source=|none|
+msg=|algo aconteceu|

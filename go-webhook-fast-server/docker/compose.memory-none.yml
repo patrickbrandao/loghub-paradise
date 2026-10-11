@@ -1,0 +1,55 @@
+# ring na RAM  ->  sink descartado
+#
+# MODO DE BENCHMARK. Todo evento atravessa o ring e e' JOGADO FORA. Serve para
+# medir o custo do caminho HTTP + envelope + ring isolado do destino, ou seja,
+# para descobrir o teto da maquina antes de escolher um sink.
+#
+# NUNCA rode isto em producao: o cliente recebe 200 e o evento nao existe mais.
+# O servidor emite um warning de boot dizendo exatamente isso.
+#
+#   docker compose -f compose.memory-none.yml up -d --build
+
+name: whf-memory-none
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whf-base
+    container_name: whf-memory-none
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whf-memory-none
+
+    environment:
+
+      # --- ring: memoria ----------------------------------------------------
+      WHS_RING_MODE: memory
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (WHS_GOMEMLIMIT e
+      # WHS_MEMORY_LIMIT).
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-256MiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+
+      # Sem sink real nao ha' FATAL, e um dump de emergencia de eventos que
+      # seriam descartados nao teria sentido. O servidor avisa no boot que
+      # ring=memory sem emergencia perde o backlog numa falha fatal do sink --
+      # e' verdade em geral, e irrelevante aqui, porque nao ha' sink.
+      WHS_EMERGENCY_ENABLED: "false"
+
+      # --- sink: none -------------------------------------------------------
+      WHS_SINK_TYPE: none
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-8}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8082}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9112}:9101"
+
+    volumes:
+      - whf-data:/data
+
+volumes:
+  whf-data:

@@ -1,0 +1,27 @@
+{
+  "uuid": "019dc7e4-2172-7076-a80a-083e4d90a009",
+  "from": "019bc119-0100-7266-97fb-d735facdf2d2",
+  "space": "com.acme.store",
+  "type": "beacon",
+  "level": 9,
+  "sid": 14921,
+  "step": 0,
+  "event": {
+    "uts": 1777175110,
+    "sub": 2118640,
+    "iso": "2026-04-26T03:45:10.002Z"
+  },
+  "payload": {
+    "name": "order-api",
+    "hostname": "api-1.acme.internal",
+    "machine": "79fb72c3199f4b85978420223a389b94",
+    "address": "10.20.0.14",
+    "uptime": 864213,
+    "meta": [
+      {
+        "key": "queue_depth",
+        "value": 3
+      }
+    ]
+  }
+}

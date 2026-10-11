@@ -1,0 +1,13 @@
+# Entrada padrao: `docker compose up -d --build` dentro desta pasta.
+#
+# Nao duplica nada -- apenas inclui a combinacao recomendada (ring na RAM, descarga
+# no Redis Streams). O `name` abaixo e' o mesmo do arquivo incluido, entao estes
+# dois comandos operam a MESMA stack:
+#
+#   docker compose up -d --build
+#   docker compose -f compose.memory-redis.yml up -d --build
+
+name: sls-memory-redis
+
+include:
+  - compose.memory-redis.yml

@@ -1,0 +1,8 @@
+# expected fields for rfc5424-rfc-example-bom.raw; one key=value per line
+rfc=|5424|
+hostname=|mymachine.example.com|
+app-name=|su|
+procid=||
+msgid=|ID47|
+msg-ts-source=|rfc5424|
+msg=|﻿'su root' failed for lonvick on /dev/pts/8|

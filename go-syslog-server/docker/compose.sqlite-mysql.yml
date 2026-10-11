@@ -1,0 +1,92 @@
+# ring em disco (ring.db)  ->  MySQL compartilhado (tabela syslog_events)
+#
+# Garantia (TCP/TLS): COMMIT com fsync no /data/ring.db antes de voltar a ler;
+#   zero perda sob crash do processo.
+#
+#   docker compose -f compose.sqlite-mysql.yml up -d --build
+#
+# Publicado no host: syslog 5150/udp e 5150/tcp (SYSLOG_PORT), TLS 16510
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19110 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-sqlite-mysql
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-sqlite-mysql
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-sqlite-mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: mysql -------------------------------------------------------
+      SYSLOG_SINK_TYPE: mysql
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao de um orcamento que a frota inteira divide
+      # (SPEC §10.5). Acima de 16 tambem e' WARN.
+      SYSLOG_SINK_WORKERS: "4"
+      SYSLOG_SINK_MYSQL_ADDR: mysql:3306
+      SYSLOG_SINK_MYSQL_USERNAME: ${SYSLOG_SINK_MYSQL_USERNAME:-syslog}
+      SYSLOG_SINK_MYSQL_PASSWORD: ${SYSLOG_SINK_MYSQL_PASSWORD:-syslog}
+      SYSLOG_SINK_MYSQL_DATABASE: ${SYSLOG_SINK_MYSQL_DATABASE:-syslog}
+      SYSLOG_SINK_MYSQL_TABLE: ${SYSLOG_SINK_MYSQL_TABLE:-syslog_events}
+      # 0 deriva sink.workers + 1 = 5.
+      SYSLOG_SINK_MYSQL_POOL_SIZE: ${SYSLOG_SINK_MYSQL_POOL_SIZE:-0}
+      SYSLOG_SINK_MYSQL_TLS: ${SYSLOG_SINK_MYSQL_TLS:-false}
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5150}:1514/udp"
+      - "${SYSLOG_PORT:-5150}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16510}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19110}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+  mysql:
+    image: ${SYSLOG_MYSQL_IMAGE:-mysql:8.4}
+    container_name: sls-sqlite-mysql-mysql
+    hostname: sls-sqlite-mysql-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SYSLOG_MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${SYSLOG_SINK_MYSQL_DATABASE:-syslog}
+      MYSQL_USER: ${SYSLOG_SINK_MYSQL_USERNAME:-syslog}
+      MYSQL_PASSWORD: ${SYSLOG_SINK_MYSQL_PASSWORD:-syslog}
+    command:
+      - mysqld
+      - --innodb_flush_log_at_trx_commit=1
+      # O pior JLH tem ~776 KiB (SPEC §3.9); 64 MiB sobram.
+      - --max_allowed_packet=64M
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # O servidor nunca faz DDL (SPEC §10.6): a tabela vem daqui.
+      - ./mysql/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "127.0.0.1:${SYSLOG_MYSQL_PORT:-13310}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  sls-data:
+  mysql-data:

@@ -1,0 +1,9 @@
+# Padroes estritamente locais desta pasta (AGENTS.md §4). O .gitignore principal
+# e' do nivel acima.
+#
+# data/: DATADIR de execucao local (identidade e emergency/*.jsonl).
+data/
+cov.out
+docker/.env
+# Credenciais NATS (.creds) montadas a mao para testar o compose: nunca versionadas.
+*.creds

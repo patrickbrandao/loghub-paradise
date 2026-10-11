@@ -1,0 +1,13 @@
+# Entrada padrao: `docker compose up -d --build` dentro desta pasta.
+#
+# Nao duplica nada -- apenas inclui a unica combinacao deste servidor (ring na
+# RAM, fila loghub.inbox no PostgreSQL). O `name` abaixo e' o mesmo do arquivo
+# incluido, entao estes dois comandos operam a MESMA stack:
+#
+#   docker compose up -d --build
+#   docker compose -f compose.memory-postgres.yml up -d --build
+
+name: whp-memory-postgres
+
+include:
+  - compose.memory-postgres.yml

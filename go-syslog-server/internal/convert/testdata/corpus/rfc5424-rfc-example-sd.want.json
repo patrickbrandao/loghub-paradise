@@ -1,0 +1,8 @@
+{
+ "format": "rfc5424",
+ "appname": "evntslog",
+ "msgid": "ID47",
+ "structured-data.exampleSDID@32473.eventID": "1011",
+ "structured-data.exampleSDID@32473.eventSource": "Application",
+ "message": "An application event log entry..."
+}

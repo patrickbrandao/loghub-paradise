@@ -1,0 +1,128 @@
+# ring na RAM  ->  fila loghub.inbox no PostgreSQL (a unica combinacao)
+#
+# O banco e' compartilhado por todas as instancias. Aceitar o evento custa uma
+# copia em memoria; o dreno insere em lotes, um comando por lote, com
+# ON CONFLICT (uuid) DO NOTHING para que uma redelivery nunca duplique.
+#
+# O servidor NUNCA cria a tabela (docs/SPEC.md 8.5.1). A imagem oficial do
+# PostgreSQL executa ./postgres/inbox.sql uma vez, na criacao do volume; o
+# webhook valida no boot que a tabela existe com as colunas, o indice unico e o
+# INSERT de que precisa, e sai com codigo 3 se algo faltar -- na hora, sem
+# esperar sink.boot_timeout.
+#
+# Durabilidade: o evento so' existe na RAM ate' o INSERT confirmar, e o que
+# "confirmado" significa e' o synchronous_commit DO SERVIDOR (SPEC 8.5.6). Fica
+# ligado explicitamente abaixo. O dump de emergencia (JSON Lines em
+# /data/emergency, SPEC 9) cobre o trecho em RAM.
+#
+# Conexoes: cada worker segura uma conexao, e o max_connections do PostgreSQL
+# e' dividido por todas as instancias. Por isso o padrao e' 4 workers (SPEC
+# 8.5.3).
+#
+# Portas do host diferentes das do go-webhook-fast-server (8080-8100,
+# 9101-9130), para os dois poderem rodar lado a lado na mesma maquina.
+#
+#   docker compose -f compose.memory-postgres.yml up -d --build
+
+name: whp-memory-postgres
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whp-base
+    container_name: whp-memory-postgres
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whp-memory-postgres
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: memoria (o unico; ring.mode nao precisa ser dito) ----------
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (WHS_GOMEMLIMIT e
+      # WHS_MEMORY_LIMIT).
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-256MiB}
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+      # Um failover do banco e' FATAL por decisao (SPEC 8.5.7): o ring vai
+      # inteiro para /data/emergency (um .jsonl, uma linha por envelope) e
+      # volta no boot seguinte. Com este destino o dump nao e' rede de
+      # seguranca, e' parte do caminho normal.
+      WHS_EMERGENCY_ENABLED: "true"
+
+      # --- sink: postgres (o unico; sink.type nao precisa ser dito) ---------
+      WHS_SINK_POSTGRES_ADDR: postgres:5432
+      WHS_SINK_POSTGRES_USERNAME: ${WHS_SINK_POSTGRES_USERNAME:-webhook}
+      # A senha padrao serve ao ambiente de desenvolvimento. Em producao, .env.
+      WHS_SINK_POSTGRES_PASSWORD: ${WHS_SINK_POSTGRES_PASSWORD:-webhook}
+      WHS_SINK_POSTGRES_DATABASE: ${WHS_SINK_POSTGRES_DATABASE:-webhook}
+      WHS_SINK_POSTGRES_TABLE: ${WHS_SINK_POSTGRES_TABLE:-loghub.inbox}
+      # 0 deriva sink.workers + 1: uma conexao por worker e uma para o health.
+      WHS_SINK_POSTGRES_POOL_SIZE: ${WHS_SINK_POSTGRES_POOL_SIZE:-0}
+      # Rede interna do compose: sem TLS. Contra um banco gerenciado, ligue
+      # WHS_SINK_POSTGRES_TLS e monte a CA em /etc/webhook (somente leitura).
+      WHS_SINK_POSTGRES_TLS: ${WHS_SINK_POSTGRES_TLS:-false}
+
+      # Cada worker e' uma conexao no servidor; some as instancias antes de
+      # subir isto.
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-4}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8200}:8080"
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9201}:9101"
+
+    # /data so' para os dumps de emergencia -- e aqui eles sao esperados.
+    volumes:
+      - whp-data:/data
+
+  postgres:
+    # 18 fixado: a DDL da fila usa uuid_extract_version (PostgreSQL 18), e a
+    # imagem 18 mudou o layout do diretorio de dados -- o volume abaixo aponta
+    # para o caminho da 18. Troque os dois juntos.
+    image: ${WHS_POSTGRES_IMAGE:-postgres:18-alpine}
+    container_name: whp-memory-postgres-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${WHS_SINK_POSTGRES_USERNAME:-webhook}
+      POSTGRES_PASSWORD: ${WHS_SINK_POSTGRES_PASSWORD:-webhook}
+      POSTGRES_DB: ${WHS_SINK_POSTGRES_DATABASE:-webhook}
+    command:
+      - postgres
+      # E' o padrao do PostgreSQL, e e' o que faz o 200 significar WAL
+      # sincronizado. Explicito porque o servidor de webhooks nao le nem
+      # altera este valor (SPEC 8.5.6): a garantia mora aqui.
+      - -c
+      - synchronous_commit=on
+    volumes:
+      # A imagem 18 guarda os dados em /var/lib/postgresql/18/docker e recusa
+      # um volume montado no antigo /var/lib/postgresql/data.
+      - postgres-data:/var/lib/postgresql
+      # Executado UMA vez pela imagem oficial, ao criar o volume. Depois disso
+      # o esquema e' seu: migre com a ferramenta que administrar o banco.
+      - ./postgres/inbox.sql:/docker-entrypoint-initdb.d/001-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${WHS_POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WHS_SINK_POSTGRES_USERNAME:-webhook} -d ${WHS_SINK_POSTGRES_DATABASE:-webhook}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whp-data:
+  postgres-data:

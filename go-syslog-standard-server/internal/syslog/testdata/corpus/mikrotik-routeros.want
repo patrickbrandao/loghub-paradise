@@ -1,0 +1,5 @@
+# expected fields for mikrotik-routeros.raw; one key=value per line
+rfc=|3164|
+hostname=|MikroTik|
+app-name=||
+msg=|dhcp,info dhcp1 assigned 10.0.0.50 to AA:BB:CC:DD:EE:FF|

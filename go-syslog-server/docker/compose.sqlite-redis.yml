@@ -1,0 +1,89 @@
+# ring em disco (ring.db)  ->  Redis Stream (loghub.<space>.syslog, campo e)
+#
+# Garantia (TCP/TLS): COMMIT com fsync no /data/ring.db antes de voltar a ler;
+#   zero perda sob crash do processo.
+#
+#   docker compose -f compose.sqlite-redis.yml up -d --build
+#
+# Publicado no host: syslog 5147/udp e 5147/tcp (SYSLOG_PORT), TLS 16507
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19107 (SYSLOG_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: sls-sqlite-redis
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: sls-base
+    container_name: sls-sqlite-redis
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: sls-sqlite-redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: redis -------------------------------------------------------
+      SYSLOG_SINK_TYPE: redis
+      SYSLOG_SINK_REDIS_STREAM: ${SYSLOG_SINK_REDIS_STREAM:-loghub.{space}.syslog}
+      # 0 desliga o trim: MAXLEN descartaria envelopes antigos em silencio.
+      SYSLOG_SINK_REDIS_MAXLEN: ${SYSLOG_SINK_REDIS_MAXLEN:-0}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README). As sem valor so' entram se definidas no .env
+      # ou no shell: vazias contariam como explicitas e travariam a URL.
+      SYSLOG_SINK_REDIS_ADDRS: redis:6379
+      SYSLOG_SINK_REDIS_DB:
+      SYSLOG_SINK_REDIS_USERNAME:
+      SYSLOG_SINK_REDIS_PASSWORD:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # SYSLOG_PORT do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5147}:1514/udp"
+      - "${SYSLOG_PORT:-5147}:1514/tcp"
+      - "${SYSLOG_TLS_PORT:-16507}:6514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19107}:9102"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - sls-data:/data
+
+  redis:
+    image: ${SYSLOG_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: sls-sqlite-redis-redis
+    hostname: sls-sqlite-redis-redis
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1 s num crash do Redis.
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${SYSLOG_REDIS_PORT:-16307}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  sls-data:
+  redis-data:

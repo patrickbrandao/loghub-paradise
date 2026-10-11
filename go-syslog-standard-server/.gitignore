@@ -1,0 +1,7 @@
+# Padroes estritamente locais desta pasta (AGENTS.md §3). O .gitignore principal
+# e' do nivel acima, mantido pelo agente do monorepo.
+data/
+*.db
+*.db-wal
+*.db-shm
+cov.out

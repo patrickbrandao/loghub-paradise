@@ -1,0 +1,11 @@
+{
+ "format": "rfc3164",
+ "host.hostname": "web-01",
+ "appname": "systemd",
+ "procid": "1",
+ "timestamp": "2026-09-13T10:00:00.123456Z",
+ "message": "Started Session 42 of user root.",
+ "_absent": [
+  "parse"
+ ]
+}
