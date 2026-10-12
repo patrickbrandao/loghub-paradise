@@ -1,0 +1,107 @@
+# ring sem ring  ->  NATS JetStream (loghub.<space>.syslog)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois de o destino
+#   confirmar: o PubAck do stream JetStream.
+#   O modo lento por definicao: a conversao roda na transacao, com ate'
+#   relp.window escritas em voo por conexao. Uma recusa `logic` do destino
+#   e' final: `500 refused by the destination`; o rsyslog descarta e loga essa
+#   linha, suspende a acao e retransmite as vizinhas da janela (duplicatas).
+#
+#   docker compose -f compose.none-nats.yml up -d --build
+#   docker compose -f compose.none-nats.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20526 (RELPLOG_PORT), RELP/TLS 20626 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9312 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-none-nats
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-none-nats
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-none-nats
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    environment:
+      # --- ring: none --------------------------------------------------------
+      RELPLOG_RING_MODE: none
+      RELPLOG_RING_MAX_INFLIGHT: ${RELPLOG_RING_MAX_INFLIGHT:-2048}
+      RELPLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: nats --------------------------------------------------------
+      RELPLOG_SINK_TYPE: nats
+      RELPLOG_SINK_NATS_MODE: ${RELPLOG_SINK_NATS_MODE:-jetstream}
+      RELPLOG_SINK_NATS_STREAM: ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG}
+      RELPLOG_SINK_NATS_SUBJECTS: ${RELPLOG_SINK_NATS_SUBJECTS:-exact}
+      # Heartbeat beacon em loghub._ctl.beacon a cada 15 s (SPEC §11).
+      LOGHUB_BEACON_INTERVAL: ${LOGHUB_BEACON_INTERVAL:-15}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README). As sem valor so' entram se definidas no .env
+      # ou no shell: vazias contariam como explicitas e travariam a URL.
+      RELPLOG_SINK_NATS_URLS: nats://nats:4222
+      RELPLOG_SINK_NATS_USERNAME:
+      RELPLOG_SINK_NATS_PASSWORD:
+      RELPLOG_SINK_NATS_TLS:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20526}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20626}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9312}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+  nats:
+    image: ${RELPLOG_NATS_IMAGE:-nats:2.11-alpine}
+    container_name: rls-none-nats-nats
+    hostname: rls-none-nats-nats
+    restart: unless-stopped
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    volumes:
+      - nats-data:/data
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      - "127.0.0.1:${RELPLOG_NATS_PORT:-24212}:4222"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # O stream e' criado aqui, a partir do arquivo que o operador aplica; o servidor
+  # so' o valida (nunca cria nem altera um stream, SPEC §10.7).
+  nats-init:
+    image: ${RELPLOG_NATS_BOX_IMAGE:-natsio/nats-box:0.20.0}
+    container_name: rls-none-nats-nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    volumes:
+      - ./nats/stream.json:/etc/nats/stream.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        nats --server nats://nats:4222 stream info ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG} >/dev/null 2>&1
+        || nats --server nats://nats:4222 stream add ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG} --config /etc/nats/stream.json
+
+volumes:
+  rls-data:
+  nats-data:

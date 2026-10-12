@@ -11,9 +11,86 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 2026-10-11 sobre a renomeação). Módulos: **W** = `go-webhook-server`,
 **S** = `go-syslog-server`, **F** = `go-webhook-fast-server`, **P** = `go-webhook-pg-server`,
 **SP** = `go-syslog-pg-server`, **SN** = `go-syslog-nats-server`,
-**N** = `go-webhook-nats-server`. Nas entradas anteriores a 2026-10-05, **S** é o
+**N** = `go-webhook-nats-server`, **R** = `go-relplog-server`. Nas entradas anteriores a 2026-10-05, **S** é o
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
+
+## 2026-10-12 — R: `go-relplog-server` desenvolvido por completo
+
+Pedido: desenvolver o `go-relplog-server` (RELP do rsyslog/`omrelp`) a partir da
+especificação extraída, com o S como modelo, sem entrevista. Decisões em
+`docs/DECISOES.md` (1–16 e 8a); a SPEC é a do S adaptada, com §5 (RELP) nova.
+
+- **Módulo independente** copiado do S e adaptado: só `listen.tcp` (`:20514`) e
+  `listen.tls`, RELP nos dois; UDP, unix e RFC 6587 saíram. Envelope JLH
+  `type=syslog` com `transport` `tcp`/`tls`, `framing` `octet-counting` e
+  `x-transport: "relp"` (D9). Mesmos rings, sinks, beacon, dump, filtro,
+  `LOGHUB_EB_URL`; prefixos `RELPLOG_`, `relplog_`, admin `127.0.0.1:9103`,
+  `relplog:ring`; stream NATS `LOGHUB_SYSLOG` compartilhado com o S.
+- **O `librelp` decide o protocolo** (lido em `src/`): um `500` **destrói** a
+  mensagem no emissor (`scrsp.c`). A especificação extraída respondia
+  `500 ring full` e `500 shutdown`: perda na origem. Agora ring cheio ou
+  indisponível, sink DOWN e shutdown **seguram** a transação; passado
+  `relp.backpressure_timeout` (30 s, abaixo dos 90 s do `omrelp`) a sessão fecha
+  sem resposta e o rsyslog retransmite. `500` só para a recusa `logic` final com
+  `ring=none`, a guarda de origem e erros de protocolo do cliente.
+- **`0 serverclose 0\n`** sem o espaço que o leitor do `librelp` recusa; o
+  `serverclose` sai depois de todas as respostas decididas, e nunca no `close`
+  do cliente. O `Close` do transporte só vence o prazo de leitura, para não
+  perder `200` de mensagens já no ring.
+- **Memória limitada:** janela por conexão (`relp.window` 128) e teto global
+  das cópias em voo (`relp.inflight_max_bytes` 64 MiB, `2 × classe + 8 KiB` por
+  transação); buffer de frame que cresce com os bytes que chegam.
+- **Rsyslog real** (8.2410, `librelp` 1.11, suíte `TestEmittersRELP*`): o `500`
+  também suspende a ação e **quebra a sessão**, e as vizinhas da janela já
+  aceitas voltam duplicadas (5–6 por `500`). Por isso o **rate-limit segura**
+  em vez de recusar (decisão 8a; a primeira versão dava `500 rate limited`). O
+  `librelp` só percebe uma sessão fechada quando envia de novo.
+- **As 30 pendências do S** foram corrigidas na criação (SPEC §22 do R cita a
+  seção de cada uma).
+- **Revisão independente** (RELP, app, config/dump, sinks, docs), cada achado
+  com teste conferido por mutação: retentativa que acordava depois do aborto e
+  ainda enfileirava (duplicata); teto em voo que contava só a cópia (5× o teto
+  com linhas pequenas); frame lido e não despachado fora da reconciliação;
+  motivo `server_closed`; aborto entre `Drain` e dump não contado, e dump falho
+  contado duas vezes (agora `Swap` com um dono só); `SIGQUIT` tardio perdido;
+  transportes fechados em sequência (um `closeGrace` por transporte); cauda de
+  senha partida pelo shell ecoada; `@` depois de `/`, `?`, `#` numa URL e
+  fragmento numa URL PostgreSQL; `Remove` do dump sem `fsync` do diretório;
+  health checks sem prazo próprio; NATS `10077` de stream cheio ou fechando era
+  fatal; `discard=new` com `max_bytes` abaixo de um registro; negação de
+  permissão mascarada no `mode=core`; MySQL `1203`/`1226`/`1461` fatais; sonda
+  MySQL com `unix`/`src_ip NULL` recusando tabela legítima.
+
+**Resultado:** `go test -race` com PostgreSQL 18, MySQL 8.4, ClickHouse 25.8,
+Redis 7 (um com `allkeys-lru`), nats-server 2.14.6 (com e sem JetStream, com
+permissões) e o rsyslog real: 16 pacotes verdes, 773 testes e subtestes, um
+pulado (vetor `transport=file`, fora por D5); cobertura 88,5%. Fuzz de 60 s
+nos oito alvos sem falha (`FuzzFrame` contra um oráculo independente).
+`BenchmarkRELPSession`: ~486 mil msg/s numa sessão, ring em memória.
+
+**A portar** (candidatos; o código é o mesmo, mas nada foi conferido nos
+irmãos):
+- S: as 30 pendências (lista em §22 da SPEC do R).
+- S, SN, N, F, W (onde houver NATS): `10077` de stream cheio/fechando como
+  `network`, `discard=new` abaixo de um registro recusado no boot, negação
+  mascarada no `mode=core`.
+- S, F, W (MySQL): `1203`/`1226`/`1461` como `network`.
+- Todos com `LOGHUB_EB_URL`: `@` depois de `/`, `?` ou `#` recusado; fragmento
+  em URL PostgreSQL recusado.
+- Todos com dump: `fsync` do diretório no `Remove`; posse única da contagem do
+  aborto (`dumpPhase` + `Swap`) e o `SIGQUIT` tardio.
+- S: fechamento simultâneo dos transportes no shutdown; prazo próprio dos
+  health checks (`withLifetime`).
+- S, N, SN: a cauda depois de um valor nomeada só dentro de uma seção conhecida
+  (`knownSectionOf`).
+- **Não se aplica** ao S: o rate-limit que segura (no TCP de syslog não há
+  resposta por mensagem; descartar continua sendo o que o S pode fazer).
+
+**Lição.** Num protocolo com confirmação, o código de resposta só vale o que o
+**cliente** faz com ele: ler o `librelp` virou do avesso a especificação
+extraída, e só o rsyslog de verdade mostrou o custo restante (sessão quebrada e
+duplicatas por `500`).
 
 ## 2026-10-11 — Todos: o projeto passa a se chamar `loghub-paradise`
 

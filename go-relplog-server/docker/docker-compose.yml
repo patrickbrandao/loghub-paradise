@@ -1,0 +1,14 @@
+# Combinacao padrao: ring=memory -> sink=nats (JetStream), o eventbus do LogHub.
+#
+#   docker compose up -d --build                     # so' o servidor e o NATS
+#   docker compose --profile demo up -d --build      # mais o rsyslog de demonstracao
+#
+# As demais combinacoes estao em compose.<ring>-<sink>.yml (README.md); o
+# emissor de demonstracao se soma a qualquer uma com -f compose.emitter.yml.
+
+name: rls-memory-nats
+
+include:
+  - compose.memory-nats.yml
+  # O servico `emitter` so' sobe com --profile demo.
+  - compose.emitter.yml

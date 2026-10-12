@@ -1,0 +1,9 @@
+{
+ "format": "rfc5424",
+ "host.hostname": "mymachine",
+ "appname": "patrick",
+ "procid": "1234",
+ "structured-data.timeQuality.tzKnown": "1",
+ "structured-data.timeQuality.syncAccuracy": "170000",
+ "message": "hello world"
+}

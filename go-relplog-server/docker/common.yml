@@ -1,0 +1,203 @@
+# Fragmento compartilhado por todos os compose deste diretorio.
+#
+# NAO suba este arquivo sozinho: ele define o servico-base `rls-base`, que os
+# compose.<ring>-<sink>.yml herdam via `extends`. O que distingue uma combinacao
+# (ring.mode, sink.type, portas, volumes, dependencias, hostname) fica no arquivo
+# de cada uma.
+#
+# Regra de heranca do Compose: `environment` e `healthcheck` sao mapas e o filho
+# sobrescreve chave a chave; `ports` e' sequencia e concatena (por isso as portas
+# ficam so' no filho); `volumes` junta por destino (os de config ficam aqui, o
+# /data de cada um no filho); `depends_on` NAO e' herdado por `extends`.
+#
+# Config em dois lugares, de proposito (SPEC §16.1, §16.3):
+#   - env (aqui e em cada compose): SO' chaves que exigem restart. Env vence o
+#     INI e nao muda num container de pe'.
+#   - conf/relplog.ini, montado em /etc/relplog: SO' as recarregaveis (filtro,
+#     rate-limit, log.level, log.access*, sink.sqlite.keep_files). Edite o
+#     arquivo e mande `docker kill -s HUP <container>`.
+#
+# Prefixo rls- em projeto, container e volume: o go-syslog-server usa sls-, e os
+# dois rodam no mesmo host sem colidir (as portas publicadas tambem sao
+# disjuntas; README, "Portas").
+
+services:
+  rls-base:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${RELPLOG_VERSION:-dev}
+        COMMIT: ${RELPLOG_COMMIT:-none}
+        GO_VERSION: ${RELPLOG_GO_VERSION:-1.25}
+        ALPINE_VERSION: ${RELPLOG_ALPINE_VERSION:-3.22}
+    image: ${RELPLOG_IMAGE:-go-relplog-server}:${RELPLOG_IMAGE_TAG:-local}
+
+    restart: unless-stopped
+
+    # Precisa ser MAIOR que shutdown.pre_stop_delay + shutdown.drain_timeout +
+    # closeGrace (6 s, o prazo de uma sessao RELP esvaziar as respostas ja'
+    # decididas; SPEC §5.8, §13.4): 0 + 30 + 6 = 36 s. Menor, o Docker mata o
+    # processo no meio do dreno e perde mensagens que ja' receberam `200 OK`,
+    # que o rsyslog ja' apagou da fila dele.
+    stop_grace_period: 45s
+    stop_signal: SIGTERM
+
+    environment:
+      # --- identidade LogHub (go-loghub-ident, SPEC §13.1) ------------------
+      # DATADIR e AGENT_NAME ja' vem da imagem. WORKSPACE e' o TENANT, nao o
+      # ambiente: prod e staging nao sao tenants. Ele vira o `space` de todo
+      # envelope e o subject loghub.<space>.syslog -- o stream NATS de
+      # nats/stream.json cobre so' "default"; quem trocar um troca o outro.
+      # HOSTNAME vem do `hostname:` de cada servico. AGENT_UUID e MACHINE_ID
+      # sao gerados e persistidos em /data na primeira subida.
+      # Lido de RELPLOG_WORKSPACE, nunca de WORKSPACE: o shell de CI (Jenkins)
+      # exporta WORKSPACE com o caminho do job, e o compose o interpolaria.
+      WORKSPACE: ${RELPLOG_WORKSPACE:-default}
+
+      # --- transportes: RELP (SPEC §4, §5) -------------------------------------
+      # So' RELP: em claro (listen.tcp) e sobre TLS (listen.tls). Nao ha UDP,
+      # unix nem as molduras da RFC 6587 -- quem precisa delas usa o
+      # go-syslog-server. As portas do container sao as padrao (SPEC §4.1),
+      # altas porque a imagem roda como uid 65532. 0.0.0.0 e' o que recebe as
+      # portas publicadas; por isso todo compose deste diretorio sobe com um
+      # WARN esperado, "ratelimit.enabled=false with listen.tcp=... reachable
+      # off this host" (por que fica desligado: [ratelimit] de conf/relplog.ini).
+      RELPLOG_LISTEN_TCP: 0.0.0.0:20514
+      # RELP sobre TLS desligado ate' haver certificado: ponha server.crt e
+      # server.key em ./tls (montada em /etc/relplog/tls, abaixo) e defina
+      # RELPLOG_LISTEN_TLS=0.0.0.0:20515 (README, "TLS"; tls/README.md).
+      RELPLOG_LISTEN_TLS: ${RELPLOG_LISTEN_TLS:-}
+      RELPLOG_TLS_CERT_FILE: ${RELPLOG_TLS_CERT_FILE:-/etc/relplog/tls/server.crt}
+      RELPLOG_TLS_KEY_FILE: ${RELPLOG_TLS_KEY_FILE:-/etc/relplog/tls/server.key}
+      RELPLOG_TLS_CLIENT_AUTH: ${RELPLOG_TLS_CLIENT_AUTH:-optional}
+      RELPLOG_TLS_CLIENT_CA: ${RELPLOG_TLS_CLIENT_CA:-}
+      # Ociosidade de uma sessao RELP: sem frame por esse tempo, sai serverclose
+      # e o omrelp reconecta na proxima mensagem (SPEC §4.4). 0 = nunca.
+      RELPLOG_TCP_IDLE_TIMEOUT: ${RELPLOG_TCP_IDLE_TIMEOUT:-120s}
+      RELPLOG_TLS_IDLE_TIMEOUT: ${RELPLOG_TLS_IDLE_TIMEOUT:-120s}
+      # Tetos de conexao, por transporte; 0 = sem teto. O rsyslog abre UMA
+      # conexao por acao omrelp: quem espera milhares de emissores fixa o teto
+      # (cada conexao custa ~10 KiB fora do ring, SPEC §15.3a).
+      RELPLOG_TCP_MAX_CONNS: ${RELPLOG_TCP_MAX_CONNS:-0}
+      RELPLOG_TLS_MAX_CONNS: ${RELPLOG_TLS_MAX_CONNS:-0}
+
+      # --- o protocolo RELP (SPEC §5; exigem restart) ---------------------------
+      # Janela do servidor: transacoes em voo por conexao antes de o leitor
+      # parar de ler (o omrelp usa 128 do lado dele, windowSize).
+      RELPLOG_RELP_WINDOW: ${RELPLOG_RELP_WINDOW:-128}
+      # Fusivel do DATALEN: acima dele a conexao fecha antes de ler o corpo.
+      RELPLOG_RELP_MAX_FRAME_BYTES: ${RELPLOG_RELP_MAX_FRAME_BYTES:-16MiB}
+      # Teto do PROCESSO para as copias das transacoes em voo, fora de
+      # ring.max_bytes; esgotado, o leitor para de ler e nada e' recusado.
+      RELPLOG_RELP_INFLIGHT_MAX_BYTES: ${RELPLOG_RELP_INFLIGHT_MAX_BYTES:-64MiB}
+      # Ring cheio, ring indisponivel ou sink DOWN: a transacao fica SEM resposta
+      # ate' isto; depois a sessao fecha (serverclose) e o rsyslog reconecta e
+      # retransmite. Fica abaixo do `timeout` do omrelp (90 s), para o servidor
+      # decidir antes de o cliente desistir sozinho. Zero e' recusado.
+      RELPLOG_RELP_BACKPRESSURE_TIMEOUT: ${RELPLOG_RELP_BACKPRESSURE_TIMEOUT:-30s}
+
+      # PROXY protocol (SPEC §4.6): so' com um balanceador na frente.
+      RELPLOG_PROXY_PROTOCOL: ${RELPLOG_PROXY_PROTOCOL:-off}
+      RELPLOG_PROXY_TRUSTED: ${RELPLOG_PROXY_TRUSTED:-127.0.0.1/32,::1/128}
+
+      RELPLOG_ADMIN_ENABLED: "true"
+      RELPLOG_ADMIN_BIND: 0.0.0.0:9103
+
+      # --- LOGHUB_EB_URL (SPEC §10.9) -----------------------------------------
+      # NAO e' repassada daqui, de proposito: um LOGHUB_EB_URL exportado no shell
+      # de quem roda o compose (comum num ambiente LogHub) colidiria com as
+      # chaves de conexao que cada compose define, e o boot sairia com 1. Cada
+      # compose de nats, redis e postgres traz a linha comentada junto das
+      # chaves que ela substitui (README, "LOGHUB_EB_URL").
+
+      # --- conversao (SPEC §6; exigem restart) -------------------------------
+      # Todo o [syslog]: nomes fixados pela skill loghub-type-syslog-schema, os
+      # MESMOS do go-syslog-server (SYSLOG_*, nao RELPLOG_*): um .env comum
+      # garante a mesma conversao nos dois. Replicas de um ring Redis
+      # compartilhado precisam de TODOS iguais (SPEC §3.5; README).
+      SYSLOG_MAX_MESSAGE_BYTES: ${SYSLOG_MAX_MESSAGE_BYTES:-64KiB}
+      SYSLOG_RFC3164_TIMEZONE: ${SYSLOG_RFC3164_TIMEZONE:-UTC}
+      SYSLOG_PAYLOAD_RAW: ${SYSLOG_PAYLOAD_RAW:-true}
+      SYSLOG_LEGACY_CHARSET: ${SYSLOG_LEGACY_CHARSET:-}
+      SYSLOG_ACCEPT_MALFORMED: ${SYSLOG_ACCEPT_MALFORMED:-true}
+      SYSLOG_DEFAULT_PRIORITY: ${SYSLOG_DEFAULT_PRIORITY:-13}
+      SYSLOG_SD_MAX_ELEMENTS: ${SYSLOG_SD_MAX_ELEMENTS:-32}
+      SYSLOG_SD_MAX_PARAMS: ${SYSLOG_SD_MAX_PARAMS:-64}
+
+      # --- chaves recarregaveis: conf/relplog.ini -----------------------------
+      # Filtro, rate-limit, log.level, log.access, log.access_sample e
+      # sink.sqlite.keep_files NAO entram no env: env vence o INI e nunca muda
+      # num container de pe', e o `docker kill -s HUP` nao mudaria nada. Edite
+      # conf/relplog.ini e mande o HUP. O caminho e' fixo; a pasta vem do volume
+      # abaixo.
+      RELPLOG_CONFIG: /etc/relplog/relplog.ini
+
+      # --- observabilidade -----------------------------------------------------
+      RELPLOG_LOG_FORMAT: ${RELPLOG_LOG_FORMAT:-json}
+
+      # --- desligamento --------------------------------------------------------
+      # Aumentou algum? Aumente stop_grace_period acima (soma + 6 s de folga).
+      RELPLOG_SHUTDOWN_PRE_STOP_DELAY: ${RELPLOG_SHUTDOWN_PRE_STOP_DELAY:-0s}
+      RELPLOG_SHUTDOWN_DRAIN_TIMEOUT: ${RELPLOG_SHUTDOWN_DRAIN_TIMEOUT:-30s}
+
+      # --- memoria (SPEC §15.3a, §15.4) ----------------------------------------
+      # Sem GOMEMLIMIT o GC nao sabe do teto do container e o OOM killer chega
+      # antes. Com ring=memory precisa cobrir 2 x ring.max_bytes; o limite do
+      # container fica ACIMA dele. A conta do processo e' ring.max_bytes +
+      # sink.workers x sink.batch_max_bytes + relp.inflight_max_bytes +
+      # conexoes x ~10 KiB (256 + 128 + 64 MiB nos compose de ring=memory).
+      GOMEMLIMIT: ${RELPLOG_GOMEMLIMIT:-512MiB}
+
+    # /healthz e' liveness pura: 200 enquanto o processo vive. /readyz NAO e'
+    # o healthcheck de proposito: ele da' 503 com o destino fora, com o ring
+    # acima de ring.high_water e durante o dreno do backlog de boot, e marcar o
+    # container unhealthy por isso (ou reinicia-lo, num orquestrador que o faca)
+    # nao conserta um destino inalcancavel -- so' interrompe o dreno e fecha as
+    # sessoes RELP. /readyz e' para o balanceador e para o operador (README,
+    # "Saude").
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9103/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+    # So' leitura, e por isso aqui e nao em cada compose. O /data gravavel e'
+    # um volume nomeado POR INSTANCIA, declarado no compose de cada combinacao.
+    volumes:
+      # conf/relplog.ini: as chaves recarregaveis. A PASTA, nao o arquivo: um
+      # bind de arquivo prende o inode, e o editor que salva por rename deixaria
+      # o container lendo a versao antiga para sempre.
+      - ./conf:/etc/relplog:ro
+      # Certificados do RELP/TLS; server.key legivel pelo uid 65532
+      # (tls/README.md). Montada por cima de ./conf, que traz a subpasta conf/tls
+      # so' como ponto de montagem: sem ela, com ./conf so' leitura, o Docker nao
+      # cria /etc/relplog/tls e o container nao sobe (conf/tls/README.md).
+      - ./tls:/etc/relplog/tls:ro
+
+    # read_only transforma "so' /data e' gravavel" em garantia: um caminho de
+    # escrita fora do volume falha no boot em vez de gravar na camada efemera.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    deploy:
+      resources:
+        limits:
+          memory: ${RELPLOG_MEMORY_LIMIT:-768M}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

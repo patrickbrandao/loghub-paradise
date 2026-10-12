@@ -1,0 +1,104 @@
+# ring na RAM  ->  PostgreSQL compartilhado (fila loghub.inbox)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois de a mensagem
+#   estar na RAM deste no'. SIGTERM nao perde (dreno); FATAL do sink nao
+#   perde (dump); SIGKILL e OOM perdem o backlog ja' confirmado, que o
+#   rsyslog ja' apagou da fila dele.
+#
+#   docker compose -f compose.memory-postgres.yml up -d --build
+#   docker compose -f compose.memory-postgres.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20517 (RELPLOG_PORT), RELP/TLS 20617 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9303 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-memory-postgres
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-memory-postgres
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-memory-postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- ring: memory ------------------------------------------------------
+      RELPLOG_RING_MODE: memory
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-256MiB}
+      RELPLOG_RING_HIGH_WATER: ${RELPLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte (SPEC §12).
+      RELPLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: postgres ----------------------------------------------------
+      RELPLOG_SINK_TYPE: postgres
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao de um orcamento que a frota inteira divide
+      # (SPEC §10.5). Acima de 16 tambem e' WARN.
+      RELPLOG_SINK_WORKERS: "4"
+      RELPLOG_SINK_POSTGRES_TABLE: ${RELPLOG_SINK_POSTGRES_TABLE:-loghub.inbox}
+      # 0 deriva sink.workers + 1 = 5.
+      RELPLOG_SINK_POSTGRES_POOL_SIZE: ${RELPLOG_SINK_POSTGRES_POOL_SIZE:-0}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README); a URL leva a senha do servico postgres abaixo
+      # (postgres://syslog:syslog@postgres:5432/syslog). Usuario e banco sem
+      # valor so' entram se definidos no .env ou no shell; sem eles vale o
+      # padrao do servidor, syslog/syslog, o mesmo do servico postgres.
+      RELPLOG_SINK_POSTGRES_ADDR: postgres:5432
+      RELPLOG_SINK_POSTGRES_PASSWORD: ${RELPLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      RELPLOG_SINK_POSTGRES_USERNAME:
+      RELPLOG_SINK_POSTGRES_DATABASE:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20517}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20617}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9303}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+  postgres:
+    image: ${RELPLOG_POSTGRES_IMAGE:-postgres:18-alpine}
+    container_name: rls-memory-postgres-postgres
+    hostname: rls-memory-postgres-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${RELPLOG_SINK_POSTGRES_USERNAME:-syslog}
+      POSTGRES_PASSWORD: ${RELPLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      POSTGRES_DB: ${RELPLOG_SINK_POSTGRES_DATABASE:-syslog}
+    volumes:
+      # A imagem 18 guarda os dados em /var/lib/postgresql/18/docker e recusa
+      # um volume montado no antigo /var/lib/postgresql/data.
+      - postgres-data:/var/lib/postgresql
+      # O servidor nunca faz DDL (SPEC §10.5): a fila loghub.inbox vem daqui,
+      # na criacao do volume (DDL literal da skill, SPEC §3.7.1).
+      - ./postgres/inbox.sql:/docker-entrypoint-initdb.d/10-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${RELPLOG_POSTGRES_PORT:-25403}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RELPLOG_SINK_POSTGRES_USERNAME:-syslog} -d ${RELPLOG_SINK_POSTGRES_DATABASE:-syslog}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  rls-data:
+  postgres-data:

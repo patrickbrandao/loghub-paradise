@@ -1,0 +1,111 @@
+# ring sem ring  ->  ClickHouse compartilhado (tabela inbox_syslog)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois de o destino
+#   confirmar: o INSERT respondido (com async_insert, o que o perfil
+#   do usuario disser, SPEC §10.10.6).
+#   O modo lento por definicao: a conversao roda na transacao, com ate'
+#   relp.window escritas em voo por conexao. Uma recusa `logic` do destino
+#   e' final: `500 refused by the destination`; o rsyslog descarta e loga essa
+#   linha, suspende a acao e retransmite as vizinhas da janela (duplicatas).
+#
+#   docker compose -f compose.none-clickhouse.yml up -d --build
+#   docker compose -f compose.none-clickhouse.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20536 (RELPLOG_PORT), RELP/TLS 20636 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9322 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-none-clickhouse
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-none-clickhouse
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-none-clickhouse
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      # --- ring: none --------------------------------------------------------
+      RELPLOG_RING_MODE: none
+      # Igual ao pool (sink.workers 4 + 1): sem ring a escrita e' sincrona, e um
+      # max_inflight acima do pool so' cria fila escondida dentro dele (SPEC
+      # §9.6; o boot avisa). Quem subir o pool sobe este junto.
+      RELPLOG_RING_MAX_INFLIGHT: ${RELPLOG_RING_MAX_INFLIGHT:-5}
+      RELPLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: clickhouse --------------------------------------------------
+      RELPLOG_SINK_TYPE: clickhouse
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao, e cada INSERT e' uma parte que o servidor
+      # precisa fundir (SPEC §10.10). Acima de 16 tambem e' WARN.
+      RELPLOG_SINK_WORKERS: "4"
+      # Protocolo nativo (9000; 9440 com TLS), nao o HTTP (8123).
+      RELPLOG_SINK_CLICKHOUSE_ADDRS: clickhouse:9000
+      RELPLOG_SINK_CLICKHOUSE_USERNAME: ${RELPLOG_SINK_CLICKHOUSE_USERNAME:-syslog}
+      RELPLOG_SINK_CLICKHOUSE_PASSWORD: ${RELPLOG_SINK_CLICKHOUSE_PASSWORD:-syslog}
+      RELPLOG_SINK_CLICKHOUSE_DATABASE: ${RELPLOG_SINK_CLICKHOUSE_DATABASE:-syslog}
+      RELPLOG_SINK_CLICKHOUSE_TABLE: ${RELPLOG_SINK_CLICKHOUSE_TABLE:-inbox_syslog}
+      # 0 deriva sink.workers + 1 = 5.
+      RELPLOG_SINK_CLICKHOUSE_POOL_SIZE: ${RELPLOG_SINK_CLICKHOUSE_POOL_SIZE:-0}
+      RELPLOG_SINK_CLICKHOUSE_TLS: ${RELPLOG_SINK_CLICKHOUSE_TLS:-false}
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20536}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20636}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9322}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+  clickhouse:
+    image: ${RELPLOG_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8}
+    container_name: rls-none-clickhouse-clickhouse
+    hostname: rls-none-clickhouse-clickhouse
+    restart: unless-stopped
+    environment:
+      # A imagem cria o banco e o usuario. O mesmo usuario serve ao servidor neste
+      # ambiente de desenvolvimento; em producao ele precisa so' de INSERT na
+      # tabela e de um perfil com readonly = 0 (SPEC §10.10).
+      CLICKHOUSE_DB: ${RELPLOG_SINK_CLICKHOUSE_DATABASE:-syslog}
+      CLICKHOUSE_USER: ${RELPLOG_SINK_CLICKHOUSE_USERNAME:-syslog}
+      CLICKHOUSE_PASSWORD: ${RELPLOG_SINK_CLICKHOUSE_PASSWORD:-syslog}
+    # async_insert, wait_for_async_insert e fsync_after_insert ficam no padrao
+    # da imagem (async_insert = 0): a garantia com ring=none mora no perfil do
+    # usuario, e o go-relplog-server nao a le nem altera (SPEC §10.10).
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      # O servidor nunca faz DDL (SPEC §10.10). inbox_syslog.sql fica fora do
+      # initdb.d (a imagem rodaria um .sql de la' no banco default); o init.sh
+      # o aplica UMA vez, na criacao do volume, dentro de CLICKHOUSE_DB.
+      - ./clickhouse/inbox_syslog.sql:/etc/rls/inbox_syslog.sql:ro
+      - ./clickhouse/init.sh:/docker-entrypoint-initdb.d/001-inbox.sh:ro
+    ports:
+      - "127.0.0.1:${RELPLOG_CLICKHOUSE_PORT:-29022}:9000"
+    healthcheck:
+      # Saudavel so' quando a TABELA existe: o servidor responde antes de o
+      # init.sh terminar, e o servidor sairia com 3 numa tabela ausente.
+      test: ["CMD-SHELL", "test \"$$(clickhouse-client -u $${CLICKHOUSE_USER} --password $${CLICKHOUSE_PASSWORD} -q \"EXISTS TABLE $${CLICKHOUSE_DB}.inbox_syslog\")\" = 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  rls-data:
+  clickhouse-data:

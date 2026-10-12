@@ -1,0 +1,20 @@
+{
+  "uuid": "019dc7e2-b4fd-73b0-8d29-57265896f49f",
+  "from": "3f8e2a91-6c4d-4b7e-9a15-2d6c8e0f7b34",
+  "space": "com.acme.store",
+  "type": "order.invoice.requested",
+  "level": 9,
+  "sid": 14921,
+  "step": 2,
+  "event": {
+    "uts": 1777175016,
+    "sub": 701944210,
+    "iso": "2026-04-26T03:43:36.701Z"
+  },
+  "payload": {
+    "ref": "019dc7e2-b4af-707b-888f-e96dffd6e718",
+    "order_id": 4512,
+    "total_cents": 125990,
+    "currency": "BRL"
+  }
+}

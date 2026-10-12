@@ -1,0 +1,61 @@
+# ring na RAM  ->  SQLite local (/data/events.db, tabela syslog_events)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois de a mensagem
+#   estar na RAM deste no'. SIGTERM nao perde (dreno); FATAL do sink nao
+#   perde (dump); SIGKILL e OOM perdem o backlog ja' confirmado, que o
+#   rsyslog ja' apagou da fila dele.
+#
+#   docker compose -f compose.memory-sqlite.yml up -d --build
+#   docker compose -f compose.memory-sqlite.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20516 (RELPLOG_PORT), RELP/TLS 20616 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9302 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-memory-sqlite
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-memory-sqlite
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-memory-sqlite
+    environment:
+      # --- ring: memory ------------------------------------------------------
+      RELPLOG_RING_MODE: memory
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-256MiB}
+      RELPLOG_RING_HIGH_WATER: ${RELPLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte (SPEC §12).
+      RELPLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: sqlite ------------------------------------------------------
+      RELPLOG_SINK_TYPE: sqlite
+      RELPLOG_SINK_SQLITE_SYNCHRONOUS: ${RELPLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      RELPLOG_SINK_SQLITE_ROTATE: ${RELPLOG_SINK_SQLITE_ROTATE:-daily}
+      # Quantos rotacionados manter (keep_files) e' recarregavel: conf/relplog.ini.
+      RELPLOG_SINK_WORKERS: "1"
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20516}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20616}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9302}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+volumes:
+  rls-data:

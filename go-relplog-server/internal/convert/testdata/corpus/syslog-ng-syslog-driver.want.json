@@ -1,0 +1,7 @@
+{
+ "format": "rfc5424",
+ "host.hostname": "gw01",
+ "appname": "sudo",
+ "structured-data.meta.sequenceId": "7",
+ "message": "patrick : TTY=pts/0"
+}

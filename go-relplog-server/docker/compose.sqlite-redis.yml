@@ -1,0 +1,92 @@
+# ring em disco (ring.db)  ->  Redis Stream (loghub.<space>.syslog, campo e)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois do COMMIT com
+#   fsync no /data/ring.db; zero perda sob crash do processo.
+#
+#   docker compose -f compose.sqlite-redis.yml up -d --build
+#   docker compose -f compose.sqlite-redis.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20521 (RELPLOG_PORT), RELP/TLS 20621 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9307 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-sqlite-redis
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-sqlite-redis
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-sqlite-redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      RELPLOG_RING_MODE: sqlite
+      RELPLOG_RING_SQLITE_SYNCHRONOUS: ${RELPLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-512MiB}
+      RELPLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: redis -------------------------------------------------------
+      RELPLOG_SINK_TYPE: redis
+      RELPLOG_SINK_REDIS_STREAM: ${RELPLOG_SINK_REDIS_STREAM:-loghub.{space}.syslog}
+      # 0 desliga o trim: MAXLEN descartaria envelopes antigos em silencio.
+      RELPLOG_SINK_REDIS_MAXLEN: ${RELPLOG_SINK_REDIS_MAXLEN:-0}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README). As sem valor so' entram se definidas no .env
+      # ou no shell: vazias contariam como explicitas e travariam a URL.
+      RELPLOG_SINK_REDIS_ADDRS: redis:6379
+      RELPLOG_SINK_REDIS_DB:
+      RELPLOG_SINK_REDIS_USERNAME:
+      RELPLOG_SINK_REDIS_PASSWORD:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20521}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20621}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9307}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+  redis:
+    image: ${RELPLOG_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: rls-sqlite-redis-redis
+    hostname: rls-sqlite-redis-redis
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1 s num crash do Redis.
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${RELPLOG_REDIS_PORT:-26307}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  rls-data:
+  redis-data:

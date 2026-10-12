@@ -1,0 +1,9 @@
+{
+ "format": "rfc3164",
+ "appname": "haproxy",
+ "procid": "123",
+ "message": "10.0.0.5:51234 [13/Sep/2026:10:00:00.123] fe be/srv1 0/0/1/2/3 200 1234 - - ---- 1/1/0/0/0 0/0 \"GET / HTTP/1.1\"",
+ "_absent": [
+  "host.hostname"
+ ]
+}

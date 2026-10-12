@@ -1,0 +1,138 @@
+# ring compartilhado num Redis (stream relplog:ring)  ->  NATS JetStream (loghub.<space>.syslog)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois do XADD no Redis
+#   do ring (AOF everysec). Replicas que compartilham o stream PRECISAM da
+#   mesma config de conversao (SPEC §3.5).
+#
+#   docker compose -f compose.redis-nats.yml up -d --build
+#   docker compose -f compose.redis-nats.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20532 (RELPLOG_PORT), RELP/TLS 20632 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9318 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-redis-nats
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-redis-nats
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-redis-nats
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+      ring-redis:
+        condition: service_healthy
+    environment:
+      # --- ring: redis -------------------------------------------------------
+      RELPLOG_RING_MODE: redis
+      RELPLOG_RING_REDIS_ADDRS: ring-redis:6379
+      RELPLOG_RING_REDIS_STREAM: ${RELPLOG_RING_REDIS_STREAM:-relplog:ring}
+      RELPLOG_RING_REDIS_GROUP: ${RELPLOG_RING_REDIS_GROUP:-relplog-ring}
+      RELPLOG_RING_REDIS_CLAIM_IDLE: ${RELPLOG_RING_REDIS_CLAIM_IDLE:-30s}
+      # Teto GLOBAL do stream, somando todas as replicas (SPEC §9.5).
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-512MiB}
+      RELPLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: nats --------------------------------------------------------
+      RELPLOG_SINK_TYPE: nats
+      RELPLOG_SINK_NATS_MODE: ${RELPLOG_SINK_NATS_MODE:-jetstream}
+      RELPLOG_SINK_NATS_STREAM: ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG}
+      RELPLOG_SINK_NATS_SUBJECTS: ${RELPLOG_SINK_NATS_SUBJECTS:-exact}
+      # Heartbeat beacon em loghub._ctl.beacon a cada 15 s (SPEC §11).
+      LOGHUB_BEACON_INTERVAL: ${LOGHUB_BEACON_INTERVAL:-15}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README). As sem valor so' entram se definidas no .env
+      # ou no shell: vazias contariam como explicitas e travariam a URL.
+      RELPLOG_SINK_NATS_URLS: nats://nats:4222
+      RELPLOG_SINK_NATS_USERNAME:
+      RELPLOG_SINK_NATS_PASSWORD:
+      RELPLOG_SINK_NATS_TLS:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20532}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20632}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9318}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+  nats:
+    image: ${RELPLOG_NATS_IMAGE:-nats:2.11-alpine}
+    container_name: rls-redis-nats-nats
+    hostname: rls-redis-nats-nats
+    restart: unless-stopped
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    volumes:
+      - nats-data:/data
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      - "127.0.0.1:${RELPLOG_NATS_PORT:-24218}:4222"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # O stream e' criado aqui, a partir do arquivo que o operador aplica; o servidor
+  # so' o valida (nunca cria nem altera um stream, SPEC §10.7).
+  nats-init:
+    image: ${RELPLOG_NATS_BOX_IMAGE:-natsio/nats-box:0.20.0}
+    container_name: rls-redis-nats-nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    volumes:
+      - ./nats/stream.json:/etc/nats/stream.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        nats --server nats://nats:4222 stream info ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG} >/dev/null 2>&1
+        || nats --server nats://nats:4222 stream add ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG} --config /etc/nats/stream.json
+
+  ring-redis:
+    image: ${RELPLOG_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: rls-redis-nats-ring-redis
+    hostname: rls-redis-nats-ring-redis
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1 s num crash do Redis.
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - ring-redis-data:/data
+    ports:
+      - "127.0.0.1:${RELPLOG_RING_REDIS_PORT:-26418}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  rls-data:
+  nats-data:
+  ring-redis-data:
