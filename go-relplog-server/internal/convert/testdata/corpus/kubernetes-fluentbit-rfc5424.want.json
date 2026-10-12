@@ -1,0 +1,13 @@
+{
+ "format": "rfc5424",
+ "host.hostname": "node-3",
+ "appname": "kube-apiserver",
+ "structured-data.k8s.pod": "api-7d9f",
+ "timestamp": "2026-09-13T13:00:00.000000Z",
+ "message": "{\"level\":\"info\",\"msg\":\"ok\"}",
+ "_absent": [
+  "procid",
+  "msgid",
+  "parse"
+ ]
+}

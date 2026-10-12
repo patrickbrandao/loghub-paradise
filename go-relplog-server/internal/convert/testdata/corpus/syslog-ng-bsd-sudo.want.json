@@ -1,0 +1,8 @@
+{
+ "format": "rfc3164",
+ "host.hostname": "gw01",
+ "appname": "sudo",
+ "facility.name": "authpriv",
+ "severity.name": "info",
+ "message": " patrick : TTY=pts/0 ; PWD=/home/patrick ; USER=root ; COMMAND=/bin/ls"
+}

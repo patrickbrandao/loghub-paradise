@@ -1,0 +1,95 @@
+# ring em disco (ring.db)  ->  MySQL compartilhado (tabela syslog_events)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois do COMMIT com
+#   fsync no /data/ring.db; zero perda sob crash do processo.
+#
+#   docker compose -f compose.sqlite-mysql.yml up -d --build
+#   docker compose -f compose.sqlite-mysql.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20524 (RELPLOG_PORT), RELP/TLS 20624 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9310 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-sqlite-mysql
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-sqlite-mysql
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-sqlite-mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      RELPLOG_RING_MODE: sqlite
+      RELPLOG_RING_SQLITE_SYNCHRONOUS: ${RELPLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-512MiB}
+      RELPLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: mysql -------------------------------------------------------
+      RELPLOG_SINK_TYPE: mysql
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao de um orcamento que a frota inteira divide
+      # (SPEC §10.5). Acima de 16 tambem e' WARN.
+      RELPLOG_SINK_WORKERS: "4"
+      RELPLOG_SINK_MYSQL_ADDR: mysql:3306
+      RELPLOG_SINK_MYSQL_USERNAME: ${RELPLOG_SINK_MYSQL_USERNAME:-syslog}
+      RELPLOG_SINK_MYSQL_PASSWORD: ${RELPLOG_SINK_MYSQL_PASSWORD:-syslog}
+      RELPLOG_SINK_MYSQL_DATABASE: ${RELPLOG_SINK_MYSQL_DATABASE:-syslog}
+      RELPLOG_SINK_MYSQL_TABLE: ${RELPLOG_SINK_MYSQL_TABLE:-syslog_events}
+      # 0 deriva sink.workers + 1 = 5.
+      RELPLOG_SINK_MYSQL_POOL_SIZE: ${RELPLOG_SINK_MYSQL_POOL_SIZE:-0}
+      RELPLOG_SINK_MYSQL_TLS: ${RELPLOG_SINK_MYSQL_TLS:-false}
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20524}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20624}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9310}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+  mysql:
+    image: ${RELPLOG_MYSQL_IMAGE:-mysql:8.4}
+    container_name: rls-sqlite-mysql-mysql
+    hostname: rls-sqlite-mysql-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${RELPLOG_MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${RELPLOG_SINK_MYSQL_DATABASE:-syslog}
+      MYSQL_USER: ${RELPLOG_SINK_MYSQL_USERNAME:-syslog}
+      MYSQL_PASSWORD: ${RELPLOG_SINK_MYSQL_PASSWORD:-syslog}
+    command:
+      - mysqld
+      - --innodb_flush_log_at_trx_commit=1
+      # O pior JLH tem ~776 KiB (SPEC §3.9); 64 MiB sobram.
+      - --max_allowed_packet=64M
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # O servidor nunca faz DDL (SPEC §10.6): a tabela vem daqui.
+      - ./mysql/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "127.0.0.1:${RELPLOG_MYSQL_PORT:-23310}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  rls-data:
+  mysql-data:

@@ -1,0 +1,1 @@
+<14>1 2026-09-13T13:00:00.000000Z node-3 kube-apiserver - - [k8s namespace="default" pod="api-7d9f" container="app"] {"level":"info","msg":"ok"}

@@ -1,0 +1,57 @@
+# ring sem ring  ->  SQLite local (/data/events.db, tabela syslog_events)
+#
+# Garantia (por mensagem): o `200 OK` RELP sai so' depois de o destino
+#   confirmar: o COMMIT no /data/events.db.
+#   O modo lento por definicao: a conversao roda na transacao, com ate'
+#   relp.window escritas em voo por conexao. Uma recusa `logic` do destino
+#   e' final: `500 refused by the destination`; o rsyslog descarta e loga essa
+#   linha, suspende a acao e retransmite as vizinhas da janela (duplicatas).
+#
+#   docker compose -f compose.none-sqlite.yml up -d --build
+#   docker compose -f compose.none-sqlite.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20528 (RELPLOG_PORT), RELP/TLS 20628 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9314 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-none-sqlite
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-none-sqlite
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-none-sqlite
+    environment:
+      # --- ring: none --------------------------------------------------------
+      RELPLOG_RING_MODE: none
+      RELPLOG_RING_MAX_INFLIGHT: ${RELPLOG_RING_MAX_INFLIGHT:-2048}
+      RELPLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite ------------------------------------------------------
+      RELPLOG_SINK_TYPE: sqlite
+      RELPLOG_SINK_SQLITE_SYNCHRONOUS: ${RELPLOG_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      RELPLOG_SINK_SQLITE_ROTATE: ${RELPLOG_SINK_SQLITE_ROTATE:-daily}
+      # Quantos rotacionados manter (keep_files) e' recarregavel: conf/relplog.ini.
+      RELPLOG_SINK_WORKERS: "1"
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20528}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20628}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9314}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+volumes:
+  rls-data:

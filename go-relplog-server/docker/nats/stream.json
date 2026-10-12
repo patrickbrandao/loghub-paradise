@@ -1,0 +1,19 @@
+{
+  "name": "LOGHUB_SYSLOG",
+  "description": "go-syslog-server and go-relplog-server: JLH type=syslog of space default. Exact subject plus the opt-in facility-severity subjects; never loghub.> (it would capture the control plane, loghub._ctl.beacon). SPEC 3.8, 10.7.",
+  "subjects": ["loghub.default.syslog", "loghub.default.syslog.>"],
+  "retention": "limits",
+  "storage": "file",
+  "num_replicas": 1,
+  "max_consumers": -1,
+  "max_msgs": -1,
+  "max_msgs_per_subject": -1,
+  "max_bytes": -1,
+  "max_age": 0,
+  "max_msg_size": -1,
+  "duplicate_window": 600000000000,
+  "discard": "old",
+  "sealed": false,
+  "deny_delete": false,
+  "deny_purge": false
+}

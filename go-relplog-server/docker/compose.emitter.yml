@@ -1,0 +1,63 @@
+# Emissor de DEMONSTRACAO: um rsyslog de verdade (librelp/omrelp) mandando
+# linhas de teste ao servico `relplog` da combinacao que estiver de pe'.
+#
+# Garantia: a do rsyslog. A fila da acao omrelp (rsyslog/rsyslog.conf) e'
+#   disk-assisted, gravada no shutdown e com action.resumeRetryCount=-1: com o
+#   servidor fora do ar, ring cheio ou sessao fechada, as linhas esperam na fila
+#   (volume emitter-spool) e saem quando ele volta; o rate-limit do servidor
+#   tambem so' as segura (desacelera). So' um `500` (recusa final do destino
+#   com ring=none, rara) faz o rsyslog descartar uma linha: ele loga "peer sent
+#   error response", suspende a acao e retransmite as vizinhas (duplicatas).
+#
+# NAO e' um compose completo: e' uma camada por cima de qualquer
+# compose.<ring>-<sink>.yml, e o servico so' sobe com o profile `demo` (um `up`
+# sem ele nao o inicia):
+#
+#   docker compose -f compose.memory-sqlite.yml -f compose.emitter.yml --profile demo up -d --build
+#   docker compose --profile demo up -d --build      # docker-compose.yml ja' o inclui
+#   docker compose -f compose.memory-sqlite.yml -f compose.emitter.yml --profile demo logs -f emitter
+#
+# Os caminhos sao relativos a esta pasta (docker/), seja pelo `-f` (relativos ao
+# primeiro arquivo, que esta' aqui) seja pelo `include` de docker-compose.yml.
+# Sem `depends_on` de proposito: e' a demonstracao de que o rsyslog segura as
+# linhas na fila enquanto o servidor nao esta' pronto, e reconecta sozinho.
+
+services:
+  emitter:
+    profiles: ["demo"]
+    build:
+      context: rsyslog
+      args:
+        ALPINE_VERSION: ${RELPLOG_ALPINE_VERSION:-3.22}
+    image: ${RELPLOG_DEMO_IMAGE:-rls-demo-emitter}:${RELPLOG_IMAGE_TAG:-local}
+    # Vira o HOSTNAME das linhas (payload.hostname do envelope).
+    hostname: rls-demo-emitter
+    restart: unless-stopped
+    # O rsyslogd grava a fila em disco no SIGTERM (queue.saveOnShutdown).
+    stop_grace_period: 30s
+    environment:
+      # O servico `relplog` de toda combinacao, na porta do CONTAINER (a rede
+      # do compose nao passa pelas portas publicadas). Para a variante TLS do
+      # rsyslog.conf, a porta e' 20515.
+      RELP_TARGET: ${RELPLOG_DEMO_TARGET:-relplog}
+      RELP_PORT: ${RELPLOG_DEMO_PORT:-20514}
+      # Rajada inicial e uma linha a cada DEMO_INTERVAL segundos (0 = so' a
+      # rajada). Cada linha leva seq=N: um buraco e' perda, um repetido e'
+      # retransmissao (rsyslog/demo.sh).
+      DEMO_BURST: ${RELPLOG_DEMO_BURST:-100}
+      DEMO_INTERVAL: ${RELPLOG_DEMO_INTERVAL:-1}
+      DEMO_TAG: ${RELPLOG_DEMO_TAG:-rls-demo}
+    volumes:
+      - ./rsyslog/rsyslog.conf:/etc/rsyslog.conf:ro
+      - ./rsyslog/demo.sh:/etc/rls-demo/demo.sh:ro
+      # Para a variante TLS: ca.crt, client.crt e client.key (tls/README.md).
+      - ./tls:/etc/rls-demo/tls:ro
+      - emitter-spool:/var/spool/rsyslog
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  emitter-spool:

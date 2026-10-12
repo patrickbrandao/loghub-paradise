@@ -1,0 +1,58 @@
+# ring na RAM  ->  descarte (benchmark)
+#
+# Garantia: NENHUMA. O `200 OK` RELP sai com a mensagem na RAM, e o rsyslog a
+#   apaga da fila dele; mas sink=none converte, serializa e DESCARTA todo
+#   envelope (SPEC §10.8, §19: "qualquer + none" perde tudo); nunca sai de UP.
+#   Mede o custo de recepcao RELP, ring, conversao e serializacao sem I/O de
+#   destino. Nao guarde log com isto.
+#
+#   docker compose -f compose.memory-none.yml up -d --build
+#   docker compose -f compose.memory-none.yml -f compose.emitter.yml --profile demo up -d --build
+#     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
+#
+# Publicado no host: RELP 20519 (RELPLOG_PORT), RELP/TLS 20619 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9305 (RELPLOG_ADMIN_PORT). Defaults
+# distintos por combinacao, e disjuntos dos do go-syslog-server, para que
+# varias rodem lado a lado no mesmo host (README, "Portas").
+
+name: rls-memory-none
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rls-base
+    container_name: rls-memory-none
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: rls-memory-none
+    environment:
+      # --- ring: memory ------------------------------------------------------
+      RELPLOG_RING_MODE: memory
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-256MiB}
+      RELPLOG_RING_HIGH_WATER: ${RELPLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte (SPEC §12).
+      RELPLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: none --------------------------------------------------------
+      RELPLOG_SINK_TYPE: none
+
+    ports:
+      # As portas do container sao as padrao do RELP (SPEC §4.1): 20514 em claro
+      # e 20515 para o TLS, que so' escuta com RELPLOG_LISTEN_TLS definido.
+      - "${RELPLOG_PORT:-20519}:20514/tcp"
+      - "${RELPLOG_TLS_PORT:-20619}:20515/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-9305}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - rls-data:/data
+
+volumes:
+  rls-data:

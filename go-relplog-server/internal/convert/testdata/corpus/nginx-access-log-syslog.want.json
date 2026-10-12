@@ -1,0 +1,8 @@
+{
+ "format": "rfc3164",
+ "host.hostname": "web-01",
+ "appname": "nginx",
+ "facility.name": "local7",
+ "severity.name": "info",
+ "message": "10.0.0.5 - - [13/Sep/2026:10:00:00 -0300] \"GET / HTTP/1.1\" 200 612"
+}

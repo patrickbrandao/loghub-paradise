@@ -1,0 +1,11 @@
+{
+ "format": "rfc5424",
+ "host.hostname": "web-01",
+ "appname": "systemd",
+ "procid": "1",
+ "message": " Started Session 42 of user root.",
+ "_absent": [
+  "msgid",
+  "structured-data"
+ ]
+}
