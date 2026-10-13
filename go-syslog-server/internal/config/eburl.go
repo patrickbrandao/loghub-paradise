@@ -259,6 +259,14 @@ func parseRedisURL(s string) (ebTarget, error) {
 	if host == "" {
 		return ebTarget{}, errors.New("a Redis URL needs a host")
 	}
+	// sink.redis.addrs is a comma-separated list: "redis://a,b:6379" became
+	// two seeds, "a:6379" and "b:6379", where every other reader of the URL
+	// sees one host named "a,b" (independent review of the port, 2026-10-13).
+	// The URL names one server; a list goes in sink.redis.addrs.
+	if strings.Contains(host, ",") {
+		return ebTarget{}, errors.New("the host of a Redis URL holds a ','; the URL names one " +
+			"server, and a list of seeds goes in sink.redis.addrs")
+	}
 	port := u.Port()
 	if port == "" {
 		port = "6379"
@@ -337,6 +345,14 @@ func parsePostgresURL(s string) (ebTarget, error) {
 		}
 	}
 
+	// An empty host= is libpq's default -- its compiled-in socket directory
+	// -- while this server would dial the URL's authority: one URL, two
+	// servers. Refused like an empty sslmode (independent review of the port,
+	// 2026-10-13).
+	if vs, ok := q["host"]; ok && vs[0] == "" {
+		return ebTarget{}, errors.New("the host= of the PostgreSQL URL is empty: drop it or give " +
+			"a unix socket directory")
+	}
 	var addr string
 	switch socket := q.Get("host"); {
 	case socket != "":

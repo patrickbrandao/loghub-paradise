@@ -285,6 +285,10 @@ type App struct {
 	// (Workers.Pending, Drain): the tests land an abort there.
 	beforeDump    func()
 	beforeCollect func()
+	// inAbort, likewise, runs inside abortLoss in the dump phase, right after
+	// aborted is set and before the counter is taken, with lossMu held: the
+	// tests land the dump's own count there (settleDump).
+	inAbort func()
 
 	// wrapSink, when set, decorates the real sink right after it is built. It
 	// is nil in the binary; the tests use it to produce a sink that stops
@@ -644,6 +648,7 @@ func (a *App) buildSink() int {
 			TLS: a.cfg.SinkCH.TLS, TLSCA: a.cfg.SinkCH.TLSCA, TLSInsecure: a.cfg.SinkCH.TLSInsecure,
 			ConnectTimeout: a.cfg.Sink.OpTimeout, AppName: a.clientName(),
 			MaxBatchBytes: config.WorstChunkBytes(a.cfg),
+			Writers:       a.chWriters(),
 		}, a.log.Logger, a.metrics)
 
 	case config.SinkTypeNATS:
@@ -691,6 +696,18 @@ func (a *App) buildSink() int {
 	return ExitOK
 }
 
+// chWriters is the most INSERTs this instance can have in flight at once on
+// the ClickHouse pool, for the per-user memory check (SPEC §10.10.5): the
+// drain workers with a ring; with ring=none the write-through receivers, up
+// to ring.max_inflight, of which the pool lets pool_size through. The health
+// check has a connection of its own and sends no chunk.
+func (a *App) chWriters() int {
+	if a.cfg.Ring.Mode == config.RingModeNone {
+		return min(a.cfg.SinkCH.PoolSize, a.cfg.Ring.MaxInflight)
+	}
+	return a.cfg.Sink.Workers
+}
+
 func (a *App) buildRing(ctx context.Context) int {
 	switch a.cfg.Ring.Mode {
 	case config.RingModeNone:
@@ -720,6 +737,11 @@ func (a *App) buildRing(ctx context.Context) int {
 			CapacityItems:     a.cfg.Ring.CapacityItems,
 			CapacityBytes:     a.cfg.Ring.MaxBytes,
 			Metrics:           a.metrics,
+			// sink=none discards what it is given: a previous life's rows
+			// stay for a life with a destination, like its dumps (SPEC §9.4,
+			// §12.2). The app is the one place that knows both axes; the
+			// ring only keeps them.
+			KeepBacklog: a.cfg.Sink.Type == config.SinkTypeNone,
 		}, a.log.Logger)
 		if err != nil {
 			a.log.Error("cannot open the ring database", "path", a.cfg.RingSQL.Path, "error", err)
@@ -926,6 +948,17 @@ func (a *App) openTransports(bindCtx, recvCtx context.Context) int {
 		a.transports = append(a.transports, namedTransport{"tls", t})
 	}
 
+	// A literal IP or a unix path binds without ever looking at bindCtx, so
+	// a signal in steps 9-12 used to reach here with every bind done: the
+	// server opened, answered /readyz 200 and left with 0 through the graceful
+	// path instead of 130 (SPEC §13.5; independent review of the port,
+	// 2026-10-13). bindFailed only sees the binds that fail; this sees the
+	// ones that succeeded after the signal. The caller closes what was bound.
+	if bindCtx.Err() != nil {
+		a.log.Info("interrupted while opening the transports")
+		return ExitAborted
+	}
+
 	for _, nt := range a.transports {
 		nt.t.Start(recvCtx)
 		// The configured number and the wire number differ inside a container
@@ -1067,6 +1100,9 @@ func (a *App) abortLoss() {
 		return // counted already: one abort, one count
 	}
 	if a.dumpPhase.Load() {
+		if a.inAbort != nil {
+			a.inAbort()
+		}
 		if n := a.dumping.Swap(0); n > 0 {
 			a.metrics.EventsDroppedTotal[obs.EventDropAbort].Add(uint64(n))
 			a.log.Error("messages lost to the abort: the emergency dump was being written", "count", n)
@@ -1076,16 +1112,57 @@ func (a *App) abortLoss() {
 	if a.ring == nil {
 		return
 	}
+	if a.persistentRing() {
+		a.logLeftInRing()
+		return
+	}
 	st := a.ring.Stats()
 	if st.Items == 0 {
 		return
 	}
-	if a.persistentRing() {
-		a.log.Warn("messages left in the ring for the next boot", "count", st.Items)
-		return
-	}
 	a.metrics.EventsDroppedTotal[obs.EventDropAbort].Add(uint64(st.Items))
 	a.log.Error("messages lost to the abort", "count", st.Items)
+}
+
+// logLeftInRing is the abort's line for a ring that outlives the process.
+// ring=sqlite says what ring.db holds: this run's rows and, with sink=none,
+// the previous life's it set aside. ring=redis says what THIS instance held:
+// the stream's occupancy is global -- other replicas' entries -- and naming it
+// as this abort's leftovers sent the operator after a number that was never
+// this instance's (independent review of the port, 2026-10-13).
+func (a *App) logLeftInRing() {
+	if a.ring == nil {
+		return
+	}
+	if a.cfg.Ring.Mode == config.RingModeRedis {
+		held := 0
+		if a.workers != nil {
+			held = a.workers.Held()
+		}
+		if held > 0 {
+			a.log.Warn("batches this instance held stay pending in the ring stream; another "+
+				"replica or the next boot claims them", "held_by_workers", held)
+		}
+		return
+	}
+	n, k := a.ring.Stats().Items, a.keptRows()
+	if n+k == 0 {
+		return
+	}
+	args := []any{"count", n + k}
+	if k > 0 {
+		args = append(args, "of_a_previous_life", k)
+	}
+	a.log.Warn("messages left in the ring for the next boot", args...)
+}
+
+// keptRows is what ring=sqlite set aside for a life with a destination
+// (sink=none, SPEC §9.4); 0 for every other ring.
+func (a *App) keptRows() int64 {
+	if sr, ok := a.ring.(*ring.SQLiteRing); ok {
+		return sr.Kept()
+	}
+	return 0
 }
 
 // enterDumpPhase hands the loss counter from the ring's own count to dumping:
@@ -1135,7 +1212,8 @@ func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
 	// what releases a reader parked in the backpressure loop. A message already
 	// handed to the ring is not affected -- Enqueue awaits its group commit or
 	// its synchronous write regardless (SPEC §9.4, §9.6) -- so what was read
-	// finishes entering the ring. Then the transports close in reverse order.
+	// finishes entering the ring. Then the transports close, all at once
+	// (closeTransports).
 	a.log.Info("closing transports")
 	if a.stopRecv != nil {
 		a.stopRecv()
@@ -1192,9 +1270,12 @@ func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
 		// boot, or another replica, delivers them. Nothing is lost, so nothing
 		// is counted as dropped and nothing is dumped -- a dump would deliver
 		// everything twice.
-		if n := int64(len(leftover)); n > 0 || (a.cfg.Ring.Mode == config.RingModeSQLite && a.ring.Stats().Items > 0) {
-			a.log.Warn("messages left in the ring for the next boot",
-				"held_by_workers", n, "ring_items", a.ring.Stats().Items)
+		if n := int64(len(leftover)); n > 0 || (a.cfg.Ring.Mode == config.RingModeSQLite && a.ring.Stats().Items+a.keptRows() > 0) {
+			args := []any{"held_by_workers", n, "ring_items", a.ring.Stats().Items}
+			if k := a.keptRows(); k > 0 {
+				args = append(args, "of_a_previous_life", k)
+			}
+			a.log.Warn("messages left in the ring for the next boot", args...)
 		}
 	} else if len(leftover) > 0 {
 		a.log.Error("messages still pending after the drain", "count", len(leftover))

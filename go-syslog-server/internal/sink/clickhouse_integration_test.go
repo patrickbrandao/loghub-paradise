@@ -611,7 +611,7 @@ func (f *chFixture) chUser(name, extra string, grants ...string) ClickHouseConfi
 	return cfg
 }
 
-// SPEC §10.10.5 and §8.8.8: the empty probe proves the privileges without a row
+// SPEC §10.10.5 and §10.10.7: the empty probe proves the privileges without a row
 // left behind -- a user with SELECT only is refused by name (497); a readonly
 // profile is refused by the health check before the probe; INSERT alone is
 // enough, and writes.

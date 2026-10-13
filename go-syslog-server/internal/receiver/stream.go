@@ -353,11 +353,20 @@ func (s *Stream) readProxy(c net.Conn, br *bufio.Reader, a *connAddrs) bool {
 
 	armDeadline(c, px.headerTimeout(), &s.closing)
 	hdr, found, err := ReadProxyHeader(br)
-	if (err != nil || !found) && s.closing.Load() {
+	if s.closing.Load() && (err != nil || px.Mode == ProxyRequired) {
 		// The shutdown expired the deadline of a connection still waiting for
 		// its header (or halfway through one). That is a deploy, not the
 		// balancer's fault: nothing is counted and nothing is logged, as the
 		// TLS handshake already does (pendência 3 de 2026-10-11, SPEC §4.6).
+		//
+		// Only then. With proxy.protocol=optional, found=false and err=nil is
+		// a connection that sent no header and whose syslog lines are already
+		// in the reader: they are messages read off the socket, and SPEC §13.4
+		// lets what was read finish entering the ring. The rule copied from
+		// go-relplog-server -- "(err != nil || !found) && closing" -- dropped
+		// up to 4 KiB of them uncounted on every Close (independent review of
+		// the port, 2026-10-13); in RELP nothing is confirmed before the
+		// header, here the TCP window already took them.
 		return false
 	}
 	switch {

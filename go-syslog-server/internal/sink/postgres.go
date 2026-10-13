@@ -60,8 +60,15 @@ type PostgresConfig struct {
 type Postgres struct {
 	cfg  PostgresConfig
 	pool *pgxpool.Pool
-	log  *slog.Logger
-	m    *obs.Metrics
+	// probe is the health check's own connection, a pool of one beside the
+	// writers' (SPEC §10.5). Taken out of the writers' pool, it waited behind
+	// every slow write -- with ring=none there are up to ring.max_inflight of
+	// them, so the "+1" connection protected nothing --, the check timed
+	// out, the sink went DOWN and, past fail_timeout, FATAL with nothing wrong
+	// with the database (independent review of the port, 2026-10-13).
+	probe *pgxpool.Pool
+	log   *slog.Logger
+	m     *obs.Metrics
 
 	// insert is the one statement this sink ever runs: ten arrays plus
 	// unnest, ten parameters whatever the chunk size, ON CONFLICT (uuid) DO
@@ -225,14 +232,27 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	pc.MaxConns = int32(cfg.PoolSize)
 	pc.MinConns = 0
 
+	// The probe's pool is a copy with one connection, lazy as well: the same
+	// server, credentials, TLS and session parameters, so what the
+	// validation reads of a session (transaction_read_only, the encoding) is
+	// what every writer's session has.
+	probeCfg := pc.Copy()
+	probeCfg.MaxConns = 1
+
 	pool, err := pgxpool.NewWithConfig(context.Background(), pc)
 	if err != nil {
+		return nil, fmt.Errorf("sink postgres: %w", err)
+	}
+	probe, err := pgxpool.NewWithConfig(context.Background(), probeCfg)
+	if err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("sink postgres: %w", err)
 	}
 
 	p := &Postgres{
 		cfg:     cfg,
 		pool:    pool,
+		probe:   probe,
 		log:     log,
 		m:       m,
 		insert:  fmt.Sprintf(pgInsert, pgx.Identifier(strings.Split(cfg.Table, ".")).Sanitize()),
@@ -551,7 +571,7 @@ func (p *Postgres) Health(ctx context.Context) error {
 		return ErrClosed
 	}
 	var inRecovery bool
-	if err := p.pool.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil {
+	if err := p.probe.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil {
 		return classifyPostgres("health", err)
 	}
 	p.observePool()
@@ -590,7 +610,7 @@ func (p *Postgres) Health(ctx context.Context) error {
 // fatal answer rather than sitting out sink.boot_timeout.
 func (p *Postgres) validate(ctx context.Context) error {
 	var readOnly, encoding string
-	if err := p.pool.QueryRow(ctx,
+	if err := p.probe.QueryRow(ctx,
 		"SELECT current_setting('transaction_read_only'), current_setting('server_encoding')").Scan(
 		&readOnly, &encoding); err != nil {
 		return classifyPostgres("validate", err)
@@ -616,7 +636,7 @@ func (p *Postgres) validate(ctx context.Context) error {
 	// queue is a plain table (skill loghub-postgres-table-inbox); it is
 	// loghub.envelope, with the same columns, that is partitioned.
 	var relkind string
-	if err := p.pool.QueryRow(ctx,
+	if err := p.probe.QueryRow(ctx,
 		"SELECT COALESCE((SELECT relkind::text FROM pg_catalog.pg_class WHERE oid = to_regclass($1)), '')",
 		p.regname).Scan(&relkind); err != nil {
 		return classifyPostgres("validate", err)
@@ -626,7 +646,7 @@ func (p *Postgres) validate(ctx context.Context) error {
 			"table %s is partitioned; the queue is a plain table (apply docker/postgres/inbox.sql)", p.regname))
 	}
 
-	rows, err := p.pool.Query(ctx, `
+	rows, err := p.probe.Query(ctx, `
 		SELECT a.attname, format_type(a.atttypid, NULL), a.atttypmod,
 		       a.attnotnull AND NOT a.atthasdef AND a.attidentity = '' AND a.attgenerated = ''
 		FROM pg_catalog.pg_attribute a
@@ -712,7 +732,7 @@ func (p *Postgres) validate(ctx context.Context) error {
 	// A unique index over (uuid, step) -- the key of the other SQL tables --
 	// does not qualify: it would admit two rows with one uuid.
 	var unique bool
-	if err := p.pool.QueryRow(ctx, `
+	if err := p.probe.QueryRow(ctx, `
 		SELECT EXISTS (
 		  SELECT 1
 		  FROM pg_catalog.pg_index i
@@ -742,7 +762,7 @@ func (p *Postgres) validate(ctx context.Context) error {
 	// failed CREATE UNIQUE INDEX CONCURRENTLY) still enforces uniqueness, and
 	// counts.
 	var extra string
-	if err := p.pool.QueryRow(ctx, `
+	if err := p.probe.QueryRow(ctx, `
 		SELECT COALESCE((
 		  SELECT def FROM (
 		    SELECT pg_get_indexdef(i.indexrelid) AS def
@@ -773,7 +793,7 @@ func (p *Postgres) validate(ctx context.Context) error {
 	// 2026-10-13). A rule ON DELETE or ON SELECT (a view's) does not touch
 	// the INSERT and is left alone.
 	var rules string
-	if err := p.pool.QueryRow(ctx, `
+	if err := p.probe.QueryRow(ctx, `
 		SELECT COALESCE((SELECT string_agg(quote_ident(rulename), ', ' ORDER BY rulename)
 		                   FROM pg_catalog.pg_rewrite
 		                  WHERE ev_class = to_regclass($1) AND ev_type IN ('2', '3')), '')`,
@@ -789,7 +809,7 @@ func (p *Postgres) validate(ctx context.Context) error {
 	// INSERT, and SELECT on uuid: ON CONFLICT (uuid) reads the arbiter
 	// column, and a role with INSERT alone fails the first chunk with 42501.
 	var canInsert, canSelectUUID bool
-	if err := p.pool.QueryRow(ctx, `
+	if err := p.probe.QueryRow(ctx, `
 		SELECT COALESCE(has_table_privilege(to_regclass($1), 'INSERT'), false),
 		       COALESCE(has_column_privilege(to_regclass($1), 'uuid', 'SELECT'), false)`,
 		p.regname).Scan(&canInsert, &canSelectUUID); err != nil {
@@ -834,6 +854,7 @@ func (p *Postgres) Close() error {
 		return nil
 	}
 	p.pool.Close()
+	p.probe.Close()
 	return nil
 }
 

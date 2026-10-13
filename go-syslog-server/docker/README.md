@@ -346,8 +346,9 @@ real; nenhum compose sai com erro de configuração.
 | todos, conforme o host | `the socket receive buffer is smaller than requested` | o `net.core.rmem_max` do host está abaixo dos 8 MiB pedidos; suba-o ([UDP](#udp)). O Docker Desktop sobe com ele |
 
 Os compose de postgres, mysql e clickhouse fixam `SYSLOG_SINK_WORKERS=4`, e os
-`compose.none-{postgres,mysql,clickhouse}.yml` fixam `SYSLOG_RING_MAX_INFLIGHT=5`, igual ao
-pool derivado (`workers + 1`), para não subirem com os `WARN` de §10.5 e §9.6.
+`compose.none-{postgres,mysql,clickhouse}.yml` fixam `SYSLOG_RING_MAX_INFLIGHT=4`, igual ao
+pool derivado (`workers`; a sonda de saúde tem conexão própria, fora do pool),
+para não subirem com os `WARN` de §10.5 e §9.6.
 
 ## UDP
 

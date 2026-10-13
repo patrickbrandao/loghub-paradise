@@ -45,7 +45,7 @@ services:
       SYSLOG_SINK_MYSQL_PASSWORD: ${SYSLOG_SINK_MYSQL_PASSWORD:-syslog}
       SYSLOG_SINK_MYSQL_DATABASE: ${SYSLOG_SINK_MYSQL_DATABASE:-syslog}
       SYSLOG_SINK_MYSQL_TABLE: ${SYSLOG_SINK_MYSQL_TABLE:-syslog_events}
-      # 0 deriva sink.workers + 1 = 5.
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, fora do pool).
       SYSLOG_SINK_MYSQL_POOL_SIZE: ${SYSLOG_SINK_MYSQL_POOL_SIZE:-0}
       SYSLOG_SINK_MYSQL_TLS: ${SYSLOG_SINK_MYSQL_TLS:-false}
 

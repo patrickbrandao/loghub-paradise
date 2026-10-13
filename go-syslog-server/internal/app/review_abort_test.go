@@ -280,3 +280,43 @@ func TestFatalShutdownToleratesTheFirstSignal(t *testing.T) {
 		t.Errorf("signalled shutdown, second signal: exit %d, want %d", code, ExitAborted)
 	}
 }
+
+// abortLoss publishes aborted before it takes the counter. A dump that reads
+// the flag in between gives up (ErrAbandoned) and used to take the whole count
+// as emergency_failed, with the abort's line then saying nothing was lost: one
+// count, the wrong reason (independent review of the port, 2026-10-13). The
+// dump runs exactly there, with lossMu held; it may not take the counter
+// before abortLoss does. Both branches: a store that gives up, and no store
+// at all (emergency.enabled=false).
+func TestAbortInsideTheDumpKeepsItsReason(t *testing.T) {
+	for _, withStore := range []bool{true, false} {
+		name := map[bool]string{true: "abandoned dump", false: "disabled dump"}[withStore]
+		t.Run(name, func(t *testing.T) {
+			a, held := abortApp(t)
+			items := append(held, a.ring.Drain()...)
+			dir := t.TempDir()
+			if withStore {
+				a.emg = emergency.NewStore(dir, testID.From)
+				a.emg.SetAbandon(a.aborted.Load)
+			}
+			a.dumpPhase.Store(true)
+			a.dumping.Store(int64(len(items)))
+			done := make(chan struct{})
+			a.inAbort = func() {
+				go func() { defer close(done); a.dumpEmergency(items) }()
+				select {
+				case <-done: // the dump did not wait for the abort
+				case <-time.After(300 * time.Millisecond):
+				}
+			}
+			a.abortLoss()
+			<-done
+			if aborted(a) != uint64(len(items)) || failedDumps(a) != 0 {
+				t.Fatalf("abort %d, emergency_failed %d; want %d, 0", aborted(a), failedDumps(a), len(items))
+			}
+			if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+				t.Fatalf("the abandoned dump left %d entries", len(ents))
+			}
+		})
+	}
+}

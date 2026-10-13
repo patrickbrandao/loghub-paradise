@@ -25,10 +25,10 @@ services:
     environment:
       # --- ring: none --------------------------------------------------------
       SYSLOG_RING_MODE: none
-      # Igual ao pool (sink.workers 4 + 1): sem ring a escrita e' sincrona, e um
+      # Igual ao pool (sink.workers = 4): sem ring a escrita e' sincrona, e um
       # max_inflight acima do pool so' cria fila escondida dentro dele (SPEC
       # §9.6; o boot avisa). Quem subir o pool sobe este junto.
-      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-5}
+      SYSLOG_RING_MAX_INFLIGHT: ${SYSLOG_RING_MAX_INFLIGHT:-4}
       SYSLOG_EMERGENCY_ENABLED: "false"
 
       # --- sink: postgres ----------------------------------------------------
@@ -38,7 +38,7 @@ services:
       # (SPEC §10.5). Acima de 16 tambem e' WARN.
       SYSLOG_SINK_WORKERS: "4"
       SYSLOG_SINK_POSTGRES_TABLE: ${SYSLOG_SINK_POSTGRES_TABLE:-loghub.inbox}
-      # 0 deriva sink.workers + 1 = 5.
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, fora do pool).
       SYSLOG_SINK_POSTGRES_POOL_SIZE: ${SYSLOG_SINK_POSTGRES_POOL_SIZE:-0}
       # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
       # URL no lugar delas, apague as quatro linhas abaixo e descomente a

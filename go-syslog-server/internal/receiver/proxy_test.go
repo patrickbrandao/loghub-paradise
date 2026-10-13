@@ -574,3 +574,73 @@ func TestProxyShutdownIsNotAProxyFailure(t *testing.T) {
 		})
 	}
 }
+
+// SPEC §4.6, §13.4: with proxy.protocol=optional, a trusted peer that sends
+// no header and whose syslog lines are already in the reader when the
+// shutdown lands keeps them: they were read off the socket, and what was read
+// finishes entering the ring. The shutdown rule above -- nothing counted, the
+// connection closed -- is for a connection still WAITING for its header; the
+// rule copied from go-relplog-server dropped these lines uncounted
+// (independent review of the port, 2026-10-13). Required mode still closes.
+func TestProxyOptionalBufferedLinesSurviveClose(t *testing.T) {
+	for _, mode := range []ProxyMode{ProxyOptional, ProxyRequired} {
+		h := newHarness(t, 10, "debug", nil)
+		cidrs, _ := ParseCIDRList("127.0.0.1/32")
+		tr, err := NewTCP(context.Background(), TCPConfig{StreamConfig: StreamConfig{Addr: "127.0.0.1:0",
+			Proxy: ProxyConfig{Mode: mode, Trusted: cidrs, HeaderTimeout: time.Hour}}}, h.in, h.m, logger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cl, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		const payload = "<13>hello\n<13>world\n"
+		if _, err := cl.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+		br := bufio.NewReaderSize(c, proxyReadBuffer)
+		for br.Buffered() < len(payload) {
+			_, _ = br.Peek(br.Buffered() + 1)
+		}
+		// The Close lands right after the bytes were read off the socket.
+		tr.closing.Store(true)
+		pip, pport := addrPortOf(c.RemoteAddr())
+		a := connAddrs{peer: netip.AddrPortFrom(pip, pport)}
+		a.src = a.peer
+		ok := tr.readProxy(c, br, &a)
+		cl.Close()
+		c.Close()
+		ln.Close()
+		tr.Close()
+		if mode == ProxyRequired {
+			if ok {
+				t.Errorf("required: a connection without a header survived the shutdown")
+			}
+			continue
+		}
+		if !ok {
+			t.Fatalf("optional: two lines already read off the socket (%d bytes in the reader) were dropped", br.Buffered())
+		}
+		fr := NewFramer(br, FramingAuto, 64<<10)
+		var got []string
+		for {
+			m, _, _, err := fr.Next()
+			if err != nil {
+				break
+			}
+			got = append(got, string(m))
+		}
+		if strings.Join(got, ",") != "<13>hello,<13>world" {
+			t.Fatalf("optional: got %q", got)
+		}
+	}
+}
