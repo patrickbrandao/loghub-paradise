@@ -1,0 +1,22 @@
+# Contexto de build da imagem (docker/Dockerfile).
+# Mantem o contexto no minimo: so' o modulo Go entra.
+
+.git
+.gitignore
+.DS_Store
+
+# Dados de execucao local: identidade e emergency/.
+data/
+*.out
+
+# Documentacao nao participa do build.
+docs/
+*.md
+
+# Corpus de fuzz e testdata continuam fora: o binario nao os usa, e eles crescem.
+**/testdata/fuzz/
+
+# Os compose mudam com frequencia; sem esta exclusao, editar um compose
+# invalidaria o cache e forcaria um rebuild completo do Go.
+docker/
+!docker/Dockerfile

@@ -1,0 +1,11 @@
+{
+ "format": "rfc3164",
+ "appname": "sshd",
+ "procid": "4242",
+ "facility.name": "auth",
+ "severity.name": "info",
+ "message": "Accepted publickey for root from 10.0.0.5 port 51234 ssh2: ED25519 SHA256:abcDEF",
+ "_absent": [
+  "host.hostname"
+ ]
+}

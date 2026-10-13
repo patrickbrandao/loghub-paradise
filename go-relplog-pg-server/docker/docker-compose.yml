@@ -1,0 +1,153 @@
+# go-relplog-pg-server: RELP (rsyslog/omrelp) -> ring na RAM -> PostgreSQL
+# (fila loghub.inbox).
+#
+#   cd docker && docker compose up -d --build
+#   docker compose --profile demo up -d --build      # com o rsyslog de demonstracao
+#
+# A unica combinacao (SPEC §2.1). Sobe o servidor, um PostgreSQL 18 com a fila
+# criada a partir de postgres/inbox.sql e -- so' com o profile `demo` -- um
+# rsyslog de verdade mandando linhas pelo omrelp.
+#
+# Garantia: o `200 OK` de cada transacao RELP diz que a mensagem esta' na RAM
+# deste no' (SPEC §2.3, §19). SIGTERM nao perde (dreno); FATAL do banco nao
+# perde (dump JSON Lines em /data/emergency, reingerido no boot seguinte);
+# SIGKILL e OOM perdem o backlog do ring. Ring cheio ou banco fora seguram a
+# transacao, e passado relp.backpressure_timeout a sessao fecha sem resposta e o
+# rsyslog retransmite: nada e' recusado com `500` (SPEC §5.7).
+#
+# SEM TLS (SPEC §1.2): nem RELP sobre TLS, nem TLS ate' o PostgreSQL (sempre
+# sslmode=disable). O banco fica na rede interna do compose.
+#
+# Publicado no host, com defaults que nao colidem com os compose do
+# go-relplog-server (RELP 20514+n, admin 9300+n, PostgreSQL 254xx), do
+# go-syslog-pg-server (5180, 19180, 15480) nem do go-relplog-nats-server
+# (20581, 19381, 14381): RELP 20580 (RELPLOG_PORT), admin 127.0.0.1:19380
+# (RELPLOG_ADMIN_PORT), PostgreSQL 127.0.0.1:15380 (RELPLOG_POSTGRES_PORT).
+# Nomes com o prefixo rlpg-.
+
+name: rlpg
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rlpg-base
+    container_name: rlpg
+    # Vira o Hostname do go-loghub-ident (e o application_name
+    # rlpg/<AgentName>@<Hostname> no PostgreSQL); precisa ser RFC 1123.
+    hostname: rlpg
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- ring: memory (o unico; nao ha RELPLOG_RING_MODE) -------------------
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-256MiB}
+      RELPLOG_RING_HIGH_WATER: ${RELPLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL ou dreno estourado despeja o
+      # backlog em /data/emergency/emg-*.jsonl, um JLH por linha (SPEC §12).
+      RELPLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: PostgreSQL (o unico; nao ha RELPLOG_SINK_TYPE) ---------------
+      # 4 e' o padrao; acima de 16 o boot avisa: cada worker prende uma conexao
+      # de um orcamento que a frota inteira divide (SPEC §10.5).
+      RELPLOG_SINK_WORKERS: ${RELPLOG_SINK_WORKERS:-4}
+      RELPLOG_SINK_POSTGRES_TABLE: ${RELPLOG_SINK_POSTGRES_TABLE:-loghub.inbox}
+      # 0 deriva sink.workers + 1 = 5.
+      RELPLOG_SINK_POSTGRES_POOL_SIZE: ${RELPLOG_SINK_POSTGRES_POOL_SIZE:-0}
+      # Conexao, SEM TLS (sempre sslmode=disable, SPEC §1.2): o banco precisa
+      # estar numa rede confiavel -- aqui, a rede interna do compose.
+      # Estas quatro sao as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para
+      # usar a URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README); a URL leva a senha do servico postgres abaixo
+      # (postgres://syslog:syslog@postgres:5432/syslog), sem sslmode=require.
+      # Usuario e banco sem valor so' entram se definidos no .env ou no shell;
+      # sem eles vale o padrao do servidor, syslog/syslog, o mesmo do servico
+      # postgres.
+      RELPLOG_SINK_POSTGRES_ADDR: postgres:5432
+      RELPLOG_SINK_POSTGRES_PASSWORD: ${RELPLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      RELPLOG_SINK_POSTGRES_USERNAME:
+      RELPLOG_SINK_POSTGRES_DATABASE:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # A porta do container e' a padrao do RELP (SPEC §4.1).
+      - "${RELPLOG_PORT:-20580}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-19380}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) e os dumps moram
+      # nele, e duas replicas no mesmo volume enfileirariam o mesmo `from`
+      # (SPEC §16.6). ./conf (as chaves recarregaveis) vem de common.yml.
+      - rlpg-data:/data
+
+  postgres:
+    image: ${RELPLOG_POSTGRES_IMAGE:-postgres:18-alpine}
+    container_name: rlpg-postgres
+    hostname: rlpg-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${RELPLOG_SINK_POSTGRES_USERNAME:-syslog}
+      POSTGRES_PASSWORD: ${RELPLOG_SINK_POSTGRES_PASSWORD:-syslog}
+      POSTGRES_DB: ${RELPLOG_SINK_POSTGRES_DATABASE:-syslog}
+    volumes:
+      # A imagem 18 guarda os dados em /var/lib/postgresql/18/docker e recusa
+      # um volume montado no antigo /var/lib/postgresql/data.
+      - rlpg-postgres-data:/var/lib/postgresql
+      # O servidor nunca faz DDL (SPEC §10.5): a fila loghub.inbox vem daqui,
+      # na criacao do volume (DDL literal da skill, SPEC §3.7.1).
+      - ./postgres/inbox.sql:/docker-entrypoint-initdb.d/10-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${RELPLOG_POSTGRES_PORT:-15380}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RELPLOG_SINK_POSTGRES_USERNAME:-syslog} -d ${RELPLOG_SINK_POSTGRES_DATABASE:-syslog}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  # Emissor de DEMONSTRACAO, so' com o profile `demo`: um rsyslog de verdade
+  # (librelp/omrelp) mandando linhas ao servico `relplog`. Sem `depends_on` de
+  # proposito: e' a demonstracao de que o rsyslog segura as linhas na fila dele
+  # enquanto o servidor nao esta' pronto, e reconecta sozinho.
+  emitter:
+    profiles: ["demo"]
+    build:
+      context: rsyslog
+      args:
+        ALPINE_VERSION: ${RELPLOG_ALPINE_VERSION:-3.22}
+    image: ${RELPLOG_DEMO_IMAGE:-rlpg-demo-emitter}:${RELPLOG_IMAGE_TAG:-local}
+    container_name: rlpg-demo-emitter
+    # Vira o HOSTNAME das linhas (payload.host.hostname do envelope).
+    hostname: rlpg-demo-emitter
+    restart: unless-stopped
+    # O rsyslogd grava a fila em disco no SIGTERM (queue.saveOnShutdown).
+    stop_grace_period: 30s
+    environment:
+      # O servico `relplog`, na porta do CONTAINER (a rede do compose nao passa
+      # pelas portas publicadas).
+      RELP_TARGET: ${RELPLOG_DEMO_TARGET:-relplog}
+      RELP_PORT: ${RELPLOG_DEMO_PORT:-20514}
+      # Rajada inicial e uma linha a cada DEMO_INTERVAL segundos (0 = so' a
+      # rajada). Cada linha leva seq=N: um buraco e' perda, um repetido e'
+      # retransmissao (rsyslog/demo.sh).
+      DEMO_BURST: ${RELPLOG_DEMO_BURST:-100}
+      DEMO_INTERVAL: ${RELPLOG_DEMO_INTERVAL:-1}
+      DEMO_TAG: ${RELPLOG_DEMO_TAG:-rlpg-demo}
+    volumes:
+      - ./rsyslog/rsyslog.conf:/etc/rsyslog.conf:ro
+      - ./rsyslog/demo.sh:/etc/rlpg-demo/demo.sh:ro
+      - rlpg-emitter-spool:/var/spool/rsyslog
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  rlpg-data:
+  rlpg-postgres-data:
+  rlpg-emitter-spool:

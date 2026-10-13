@@ -1,0 +1,171 @@
+# go-relplog-nats-server: RELP (rsyslog/omrelp) -> ring na RAM -> NATS JetStream
+# (loghub.<space>.syslog).
+#
+#   cd docker && docker compose up -d --build
+#   docker compose --profile demo up -d --build      # com o rsyslog de demonstracao
+#
+# A unica combinacao (SPEC §2.1). Sobe o servidor, um nats-server com JetStream,
+# o job nats-init, que cria o stream LOGHUB_SYSLOG a partir de nats/stream.json,
+# e -- so' com o profile `demo` -- um rsyslog de verdade mandando linhas pelo
+# omrelp. O heartbeat beacon sai em loghub._ctl.beacon por NATS core.
+#
+# Garantia: o `200 OK` de cada transacao RELP diz que a mensagem esta' na RAM
+# deste no' (SPEC §2.3, §19). SIGTERM nao perde (dreno); FATAL do NATS nao perde
+# (dump JSON Lines em /data/emergency, reingerido no boot seguinte); SIGKILL e
+# OOM perdem o backlog do ring. Ring cheio ou NATS fora seguram a transacao, e
+# passado relp.backpressure_timeout a sessao fecha sem resposta e o rsyslog
+# retransmite: nada e' recusado com `500` (SPEC §5.7). Depois do PubAck, a
+# durabilidade e' a do stream.
+#
+# SEM TLS (SPEC §1.2): nem RELP sobre TLS, nem TLS ate' o NATS; nats:// e so'.
+#
+# Publicado no host, com defaults que nao colidem com os compose do
+# go-relplog-server (RELP 20514+n, admin 9300+n), do go-syslog-nats-server
+# (5181, 19181, 14281, 18281) nem do go-relplog-pg-server: RELP 20581
+# (RELPLOG_PORT), admin 127.0.0.1:19381 (RELPLOG_ADMIN_PORT), cliente NATS
+# 127.0.0.1:14381 (RELPLOG_NATS_PORT), monitor do NATS 127.0.0.1:18381
+# (RELPLOG_NATS_MONITOR_PORT). Nomes com o prefixo rlnats-.
+
+name: rlnats
+
+services:
+  relplog:
+    extends:
+      file: common.yml
+      service: rlnats-base
+    container_name: rlnats
+    # Vira o Hostname do go-loghub-ident: o `hostname` do beacon e o nome do
+    # cliente NATS rlnats/<AgentName>@<Hostname> no connz; precisa ser RFC 1123.
+    hostname: rlnats
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    environment:
+      # --- ring: memory (o unico; nao ha RELPLOG_RING_MODE) -------------------
+      RELPLOG_RING_CAPACITY_ITEMS: ${RELPLOG_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      RELPLOG_RING_MAX_BYTES: ${RELPLOG_RING_MAX_BYTES:-256MiB}
+      RELPLOG_RING_HIGH_WATER: ${RELPLOG_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL ou dreno estourado despeja o
+      # backlog em /data/emergency/emg-*.jsonl, um JLH por linha (SPEC §12).
+      RELPLOG_EMERGENCY_ENABLED: "true"
+
+      # --- sink: NATS (o unico; nao ha RELPLOG_SINK_TYPE) ---------------------
+      # 8 workers dividem UMA conexao NATS (SPEC §10.1).
+      RELPLOG_SINK_WORKERS: ${RELPLOG_SINK_WORKERS:-8}
+      # jetstream: PubAck por mensagem e deduplicacao por Nats-Msg-Id. core:
+      # best effort, o boot avisa (WARN) -- sem stream, mensagem sem assinante
+      # some, depois de o rsyslog ter recebido o `200 OK`.
+      RELPLOG_SINK_NATS_MODE: ${RELPLOG_SINK_NATS_MODE:-jetstream}
+      # Validado no boot, nunca criado (SPEC §10.7): o nats-init abaixo o cria.
+      RELPLOG_SINK_NATS_STREAM: ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG}
+      # Heartbeat beacon em loghub._ctl.beacon a cada 15 s; 0 desliga so' o
+      # periodico, nao o de conexao (SPEC §11).
+      LOGHUB_BEACON_INTERVAL: ${LOGHUB_BEACON_INTERVAL:-15}
+      # Conexao, SEM TLS: so' nats:// (tls://, ws://, wss:// sao exit 1, e um
+      # nats-server que exige TLS e' exit 3 no boot). O NATS precisa estar numa
+      # rede confiavel -- aqui, a rede interna do compose.
+      # Estas quatro sao as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para
+      # usar a URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README). As sem valor so' entram se definidas no .env ou
+      # no shell: vazias contariam como explicitas e travariam a URL.
+      RELPLOG_SINK_NATS_URLS: nats://nats:4222
+      RELPLOG_SINK_NATS_USERNAME:
+      RELPLOG_SINK_NATS_PASSWORD:
+      RELPLOG_SINK_NATS_TOKEN:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      - "${RELPLOG_PORT:-20581}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${RELPLOG_ADMIN_PORT:-19381}:9103"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) e os dumps moram
+      # nele, e duas replicas no mesmo volume publicariam o mesmo `from`
+      # (SPEC §16.6). ./conf (as chaves recarregaveis) vem de common.yml.
+      - rlnats-data:/data
+
+  nats:
+    image: ${RELPLOG_NATS_IMAGE:-nats:2.11-alpine}
+    container_name: rlnats-nats
+    hostname: rlnats-nats
+    restart: unless-stopped
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    volumes:
+      - rlnats-nats-data:/data
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      # Cliente e monitor so' no loopback do host: para o `nats` CLI e o connz.
+      - "127.0.0.1:${RELPLOG_NATS_PORT:-14381}:4222"
+      - "127.0.0.1:${RELPLOG_NATS_MONITOR_PORT:-18381}:8222"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # Job de uma vez: cria o stream a partir do arquivo que o operador aplica; o
+  # servidor so' o valida (nunca cria nem altera um stream, SPEC §10.7). Se o
+  # stream ja' existe (o volume do NATS sobreviveu), nada muda: um stream
+  # existente com outra config continua a ser validado no boot.
+  nats-init:
+    image: ${RELPLOG_NATS_BOX_IMAGE:-natsio/nats-box:0.20.0}
+    container_name: rlnats-nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    volumes:
+      - ./nats/stream.json:/etc/nats/stream.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        nats --server nats://nats:4222 stream info ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG} >/dev/null 2>&1
+        || nats --server nats://nats:4222 stream add ${RELPLOG_SINK_NATS_STREAM:-LOGHUB_SYSLOG} --config /etc/nats/stream.json
+
+  # Emissor de DEMONSTRACAO, so' com o profile `demo`: um rsyslog de verdade
+  # (librelp/omrelp) mandando linhas ao servico `relplog`. Sem `depends_on` de
+  # proposito: e' a demonstracao de que o rsyslog segura as linhas na fila dele
+  # enquanto o servidor nao esta' pronto, e reconecta sozinho.
+  emitter:
+    profiles: ["demo"]
+    build:
+      context: rsyslog
+      args:
+        ALPINE_VERSION: ${RELPLOG_ALPINE_VERSION:-3.22}
+    image: ${RELPLOG_DEMO_IMAGE:-rlnats-demo-emitter}:${RELPLOG_IMAGE_TAG:-local}
+    container_name: rlnats-demo-emitter
+    # Vira o HOSTNAME das linhas (payload.host.hostname do envelope).
+    hostname: rlnats-demo-emitter
+    restart: unless-stopped
+    # O rsyslogd grava a fila em disco no SIGTERM (queue.saveOnShutdown).
+    stop_grace_period: 30s
+    environment:
+      # O servico `relplog`, na porta do CONTAINER (a rede do compose nao passa
+      # pelas portas publicadas).
+      RELP_TARGET: ${RELPLOG_DEMO_TARGET:-relplog}
+      RELP_PORT: ${RELPLOG_DEMO_PORT:-20514}
+      # Rajada inicial e uma linha a cada DEMO_INTERVAL segundos (0 = so' a
+      # rajada). Cada linha leva seq=N: um buraco e' perda, um repetido e'
+      # retransmissao (rsyslog/demo.sh).
+      DEMO_BURST: ${RELPLOG_DEMO_BURST:-100}
+      DEMO_INTERVAL: ${RELPLOG_DEMO_INTERVAL:-1}
+      DEMO_TAG: ${RELPLOG_DEMO_TAG:-rlnats-demo}
+    volumes:
+      - ./rsyslog/rsyslog.conf:/etc/rsyslog.conf:ro
+      - ./rsyslog/demo.sh:/etc/rlnats-demo/demo.sh:ro
+      - rlnats-emitter-spool:/var/spool/rsyslog
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  rlnats-data:
+  rlnats-nats-data:
+  rlnats-emitter-spool:

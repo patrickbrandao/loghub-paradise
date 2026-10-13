@@ -1,0 +1,6 @@
+{
+ "format": "rfc3164",
+ "host.hostname": "2001:db8::1",
+ "appname": "app",
+ "message": "via v6"
+}

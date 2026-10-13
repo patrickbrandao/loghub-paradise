@@ -11,9 +11,101 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 2026-10-11 sobre a renomeação). Módulos: **W** = `go-webhook-server`,
 **S** = `go-syslog-server`, **F** = `go-webhook-fast-server`, **P** = `go-webhook-pg-server`,
 **SP** = `go-syslog-pg-server`, **SN** = `go-syslog-nats-server`,
-**N** = `go-webhook-nats-server`, **R** = `go-relplog-server`. Nas entradas anteriores a 2026-10-05, **S** é o
+**N** = `go-webhook-nats-server`, **R** = `go-relplog-server`,
+**RP** = `go-relplog-pg-server`, **RN** = `go-relplog-nats-server`. Nas entradas anteriores a 2026-10-05, **S** é o
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
+
+## 2026-10-13 — RP, RN: `go-relplog-pg-server` e `go-relplog-nats-server`, cortes do R
+
+Pedido: a partir do R, criar os dois servidores RELP simplificados nos moldes
+dos cortes do S — **RP** (memória → PostgreSQL `loghub.inbox`, molde SP) e
+**RN** (memória → NATS, molde SN) —, tudo automático, sem entrevista. Um
+sub-agente por módulo, em paralelo; depois revisão independente por área (cinco
+áreas por módulo), correção com teste conferido por mutação e porte cruzado RP↔RN.
+Decisões em `docs/DECISOES.md` de cada um (RP-1..12; RN 1–14).
+
+- **Forma:** cópia do R **cortada**, com fusão de três vias (R como nosso, S
+  como base, SP/SN como deles) e a numeração da SPEC do R. Herdado do molde:
+  ring só em memória, dump em JSON Lines (um JLH por linha, reingerido em fluxo
+  pelo `ParseLine` estrito), **sem TLS em lugar nenhum** (RELP só em
+  `listen.tcp` `:20514`; PostgreSQL sempre `sslmode=disable`; NATS só
+  `nats://` com o `TLSCertCB` que recusa), sem filtro, rate-limit (a decisão 8a
+  do R deixa de valer) nem as chaves `ring.mode`/`sink.type`. RN mantém beacon,
+  JetStream + core e o subject exato. Prefixos do R (`RELPLOG_`, `relplog_`);
+  admin `127.0.0.1:9103` **compartilhada por R, RP e RN** (regra da família,
+  como S/SP/SN na 9102); docker `rlpg-*` e `rlnats-*` em portas próprias.
+- **Os `500` do R reavaliados:** sem `ring=none`, a recusa `logic` acontece
+  depois do `200` e é descarte contado (`events_dropped{sink_logic}`); `500` só
+  sobra para a guarda de origem e erros de protocolo do cliente. Um erro
+  inesperado do ring é segurado como ring cheio, nunca `500`.
+- **Dois pais conferidos por lista:** as correções da revisão do R (SPEC §22),
+  do SP/SN e os portes de 2026-10-11, uma a uma com teste (TESTING §9 de cada
+  módulo). Os "a portar" do R (fsync do diretório no `Remove`, `dumpPhase` +
+  `Swap`, `SIGQUIT` tardio, `withLifetime`, `knownSectionOf`, `@` depois de
+  `/ ? #`) chegaram pelo código do R; o molde não os tinha.
+
+**Achados das revisões** (cada um com teste que falhava antes):
+- **Aborto contado duas vezes** (herdado do R): um aborto durante
+  `Pending`/`Drain`, ou entre os dois `Store`, contava N como `abort` e de novo
+  como `emergency_failed`; e o dump já contado como perdido ainda podia ser
+  publicado e reingerido. Agora `lossMu` + `enterDumpPhase`/`oweDump`,
+  `Store.SetAbandon`, e nada é contado depois do dono (`owed == 0`). O
+  `SIGQUIT` tardio chega por um canal (`quitNow`), não por uma flag lida uma vez.
+- **Reingestão morria no primeiro soluço** depois de gastar o `boot_timeout`
+  único com entregas bem-sucedidas (regra do SP): o prazo agora conta **sem
+  progresso**. O gauge `emergency_events_pending` mostrava o tamanho do pedaço.
+- **Pré-checagem do ring cheio só pelo teto de itens:** com `ring.max_bytes`
+  limitando, cada retentativa de 50 ms cunhava `uuid`, copiava e montava o
+  item. Agora `ring.FullFor(n)` nos dois tetos; o fim da sessão é conferido até
+  o `Enqueue`.
+- RP: **`pool_size == workers`** deixava a sonda de saúde sem conexão (DOWN e
+  depois FATAL com o banco sadio): agora `≥ workers + 1`. **`RULE` de
+  INSERT/UPDATE** na fila passava no boot e cada pedaço dava `0A000` como
+  `network` para sempre: recusa no boot via `pg_rewrite`, `0A000` fatal.
+  `Deliver` com SIGTERM durante uma recusa `logic` a contava sem o log dos uuids.
+- RN: **TLS exigido depois do boot** nunca virava veredito — o `nats.go` só o
+  relata por `LastError`, nunca pelo `ReconnectErrCB`; um flush core que
+  atravessava uma reconexão confirmava o pedaço (contagem de reconexões +
+  `flushErr`); `MaxPending` com folga de 2×.
+- **Config:** sem tetos (`makechan` em pânico, `pool_size` dando a volta no
+  `int32`, `batch_max_bytes` acima de 1 GiB sem SQLSTATE) → tetos com exit 1;
+  valor colado ao nome (`--sink.postgres.passwordX`) e continuação de segredo
+  numa linha do INI eram ecoados; `--dump-config=false` despejava e saía 0;
+  `--config=` vazio caía no env; BOM quebrava a linha 1; flag removida do R
+  depois de uma com valor culpava a flag errada; RP: tab, `[h:5432]` e `,`
+  no `addr`/`host=`, `sslmode=` vazio, URL só com brancos; **a
+  `LOGHUB_EB_URL` do RP passa a exigir usuário e banco** (antes caía no padrão
+  do registry, e um servidor podia escrever no banco errado).
+- Sinal entre a reingestão e o bind de um nome de host saía 1, não 130.
+- **Flake** de `TestPostgresWrongPasswordIsFatal`: com as vagas esgotadas o
+  PostgreSQL responde `53300` antes de conferir a senha.
+
+**Resultado:** RP — 3 dependências diretas (pgx, ident, uuidv7), binário
+17,3 MB (31,9 no R); `-race` verde com PG 18 e rsyslog real, 402 testes de
+primeiro nível + 281 subtestes, 1 pulado (D5), cobertura 91,1 %; ~590 mil
+msg/s numa sessão. RN — 3 dependências (nats.go, ident, uuidv7), 12,6 MB;
+`-race` verde com nats-server 2.14.6 (JetStream, core, permissões, `tls {}`) e
+rsyslog real, 435 + 332, 1 pulado, cobertura 91,6 %; ~530 mil msg/s. Fuzz de
+60 s nos alvos tocados sem falha. RP e RN diferem só onde SP e SN diferem.
+
+**A portar** (candidatos; nada conferido nos irmãos):
+- R, SP, SN: posse do aborto (`lossMu`, `SetAbandon`, `owed == 0`),
+  `quitNow`, bind cancelado = 130, `ErrNotDurable` na abertura do diretório,
+  `FullFor` e `ctx` antes do `Enqueue`, `Deliver` com `logic` antes do `ctx`,
+  tetos de config, valor colado ao nome, switches com valor, `--config=`
+  vazio, BOM, continuação de segredo no INI.
+- SP, SN: prazo da reingestão sem progresso; gauge do pedaço; derivados
+  comentados no `--dump-config`; sinônimos de charset no SIGHUP.
+- SP, R (PostgreSQL): `pool ≥ workers + 1`, `RULE`/`0A000`, `addr` com tab/`,`,
+  `sslmode=` vazio, URL sem usuário/banco.
+- SN, N, R (NATS): veredito do TLS na reconexão, contagem de reconexões +
+  `flushErr`, folga do `MaxPending`.
+
+**Lição.** Um corte de dois pais herda os defeitos dos dois e as correções de
+nenhum, a menos que alguém confira por lista. E as janelas de contagem no
+shutdown só aparecem quando o aborto cai em cada uma: os revisores as
+reproduziram reencenando a sequência exata, não esperando a corrida.
 
 ## 2026-10-12 — R: `go-relplog-server` desenvolvido por completo
 

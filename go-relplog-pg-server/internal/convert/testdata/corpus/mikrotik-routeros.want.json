@@ -1,0 +1,8 @@
+{
+ "format": "rfc3164",
+ "host.hostname": "MikroTik",
+ "message": "dhcp,info dhcp1 assigned 10.0.0.50 to AA:BB:CC:DD:EE:FF",
+ "_absent": [
+  "appname"
+ ]
+}
