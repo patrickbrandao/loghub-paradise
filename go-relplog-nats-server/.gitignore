@@ -1,0 +1,6 @@
+# Padroes estritamente locais desta pasta (AGENTS.md §4). O .gitignore principal
+# e' do nivel acima.
+data/
+cov.out
+cover.out
+docker/.env

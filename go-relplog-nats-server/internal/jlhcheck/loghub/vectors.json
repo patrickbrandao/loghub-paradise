@@ -1,0 +1,1592 @@
+{
+  "$comment": "Vetores dourados da skill loghub-type-syslog-schema. 'input' é a SYSLOG-MSG (ou o fluxo TCP quando stream=true); 'expected' é a lista de envelopes. Na comparação o uuid só vale pelos bits de tempo. Conferir: python3 scripts/syslog_to_jlh.py vectors testdata/vectors.json",
+  "vectors": [
+    {
+      "id": "rfc5424-udp-basico",
+      "description": "RFC 5424 por UDP (RFC 5426): o exemplo canônico do LogHub.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<86>1 2024-03-15T14:22:05.123Z srv101.intranet.br sshd 12345 ID47 - Accepted publickey for alice from 10.0.0.2 port 54321 ssh2",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15b-db8fdb816d6a",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "srv101.intranet.br",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 86,
+            "facility": {
+              "code": 10,
+              "name": "authpriv"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2024-03-15T14:22:05.123Z",
+            "appname": "sshd",
+            "procid": "12345",
+            "msgid": "ID47",
+            "message": "Accepted publickey for alice from 10.0.0.2 port 54321 ssh2",
+            "size": 126,
+            "raw": "<86>1 2024-03-15T14:22:05.123Z srv101.intranet.br sshd 12345 ID47 - Accepted publickey for alice from 10.0.0.2 port 54321 ssh2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc5424-tcp-octet-counting-sd-bom",
+      "description": "Exemplo 3 da RFC 5424 §6.5 por TCP com octet-counting (RFC 6587): STRUCTURED-DATA e MSG com BOM.",
+      "reception": {
+        "transport": "tcp",
+        "src-ip": "10.0.0.3",
+        "src-port": 40112,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "stream": true,
+      "input": "175 <165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] ﻿An application event log entry...",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b158-6d7996594a2c",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 4456929042733856,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "mymachine.example.com",
+              "src-ip": "10.0.0.3",
+              "src-port": 40112,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "tcp",
+            "framing": "octet-counting",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 165,
+            "facility": {
+              "code": 20,
+              "name": "local4"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "timestamp": "2003-10-11T22:14:15.003Z",
+            "appname": "evntslog",
+            "msgid": "ID47",
+            "structured-data": {
+              "exampleSDID@32473": {
+                "iut": "3",
+                "eventSource": "Application",
+                "eventID": "1011"
+              }
+            },
+            "message": "An application event log entry...",
+            "size": 175,
+            "raw": "<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] ﻿An application event log entry..."
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc5424-tls-sd-repetido-escapes",
+      "description": "RFC 5424 por TLS (RFC 5425): PARAM repetido vira array, escapes \\\" e \\] removidos, escape inválido \\b preservado, offset -03:00 normalizado para UTC.",
+      "reception": {
+        "transport": "tls",
+        "src-ip": "198.51.100.7",
+        "src-port": 51514,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 6514,
+        "received-at": "2026-10-03T12:00:00.123456789Z",
+        "tls": {
+          "version": "TLS1.3",
+          "cipher": "TLS_AES_128_GCM_SHA256",
+          "peer-subject": "CN=fw01.example.net,O=Example",
+          "peer-fingerprint": "sha-256:3B:8E:6C:A1:4F:22:90:17:D5:61:0B:7E:AA:93:C4:58:12:EE:F0:4D:39:B7:6A:85:C1:2F:9D:03:E8:57:44:B6"
+        }
+      },
+      "stream": true,
+      "input": "243 <14>1 2026-10-03T08:59:59.999999-03:00 fw01.example.net app 42 - [origin ip=\"192.0.2.1\" ip=\"192.0.2.129\" software=\"fw\\\"x\\]\"][timeQuality tzKnown=\"1\" isSynced=\"1\" syncAccuracy=\"60000000\"][meta sequenceId=\"7\" note=\"a\\b\"] teste de structured-data",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15a-03e2a2a1d45d",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 5761282229446166,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "fw01.example.net",
+              "src-ip": "198.51.100.7",
+              "src-port": 51514,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 6514
+            },
+            "transport": "tls",
+            "framing": "octet-counting",
+            "tls": {
+              "version": "TLS1.3",
+              "cipher": "TLS_AES_128_GCM_SHA256",
+              "peer-subject": "CN=fw01.example.net,O=Example",
+              "peer-fingerprint": "sha-256:3B:8E:6C:A1:4F:22:90:17:D5:61:0B:7E:AA:93:C4:58:12:EE:F0:4D:39:B7:6A:85:C1:2F:9D:03:E8:57:44:B6"
+            },
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T11:59:59.999999Z",
+            "appname": "app",
+            "procid": "42",
+            "structured-data": {
+              "origin": {
+                "ip": [
+                  "192.0.2.1",
+                  "192.0.2.129"
+                ],
+                "software": "fw\"x]"
+              },
+              "timeQuality": {
+                "tzKnown": "1",
+                "isSynced": "1",
+                "syncAccuracy": "60000000"
+              },
+              "meta": {
+                "sequenceId": "7",
+                "note": "a\\b"
+              }
+            },
+            "message": "teste de structured-data",
+            "size": 243,
+            "raw": "<14>1 2026-10-03T08:59:59.999999-03:00 fw01.example.net app 42 - [origin ip=\"192.0.2.1\" ip=\"192.0.2.129\" software=\"fw\\\"x\\]\"][timeQuality tzKnown=\"1\" isSynced=\"1\" syncAccuracy=\"60000000\"][meta sequenceId=\"7\" note=\"a\\b\"] teste de structured-data"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc5424-nilvalues",
+      "description": "RFC 5424 com todos os campos NILVALUE e sem MSG: tudo omitido, message vazia, sem avisos.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<165>1 - - - - - -",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b156-15790e643cac",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 165,
+            "facility": {
+              "code": 20,
+              "name": "local4"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "message": "",
+            "size": 18,
+            "raw": "<165>1 - - - - - -"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc5424-sd-invalido",
+      "description": "STRUCTURED-DATA sem ']' de fechamento: sd-invalid, o texto a partir do SD vai para message; timestamp sem fração ganha .000.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<14>1 2026-10-03T12:00:00Z host01 app - - [semFechamento x=\"1\" mensagem",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b159-dd57893a4954",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "host01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T12:00:00.000Z",
+            "appname": "app",
+            "message": "[semFechamento x=\"1\" mensagem",
+            "size": 71,
+            "raw": "<14>1 2026-10-03T12:00:00Z host01 app - - [semFechamento x=\"1\" mensagem",
+            "parse": {
+              "warnings": [
+                "sd-invalid"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc5424-ssign-rfc5848",
+      "description": "Mensagem de Signature Block (RFC 5848): SD 'ssign' preservado como recebido; raw guarda os bytes exatos para verificação posterior.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<110>1 2026-10-03T12:00:00.000001Z signer.example.net syslogd 1234 - [ssign VER=\"0111\" RSID=\"1\" SG=\"0\" SPRI=\"0\" GBC=\"1\" FMN=\"1\" CNT=\"1\" HB=\"aGFzaA==\" SIGN=\"c2lnbmF0dXJl\"]",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15f-58d022d90e09",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "signer.example.net",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 110,
+            "facility": {
+              "code": 13,
+              "name": "audit"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T12:00:00.000001Z",
+            "appname": "syslogd",
+            "procid": "1234",
+            "structured-data": {
+              "ssign": {
+                "VER": "0111",
+                "RSID": "1",
+                "SG": "0",
+                "SPRI": "0",
+                "GBC": "1",
+                "FMN": "1",
+                "CNT": "1",
+                "HB": "aGFzaA==",
+                "SIGN": "c2lnbmF0dXJl"
+              }
+            },
+            "message": "",
+            "size": 170,
+            "raw": "<110>1 2026-10-03T12:00:00.000001Z signer.example.net syslogd 1234 - [ssign VER=\"0111\" RSID=\"1\" SG=\"0\" SPRI=\"0\" GBC=\"1\" FMN=\"1\" CNT=\"1\" HB=\"aGFzaA==\" SIGN=\"c2lnbmF0dXJl\"]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc5424-version-2",
+      "description": "VERSION diferente de 1: cabeçalho lido como RFC 5424, com aviso version-unsupported.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<14>2 2026-10-03T12:00:00.5Z host01 app - - - versao futura",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b159-ab91143ac1cc",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "host01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 2,
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T12:00:00.500Z",
+            "appname": "app",
+            "message": "versao futura",
+            "size": 59,
+            "raw": "<14>2 2026-10-03T12:00:00.5Z host01 app - - - versao futura",
+            "parse": {
+              "warnings": [
+                "version-unsupported"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc3164-exemplo-rfc",
+      "description": "Exemplo 1 da RFC 3164 §5.4: ano e fuso inferidos.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-12T01:14:16.000000500Z"
+      },
+      "input": "<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8",
+      "expected": [
+        {
+          "uuid": "01a12dac-b640-7000-9f4a-56294951ba96",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 2,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791767656,
+            "sub": 500,
+            "iso": "2026-10-12T01:14:16.000Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "mymachine",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 34,
+            "facility": {
+              "code": 4,
+              "name": "auth"
+            },
+            "severity": {
+              "code": 2,
+              "name": "crit"
+            },
+            "timestamp": "2026-10-11T22:14:15.000Z",
+            "appname": "su",
+            "message": "'su root' failed for lonvick on /dev/pts/8",
+            "size": 76,
+            "raw": "<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc3164-tag-pid-fuso",
+      "description": "RFC 3164 com tag[pid] e fuso configurado (America/Sao_Paulo); ano inferido para o passado.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "config": {
+        "rfc3164-timezone": "America/Sao_Paulo"
+      },
+      "input": "<86>Mar 15 14:22:05 srv101 sshd[12345]: Accepted publickey for alice from 10.0.0.2 port 54321 ssh2",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15d-1bdca13ba446",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "srv101",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 86,
+            "facility": {
+              "code": 10,
+              "name": "authpriv"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-03-15T17:22:05.000Z",
+            "appname": "sshd",
+            "procid": "12345",
+            "message": "Accepted publickey for alice from 10.0.0.2 port 54321 ssh2",
+            "size": 98,
+            "raw": "<86>Mar 15 14:22:05 srv101 sshd[12345]: Accepted publickey for alice from 10.0.0.2 port 54321 ssh2",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc3164-sem-hostname-dia-com-espaco",
+      "description": "RFC 3164 sem HOSTNAME (o token seguinte é a TAG) e dia < 10 com espaço.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<13>Oct  1 09:00:00 su: (to root) alice on pts/0",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b156-91dbe1c8a8f5",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 13,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "timestamp": "2026-10-01T09:00:00.000Z",
+            "appname": "su",
+            "message": "(to root) alice on pts/0",
+            "size": 48,
+            "raw": "<13>Oct  1 09:00:00 su: (to root) alice on pts/0",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred",
+                "hostname-missing"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc3164-timestamp-iso-sem-raw",
+      "description": "Variante rsyslog/syslog-ng com timestamp RFC 3339 no lugar do BSD; com include-raw=false o raw é omitido.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "config": {
+        "include-raw": false
+      },
+      "input": "<30>2026-10-03T08:59:58.123456-03:00 web01 nginx[812]: GET /health 200",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15e-da6daf413b35",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "web01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 30,
+            "facility": {
+              "code": 3,
+              "name": "daemon"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T11:59:58.123456Z",
+            "appname": "nginx",
+            "procid": "812",
+            "message": "GET /health 200",
+            "size": 70
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc3164-virada-de-ano",
+      "description": "Mensagem de 31/dez recebida em 1º/jan: o ano inferido é o anterior.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2027-01-01T00:00:02.500Z"
+      },
+      "input": "<78>Dec 31 23:59:59 cron01 CRON[4321]: (root) CMD (run-parts /etc/cron.hourly)",
+      "expected": [
+        {
+          "uuid": "01a2ce8b-ddc4-7000-8008-e82bb40b7f5a",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1798761602,
+            "sub": 500000000,
+            "iso": "2027-01-01T00:00:02.500Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "cron01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 78,
+            "facility": {
+              "code": 9,
+              "name": "cron"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-12-31T23:59:59.000Z",
+            "appname": "CRON",
+            "procid": "4321",
+            "message": "(root) CMD (run-parts /etc/cron.hourly)",
+            "size": 78,
+            "raw": "<78>Dec 31 23:59:59 cron01 CRON[4321]: (root) CMD (run-parts /etc/cron.hourly)",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "rfc3164-cisco-sem-timestamp",
+      "description": "Cisco IOS com número de sequência antes do timestamp: o cabeçalho não é reconhecido, tudo após o PRI vira message (RFC 3164 §4.3.2).",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<189>123: *Mar  1 00:00:01.123: %SYS-5-CONFIG_I: Configured from console by vty0 (10.0.0.5)",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15f-c3d0607ea7a3",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 189,
+            "facility": {
+              "code": 23,
+              "name": "local7"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "message": "123: *Mar  1 00:00:01.123: %SYS-5-CONFIG_I: Configured from console by vty0 (10.0.0.5)",
+            "size": 91,
+            "raw": "<189>123: *Mar  1 00:00:01.123: %SYS-5-CONFIG_I: Configured from console by vty0 (10.0.0.5)",
+            "parse": {
+              "warnings": [
+                "timestamp-missing"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "arquivo-sem-pri",
+      "description": "Linha de /var/log importada de arquivo (sem PRI): PRI padrão 13, event = timestamp da mensagem (Caso 2).",
+      "reception": {
+        "transport": "file",
+        "framing": "non-transparent",
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "config": {
+        "rfc3164-timezone": "America/Sao_Paulo"
+      },
+      "input": "Oct  3 08:15:00 srv101 sshd[999]: Server listening on 0.0.0.0 port 22.",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b151-aab2174246d1",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 0,
+          "step": 0,
+          "event": {
+            "uts": 1791026100,
+            "sub": 0,
+            "iso": "2026-10-03T11:15:00.000Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "srv101"
+            },
+            "transport": "file",
+            "framing": "non-transparent",
+            "format": "rfc3164",
+            "priority": 13,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "timestamp": "2026-10-03T11:15:00.000Z",
+            "appname": "sshd",
+            "procid": "999",
+            "message": "Server listening on 0.0.0.0 port 22.",
+            "size": 70,
+            "raw": "Oct  3 08:15:00 srv101 sshd[999]: Server listening on 0.0.0.0 port 22.",
+            "parse": {
+              "warnings": [
+                "pri-missing",
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "unix-socket-glibc",
+      "description": "syslog(3) local via /dev/log (socket unix datagram): sem HOSTNAME e sem campos de rede.",
+      "reception": {
+        "transport": "unix",
+        "framing": "datagram",
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<38>Oct  3 09:00:00 sshd[100]: Accepted password for bob from 10.0.0.9 port 4022 ssh2",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b157-526e90cc7652",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 0,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "transport": "unix",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 38,
+            "facility": {
+              "code": 4,
+              "name": "auth"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T09:00:00.000Z",
+            "appname": "sshd",
+            "procid": "100",
+            "message": "Accepted password for bob from 10.0.0.9 port 4022 ssh2",
+            "size": 85,
+            "raw": "<38>Oct  3 09:00:00 sshd[100]: Accepted password for bob from 10.0.0.9 port 4022 ssh2",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred",
+                "hostname-missing"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "pri-invalido",
+      "description": "PRI com zero à esquerda: malformed e a mensagem inteira, inclusive '<00>', vira message (RFC 3164 §4.3.3).",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<00>Oct 11 22:14:15 host01 app: prioridade invalida",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15b-3b215ca25e2d",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "malformed",
+            "priority": 13,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "message": "<00>Oct 11 22:14:15 host01 app: prioridade invalida",
+            "size": 51,
+            "raw": "<00>Oct 11 22:14:15 host01 app: prioridade invalida",
+            "parse": {
+              "warnings": [
+                "pri-invalid"
+              ],
+              "error": "PRI inválido: a mensagem inteira foi tratada como CONTENT (RFC 3164 §4.3.3)"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sem-pri-sem-cabecalho",
+      "description": "Requisição HTTP enviada por engano à porta TCP syslog: sem PRI e sem cabeçalho, malformed.",
+      "reception": {
+        "transport": "tcp",
+        "src-ip": "10.0.0.3",
+        "src-port": 40200,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "stream": true,
+      "input-base64": "R0VUIC8gSFRUUC8xLjENCg==",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b153-604d9f06da10",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 5848980841092526,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "src-ip": "10.0.0.3",
+              "src-port": 40200,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "tcp",
+            "framing": "non-transparent",
+            "format": "malformed",
+            "priority": 13,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "message": "GET / HTTP/1.1",
+            "size": 14,
+            "raw": "GET / HTTP/1.1",
+            "parse": {
+              "warnings": [
+                "pri-missing"
+              ],
+              "error": "sem PRI e sem cabeçalho syslog reconhecível"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "utf8-invalido",
+      "description": "MSG em Latin-1 (bytes não UTF-8): U+FFFD em message, aviso encoding-invalid e raw em base64.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input-base64": "PDE0Pk9jdCAgMyAwODo1OTo1OSBwYWJ4MDEgYXBwOiBMaWdh5+NvIGVuY2VycmFkYQ==",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b150-efcaa7fbf527",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "pabx01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T08:59:59.000Z",
+            "appname": "app",
+            "message": "Liga��o encerrada",
+            "size": 49,
+            "raw": "PDE0Pk9jdCAgMyAwODo1OTo1OSBwYWJ4MDEgYXBwOiBMaWdh5+NvIGVuY2VycmFkYQ==",
+            "raw-encoding": "base64",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred",
+                "encoding-invalid"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "charset-legado",
+      "description": "Mesmo caso com legacy-charset=cp1252 configurado: texto decodificado e aviso encoding-legacy.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "config": {
+        "legacy-charset": "cp1252"
+      },
+      "input-base64": "PDE0Pk9jdCAgMyAwODo1OTo1OSBwYWJ4MDEgYXBwOiBMaWdh5+NvIGVuY2VycmFkYQ==",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15d-7826dd861f16",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "pabx01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc3164",
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T08:59:59.000Z",
+            "appname": "app",
+            "message": "Ligação encerrada",
+            "size": 49,
+            "raw": "PDE0Pk9jdCAgMyAwODo1OTo1OSBwYWJ4MDEgYXBwOiBMaWdh5+NvIGVuY2VycmFkYQ==",
+            "raw-encoding": "base64",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred",
+                "encoding-legacy"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "utf8-sequencia-incompleta",
+      "description": "Sequência UTF-8 cortada no meio da MSG: cada octeto inválido vira um U+FFFD (mesmo resultado de json.Marshal/utf8.DecodeRune em Go).",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input-base64": "PDE0PjEgMjAyNi0xMC0wM1QxMjowMDowMFogaG9zdDAxIGFwcCAtIC0gLSBhYmPjgXh5eg==",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15c-dbf9d32af6e4",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "host01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T12:00:00.000Z",
+            "appname": "app",
+            "message": "abc��xyz",
+            "size": 52,
+            "raw": "PDE0PjEgMjAyNi0xMC0wM1QxMjowMDowMFogaG9zdDAxIGFwcCAtIC0gLSBhYmPjgXh5eg==",
+            "raw-encoding": "base64",
+            "parse": {
+              "warnings": [
+                "encoding-invalid"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "truncado",
+      "description": "Mensagem maior que max-message-bytes (64): truncada no fim (RFC 5424 §6.1); size guarda o tamanho original.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "config": {
+        "max-message-bytes": 64
+      },
+      "input": "<14>1 2026-10-03T12:00:00.000Z host01 app - - - Esta mensagem passa do limite configurado de octetos.",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b152-00c544a83a7a",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 593636897809901,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "host01",
+              "src-ip": "10.0.0.3",
+              "src-port": 59922,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T12:00:00.000Z",
+            "appname": "app",
+            "message": "Esta mensagem pa",
+            "size": 101,
+            "raw": "<14>1 2026-10-03T12:00:00.000Z host01 app - - - Esta mensagem pa",
+            "parse": {
+              "warnings": [
+                "truncated"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "tcp-octet-counting-dois-frames",
+      "description": "Um fluxo TCP com dois frames octet-counting: um RFC 3164 e um RFC 5424.",
+      "reception": {
+        "transport": "tcp",
+        "src-ip": "10.0.0.3",
+        "src-port": 40300,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "stream": true,
+      "input": "37 <34>Oct 11 22:14:15 server su: failed53 <13>1 2026-10-03T11:59:59.9Z server app - - - segundo",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15c-8b283ddf9da0",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 2,
+          "sid": 972067113321849,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "server",
+              "src-ip": "10.0.0.3",
+              "src-port": 40300,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "tcp",
+            "framing": "octet-counting",
+            "format": "rfc3164",
+            "priority": 34,
+            "facility": {
+              "code": 4,
+              "name": "auth"
+            },
+            "severity": {
+              "code": 2,
+              "name": "crit"
+            },
+            "timestamp": "2025-10-11T22:14:15.000Z",
+            "appname": "su",
+            "message": "failed",
+            "size": 37,
+            "raw": "<34>Oct 11 22:14:15 server su: failed",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred"
+              ]
+            }
+          }
+        },
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15b-6f02c7fb72a3",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 972067113321849,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "server",
+              "src-ip": "10.0.0.3",
+              "src-port": 40300,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "tcp",
+            "framing": "octet-counting",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 13,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "timestamp": "2026-10-03T11:59:59.900Z",
+            "appname": "app",
+            "message": "segundo",
+            "size": 53,
+            "raw": "<13>1 2026-10-03T11:59:59.9Z server app - - - segundo"
+          }
+        }
+      ]
+    },
+    {
+      "id": "tcp-non-transparent-crlf",
+      "description": "Fluxo TCP non-transparent com trailer CRLF (RFC 6587 §3.4.2): um envelope por linha.",
+      "reception": {
+        "transport": "tcp",
+        "src-ip": "10.0.0.3",
+        "src-port": 40400,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "stream": true,
+      "input-base64": "PDEzPk9jdCAgMyAwODowMDowMCBoMSBhOiB1bQ0KPDEzPk9jdCAgMyAwODowMDowMSBoMSBhOiBkb2lzDQo=",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b15b-6f0963413ebb",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 4201260941351516,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "h1",
+              "src-ip": "10.0.0.3",
+              "src-port": 40400,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "tcp",
+            "framing": "non-transparent",
+            "format": "rfc3164",
+            "priority": 13,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "timestamp": "2026-10-03T08:00:00.000Z",
+            "appname": "a",
+            "message": "um",
+            "size": 28,
+            "raw": "<13>Oct  3 08:00:00 h1 a: um",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred"
+              ]
+            }
+          }
+        },
+        {
+          "uuid": "01a101a2-aa7b-71c8-b157-b7177bfb7a5d",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 5,
+          "sid": 4201260941351516,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "h1",
+              "src-ip": "10.0.0.3",
+              "src-port": 40400,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "tcp",
+            "framing": "non-transparent",
+            "format": "rfc3164",
+            "priority": 13,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 5,
+              "name": "notice"
+            },
+            "timestamp": "2026-10-03T08:00:01.000Z",
+            "appname": "a",
+            "message": "dois",
+            "size": 30,
+            "raw": "<13>Oct  3 08:00:01 h1 a: dois",
+            "parse": {
+              "warnings": [
+                "timestamp-year-inferred",
+                "timestamp-zone-inferred"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "ipv6-canonico",
+      "description": "Endereços IPv6: forma RFC 5952 em src-ip; IPv4-mapeado em dst-ip vira IPv4.",
+      "reception": {
+        "transport": "udp",
+        "framing": "datagram",
+        "src-ip": "2001:DB8:0:0:0:0:0:1",
+        "src-port": 50514,
+        "dst-ip": "::ffff:10.0.0.10",
+        "dst-port": 514,
+        "received-at": "2026-10-03T12:00:00.123456789Z"
+      },
+      "input": "<14>1 2026-10-03T12:00:00Z sw01 - - - - link up",
+      "expected": [
+        {
+          "uuid": "01a101a2-aa7b-71c8-b157-576e1b01ac50",
+          "from": "01962a3f-07bc-70b4-ae05-c57e7541d8a8",
+          "space": "default",
+          "type": "syslog",
+          "level": 6,
+          "sid": 4462507918188467,
+          "step": 0,
+          "event": {
+            "uts": 1791028800,
+            "sub": 123456789,
+            "iso": "2026-10-03T12:00:00.123Z"
+          },
+          "payload": {
+            "host": {
+              "hostname": "sw01",
+              "src-ip": "2001:db8::1",
+              "src-port": 50514,
+              "dst-ip": "10.0.0.10",
+              "dst-port": 514
+            },
+            "transport": "udp",
+            "framing": "datagram",
+            "format": "rfc5424",
+            "version": 1,
+            "priority": 14,
+            "facility": {
+              "code": 1,
+              "name": "user"
+            },
+            "severity": {
+              "code": 6,
+              "name": "info"
+            },
+            "timestamp": "2026-10-03T12:00:00.000Z",
+            "message": "link up",
+            "size": 47,
+            "raw": "<14>1 2026-10-03T12:00:00Z sw01 - - - - link up"
+          }
+        }
+      ]
+    }
+  ]
+}

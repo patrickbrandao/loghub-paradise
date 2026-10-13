@@ -1,0 +1,7 @@
+{
+ "format": "rfc3164",
+ "host.hostname": "mx1",
+ "appname": "postfix/smtpd",
+ "procid": "9876",
+ "message": "connect from unknown[10.0.0.9]"
+}

@@ -1,0 +1,376 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loghub/schemas/jlh-syslog-payload.schema.json",
+  "title": "JLH payload — type=syslog",
+  "description": "Payload de envelopes JLH com type=syslog, produzido por servidores syslog (server-syslog / Bridge-IN) a partir de mensagens RFC 3164, RFC 5424 e RFC 3195 recebidas por UDP (RFC 5426), TCP (RFC 6587), TLS (RFC 5425), DTLS (RFC 6012), socket unix ou arquivo. Campos ausentes na mensagem de origem são OMITIDOS (nunca null, nunca string vazia), exceto 'message', que é sempre presente. Chaves com mais de uma palavra usam kebab-case.",
+  "type": "object",
+  "required": ["transport", "format", "priority", "facility", "severity", "message", "size"],
+  "properties": {
+    "host": {
+      "description": "Origem do log. 'hostname' é o HOSTNAME declarado no cabeçalho syslog; os demais campos vêm do socket que recebeu a mensagem. Omitido quando nenhum campo estiver disponível.",
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "hostname": {
+          "description": "HOSTNAME declarado na mensagem (RFC 5424 §6.2.4 / RFC 3164 §4.1.2), preservado como recebido: sem resolução DNS, sem mudar caixa. Omitido se NILVALUE ou ausente.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S+$"
+        },
+        "src-ip": {
+          "description": "IP de origem do datagrama/conexão (peer), em forma canônica: IPv4 decimal pontuado; IPv6 RFC 5952 minúsculo; IPv4-mapeado (::ffff:a.b.c.d) convertido para IPv4; sem zona (%eth0).",
+          "type": "string",
+          "anyOf": [{ "format": "ipv4" }, { "format": "ipv6" }]
+        },
+        "src-port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "dst-ip": {
+          "description": "IP local que recebeu a mensagem (IP_PKTINFO/IPV6_RECVPKTINFO no UDP, LocalAddr no TCP). Omitir se desconhecido; nunca usar 0.0.0.0 ou ::.",
+          "type": "string",
+          "anyOf": [{ "format": "ipv4" }, { "format": "ipv6" }]
+        },
+        "dst-port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      },
+      "additionalProperties": false
+    },
+    "transport": {
+      "description": "Como a mensagem chegou ao servidor. 'file' = importação de arquivo de log; 'beep' = RFC 3195 (histórico).",
+      "enum": ["udp", "tcp", "tls", "dtls", "unix", "file", "beep"]
+    },
+    "framing": {
+      "description": "Delimitação da mensagem no transporte: 'datagram' (um datagrama = uma mensagem; RFC 5426), 'octet-counting' (MSG-LEN SP SYSLOG-MSG; RFC 6587 §3.4.1, RFC 5425, RFC 6012) ou 'non-transparent' (SYSLOG-MSG TRAILER; RFC 6587 §3.4.2; também linhas de arquivo).",
+      "enum": ["datagram", "octet-counting", "non-transparent"]
+    },
+    "tls": {
+      "description": "Sessão TLS/DTLS que entregou a mensagem (RFC 5425 / RFC 6012). Somente com transport tls ou dtls.",
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "version": { "type": "string", "pattern": "^D?TLS1\\.[0-3]$", "examples": ["TLS1.3", "DTLS1.2"] },
+        "cipher": { "type": "string", "pattern": "^TLS_[A-Z0-9_]+$", "examples": ["TLS_AES_128_GCM_SHA256"] },
+        "peer-subject": { "description": "Subject DN do certificado do cliente (RFC 4514).", "type": "string", "minLength": 1 },
+        "peer-fingerprint": {
+          "description": "Fingerprint do certificado do cliente no formato da RFC 5425 §4.2.2: rótulo do hash em minúsculas, ':' e octetos em hexadecimal maiúsculo separados por ':'. Recomendado sha-256.",
+          "type": "string",
+          "pattern": "^[a-z0-9-]+(:[0-9A-F]{2})+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "format": {
+      "description": "Sintaxe reconhecida na SYSLOG-MSG: 'rfc5424' (cabeçalho IETF com VERSION), 'rfc3164' (cabeçalho BSD, inclusive variantes toleradas), 'rfc3195' (entrada COOKED do BEEP) ou 'malformed' (PRI inválido, ou sem PRI e sem cabeçalho reconhecível: tudo vira 'message').",
+      "enum": ["rfc5424", "rfc3164", "rfc3195", "malformed"]
+    },
+    "version": {
+      "description": "VERSION do cabeçalho RFC 5424 (hoje 1). Somente em format=rfc5424.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 999
+    },
+    "priority": {
+      "description": "PRIVAL = facility.code * 8 + severity.code. Quando o PRI está ausente ou é inválido, recebe o PRI padrão (13 = user.notice, RFC 3164 §4.3.3) e parse.warnings indica o motivo.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 191
+    },
+    "facility": { "$ref": "#/$defs/facility" },
+    "severity": { "$ref": "#/$defs/severity" },
+    "timestamp": {
+      "description": "TIMESTAMP declarado pela origem, normalizado para UTC (sufixo Z), com fração de segundo preservando a precisão de origem: mínimo 3 e máximo 9 dígitos. Omitido se NILVALUE, ausente ou inválido.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3,9}Z$"
+    },
+    "appname": {
+      "description": "APP-NAME (RFC 5424) ou TAG sem '[pid]' e sem ':' (RFC 3164).",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S+$"
+    },
+    "procid": {
+      "description": "PROCID (RFC 5424) ou o conteúdo entre colchetes de 'tag[pid]:' (RFC 3164). Sempre string, mesmo quando numérico.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S+$"
+    },
+    "msgid": {
+      "description": "MSGID (RFC 5424). Somente em format=rfc5424.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S+$"
+    },
+    "structured-data": {
+      "description": "STRUCTURED-DATA (RFC 5424 §6.3) como objeto: SD-ID -> { PARAM-NAME -> valor }. Valores já sem escape (\\\" \\\\ \\]). PARAM-NAME repetido no mesmo elemento vira array de strings na ordem recebida. Elemento sem parâmetros vira {}. Somente em format=rfc5424; omitido se NILVALUE.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/sdName" },
+      "additionalProperties": {
+        "type": "object",
+        "propertyNames": { "$ref": "#/$defs/sdName" },
+        "additionalProperties": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "minItems": 2, "items": { "type": "string" } }
+          ]
+        }
+      }
+    },
+    "message": {
+      "description": "MSG (RFC 5424) ou CONTENT (RFC 3164) em UTF-8: sem BOM, sem o separador inicial e sem CR/LF/NUL finais. Quebras de linha internas são preservadas (o JSON as serializa como \\n). String vazia quando a mensagem não tem MSG.",
+      "type": "string"
+    },
+    "size": {
+      "description": "Tamanho em octetos da SYSLOG-MSG recebida, sem framing, antes de qualquer truncamento.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "raw": {
+      "description": "SYSLOG-MSG original byte a byte (sem framing; truncada se 'truncated'). Texto UTF-8 quando os bytes são UTF-8 válido; caso contrário base64 com raw-encoding=base64. Obrigatório em format=malformed e com aviso de encoding; nos demais casos incluído por padrão (desligável por configuração).",
+      "type": "string"
+    },
+    "raw-encoding": {
+      "description": "Codificação de 'raw'. Ausente significa utf-8.",
+      "enum": ["utf-8", "base64"]
+    },
+    "parse": {
+      "description": "Diagnóstico da conversão. Omitido quando a mensagem foi convertida sem nenhum desvio.",
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "warnings": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/warningCode" }
+        },
+        "error": {
+          "description": "Motivo legível de format=malformed.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "patternProperties": {
+    "^x-[a-z0-9][a-z0-9.-]*$": {
+      "description": "Extensões locais (enriquecimento, dialetos de fabricante). Consumidores devem ignorar o que não conhecem."
+    }
+  },
+  "additionalProperties": false,
+
+  "allOf": [
+    {
+      "if": { "properties": { "transport": { "const": "udp" } } },
+      "then": { "required": ["framing"], "properties": { "framing": { "const": "datagram" } } }
+    },
+    {
+      "if": { "properties": { "transport": { "const": "tcp" } } },
+      "then": { "required": ["framing"], "properties": { "framing": { "enum": ["octet-counting", "non-transparent"] } } }
+    },
+    {
+      "if": { "properties": { "transport": { "enum": ["tls", "dtls"] } } },
+      "then": { "required": ["framing"], "properties": { "framing": { "const": "octet-counting" } } },
+      "else": { "not": { "required": ["tls"] } }
+    },
+    {
+      "if": { "properties": { "transport": { "const": "unix" } } },
+      "then": { "required": ["framing"], "properties": { "framing": { "enum": ["datagram", "non-transparent"] } } }
+    },
+    {
+      "if": { "properties": { "transport": { "const": "file" } } },
+      "then": { "required": ["framing"], "properties": { "framing": { "const": "non-transparent" } } }
+    },
+    {
+      "if": { "properties": { "transport": { "enum": ["udp", "tcp", "tls", "dtls", "beep"] } } },
+      "then": {
+        "required": ["host"],
+        "properties": { "host": { "required": ["src-ip", "src-port"] } }
+      }
+    },
+    {
+      "if": { "properties": { "transport": { "enum": ["unix", "file"] } } },
+      "then": {
+        "properties": {
+          "host": {
+            "not": {
+              "anyOf": [
+                { "required": ["src-ip"] },
+                { "required": ["src-port"] },
+                { "required": ["dst-ip"] },
+                { "required": ["dst-port"] }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "format": { "const": "rfc5424" } } },
+      "then": { "required": ["version"] },
+      "else": {
+        "not": {
+          "anyOf": [
+            { "required": ["version"] },
+            { "required": ["msgid"] },
+            { "required": ["structured-data"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "properties": { "format": { "const": "malformed" } } },
+      "then": {
+        "required": ["raw", "parse"],
+        "properties": {
+          "parse": { "required": ["error"] },
+          "host": { "not": { "required": ["hostname"] } }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["timestamp"] },
+            { "required": ["appname"] },
+            { "required": ["procid"] }
+          ]
+        }
+      },
+      "else": {
+        "properties": { "parse": { "not": { "required": ["error"] } } }
+      }
+    },
+    {
+      "if": { "required": ["raw-encoding"] },
+      "then": { "required": ["raw"] }
+    },
+    {
+      "if": {
+        "required": ["raw-encoding"],
+        "properties": { "raw-encoding": { "const": "base64" } }
+      },
+      "then": {
+        "properties": { "raw": { "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$" } }
+      }
+    },
+    {
+      "if": {
+        "required": ["parse"],
+        "properties": {
+          "parse": {
+            "required": ["warnings"],
+            "properties": {
+              "warnings": { "contains": { "enum": ["encoding-invalid", "encoding-legacy"] } }
+            }
+          }
+        }
+      },
+      "then": { "required": ["raw"] }
+    }
+  ],
+
+  "$defs": {
+    "sdName": {
+      "description": "SD-NAME (RFC 5424 §6.3): 1 a 32 caracteres US-ASCII imprimíveis, exceto '=', ']', '\"' e espaço.",
+      "type": "string",
+      "pattern": "^[!#-<>-\\\\^-~]{1,32}$"
+    },
+    "facility": {
+      "description": "Facility (PRI / 8) com o rótulo normativo da RFC 5427 (SyslogFacility).",
+      "type": "object",
+      "required": ["code", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "integer", "minimum": 0, "maximum": 23 },
+        "name": { "type": "string" }
+      },
+      "oneOf": [
+        { "properties": { "code": { "const": 0 }, "name": { "const": "kern" } } },
+        { "properties": { "code": { "const": 1 }, "name": { "const": "user" } } },
+        { "properties": { "code": { "const": 2 }, "name": { "const": "mail" } } },
+        { "properties": { "code": { "const": 3 }, "name": { "const": "daemon" } } },
+        { "properties": { "code": { "const": 4 }, "name": { "const": "auth" } } },
+        { "properties": { "code": { "const": 5 }, "name": { "const": "syslog" } } },
+        { "properties": { "code": { "const": 6 }, "name": { "const": "lpr" } } },
+        { "properties": { "code": { "const": 7 }, "name": { "const": "news" } } },
+        { "properties": { "code": { "const": 8 }, "name": { "const": "uucp" } } },
+        { "properties": { "code": { "const": 9 }, "name": { "const": "cron" } } },
+        { "properties": { "code": { "const": 10 }, "name": { "const": "authpriv" } } },
+        { "properties": { "code": { "const": 11 }, "name": { "const": "ftp" } } },
+        { "properties": { "code": { "const": 12 }, "name": { "const": "ntp" } } },
+        { "properties": { "code": { "const": 13 }, "name": { "const": "audit" } } },
+        { "properties": { "code": { "const": 14 }, "name": { "const": "console" } } },
+        { "properties": { "code": { "const": 15 }, "name": { "const": "cron2" } } },
+        { "properties": { "code": { "const": 16 }, "name": { "const": "local0" } } },
+        { "properties": { "code": { "const": 17 }, "name": { "const": "local1" } } },
+        { "properties": { "code": { "const": 18 }, "name": { "const": "local2" } } },
+        { "properties": { "code": { "const": 19 }, "name": { "const": "local3" } } },
+        { "properties": { "code": { "const": 20 }, "name": { "const": "local4" } } },
+        { "properties": { "code": { "const": 21 }, "name": { "const": "local5" } } },
+        { "properties": { "code": { "const": 22 }, "name": { "const": "local6" } } },
+        { "properties": { "code": { "const": 23 }, "name": { "const": "local7" } } }
+      ]
+    },
+    "severity": {
+      "description": "Severity (PRI % 8) com o rótulo normativo da RFC 5427 (SyslogSeverity). O level do envelope é igual a severity.code.",
+      "type": "object",
+      "required": ["code", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "integer", "minimum": 0, "maximum": 7 },
+        "name": { "type": "string" }
+      },
+      "oneOf": [
+        { "properties": { "code": { "const": 0 }, "name": { "const": "emerg" } } },
+        { "properties": { "code": { "const": 1 }, "name": { "const": "alert" } } },
+        { "properties": { "code": { "const": 2 }, "name": { "const": "crit" } } },
+        { "properties": { "code": { "const": 3 }, "name": { "const": "err" } } },
+        { "properties": { "code": { "const": 4 }, "name": { "const": "warning" } } },
+        { "properties": { "code": { "const": 5 }, "name": { "const": "notice" } } },
+        { "properties": { "code": { "const": 6 }, "name": { "const": "info" } } },
+        { "properties": { "code": { "const": 7 }, "name": { "const": "debug" } } }
+      ]
+    },
+    "warningCode": {
+      "description": "Códigos de desvio detectados na conversão. Ver references/algoritmo-de-conversao.md.",
+      "enum": [
+        "pri-missing",
+        "pri-invalid",
+        "version-unsupported",
+        "header-invalid",
+        "timestamp-missing",
+        "timestamp-invalid",
+        "timestamp-year-inferred",
+        "timestamp-zone-inferred",
+        "hostname-missing",
+        "sd-invalid",
+        "sd-duplicate-id",
+        "encoding-invalid",
+        "encoding-legacy",
+        "truncated"
+      ]
+    }
+  },
+
+  "examples": [
+    {
+      "host": {
+        "hostname": "srv101.intranet.br",
+        "src-ip": "10.0.0.3",
+        "src-port": 59922,
+        "dst-ip": "10.0.0.10",
+        "dst-port": 514
+      },
+      "transport": "udp",
+      "framing": "datagram",
+      "format": "rfc5424",
+      "version": 1,
+      "priority": 86,
+      "facility": { "code": 10, "name": "authpriv" },
+      "severity": { "code": 6, "name": "info" },
+      "timestamp": "2024-03-15T14:22:05.123Z",
+      "appname": "sshd",
+      "procid": "12345",
+      "msgid": "ID47",
+      "message": "Accepted publickey for alice from 10.0.0.2 port 54321 ssh2",
+      "size": 126,
+      "raw": "<86>1 2024-03-15T14:22:05.123Z srv101.intranet.br sshd 12345 ID47 - Accepted publickey for alice from 10.0.0.2 port 54321 ssh2"
+    }
+  ]
+}
