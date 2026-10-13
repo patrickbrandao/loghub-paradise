@@ -60,7 +60,11 @@ type Redis struct {
 	// bounded by construction.
 	streams atomic.Pointer[[2]string]
 
-	closed atomic.Bool
+	// validated is set once the eviction policy has been checked
+	// (checkEviction): once per process, at the first check that reaches the
+	// server, which is the boot's.
+	validated atomic.Bool
+	closed    atomic.Bool
 }
 
 // NewRedis prepares the client without dialling: the connection is opened by
@@ -233,6 +237,38 @@ func (r *Redis) Health(ctx context.Context) error {
 			return classifyRedis(ops[i], err, "")
 		}
 	}
+	if !r.validated.Load() {
+		if err := r.checkEviction(ctx, client); err != nil {
+			return err
+		}
+		r.validated.Store(true)
+	}
+	return nil
+}
+
+// checkEviction refuses a server whose maxmemory-policy is allkeys-* (SPEC
+// §10.3), once, at the first check that reaches it. Under such a policy a full
+// Redis never answers the OOM that is fatal here: it evicts keys, and each
+// stream is one key, so every event already confirmed to its emitter goes at
+// once while this sink stays UP. The write probe above cannot see it: under
+// allkeys-* an XADD at maxmemory succeeds, by evicting.
+//
+// It runs after the probe, so a Redis that is not up yet stays a network
+// failure retried by WaitReady, and only a server that answers is judged. An
+// unreadable policy (an ACL without INFO and CONFIG) is a WARN with the
+// premise, and the boot goes on.
+func (r *Redis) checkEviction(ctx context.Context, client rueidis.Client) error {
+	policy, err := rediscli.CheckEviction(ctx, client)
+	switch {
+	case errors.Is(err, rediscli.ErrPolicyUnknown):
+		r.log.Warn("sink redis: cannot read maxmemory-policy; it must be noeviction (or volatile-*: the "+
+			"streams never have a TTL), or a full Redis evicts whole streams of delivered events",
+			"error", err)
+		return nil
+	case err != nil:
+		return classifyRedis("maxmemory-policy", err, "")
+	}
+	r.log.Debug("sink redis: maxmemory-policy checked", "policy", policy)
 	return nil
 }
 

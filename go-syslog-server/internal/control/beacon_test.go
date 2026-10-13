@@ -277,9 +277,11 @@ func TestBeaconKickBeforeStartIsNotLost(t *testing.T) {
 func TestBeaconPeriodic(t *testing.T) {
 	pub := &fakePub{}
 	cfg := testConfig()
-	cfg.Interval = 10 * time.Millisecond
 	cfg.Namespace = "custom.ctl"
 	b := New(pub, cfg, discard(), metrics())
+	// Below MinInterval, which New would floor: set after it, so the test
+	// sees several beacons in milliseconds.
+	b.cfg.Interval = 10 * time.Millisecond
 	b.Start(t.Context())
 	waitFor(t, 2*time.Second, func() bool { return pub.count() >= 3 })
 	b.Stop()
@@ -330,4 +332,34 @@ func TestBeaconStartStopIdempotent(t *testing.T) {
 	b.Start(t.Context())
 	b.Stop()
 	b.Stop()
+}
+
+// SPEC §22 pendência 21: an interval of 1ns or 15ms (for 15s) turned the beacon
+// into a loop that flooded <ctl_namespace>.beacon and competed for the data
+// plane's connection. The configuration refuses it; the beacon floors it on
+// its own too, so with no kick not one beacon goes out in a tenth of a second.
+// Zero, MinInterval itself and the default are the controls.
+func TestBeaconTinyIntervalIsFloored(t *testing.T) {
+	for _, iv := range []time.Duration{time.Nanosecond, 15 * time.Millisecond} {
+		pub := &fakePub{}
+		cfg := testConfig()
+		cfg.Interval = iv
+		b := New(pub, cfg, discard(), metrics())
+		if b.cfg.Interval != MinInterval {
+			t.Errorf("interval %s kept as %s, want the floor %s", iv, b.cfg.Interval, MinInterval)
+		}
+		b.Start(t.Context())
+		time.Sleep(100 * time.Millisecond)
+		b.Stop()
+		if n := pub.count(); n > 0 {
+			t.Errorf("interval %s: %d beacons in 100ms, want none before the floor elapses", iv, n)
+		}
+	}
+	for _, iv := range []time.Duration{0, MinInterval, 15 * time.Second} {
+		cfg := testConfig()
+		cfg.Interval = iv
+		if b := New(&fakePub{}, cfg, discard(), metrics()); b.cfg.Interval != iv {
+			t.Errorf("interval %s changed to %s", iv, b.cfg.Interval)
+		}
+	}
 }

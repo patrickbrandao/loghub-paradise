@@ -152,7 +152,9 @@ func (h *Health) Run(ctx context.Context) {
 }
 
 func (h *Health) check(ctx context.Context) {
-	cctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+	// The check carries ctx as its lifetime: a boot validation that outlives
+	// sink.health_timeout (validationContext) watches it for cancellation.
+	cctx, cancel := context.WithTimeout(withLifetime(ctx), h.cfg.Timeout)
 	start := time.Now()
 	err := h.sink.Health(cctx)
 	elapsed := time.Since(start)
@@ -261,7 +263,9 @@ func (h *Health) WaitReady(ctx context.Context, timeout, backoffMin, backoffMax 
 	var lastErr error
 
 	for attempt := 1; ; attempt++ {
-		cctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+		// The boot's context is the lifetime of this check: a validation
+		// running past the check's deadline still sees a SIGTERM (SPEC §10.5).
+		cctx, cancel := context.WithTimeout(withLifetime(ctx), h.cfg.Timeout)
 		err := h.sink.Health(cctx)
 		cancel()
 
@@ -301,4 +305,25 @@ func (h *Health) WaitReady(ctx context.Context, timeout, backoffMin, backoffMax 
 			backoff = backoffMax
 		}
 	}
+}
+
+// lifetimeKey carries, inside a health check's context, the context the check
+// was derived from: the boot's, or the process's. A sink whose boot
+// validation has to outlive the check's own deadline watches this one for
+// cancellation instead (validationContext), because once the check's deadline
+// has passed, the check context can no longer report that the boot was
+// cancelled. PostgreSQL, MySQL and ClickHouse use it.
+//
+// go-relplog-server keeps this pair in postgres.go, next to
+// validationContext; here it lives with its two callers, Health.check and
+// Health.WaitReady, so the health checks carry their lifetime whether or not
+// a sink reads it.
+type lifetimeKey struct{}
+
+// withLifetime records ctx as the lifetime of the checks derived from it:
+// Health.WaitReady and Health.check wrap their context in it before adding
+// sink.health_timeout. Without it, validationContext falls back to watching
+// the check context itself (see there for what that misses).
+func withLifetime(ctx context.Context) context.Context {
+	return context.WithValue(ctx, lifetimeKey{}, ctx)
 }

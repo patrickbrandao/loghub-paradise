@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,26 @@ const (
 	// larger batch here is what lets the operator see the ceiling instead of
 	// discovering it (SPEC §10.6).
 	mysqlMaxBatch = 65535 / mysqlColumns
+)
+
+// Ceilings of SPEC §13.2 for the keys that size memory or a count handed to a
+// library (independent review of go-relplog-pg-server and
+// go-relplog-nats-server, 2026-10-13, ported). Without them a typo of a few
+// digits panicked the boot (ring.capacity_items and ring.sqlite.commit_batch:
+// makechan), allocated a gigabyte per Dequeue (sink.batch), wrapped around in
+// the pool's int32 (sink.postgres.pool_size 4294967300 became 4) or built a
+// chunk whose Bind passes libpq's 1 GiB message limit and fails with no
+// SQLSTATE -- a network error retried forever (sink.batch_max_bytes). The
+// MySQL and ClickHouse pools take the PostgreSQL ceiling: a pool of thousands
+// of connections per instance is a typo, never a budget.
+const (
+	maxRingItems     = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxCommitBatch   = 65536
+	maxSinkBatch     = 65536
+	maxBatchMaxBytes = 256 << 20
+	maxSinkWorkers   = 1024
+	maxPoolSize      = 4096
+	maxListeners     = 256
 )
 
 // pgIdent is what sink.postgres.table must look like: a plain lowercase
@@ -191,8 +212,8 @@ func validateListeners(c *Config) error {
 		{"listen.tcp_listeners", c.Listen.TCPListeners},
 		{"listen.tls_listeners", c.Listen.TLSListeners},
 	} {
-		if n.v < 1 {
-			return fmt.Errorf("%s: %d is below 1", n.name, n.v)
+		if n.v < 1 || n.v > maxListeners {
+			return fmt.Errorf("%s: %d is outside 1..%d", n.name, n.v, maxListeners)
 		}
 	}
 	if c.Listen.Unix != "" && !filepath.IsAbs(c.Listen.Unix) {
@@ -308,8 +329,8 @@ func validateFilter(c *Config) error {
 }
 
 func validateRanges(c *Config) error {
-	if c.Ring.CapacityItems < 1 {
-		return fmt.Errorf("ring.capacity_items: %d is below 1", c.Ring.CapacityItems)
+	if c.Ring.CapacityItems < 1 || c.Ring.CapacityItems > maxRingItems {
+		return fmt.Errorf("ring.capacity_items: %d is outside 1..%d", c.Ring.CapacityItems, maxRingItems)
 	}
 	if c.Ring.MaxBytes < 1 {
 		return fmt.Errorf("ring.max_bytes: must be positive")
@@ -320,20 +341,21 @@ func validateRanges(c *Config) error {
 	if c.Ring.MaxInflight < 1 {
 		return fmt.Errorf("ring.max_inflight: %d is below 1", c.Ring.MaxInflight)
 	}
-	if c.Sink.Workers < 1 {
-		return fmt.Errorf("sink.workers: %d is below 1", c.Sink.Workers)
+	if c.Sink.Workers < 1 || c.Sink.Workers > maxSinkWorkers {
+		return fmt.Errorf("sink.workers: %d is outside 1..%d", c.Sink.Workers, maxSinkWorkers)
 	}
-	if c.Sink.Batch < 1 {
-		return fmt.Errorf("sink.batch: %d is below 1", c.Sink.Batch)
+	if c.Sink.Batch < 1 || c.Sink.Batch > maxSinkBatch {
+		return fmt.Errorf("sink.batch: %d is outside 1..%d", c.Sink.Batch, maxSinkBatch)
 	}
-	if c.Sink.BatchMaxBytes < 1 {
-		return fmt.Errorf("sink.batch_max_bytes: must be positive")
+	if c.Sink.BatchMaxBytes < 1 || c.Sink.BatchMaxBytes > maxBatchMaxBytes {
+		return fmt.Errorf("sink.batch_max_bytes: %s is outside 1..256MiB (a chunk is one write, "+
+			"and libpq refuses a message above 1GiB with no SQLSTATE)", FormatBytes(c.Sink.BatchMaxBytes))
 	}
 	if c.Sink.MaxRetries < 1 {
 		return fmt.Errorf("sink.max_retries: %d is below 1", c.Sink.MaxRetries)
 	}
-	if c.RingSQL.CommitBatch < 1 {
-		return fmt.Errorf("ring.sqlite.commit_batch: %d is below 1", c.RingSQL.CommitBatch)
+	if c.RingSQL.CommitBatch < 1 || c.RingSQL.CommitBatch > maxCommitBatch {
+		return fmt.Errorf("ring.sqlite.commit_batch: %d is outside 1..%d", c.RingSQL.CommitBatch, maxCommitBatch)
 	}
 	if c.Sink.RetryBackoffMax < c.Sink.RetryBackoffMin {
 		return fmt.Errorf("sink.retry_backoff_max (%s) is below sink.retry_backoff_min (%s)",
@@ -373,6 +395,15 @@ func validateRanges(c *Config) error {
 	}
 	if c.Log.AccessSample < 0 || c.Log.AccessSample > 1 {
 		return fmt.Errorf("log.access_sample: %g is outside [0, 1]", c.Log.AccessSample)
+	}
+	// "15ms" typed for "15s", or a bare 1ns, is a loop that floods
+	// <ctl_namespace>.beacon and competes with the data for the one NATS
+	// connection, not a heartbeat. Zero keeps its meaning: no periodic beacon
+	// (SPEC §11; pendência 21 de 2026-10-11). Checked whatever the sink, so a
+	// configuration that is refused with sink=nats is not accepted with
+	// another one.
+	if b := c.LogHub.BeaconInterval; b != 0 && b < time.Second {
+		return fmt.Errorf("loghub.beacon_interval: %s is below 1s; 0 disables the periodic beacon", b)
 	}
 	return nil
 }
@@ -516,11 +547,17 @@ func validateSQL(c *Config) error {
 		}
 	}
 	if c.Sink.Type == SinkTypePostgres {
+		if err := validatePostgresAddr(d.Addr); err != nil {
+			return err
+		}
 		if !pgIdent.MatchString(d.Table) {
 			return fmt.Errorf("sink.postgres.table: %q must be a lowercase identifier, "+
 				"optionally schema-qualified", d.Table)
 		}
 		return nil
+	}
+	if err := validateDBName("sink.mysql.database", d.Database); err != nil {
+		return err
 	}
 	if !mysqlIdent.MatchString(d.Table) {
 		return fmt.Errorf("sink.mysql.table: %q is not a plain identifier "+
@@ -534,6 +571,87 @@ func validateSQL(c *Config) error {
 			"(65535 placeholders, %d per row)", c.Sink.Batch, mysqlMaxBatch, mysqlColumns)
 	}
 	return nil
+}
+
+// maxDBName is the longest database name MySQL accepts (64 characters), and
+// the ceiling used for ClickHouse too.
+const maxDBName = 64
+
+// validateDBName holds sink.mysql.database and sink.clickhouse.database to
+// what can go between backticks (pendência 12 de 2026-10-11). Both sinks put
+// the name raw inside `...` in the INSERT and in the table probe, which exists
+// precisely so nothing typed in the configuration can change a statement: a
+// backtick ends the quoting (and in MySQL the 1064 that follows was classed
+// network, so the probe waited sink.boot_timeout), a backslash is an escape to
+// ClickHouse inside a quoted identifier, and control bytes are no name either
+// server would show back. Longer than 64 bytes MySQL refuses it anyway, after
+// the wait (SPEC §10.6, §10.10.5, §13.2). The sinks' constructors check the
+// same rule (checkQuotedName) for a caller that bypasses this.
+func validateDBName(key, v string) error {
+	if len(v) > maxDBName {
+		return fmt.Errorf("%s: %d bytes is above %d", key, len(v), maxDBName)
+	}
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; {
+		case c == '`' || c == '\\':
+			return fmt.Errorf("%s: %q holds a backtick or a backslash, which would break the "+
+				"quoting of the name in every statement", key, v)
+		case c < 0x20 || c == 0x7f:
+			return fmt.Errorf("%s: %q holds a control byte", key, v)
+		}
+	}
+	return nil
+}
+
+// validatePostgresAddr accepts one server, by host:port or by socket
+// directory (with an optional :port, which names the socket file:
+// /run/pg:5433 is /run/pg/.s.PGSQL.5433, what LOGHUB_EB_URL fills from
+// postgres://u@:5433/db?host=/run/pg). Anything else -- "h1,h2:5432", an
+// empty host, port 0, a tab, "[h:5432]:5433" -- passed here and then failed in
+// the DNS or the dial, retried as a network error for the whole
+// sink.boot_timeout (SPEC §10.5, §13.2; pendência 22 de 2026-10-11, and the
+// independent review of go-relplog-pg-server, 2026-10-13).
+func validatePostgresAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	switch {
+	case strings.HasPrefix(addr, "/"):
+		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
+		// which pgx then tries as a list: refused like "h1,h2" below.
+		if strings.ContainsAny(addr, ",\t ") {
+			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
+				"with no comma or blank", addr)
+		}
+		if err != nil {
+			return nil // a bare socket directory: port 5432
+		}
+		if !validPort(port) {
+			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
+				"must be 1..65535", addr)
+		}
+	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
+		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
+			"1..65535) nor a unix socket directory starting with /", addr)
+	}
+	return nil
+}
+
+// oneHost reports whether host, the part before the port, names one server: a
+// name or an IP literal. A ':' is only an IPv6 literal's: "[h:5432]:5433"
+// (what postgres://u@h:5432:5433/db becomes) passed as host "h:5432", a DNS
+// name no resolver has, retried for the whole sink.boot_timeout.
+func oneHost(host string) bool {
+	if !strings.Contains(host, ":") {
+		return true
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
+}
+
+// validPort is a decimal port 1..65535 written the canonical way: "+80" and
+// "080" parse with Atoi and would be dialled as something other than written.
+func validPort(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == s
 }
 
 // chIdent is what sink.clickhouse.table must look like: an unquoted
@@ -563,6 +681,9 @@ func validateClickHouse(c *Config) error {
 			return fmt.Errorf("sink.clickhouse.%s: cannot be empty when sink.type=clickhouse", f.key)
 		}
 	}
+	if err := validateDBName("sink.clickhouse.database", ch.Database); err != nil {
+		return err
+	}
 	if !chIdent.MatchString(ch.Table) {
 		return fmt.Errorf("sink.clickhouse.table: %q is not a plain identifier "+
 			"(name or database.name; letters, digits and _, not starting with a digit; up to 64 characters each)", ch.Table)
@@ -582,6 +703,9 @@ func validateNATS(c *Config) error {
 	n := &c.SinkNATS
 	if len(n.URLs) == 0 {
 		return fmt.Errorf("sink.nats.urls: at least one URL is required when sink.type=nats")
+	}
+	if err := validateNATSURLs(n); err != nil {
+		return err
 	}
 	if n.Mode == NATSModeJetStream && !natsToken.MatchString(n.Stream) {
 		return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
@@ -724,14 +848,24 @@ func (v *validator) dbWorkers(sinkType string, poolSize *int) error {
 		v.warn("sink.type=%s with sink.workers=%d: above %d, a larger pool trades throughput "+
 			"for lock contention inside the database", sinkType, c.Sink.Workers, dbWarnWorkers)
 	}
+	if *poolSize < 0 || *poolSize > maxPoolSize {
+		return fmt.Errorf("sink.%s.pool_size: %d is outside 0..%d; 0 derives sink.workers + 1",
+			sinkType, *poolSize, maxPoolSize)
+	}
 	if *poolSize == 0 {
 		*poolSize = c.Sink.Workers + 1
 		v.notes["sink."+sinkType+".pool_size"] = "derived: sink.workers + 1"
 	}
-	if *poolSize < c.Sink.Workers {
-		return fmt.Errorf("sink.%s.pool_size=%d is below sink.workers=%d: a worker would "+
-			"block waiting for a connection another worker holds",
-			sinkType, *poolSize, c.Sink.Workers)
+	// workers + 1, not workers: the health probe takes its connection out of
+	// the same pool (pgxpool, database/sql and clickhouse-go alike). With
+	// pool_size = workers, slow but working writes held every connection,
+	// the probe timed out waiting for one, the sink went DOWN and, past
+	// fail_timeout, FATAL: exit 3 with nothing wrong with the database
+	// (independent review of go-relplog-pg-server, 2026-10-13).
+	if *poolSize < c.Sink.Workers+1 {
+		return fmt.Errorf("sink.%s.pool_size=%d is below sink.workers + 1 = %d: every worker "+
+			"holds a connection while it writes, and the health probe needs one more",
+			sinkType, *poolSize, c.Sink.Workers+1)
 	}
 	// With ring=none the receiver writes through, and the semaphore is the only
 	// accounting there is. Writers beyond the pool queue INSIDE the pool, which

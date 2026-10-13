@@ -41,12 +41,13 @@ func TestClassifyMySQLNumber(t *testing.T) {
 		// The destination is alive and refused THIS data.
 		{1048, ClassLogic}, {1062, ClassLogic}, {1153, ClassLogic}, {1264, ClassLogic},
 		{1366, ClassLogic}, {1406, ClassLogic}, {1690, ClassLogic},
+		{3819, ClassLogic}, // a CHECK: its SQLSTATE is HY000, so the fallback cannot see it
 
-		// Unknown is retried, not dropped.
+		// Unknown, with no SQLSTATE to fall back on, is retried, not dropped.
 		{0, ClassNetwork}, {1064, ClassNetwork}, {9999, ClassNetwork},
 	}
 	for _, tc := range cases {
-		if got := classifyMySQLNumber(tc.n); got != tc.want {
+		if got := classifyMySQLNumber(tc.n, ""); got != tc.want {
 			t.Errorf("error %d: class = %s, want %s", tc.n, got, tc.want)
 		}
 	}

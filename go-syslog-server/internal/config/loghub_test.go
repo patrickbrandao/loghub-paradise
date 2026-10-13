@@ -56,9 +56,10 @@ func TestEBURLMapping(t *testing.T) {
 		{"postgresql://loghub:pw@pg-1:6432/logs?sslmode=require", SinkTypePostgres, func(c *Config) bool {
 			return c.SinkPG.Addr == "pg-1:6432" && c.SinkPG.TLS
 		}},
-		{"postgres://pg-1/logs?sslmode=verify-full", SinkTypePostgres, func(c *Config) bool {
-			// No userinfo: the registry defaults stay, the password is empty.
-			return c.SinkPG.TLS && c.SinkPG.Username == "syslog" && c.SinkPG.Password == ""
+		{"postgres://app@pg-1/logs?sslmode=verify-full", SinkTypePostgres, func(c *Config) bool {
+			// A user without a password: the password is empty. A URL with
+			// no user at all is refused (TestEBURLMustNameItsParts).
+			return c.SinkPG.TLS && c.SinkPG.Username == "app" && c.SinkPG.Password == ""
 		}},
 		{"postgres://u:p@pg-1/logs?sslmode=disable", SinkTypePostgres, func(c *Config) bool {
 			return !c.SinkPG.TLS
@@ -149,7 +150,7 @@ func TestEBURLConflicts(t *testing.T) {
 			[]string{"sink.nats.tls"}},
 		{[]string{"--sink.nats.token=t"}, map[string]string{"LOGHUB_EB_URL": "nats://n:4222"},
 			[]string{"sink.nats.token"}},
-		{[]string{"--sink.postgres.database=other"}, map[string]string{"LOGHUB_EB_URL": "postgres://pg"},
+		{[]string{"--sink.postgres.database=other"}, map[string]string{"LOGHUB_EB_URL": "postgres://u@pg/db"},
 			[]string{"sink.postgres.database"}},
 		{[]string{"--sink.redis.db=3"}, map[string]string{"LOGHUB_EB_URL": "redis://r/3"},
 			[]string{"sink.redis.db"}},
@@ -214,9 +215,11 @@ func TestEBURLDump(t *testing.T) {
 	// Without a secret the dump reads back to the same configuration: the
 	// keys the URL decides are commented out -- filled ones and the ones it
 	// leaves at their default -- so the URL decides them again instead of
-	// conflicting with an explicit copy.
+	// conflicting with an explicit copy. A PostgreSQL URL is not among them:
+	// it always names a user (SPEC §10.9), and a bare user part is redacted
+	// whole, as it may be a token, so its dump carries the "cannot be used as
+	// a config file as-is" warning.
 	for _, u := range []string{
-		"postgres://pg-1/logs?sslmode=require",
 		"tls://n1:4222,tls://n2:4222",
 		"rediss://r:6380/1",
 	} {

@@ -16,6 +16,8 @@ const identitySection = "identity"
 // errors can point at the offending line.
 type iniEntry struct {
 	Name string // canonical dotted name
+	Sec  string // the [section] it was under
+	Key  string // what came before the '=', trimmed
 	Raw  string
 	Line int
 }
@@ -46,14 +48,24 @@ func parseINI(r io.Reader) ([]iniEntry, error) {
 
 	for sc.Scan() {
 		lineNo++
-		line := strings.TrimSpace(sc.Text())
+		text := sc.Text()
+		if lineNo == 1 {
+			// A UTF-8 byte-order mark, which some Windows editors write, is
+			// not part of the first line: kept, it made the line "expected
+			// 'key = value'" with nothing visible to say why (independent
+			// review, 2026-10-13).
+			text = strings.TrimPrefix(text, "\ufeff")
+		}
+		line := strings.TrimSpace(text)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 
 		if strings.HasPrefix(line, "[") {
 			if !strings.HasSuffix(line, "]") {
-				return nil, fmt.Errorf("line %d: malformed section header %q", lineNo, line)
+				// The line is not quoted: "[sink.nats hunter2" is a header
+				// someone typed a value into (SPEC §13.2).
+				return nil, fmt.Errorf("line %d: malformed section header (no closing ']')", lineNo)
 			}
 			section = strings.TrimSpace(line[1 : len(line)-1])
 			if section == "" {
@@ -73,17 +85,26 @@ func parseINI(r io.Reader) ([]iniEntry, error) {
 
 		eq := strings.Index(line, "=")
 		if eq < 0 {
-			return nil, fmt.Errorf("line %d: expected 'key = value', got %q", lineNo, line)
+			// The line is not quoted: "password: hunter2" is exactly the
+			// kind of line that lands here, and the error goes to stderr
+			// (SPEC §13.2).
+			return nil, fmt.Errorf("line %d: expected 'key = value'", lineNo)
 		}
 		key := strings.TrimSpace(line[:eq])
 		if key == "" {
 			return nil, fmt.Errorf("line %d: empty key", lineNo)
 		}
 		if section == "" {
+			// Named only when it looks like a key, for the reason of lookup.
+			if !iniKeyRE.MatchString(key) {
+				return nil, fmt.Errorf("line %d: a key appears before any [section]", lineNo)
+			}
 			return nil, fmt.Errorf("line %d: key %q appears before any [section]", lineNo, key)
 		}
 		out = append(out, iniEntry{
 			Name: section + "." + key,
+			Sec:  section,
+			Key:  key,
 			Raw:  unquote(strings.TrimSpace(line[eq+1:])),
 			Line: lineNo,
 		})

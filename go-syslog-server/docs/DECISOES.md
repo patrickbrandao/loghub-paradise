@@ -179,6 +179,13 @@ de parse congelada.
   fazem DDL.
 - O boot calcula o pior JLH e recusa com exit 3, como a standard, quando ele não
   cabe no `max_payload` do NATS ou no `max_allowed_packet` do MySQL.
+- **Stream com `retention: interest` é recusado** (FATAL, exit 3; SPEC §10.7),
+  decisão portada do R (decisão 16 do `go-relplog-server`, 2026-10-13) para a
+  pendência 17 de 2026-10-11, que era "a decidir pelo usuário": sem consumidor
+  interessado o NATS responde ao publish com um `PubAck` normal e não guarda
+  nada, então um pedaço confirmado (e, com `ring=none`, liberado) se perderia sem
+  erro nem contador. `limits` e `workqueue` são aceitos; `max_msgs_per_subject >
+  0` só gera `WARN`, uma vez por valor. Contestável: a alternativa era só avisar.
 
 ### Configuração e operação
 
@@ -201,6 +208,13 @@ de parse congelada.
 - Docker: os 18 compose de ring × sink da standard, mais dois com `ring=redis`
   (nats e postgres); `AGENT_NAME=go-syslog-server`, `DATADIR=/data`,
   `hostname:` em cada serviço, um volume por instância.
+- **`LOGHUB_EB_URL` PostgreSQL exige usuário e banco** (decisão portada do RP,
+  2026-10-13, contestável; SPEC §10.9). O defeito é o mesmo aqui: sem eles este
+  servidor caía no padrão do registry (`syslog`/`syslog`) enquanto a libpq de
+  qualquer outro leitor da mesma URL usaria o usuário do sistema operacional e
+  um banco de mesmo nome, e a URL é dona das duas chaves. Explícito em vez de
+  adivinhado. Custo: o dump de uma URL PostgreSQL redige o usuário (um usuário
+  sem senha pode ser um token) e não é relido como está.
 
 ### Testes
 
@@ -214,6 +228,26 @@ de parse congelada.
   `SYSLOG_TEST_PG_DSN`, `SYSLOG_TEST_MYSQL_DSN`, `SYSLOG_TEST_NATS_URL`) e
   emissores vivos (`SYSLOG_TEST_EMITTERS=1`), agora com um cenário TLS do
   rsyslog. `-race` sempre.
+
+### Decisões portadas do `go-relplog-server` (2026-10-13)
+
+Pendências "a decidir pelo usuário" da SPEC §22.1 de 2026-10-11, decididas no R
+(decisão 16 dele) e trazidas para cá como estão. Contestáveis: o usuário não as
+decidiu para o S.
+
+- **Pendência 2, teto por IP:** `max_conns_per_ip` conta o endereço **exato**
+  (um /128 no IPv6), documentado em SPEC §4.4. Contar por prefixo IPv6 foi
+  recusado: um /64 pode ser uma LAN inteira de emissores, e uma cota por prefixo
+  deixaria um deles calar os outros. Teste: `TestPerIPLimitCountsTheExactAddress`.
+- **Pendência 4, offset ISO fora de faixa na RFC 3164:** segue a skill (aplicado
+  como veio, sem aviso), registrado em SPEC §6.5.1, **sem desvio novo**: um
+  desvio de conversão quebraria a igualdade com o R, que publica o mesmo `type`.
+  Teste: `TestRFC3164ISOOffsetIsNotRangeChecked`.
+- **Pendência 26, reingestão com `sink=none`:** os dumps
+  **ficam** no disco, nomeados num `WARN` e contados nos gauges, à espera de um
+  boot com destino; descartá-los destruiria mensagens que uma vida com destino
+  real aceitou (SPEC §12.2). A alternativa — reingerir no descarte e remover —
+  continua possível se o usuário preferir.
 
 ---
 

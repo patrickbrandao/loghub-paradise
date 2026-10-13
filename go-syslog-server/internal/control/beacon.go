@@ -35,6 +35,14 @@ type Publisher interface {
 // DefaultNamespace is loghub.ctl_namespace's default (env LOGHUB_CTL_NAMESPACE).
 const DefaultNamespace = "loghub._ctl"
 
+// MinInterval is the shortest periodic beacon this package emits. The
+// configuration refuses a shorter loghub.beacon_interval (zero aside, SPEC
+// §11); the beacon holds the same line on its own, so no path into it -- a
+// caller that skipped the validation, a test -- turns 1ns or 15ms (for 15s)
+// into a loop that floods <ctl_namespace>.beacon and competes for the one
+// connection the data plane writes on.
+const MinInterval = time.Second
+
 // Config is the [loghub] beacon settings plus what the payload reports.
 type Config struct {
 	Identity ident.Identity
@@ -93,6 +101,11 @@ func New(pub Publisher, cfg Config, log *slog.Logger, m *obs.Metrics) *Beacon {
 	}
 	if cfg.Interval < 0 {
 		cfg.Interval = 0
+	}
+	if cfg.Interval > 0 && cfg.Interval < MinInterval {
+		log.Warn("loghub.beacon_interval below the minimum; the beacon uses the minimum",
+			"beacon_interval", cfg.Interval.String(), "minimum", MinInterval.String())
+		cfg.Interval = MinInterval
 	}
 	pid := uint64(os.Getpid())
 	if pid > jlh.MaxSID {

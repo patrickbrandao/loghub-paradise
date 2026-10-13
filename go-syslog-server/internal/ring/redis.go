@@ -323,6 +323,17 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 			"so its keys share a slot, e.g. {%s}", ErrFatal, cfg.Stream)
 	}
 
+	// The eviction policy, before anything is created (SPEC §9.5). Under an
+	// allkeys-* policy a full Redis does not answer OOM, the fatal reply this
+	// ring relies on to stop accepting: it evicts, and the stream is ONE key,
+	// so every entry waiting in it goes at once, the byte counter with it or
+	// apart from it, with the ring reporting itself available. Refused here,
+	// with exit 3, as a misconfiguration waiting cannot fix.
+	if err := checkEviction(ctx, client, cfg.OpTimeout, log); err != nil {
+		client.Close()
+		return nil, bootErr("maxmemory-policy check", err)
+	}
+
 	r := &RedisRing{
 		cfg:          cfg,
 		log:          log,
@@ -365,6 +376,27 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 	go r.claimLoop()
 	go r.statsLoop()
 	return r, nil
+}
+
+// checkEviction runs rediscli.CheckEviction under OpTimeout. An unreadable
+// policy (an ACL without INFO and CONFIG, a proxy) is a WARN with the premise
+// spelled out, not a refusal: least-privilege ACLs are what a hardened
+// deployment has, and the premise is then the operator's to keep. Any other
+// error goes back to bootErr: fatal for allkeys-*, retried for the rest.
+func checkEviction(ctx context.Context, client rueidis.Client, timeout time.Duration, log *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	policy, err := rediscli.CheckEviction(ctx, client)
+	if errors.Is(err, rediscli.ErrPolicyUnknown) {
+		log.Warn("ring redis: cannot read maxmemory-policy; it must be noeviction (or volatile-*: the "+
+			"ring's keys never have a TTL), or a full Redis evicts the whole stream with the ring UP",
+			"error", err)
+		return nil
+	}
+	if err == nil {
+		log.Debug("ring redis: maxmemory-policy checked", "policy", policy)
+	}
+	return err
 }
 
 // ceiling maps "no ceiling" onto a number the enqueue script can compare.

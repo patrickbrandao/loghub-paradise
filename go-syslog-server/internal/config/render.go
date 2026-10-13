@@ -168,6 +168,16 @@ func (l *Loaded) DumpINI(w io.Writer, info ...InfoSection) error {
 			}
 			if note := l.Notes[name]; note != "" {
 				fmt.Fprintf(bw, "# %s\n", note)
+				if l.Source[name] == FromDefault && strings.HasPrefix(note, "derived") {
+					// A derived value written as a key would be explicit when
+					// the dump is read back: sink.postgres.pool_size would
+					// stop following sink.workers, emergency.dir and the
+					// sqlite paths stop following data_dir. Commented, it is
+					// derived again (independent review of
+					// go-relplog-pg-server, 2026-10-13).
+					fmt.Fprintf(bw, "# %-28s = %s\n", p.Key, quoteINI(redact(p, formatValue(p))))
+					continue
+				}
 			}
 			fmt.Fprintf(bw, "%-30s = %s\n", p.Key, quoteINI(redact(p, formatValue(p))))
 		}

@@ -27,7 +27,7 @@
 //	tcp, err := receiver.NewTCP(ctx, receiver.TCPConfig{...}, in, metrics, log)
 //	tls, err := receiver.NewTLS(ctx, receiver.TLSConfig{...}, in, metrics, log)
 //	... X.Start(recvCtx) on each; at shutdown cancel recvCtx, then X.Close()
-//	in reverse boot order (SPEC §13.4).
+//	on every transport at once, in parallel (SPEC §13.4).
 package receiver
 
 import (

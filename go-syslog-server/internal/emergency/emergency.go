@@ -52,6 +52,11 @@ const (
 	fileSuffix = ".bin"
 	corruptExt = ".corrupt"
 
+	// tmpSuffix, with a leading dot on the name, marks a dump still being
+	// written: .emg-<agent>-<unixnano>.bin.tmp, which List never returns
+	// (SPEC §12.1).
+	tmpSuffix = ".tmp"
+
 	// maxLenField is a sanity ceiling on one declared length. The real check
 	// is against what is left of the file; this one only keeps the arithmetic
 	// far from overflow.
@@ -65,13 +70,28 @@ const (
 
 // Store reads and writes dumps in one directory.
 type Store struct {
-	dir   string
-	agent string
+	dir     string
+	agent   string
+	abandon func() bool
 }
 
 // NewStore builds a store for emergency.dir. agentUUID is the instance's
 // AgentUUID, which names the files it writes (SPEC §12.1).
 func NewStore(dir, agentUUID string) *Store { return &Store{dir: dir, agent: agentUUID} }
+
+// SetAbandon installs the check a Write in progress consults: true means the
+// process was aborted and counted the dump's messages lost, so the dump gives
+// up and removes its temporary file instead of publishing a file the next boot
+// would reingest (SPEC §13.4). Checked every 1024 records and before the
+// publish; a dump that publishes between the last check and the abort is both
+// counted and kept, an overcount, never a loss (ported from
+// go-relplog-nats-server, independent review of 2026-10-13).
+func (s *Store) SetAbandon(f func() bool) { s.abandon = f }
+
+func (s *Store) abandoned() bool { return s.abandon != nil && s.abandon() }
+
+// ErrAbandoned is Write giving up because the process was aborted.
+var ErrAbandoned = errors.New("emergency: dump abandoned: the process was aborted")
 
 // Dir reports the configured directory.
 func (s *Store) Dir() string { return s.dir }
@@ -98,13 +118,23 @@ func (s *Store) Prepare() error {
 
 // Write dumps items to a new file and returns its path.
 //
-// Durability here is the whole point, so the file is fsynced AND the directory
-// entry is fsynced. Without the second one, a crash right after this call can
-// leave a file whose name never made it to disk -- the data would be written
-// and unreachable.
+// Durability here is the whole point. The records go to a hidden temporary
+// name (.emg-…bin.tmp, which List never sees), the file is fsynced, linked to
+// its final name (renamed, on a file system without hard links: publish) and
+// the directory is fsynced. Written under the final name, a dump cut at a
+// record boundary -- a 1 MiB buffer flush ending exactly between two records,
+// then a SIGKILL, an OOM or an abort before the fsync -- would read back as a
+// clean file, be delivered in part and then REMOVED, the tail lost with no
+// count; and another instance sharing the directory could take a file still
+// being written. Without the directory fsync, a crash right after this call
+// can leave a name that never made it to disk -- the data written and
+// unreachable. Any failure removes what was written (SPEC §12.1, §12.3).
 func (s *Store) Write(items []*item.Item) (string, error) {
 	if len(items) == 0 {
 		return "", nil
+	}
+	if s.abandoned() {
+		return "", ErrAbandoned
 	}
 	if err := os.MkdirAll(s.dir, 0o750); err != nil {
 		return "", fmt.Errorf("emergency: cannot create %s: %w", s.dir, err)
@@ -112,18 +142,23 @@ func (s *Store) Write(items []*item.Item) (string, error) {
 
 	name := FileName(s.agent, time.Now())
 	path := filepath.Join(s.dir, name)
+	tmp := filepath.Join(s.dir, "."+name+tmpSuffix)
 
-	// O_EXCL: never append to or truncate an existing dump, which would be
+	// O_EXCL: never append to or truncate an existing file, which would be
 	// another instance's -- or an earlier incident's -- pending data.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
 	if err != nil {
-		return "", fmt.Errorf("emergency: cannot create %s: %w", path, err)
+		return "", fmt.Errorf("emergency: cannot create %s: %w", tmp, err)
 	}
 
 	w := bufio.NewWriterSize(f, 1<<20)
 	head := make([]byte, 0, 512)
 	hdr := make([]byte, 0, maxHeaderLine)
-	for _, it := range items {
+	for i, it := range items {
+		if i&1023 == 1023 && s.abandoned() {
+			f.Close()
+			return "", s.abort(tmp, ErrAbandoned)
+		}
 		if it == nil {
 			continue
 		}
@@ -134,33 +169,78 @@ func (s *Store) Write(items []*item.Item) (string, error) {
 		hdr = append(hdr, '\n')
 		if _, err := w.Write(hdr); err != nil {
 			f.Close()
-			return "", s.abort(path, err)
+			return "", s.abort(tmp, err)
 		}
 		if _, err := w.Write(head); err != nil {
 			f.Close()
-			return "", s.abort(path, err)
+			return "", s.abort(tmp, err)
 		}
 		if _, err := w.Write(it.Raw); err != nil {
 			f.Close()
-			return "", s.abort(path, err)
+			return "", s.abort(tmp, err)
 		}
 	}
 
 	if err := w.Flush(); err != nil {
 		f.Close()
-		return "", s.abort(path, err)
+		return "", s.abort(tmp, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		return "", s.abort(path, err)
+		return "", s.abort(tmp, err)
 	}
 	if err := f.Close(); err != nil {
-		return "", s.abort(path, err)
+		return "", s.abort(tmp, err)
+	}
+	if s.abandoned() {
+		return "", s.abort(tmp, ErrAbandoned)
+	}
+	if err := publish(tmp, path); err != nil {
+		return "", s.abort(tmp, err)
 	}
 	if err := syncDir(s.dir); err != nil {
-		return "", s.abort(path, err)
+		// The name is published but may not survive a power loss, and the
+		// process would leave believing the messages were saved: the dump
+		// failed (SPEC §12.3), and the file goes with it.
+		_ = os.Remove(path)
+		return "", s.abort(tmp, err)
 	}
 	return path, nil
+}
+
+// link is os.Link, replaceable by the tests: a file system without hard links
+// is not something a test can count on having.
+var link = os.Link
+
+// publish gives the complete temporary file its final name, never over an
+// existing dump: the stamp makes a collision unlikely, and Link refuses one
+// where Rename would silently replace it (SPEC §12.1).
+//
+// A file system without hard links -- vfat, exFAT, the object-store FUSE
+// mounts -- refuses Link whatever the names, and every dump would fail there,
+// the whole ring lost, where writing in place had worked. There the final
+// name is checked free and the file renamed: the nanosecond stamp in the name
+// is what keeps the window between the two harmless. A Link refused because
+// the name exists is no reason to try. Either way the directory fsync that
+// follows decides the dump, the renamed one included (ported from
+// go-syslog-nats-server, which keeps that fsync fatal as this server does).
+func publish(tmp, path string) error {
+	err := link(tmp, path)
+	if err == nil {
+		_ = os.Remove(tmp)
+		return nil
+	}
+	if errors.Is(err, os.ErrExist) {
+		return err
+	}
+	if _, serr := os.Lstat(path); !errors.Is(serr, os.ErrNotExist) {
+		return fmt.Errorf("%w (and %s exists)", err, filepath.Base(path))
+	}
+	if rerr := os.Rename(tmp, path); rerr != nil {
+		return fmt.Errorf("%w (and the rename that replaces it on a file system without "+
+			"hard links failed: %v)", err, rerr)
+	}
+	return nil
 }
 
 // FileName is emg-<agent_uuid>-<unixnano>.bin (SPEC §12.1).
@@ -174,10 +254,50 @@ func FileName(agentUUID string, t time.Time) string {
 
 // abort removes a partially written dump: a truncated file that nobody knows is
 // truncated is worse than no file, because reingestion would silently deliver
-// half a batch and delete the rest.
+// half a batch and delete the rest. path is the temporary name.
 func (s *Store) abort(path string, cause error) error {
 	_ = os.Remove(path)
 	return fmt.Errorf("emergency: writing %s: %w", path, cause)
+}
+
+// Leftovers deals with the temporary files a dump leaves when it is cut short
+// (SPEC §12.1); the boot calls it once, before List.
+//
+// A temporary that is the same file as the dump under its final name is a
+// twin -- the process died between the link and the removal of the temporary
+// -- and is removed: the dump itself is what reingestion reads. Any other is
+// an interrupted dump. It is returned, for the boot to report at WARN, and
+// never read or removed here: it may be complete (a SIGKILL after the last
+// write) or cut anywhere, its messages were counted as lost only if a second
+// signal aborted the dump, and only the operator can decide; renamed to its
+// final name, its intact records are reingested and the rest quarantined at
+// the next boot. Without this nothing told the operator it was there (the
+// review of go-webhook-nats-server).
+func (s *Store) Leftovers() (interrupted []string, err error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if !e.Type().IsRegular() || !strings.HasPrefix(n, "."+filePrefix) ||
+			!strings.HasSuffix(n, fileSuffix+tmpSuffix) {
+			continue
+		}
+		tmp := filepath.Join(s.dir, n)
+		final := filepath.Join(s.dir, strings.TrimSuffix(n[1:], tmpSuffix))
+		ti, terr := os.Lstat(tmp)
+		fi, ferr := os.Lstat(final)
+		if terr == nil && ferr == nil && os.SameFile(ti, fi) {
+			_ = os.Remove(tmp)
+			continue
+		}
+		interrupted = append(interrupted, tmp)
+	}
+	return interrupted, nil
 }
 
 // List returns the dump files in lexicographic order of name (SPEC §12.2):
@@ -411,12 +531,34 @@ func parseLen(b []byte) (int64, error) {
 
 // Remove deletes a fully reingested dump: only after every one of its items was
 // confirmed (SPEC §12.2).
-func (s *Store) Remove(path string) error { return os.Remove(path) }
+//
+// The directory is fsynced after the unlink. Without it a power loss right
+// after the reingestion can bring the name back, and the next boot delivers
+// the whole dump a second time under the same uuids -- deduplicated by (uuid,
+// step) where the destination can, a duplicate everywhere else (the
+// JetStream window long gone, core NATS, a Redis stream). An error wrapping
+// ErrNotDurable means the file WAS removed and only that durability is in
+// doubt; the caller logs it at WARN.
+func (s *Store) Remove(path string) error {
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
 
 // Quarantine renames a damaged file aside instead of deleting it. The intact
 // records have already been reingested; what remains is unrecoverable by this
 // program but may still be worth a human's attention, and deleting evidence of
 // a crash is not this program's call.
+//
+// A non-empty name means the file WAS quarantined, whatever the error says:
+// the rename happened, and the error, if any, is the directory fsync that
+// followed (errors.Is(err, ErrNotDurable)), which only means the new name may
+// not survive a power loss. The caller logs that at WARN and still reports
+// the quarantine -- the ERROR with the discarded byte counts -- under the new
+// name. Read as "not quarantined", it logged "cannot quarantine" with a path
+// that no longer existed and dropped the count of what was lost (SPEC §12.2).
+// An empty name means the file is still where it was.
 func (s *Store) Quarantine(path string) (string, error) {
 	dst := path + corruptExt
 	if err := os.Rename(path, dst); err != nil {
@@ -477,14 +619,25 @@ func countFile(path string) (int64, error) {
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return err
+		// Also not durable, not undone: Remove and Quarantine call this AFTER
+		// the unlink or the rename succeeded, and reporting "cannot remove"
+		// for a file that is gone would be false (go-relplog-nats-server,
+		// independent review, 2026-10-13). In Write it is still a failed dump.
+		return fmt.Errorf("%w: cannot open directory %s to fsync it: %w", ErrNotDurable, dir, err)
 	}
 	defer d.Close()
 	if err := dirSync(d); err != nil {
-		return fmt.Errorf("fsync of directory %s: %w", dir, err)
+		return fmt.Errorf("%w: fsync of directory %s: %w", ErrNotDurable, dir, err)
 	}
 	return nil
 }
+
+// ErrNotDurable marks the failure of a directory fsync after the operation on
+// the directory entry itself succeeded: the unlink of Remove or the rename of
+// Quarantine happened, and only its durability is in doubt. Write's error may wrap it too, but
+// there the fsync decides the dump: the file is removed and the dump has
+// failed (SPEC §12.3).
+var ErrNotDurable = errors.New("emergency: the directory entry may not be durable")
 
 // dirSync is (*os.File).Sync, behind a variable only so the tests can make a
 // directory fsync fail: no portable filesystem does that on demand.

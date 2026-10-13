@@ -520,3 +520,57 @@ func TestProxyCloseBreaksAHeaderWait(t *testing.T) {
 		t.Fatal("Close waited on a reader parked in the PROXY header")
 	}
 }
+
+// Pendência 3 of 2026-10-11 (SPEC §4.6): a header wait broken by the shutdown
+// is a deploy, not a balancer failure. Close expires the deadline of a reader
+// still waiting for its header; before the fix that counted
+// proxy_headers_total{absent} (or {invalid}, with half a header) and, in
+// required, messages_dropped{proxy}, with a WARN blaming the balancer. Nothing
+// is counted and nothing is logged now.
+func TestProxyShutdownIsNotAProxyFailure(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		mode    ProxyMode
+		partial string // what the peer sent before the shutdown
+	}{
+		{"required, no header", ProxyRequired, ""},
+		{"optional, no header", ProxyOptional, ""},
+		{"required, half a header", ProxyRequired, "PROXY TCP4 192.0.2.10 "},
+		{"optional, half a header", ProxyOptional, "PROXY TCP4 192.0.2.10 "},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, 10, "debug", nil)
+			var logs syncBuf
+			cidrs, _ := ParseCIDRList("127.0.0.1/32")
+			tr, err := NewTCP(context.Background(), TCPConfig{StreamConfig: StreamConfig{Addr: "127.0.0.1:0",
+				Proxy: ProxyConfig{Mode: c.mode, Trusted: cidrs, HeaderTimeout: time.Hour}}},
+				h.in, h.m, obs.NewLogger(&logs, "text", "warn"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			tr.Start(ctx)
+			conn := dial(t, tr.Addr())
+			if c.partial != "" {
+				fmt.Fprint(conn, c.partial)
+			}
+			waitFor(t, "the connection", func() bool { return h.m.ConnsActive[obs.TransportTCP].Load() == 1 })
+			// Let the reader consume what was sent and park in the header read.
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+			tr.Close()
+			if n := h.m.ProxyHeadersTotal[obs.ProxyAbsent].Load(); n != 0 {
+				t.Errorf("proxy_headers_total{absent} = %d after a shutdown", n)
+			}
+			if n := h.m.ProxyHeadersTotal[obs.ProxyInvalid].Load(); n != 0 {
+				t.Errorf("proxy_headers_total{invalid} = %d after a shutdown", n)
+			}
+			if n := h.m.MessagesDroppedTotal[obs.DropProxy].Load(); n != 0 {
+				t.Errorf("messages_dropped_total{proxy} = %d after a shutdown", n)
+			}
+			if s := logs.String(); strings.Contains(s, "PROXY") {
+				t.Errorf("the shutdown logged a PROXY warning:\n%s", s)
+			}
+		})
+	}
+}

@@ -16,6 +16,62 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-10-13 — S: porte das correções do R, RP e RN
+
+Pedido: trazer para o `go-syslog-server` os "a portar" das entradas R e RP, RN
+abaixo, conferindo cada um no S, com teste que falha antes (conferido por
+mutação), regra na SPEC e decisões na DECISOES; sem o rate-limit que segura.
+Cinco sub-agentes por área (ciclo de vida e dump, configuração, NATS, SQL,
+transportes/Redis/conversão), cada um num worktree isolado, depois integração
+e a suíte inteira contra os destinos reais.
+
+- **As 30 pendências** da SPEC §22.1 do S estão corrigidas; §22 diz em que
+  seção ficou a regra de cada uma. As quatro "a decidir pelo usuário" seguem a
+  decisão do R, registradas como **contestáveis** em `docs/DECISOES.md` §2: teto
+  por IP pelo endereço exato; offset ISO fora de faixa como a skill;
+  `retention: interest` recusado; reingestão com `sink=none` mantém os dumps.
+- **Ciclo de vida e dump:** posse única da contagem do aborto na forma final do
+  RN (`lossMu`, `enterDumpPhase`/`oweDump`, `SetAbandon`), `quitNow`, bind
+  cancelado = 130 (nos quatro transportes e no admin), `ErrNotDurable` ao abrir
+  o diretório e `fsync` dele no `Remove`, `withLifetime` nos health checks,
+  transportes fechados em paralelo.
+- **Configuração:** `knownSectionOf`, valor colado ao nome, continuação de
+  segredo no INI, switches com valor, `--config=` vazio, BOM, tetos (mais os
+  que só o S precisa: `ring.sqlite.commit_batch`, pools do MySQL e ClickHouse,
+  `*_listeners`), `@` depois de `/ ? #`, fragmento e as regras da URL
+  PostgreSQL do RP; `pool_size ≥ workers + 1` estendido a MySQL e ClickHouse
+  (as três sondas usam o pool). **Decisão:** a `LOGHUB_EB_URL` PostgreSQL passa
+  a exigir usuário e banco, como no RP (o S tinha o mesmo defeito).
+- **NATS:** `nats.go` do R (pendências 13–20, `10077`, `discard=new`, negação
+  mascarada no `core`) e os achados do RN **adaptados ao TLS do S**: só o TLS
+  que nunca vai dar certo (certificado que não verifica, `ErrSecureConnWanted`)
+  vira veredito, lido do `LastError` em `RECONNECTING`; `flushErr` + contagem de
+  reconexões; `MaxPending` com folga de 2×.
+- **SQL:** pendências 6–12, MySQL `1203`/`1226`/`1461` como `network`, `RULE`/
+  `0A000` e `Deliver` com `logic` antes do `ctx` do RP. A sonda MySQL do R foi
+  **adaptada**, não copiada: o S tem `unix`, então `src_ip NULL` + `unix` é
+  linha real; o defeito do S era `NULL` com `udp`.
+- **Não se aplica ao S:** o rate-limit que segura (decisão 8a do R); `FullFor`
+  e o `ctx` conferido antes do `Enqueue` (o S não pré-checa o ring, e conferir o
+  `ctx` ali perderia no shutdown mensagens TCP já lidas, que §13.4 manda para o
+  ring); "flag removida culpava a errada" (o S não tem chaves removidas);
+  `conns_refused{proxy}` (mudança de contrato de métrica do R). O prazo da
+  reingestão sem progresso já valia (cada lote tem o seu); o teste veio como guarda.
+- **Achado no caminho:** `indexTerminator` procurava o NUL no buffer inteiro
+  antes do LF; a moldura LF custava o dobro da octet.
+
+**Resultado:** `go vet` limpo; `go test -race` verde nos 16 pacotes com
+PostgreSQL 18, MySQL 8.4, ClickHouse 25.8, dois Redis 7 (um `allkeys-lru`),
+nats-server 2.14.6 (JetStream, sem JetStream, com permissões) e os emissores
+reais: 681 testes + 458 subtestes, 1 pulado (D5). Mais de 120 mutantes, todos mortos. O que ficou sem prova está em TESTING §8
+item 14.
+
+**Lição.** O "a portar" de um corte é uma lista de candidatos, não de
+patches: das correções vindas do RELP, três não valiam para o syslog (uma
+**perderia** mensagens se portada), e duas tiveram de ser adaptadas ao que o S
+tem e o pai não (`unix` na sonda MySQL, TLS no NATS). Conferir no destino antes
+de copiar é o que separa um porte de uma regressão.
+
 ## 2026-10-13 — RP, RN: `go-relplog-pg-server` e `go-relplog-nats-server`, cortes do R
 
 Pedido: a partir do R, criar os dois servidores RELP simplificados nos moldes

@@ -121,8 +121,12 @@ func NewClickHouse(cfg ClickHouseConfig, log *slog.Logger, m *obs.Metrics) (*Cli
 	if !chIdent.MatchString(cfg.Table) {
 		return nil, fmt.Errorf("sink clickhouse: table %q is not a plain identifier", cfg.Table)
 	}
-	if cfg.Database == "" {
-		return nil, errors.New("sink clickhouse: database is empty")
+	// The database goes between backticks in the INSERT; the rule and the
+	// reason are checkQuotedName's (SPEC §10.10.5). Inside backticks
+	// ClickHouse reads a backslash as an escape, so a name with one would
+	// address another database than the one validated.
+	if err := checkQuotedName("sink clickhouse: database", cfg.Database); err != nil {
+		return nil, err
 	}
 
 	opts := &clickhouse.Options{
@@ -403,8 +407,10 @@ func (c *ClickHouse) Health(ctx context.Context) error {
 		// attempt against a server 60 ms away. And the deadline is
 		// sink.op_timeout, the drain's: the driver turns a deadline into
 		// max_execution_time, and a probe sent with another one than the
-		// drain's passed a profile that refuses the drain's (452).
-		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.ConnectTimeout)
+		// drain's passed a profile that refuses the drain's (452). A
+		// cancelled boot still reaches it (validationContext): a bare
+		// WithoutCancel kept a SIGTERM waiting for the whole op_timeout.
+		vctx, cancel := validationContext(ctx, c.cfg.ConnectTimeout)
 		err := c.validate(vctx)
 		cancel()
 		if err != nil {

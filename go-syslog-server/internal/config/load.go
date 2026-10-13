@@ -146,11 +146,15 @@ func Load(opts Options) (*Loaded, error) {
 		if err != nil {
 			return nil, err
 		}
+		// afterSecret: the line before was a secret, so an unknown key here
+		// may be the rest of it wrapped onto this line (lookupINI).
+		afterSecret := false
 		for _, e := range entries {
-			p, err := ix.lookup(e.Name)
+			p, err := ix.lookupINI(e, afterSecret)
 			if err != nil {
 				return nil, fmt.Errorf("%s line %d: %w", file, e.Line, err)
 			}
+			afterSecret = p.Redact != RedactNone
 			if err := setValue(p, e.Raw); err != nil {
 				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, p.Name(), err)
 			}

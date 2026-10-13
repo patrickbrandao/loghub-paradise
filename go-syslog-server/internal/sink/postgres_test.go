@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	uuidv7 "github.com/patrickbrandao/go-loghub-uuidv7"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-server/internal/jlhcheck"
 )
@@ -40,6 +42,18 @@ func TestClassifySQLState(t *testing.T) {
 		"28000", // invalid_authorization_specification
 		"28P01", // invalid_password
 		"2F005", // function executed no return statement
+		// 3D000 invalid_catalog_name: sink.postgres.database does not exist;
+		// as network it was retried until boot_timeout with the network's
+		// message, where MySQL's 1049 is fatal (pendência 8 de 2026-10-11).
+		"3D000",
+		// 23502 not_null_violation: the sink never sends NULL, so it is the
+		// table (a required column added, a DEFAULT dropped); as logic it
+		// dropped every chunk with the sink UP (pendência 7 de 2026-10-11).
+		"23502",
+		// 0A000 feature_not_supported: ON CONFLICT on a table with an INSERT
+		// or UPDATE rule; as network it was retried forever with the sink UP
+		// (go-relplog-pg-server review, 2026-10-13).
+		"0A000",
 	}
 	for _, c := range fatal {
 		if got := classifySQLState(c); got != ClassFatal {
@@ -51,14 +65,14 @@ func TestClassifySQLState(t *testing.T) {
 		"53100", "53200", "53300", // resources
 		"57P01", "57P03", "57014", // operator intervention
 		"40001", "40P01", // rollback
-		"55P03", "XX001", "3D000", "54000", "", "9", // anything else
+		"55P03", "XX001", "54000", "", "9", // anything else
 	}
 	for _, c := range network {
 		if got := classifySQLState(c); got != ClassNetwork {
 			t.Errorf("SQLSTATE %s = %v, want network", c, got)
 		}
 	}
-	logic := []string{"22021", "22003", "22P02", "22P05", "23502", "23505", "23514"}
+	logic := []string{"22021", "22003", "22P02", "22P05", "23505", "23514"}
 	for _, c := range logic {
 		if got := classifySQLState(c); got != ClassLogic {
 			t.Errorf("SQLSTATE %s = %v, want logic", c, got)
@@ -450,24 +464,87 @@ func TestNewPostgresIgnoresTheLibpqEnvironment(t *testing.T) {
 	t.Setenv("PGOPTIONS", "-c search_path=nowhere")
 	t.Setenv("PGTARGETSESSIONATTRS", "standby")
 	t.Setenv("PGAPPNAME", "from-env")
-	p, err := NewPostgres(PostgresConfig{Addr: "127.0.0.1:1", AppName: "sls"}, discard(), metrics())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-	cc := p.pool.Config().ConnConfig
-	if cc.ValidateConnect != nil {
-		t.Error("ValidateConnect from PGTARGETSESSIONATTRS survived")
-	}
-	want := map[string]string{"client_encoding": "UTF8", "application_name": "sls"}
-	if len(cc.RuntimeParams) != len(want) {
-		t.Errorf("runtime params %v, want %v", cc.RuntimeParams, want)
-	}
-	for k, v := range want {
-		if cc.RuntimeParams[k] != v {
-			t.Errorf("runtime param %s = %q, want %q", k, cc.RuntimeParams[k], v)
+	t.Setenv("PGHOST", "10.255.255.1,10.255.255.2")
+
+	build := func(t *testing.T) *pgxpool.Config {
+		t.Helper()
+		p, err := NewPostgres(PostgresConfig{Addr: "127.0.0.1:1", AppName: "sls"}, discard(), metrics())
+		if err != nil {
+			t.Fatalf("the libpq environment reached the parse: %v", err)
 		}
+		t.Cleanup(func() { p.Close() })
+		return p.pool.Config()
 	}
+
+	// Pendência 9 de 2026-10-11, first half: these used to fail the parse itself --
+	// exit 1 over a variable the registry does not know.
+	for name, kv := range map[string][2]string{
+		"PGSSLMODE=bogus":   {"PGSSLMODE", "bogus"},
+		"PGPORT not a port": {"PGPORT", "not-a-port"},
+		"PGSERVICE missing": {"PGSERVICE", "no-such-service"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("PGSERVICEFILE", filepath.Join(t.TempDir(), "absent.conf"))
+			t.Setenv(kv[0], kv[1])
+			if _, err := pgxpool.ParseConfig(""); err == nil {
+				t.Fatalf("control: pgx parsed %s=%s; the environment did not reach the parser", kv[0], kv[1])
+			}
+			build(t)
+			if os.Getenv(kv[0]) != kv[1] {
+				t.Errorf("%s was not restored after the parse", kv[0])
+			}
+		})
+	}
+
+	// Second half: these parse, and landed in fields nothing overwrote,
+	// refusing every connection with no SQLSTATE -- network, retried until
+	// boot_timeout with the log blaming the network.
+	t.Run("connection settings", func(t *testing.T) {
+		t.Setenv("PGSSLMODE", "require")
+		t.Setenv("PGCHANNELBINDING", "require")
+		t.Setenv("PGREQUIREAUTH", "md5")
+		t.Setenv("PGSSLNEGOTIATION", "direct")
+		t.Setenv("PGMINPROTOCOLVERSION", "3.2")
+		t.Setenv("PGMAXPROTOCOLVERSION", "3.2")
+		ctl, err := pgxpool.ParseConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c := ctl.ConnConfig; c.ChannelBinding != "require" || c.RequireAuth != "md5" ||
+			c.SSLNegotiation != "direct" || c.MinProtocolVersion != "3.2" || len(c.Fallbacks) == 0 {
+			t.Fatalf("control: the environment did not reach the parser (%q %q %q %q, %d fallbacks)",
+				c.ChannelBinding, c.RequireAuth, c.SSLNegotiation, c.MinProtocolVersion, len(c.Fallbacks))
+		}
+
+		cc := build(t).ConnConfig
+		if cc.ValidateConnect != nil {
+			t.Error("ValidateConnect from PGTARGETSESSIONATTRS survived")
+		}
+		if cc.TLSConfig != nil {
+			t.Error("PGSSLMODE reached the pool as a TLSConfig; TLS comes from [sink.postgres] alone")
+		}
+		if len(cc.Fallbacks) != 0 {
+			t.Errorf("%d fallbacks survived: a refused dial would be retried elsewhere or in another mode", len(cc.Fallbacks))
+		}
+		if cc.Host != "127.0.0.1" || cc.Port != 1 {
+			t.Errorf("host %s port %d, want the configured 127.0.0.1:1 over PGHOST", cc.Host, cc.Port)
+		}
+		if cc.ChannelBinding == "require" || cc.RequireAuth != "" || cc.SSLNegotiation == "direct" ||
+			cc.MinProtocolVersion == "3.2" || cc.MaxProtocolVersion == "3.2" {
+			t.Errorf("libpq settings survived: channel_binding=%q require_auth=%q sslnegotiation=%q "+
+				"min_protocol=%q max_protocol=%q", cc.ChannelBinding, cc.RequireAuth, cc.SSLNegotiation,
+				cc.MinProtocolVersion, cc.MaxProtocolVersion)
+		}
+		want := map[string]string{"client_encoding": "UTF8", "application_name": "sls"}
+		if len(cc.RuntimeParams) != len(want) {
+			t.Errorf("runtime params %v, want %v", cc.RuntimeParams, want)
+		}
+		for k, v := range want {
+			if cc.RuntimeParams[k] != v {
+				t.Errorf("runtime param %s = %q, want %q", k, cc.RuntimeParams[k], v)
+			}
+		}
+	})
 }
 
 // Review finding 8 (minor): the text "\\u0000" is not a NUL escape, and its
