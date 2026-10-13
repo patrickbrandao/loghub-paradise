@@ -1,0 +1,15 @@
+{
+ "format": "rfc3164",
+ "priority": 34,
+ "host.hostname": "mymachine",
+ "appname": "su",
+ "timestamp": "2025-10-11T22:14:15.000Z",
+ "message": "'su root' failed for lonvick on /dev/pts/8",
+ "parse.warnings": [
+  "timestamp-year-inferred",
+  "timestamp-zone-inferred"
+ ],
+ "_absent": [
+  "procid"
+ ]
+}

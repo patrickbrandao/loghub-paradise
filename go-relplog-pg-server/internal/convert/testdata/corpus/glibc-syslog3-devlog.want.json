@@ -1,0 +1,15 @@
+{
+ "format": "rfc3164",
+ "appname": "systemd",
+ "procid": "1",
+ "message": "Started Session 42.",
+ "timestamp": "2026-09-13T10:00:00.000Z",
+ "parse.warnings": [
+  "timestamp-year-inferred",
+  "timestamp-zone-inferred",
+  "hostname-missing"
+ ],
+ "_absent": [
+  "host.hostname"
+ ]
+}

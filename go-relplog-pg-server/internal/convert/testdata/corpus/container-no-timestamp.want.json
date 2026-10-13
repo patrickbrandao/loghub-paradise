@@ -1,0 +1,13 @@
+{
+ "format": "rfc3164",
+ "appname": "myapp",
+ "procid": "123",
+ "message": "algo aconteceu",
+ "parse.warnings": [
+  "timestamp-missing"
+ ],
+ "_absent": [
+  "host.hostname",
+  "timestamp"
+ ]
+}
