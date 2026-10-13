@@ -161,7 +161,9 @@ docker run --rm -d -p 16379:6379 --name sls-test-redis redis:7-alpine
 SYSLOG_TEST_REDIS_ADDR=127.0.0.1:16379 go test -race -timeout 600s ./internal/sink/ ./internal/ring/ ./internal/app/
 ```
 
-PostgreSQL, MySQL e ClickHouse: `docs/TESTING.md` (§6.2–§6.4a).
+PostgreSQL, MySQL e ClickHouse: `docs/TESTING.md` (§6.2–§6.4a). Um segundo Redis
+com `allkeys-lru` (`SYSLOG_TEST_REDIS_LRU_ADDR`, §6.1) e um NATS com usuários de
+permissões limitadas (`SYSLOG_TEST_NATS_PERM_URL`, §6.4) provam as recusas.
 
 Executar localmente (um `DATADIR` relativo é resolvido a partir do diretório de
 trabalho antes do `Initialize()`, SPEC §13.1 passo 2; o hostname do macOS não
@@ -261,6 +263,10 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514   # o logger do ma
 - **Escrita no boot é por chunk.** Um retry em volta de `Instrumented.Write`
   reconverte, e um erro `logic` no meio do lote deixava os chunks seguintes sem
   escrita e confirmados. Use `Instrumented.Deliver`.
+- **Um "a portar" de um irmão é candidato, não patch.** O R é RELP: o `ctx`
+  conferido antes do `Enqueue` evita duplicata lá e **perderia** mensagens TCP
+  já lidas aqui; a sonda MySQL do R não tem `unix`, a deste servidor tem.
+  Confira no S antes de copiar (CHANGELOG, 2026-10-13).
 - **Valores aceitos pela config precisam significar algo para quem os usa.** Um
   enum aceito pelo registry e desconhecido no pacote consumidor desliga o recurso
   em silêncio (aliases de facility; `windows-1252`).

@@ -109,6 +109,8 @@ go test -run XXX -bench . -benchmem ./internal/convert ./internal/ratelimit ./in
 | `Convert/rfc5424` | 1,09 µs/op (158 MB/s) | 0 B, 0 allocs | idem, com SD |
 | `SchemaValidate/rfc5424` | 97 µs/op | 82 KiB, 1 922 allocs | o custo que D3 tira do caminho quente: ~90× a conversão |
 | `IngestAccept` | 137 ns/op | 280 B, 2 allocs | recepção até o ring (moldura já feita) |
+| `TCPReceive/octet` | 450–560 ns/op (~2 M msg/s) | ~335 B, 2 allocs | uma conexão, linhas de ~200 bytes, socket real + moldura + pipeline até o ring de memória; igual com o leitor de 64 KiB (460–530 ns) e com o de 4 KiB (SPEC §5.4) |
+| `TCPReceive/lf` | 450–570 ns/op (~2 M msg/s) | ~330 B, 2 allocs | idem em LF; com 64 KiB era 860–1 020 ns, porque a busca do NUL varria o buffer inteiro a cada frame (corrigido junto: o NUL só é procurado antes do LF) |
 | `AllowSameKey` | 152 ns/op | 0 | rate-limit, um emissor (contenção no shard) |
 | `AllowSpreadKeys` | 39 ns/op | 3 B | rate-limit, emissores espalhados |
 
@@ -179,9 +181,19 @@ chave); os contêineres são descartáveis.
 
 ```bash
 docker run --rm -d -p 16379:6379 --name sls-test-redis redis:7-alpine
-SYSLOG_TEST_REDIS_ADDR=127.0.0.1:16379 go test -race -timeout 600s ./internal/ring/ ./internal/sink/ ./internal/app/
-docker rm -f sls-test-redis
+docker run --rm -d -p 16381:6379 --name sls-test-redis-lru redis:7-alpine \
+  redis-server --maxmemory-policy allkeys-lru
+SYSLOG_TEST_REDIS_ADDR=127.0.0.1:16379 SYSLOG_TEST_REDIS_LRU_ADDR=127.0.0.1:16381 \
+  go test -race -timeout 600s ./internal/rediscli/ ./internal/ring/ ./internal/sink/ ./internal/app/
+docker rm -f sls-test-redis sls-test-redis-lru
 ```
+
+O segundo Redis (`SYSLOG_TEST_REDIS_LRU_ADDR`, `allkeys-lru`) é só para a
+política de despejo (SPEC §9.5, §10.3; pendência 5 de 2026-10-11): o ring e o
+sink recusam o boot como FATAL, sem criar chave. É um servidor à parte porque o
+primeiro é compartilhado por todos os pacotes da rodada, em paralelo, e trocar a
+política dele quebraria os outros. Sem a variável, esses dois testes pulam; os
+de ACL sem `INFO`/`CONFIG` (`WARN` e o boot segue) usam o primeiro.
 
 Prova, entre outros: o script de enfileiramento com os dois tetos globais, o
 `Commit` que só decrementa o que o `XDEL` removeu, a releitura dos próprios
@@ -223,7 +235,7 @@ obrigatória (`received_at` sem default recusada; sem `received_at`, com
 default, identidade, `bigserial` e gerada toleradas). Sem servidor:
 `TestPostgresInboxFileIsTheSkillDDL` confere o hash da DDL da skill,
 `TestNewPostgresIgnoresTheLibpqEnvironment` o pool livre de `PGOPTIONS`,
-`PGTARGETSESSIONATTRS` e `PGAPPNAME` (os demais `PG*` ainda chegam: SPEC §22.1), e
+`PGTARGETSESSIONATTRS`, `PGAPPNAME` e de todo outro `PG*` (parse com o ambiente libpq escondido, pendência 9), e
 `FuzzInboxPayload` (o caminho real) e `FuzzJSONBSafe` (o recurso de reserva) a
 troca do NUL. **Não provado:** o FATAL no boot de um servidor em recuperação
 (`pg_is_in_recovery()`) exige uma réplica de verdade.
@@ -259,6 +271,42 @@ desligado fatal na hora, entrega parcial (`10054`), beacon em
 `loghub._ctl.beacon` (schema do envelope, `type=beacon`, `level=9`,
 `sid`=PID, periódico e na reconexão), queda e volta por proxy sem perda, e FATAL
 pelos fusíveis → dump → reingestão no stream.
+
+Com permissões (pendências 14 e 19 de 2026-10-11, portadas do R), um terceiro
+servidor, com JetStream e usuários:
+
+```bash
+cat > /tmp/nats-perm.conf <<'EOF'
+listen: 127.0.0.1:14224
+jetstream { store_dir: "/tmp/nats-perm" }
+authorization { users = [
+  { user: admin, password: admin }
+  { user: nopub, password: nopub, permissions: {
+      publish: { allow: [">"], deny: ["loghub.*.syslog", "loghub.*.syslog.>"] },
+      subscribe: { allow: [">"] } } }
+  { user: noinbox, password: noinbox, permissions: {
+      publish: { allow: [">"] }, subscribe: { deny: ["_INBOX.>"] } } }
+  { user: nobeacon, password: nobeacon, permissions: {
+      publish: { allow: [">"], deny: ["*.beacon"] }, subscribe: { allow: [">"] } } }
+] }
+EOF
+go run github.com/nats-io/nats-server/v2@v2.14.6 -c /tmp/nats-perm.conf &
+SYSLOG_TEST_NATS_PERM_URL=nats://127.0.0.1:14224 go test -race ./internal/sink/ -run 'Permission|RefusedCredentials'
+```
+
+| Variável | Valor |
+|---|---|
+| `SYSLOG_TEST_NATS_PERM_URL` | sem usuário na URL; usuários `admin`, `nopub`, `noinbox`, `nobeacon` (senha = usuário); a mesma conf está no comentário de `natsPermSetup` em `internal/sink/review_nats_test.go` |
+
+Prova a negação do subject de dados (`jetstream`: fatal depois do
+`sink.op_timeout`; `core`: fatal na hora) e da assinatura `_INBOX` como veredito
+FATAL, a negação do subject do beacon **sem** veredito, e senha errada no
+primeiro `CONNECT` como FATAL sem esperar o `boot_timeout`. O resto das
+pendências 13–20 (stream editado em tempo de execução, `retention: interest`,
+mensagem acima do `max_payload` recusada sozinha) roda contra o
+`SYSLOG_TEST_NATS_URL`; o TLS que nunca verifica, o *flush* que atravessa uma
+reconexão e a negação mascarada rodam contra um servidor falso em processo
+(`natsFake`, sem variável).
 
 ### 6.4a ClickHouse (`inbox_syslog`, 2026-10-07)
 
@@ -309,6 +357,15 @@ severidade conferidos.
 | `ring` + `emergency` com Redis | passa, `-count=2` |
 | `app` com cada variável sozinha e com as cinco juntas | passa (~52 s com todas) |
 | `receiver` no Linux (Docker, Go 1.27.1), inclusive PKTINFO IPv4/IPv6 e o *flood* de `KeyUpdate` | passa, `-count=2` |
+
+### 6.7 Resultado da rodada de 2026-10-13 (porte do R, RP, RN)
+
+`go vet ./...` limpo e `go test -race -count=1 ./...` verde, os 16 pacotes, com
+PostgreSQL 18, MySQL 8.4, ClickHouse 25.8, Redis 7 (dois: um com
+`allkeys-lru`, `SYSLOG_TEST_REDIS_LRU_ADDR`) e nats-server 2.14.6 (JetStream,
+sem JetStream e com permissões, `SYSLOG_TEST_NATS_PERM_URL`) e os emissores reais (`SYSLOG_TEST_EMITTERS=1`) — todas as variáveis de §6:
+681 testes de primeiro nível e 458 subtestes passam, **1 pulado**
+(`TestGoldenVectors/arquivo-sem-pri`: `transport=file`, fora por D5).
 
 ---
 
@@ -378,6 +435,34 @@ Registradas por honestidade, não por esquecimento.
     do limite global do servidor e de uma perda breve do Keeper. Uma
     *materialized view* sobre a tabela faz uma recusa dela chegar depois das
     linhas gravadas (o boot avisa); nenhum teste a cobre.
+14. **Porte de 2026-10-13: o que ficou sem prova.**
+    - Custo por conexão medido com 100–200 conexões em processo (as duas pontas
+      no mesmo heap); nada com milhares de conexões reais nem sob `GOMEMLIMIT`.
+      `BenchmarkTCPReceive` e o fuzz de 60 s de `FuzzFrame`, `FuzzFrameOracle` e
+      `FuzzProxy` rodaram com a máquina sob carga alta (poucas execuções):
+      repetir com ela livre (soma-se à lacuna 1).
+    - Política de despejo do Redis lida de um nó só e só no boot; um
+      `CONFIG SET` com o servidor no ar não é visto.
+    - O `withLifetime` e o `validationContext` estão provados cada um no seu
+      pacote; não há teste de app de um `SIGTERM` durante uma validação longa.
+    - Sonda MySQL: linhas `unix` de um ring persistente drenadas numa vida sem
+      listener `unix` não têm teste; `parseWithoutLibpqEnv` mexe no ambiente do
+      processo sob mutex, sem teste de concorrência com outra leitura dele.
+    - `pool_size ≥ workers + 1` no MySQL e no ClickHouse foi estendido pela
+      leitura do código (a sonda usa o mesmo pool), sem teste de integração; o
+      teto de 4096 desses pools é escolha, não limite de biblioteca.
+    - O `knownSectionOf` ainda cita uma cauda de senha com cara de
+      `sink.nats.xyz`: risco reduzido, não fechado (como no R e no RN).
+    - NATS: a folga 2× do `MaxPending` não tem teste (tirá-la não mata nenhum);
+      o TLS que nunca verifica e o `ErrSecureConnWanted` só contra o `natsFake`,
+      sem `nats-server` com `tls {}`; num cluster com **um** nó de certificado
+      ruim, a reconexão que cair nele vira FATAL (semântica do RN, não testada).
+    - Dump: o abandono a cada 1024 registros só é provado no início e antes da
+      publicação; o fechamento paralelo dos quatro transportes reais com
+      conexões presas não tem teste de tempo (`TestTransportsCloseTogether` usa
+      transportes falsos); bind cancelado provado em `tcp`, `udp` e admin, não
+      em `unix` e `tls`; o fluxo "operador renomeia o temporário interrompido e
+      o boot seguinte o reingere" não tem teste.
 
 ---
 
@@ -429,3 +514,36 @@ que o encontrou. A lição vai para `AGENTS.md` §9 quando generaliza.
 | Revisão independente: inferência de datas no tipo `JSON` | um `procid` 12345 voltava `"1970-01-01 03:25:45"`, valores de SD de outro emissor como datas | desligar a inferência em todo `INSERT`; teste com atacante e vítimas no mesmo pedaço, conferido por mutação |
 | Revisão independente: `EPHEMERAL`, `is_deleted`, partição, CHECK entre crases, `system.replicas`, limite por usuário, `452`, `44` | perda silenciosa, lotes descartados ou boot preso/fatal sem motivo | as regras de §10.10.5, uma tabela recusada por regra |
 
+
+### Porte das correções do R, RP e RN (2026-10-13)
+
+As 30 pendências de 2026-10-11 e os "a portar" das entradas R e RP, RN do
+`CHANGELOG.md` da raiz, por área (ciclo de vida e dump, configuração, NATS,
+SQL, transportes/Redis/conversão). Cada correção tem teste que falhava antes ou,
+quando o teste usa API nova, que falha com a correção desfeita (mutação: mais de 120
+mutantes, todos mortos).
+
+| Achado por | Bug | Lição |
+|---|---|---|
+| pendência 1 | cada conexão TCP/TLS segurava um `bufio.Reader` de 64 KiB e o buffer de frame de uma mensagem grande: ~67 KB de heap por conexão TCP calada (81 KB TLS), fora de `ring.max_bytes` | memória por conexão é medida (`TestIdle*ConnectionFixedCost`); o maior `Peek` dita o tamanho do leitor |
+| `BenchmarkTCPReceive` | `indexTerminator` procurava o NUL no buffer inteiro antes do LF: a moldura LF custava o dobro da octet | benchmark de ponta a ponta pega custo proporcional ao buffer que o micro-benchmark esconde |
+| pendência 3 | o `Close` contava quem esperava o cabeçalho PROXY como `absent`/`invalid` e `messages_dropped{proxy}`, culpando o balanceador | todo caminho que o shutdown interrompe confere `closing` antes de contar |
+| pendência 5 | com `allkeys-*` o Redis cheio despeja o stream inteiro com o serviço UP | premissa do destino que decide perda é conferida no boot (FATAL), com `WARN` se a ACL não deixar ler |
+| pendência 6 | validação do boot do PG/MySQL no `health_timeout` (1 s): a ~55 ms nunca cabia; a do ClickHouse ignorava o `SIGTERM` | prazo da validação é do trabalho, não da checagem que a dispara |
+| pendências 7, 8 | `23502` era `logic` e `3D000` `network` | erro que o servidor nunca causa é da tabela: fatal |
+| pendência 9 | `PG*` do ambiente derrubavam o parse ou recusavam toda conexão | esconder o ambiente durante o parse, não sobrescrever depois |
+| pendência 10 | MySQL com `autocommit=0` global: `Write` confirmava e as linhas sumiam | parâmetro de sessão de que o sink depende é fixado e relido |
+| pendência 11 | outro índice único, prefixo `uuid(4)`, coluna estreita e número sem SQLSTATE no MySQL | `ON DUPLICATE KEY` dispara em qualquer único: só o árbitro pode existir |
+| pendência 12 | nome do banco cru entre crases | o que entra cru no SQL é validado na config e no construtor |
+| revisão do R | MySQL `1203`/`1226`/`1461` seriam fatais pelo recurso ao SQLSTATE; a sonda punha `src_ip NULL` com `udp`, linha que nenhum listener faz | o recurso por classe precisa das exceções; a sonda usa só linhas reais **deste** servidor (aqui `unix` existe) |
+| revisão do RP | `RULE` de INSERT/UPDATE passava no boot e cada pedaço dava `0A000` `network`; `Deliver` conferia o `ctx` antes da recusa `logic`; `53300` antes da senha | conferir no catálogo o que o dreno não aceita; contagem e log da perda andam juntos |
+| pendências 13–20 | token no log de conexão e URL não validada; negação de permissão retentada para sempre (`jetstream`) ou confirmada e perdida (`core`); `ErrMaxPayload` perdia o pedaço; contrato do stream só no boot; `interest` confirmava sem guardar; `10158`/`10167` fatais; credencial expirada `network`; dump de outro `space` perdido em silêncio | negação assíncrona vira veredito; o contrato vale a vida inteira; todo 429 é backpressure |
+| revisão do R (NATS) | `10077` cheio/fechando fatal; `discard=new` abaixo de um registro aceito; negação do beacon mascarava a dos dados no `core` | o `nats.go` guarda só o último `-ERR` |
+| revisão do RN (adaptada ao TLS do S) | TLS que nunca verifica depois do boot ficava `network` até os fusíveis; flush `core` que atravessava uma reconexão confirmava o pedaço | ler o `LastError` em `RECONNECTING`; `flushErr` + contagem de reconexões |
+| pendências 21, 22 | `beacon_interval` de `1ns`; `?host=/socket` perdia a porta; `sslmode` repetido valia o primeiro; `addr` com dois hosts | chave dona da URL não perde informação; dois leitores leem a mesma coisa |
+| pendência 30, revisões do R/RP/RN | erros de URL, consulta PG, INI e flags citavam a entrada (senhas); `@` depois de `/ ? #`; cauda de senha partida, valor colado ao nome, continuação no INI | mensagem de config cita posição, nome com forma de nome e dica, nunca o texto |
+| revisão do RP/RN (config) | `--dump-config=false` despejava; `--config=` vazio caía no env; BOM; sem tetos (`makechan` em pânico, `pool_size` dando a volta no `int32`); `pool_size = workers` sem conexão para a sonda; derivados no dump; sinônimos de charset no `SIGHUP` | toda chave que dimensiona memória tem teto; a sonda é mais um cliente do pool; comparar valores canônicos |
+| pendências 23–25 | dump escrito no nome final (parcial com cara de pronto); quarentena feita logada como não feita; gauges zerados com dump no disco | publicar só o completo (temporário, `link`, `fsync` do diretório); recontar do diretório |
+| pendências 27–29, revisões do R/RN | recusa fatal logada como `boot_timeout`; primeiro `SIGTERM` abortava o shutdown por FATAL; aborto durante o dump subcontado, depois contado duas vezes, e dump já contado como perdido publicado | um dono só da contagem (`lossMu`, `enterDumpPhase`/`oweDump`, `SetAbandon`) |
+| revisão do RN | `SIGQUIT` depois da leitura da flag ignorado; sinal antes do bind de um nome de host saía 1 | sinal tardio chega por canal; bind cancelado é 130 |
+| revisão do R | `Remove` do dump sem `fsync` do diretório; health checks sem o contexto de vida; transportes fechados em sequência (um `closeGrace` cada) | `ErrNotDurable` também ao abrir o diretório; `withLifetime`; fechar todos em paralelo |

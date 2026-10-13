@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -418,7 +420,7 @@ func Registry(c *Config) []*Param {
 			Desc:    "LogHub eventbus URL; its scheme selects sink.type and the URL fills that sink's connection: nats:// tls:// redis:// rediss:// postgres:// postgresql://. An explicit conflicting sink key is an error (SPEC §10.9)"},
 		{Sec: "loghub", Key: "beacon_interval", Kind: KSeconds, Def: "15", Ptr: &c.LogHub.BeaconInterval,
 			EnvName: loghubEnv("beacon_interval"),
-			Desc:    "period of the heartbeat beacon (sink=nats only); a bare integer is seconds, as the skill defines it; 0 disables the periodic beacon, not the one on connect"},
+			Desc:    "period of the heartbeat beacon (sink=nats only); a bare integer is seconds, as the skill defines it; at least 1s; 0 disables the periodic beacon, not the one on connect"},
 		{Sec: "loghub", Key: "ctl_namespace", Kind: KString, Def: "loghub._ctl", Ptr: &c.LogHub.CtlNamespace,
 			EnvName: loghubEnv("ctl_namespace"),
 			Desc:    "control-plane prefix; the beacon goes to <ctl_namespace>.beacon over NATS core, never JetStream"},
@@ -521,10 +523,93 @@ func newIndex(params []*Param) *index {
 func (ix *index) lookup(name string) (*Param, error) {
 	p, ok := ix.byName[name]
 	if !ok {
+		// Named only when it has the shape of a name. What reaches here from
+		// an INI key or a flag is everything before the first '=', and a
+		// ':' typed for the '=' ("password: hunter2 = x",
+		// "--sink.nats.password:hunter2") puts the value inside it; the error
+		// goes to stderr and, on a SIGHUP, to the log (SPEC §16.2, pendência
+		// 30 de 2026-10-11).
+		if !paramNameRE.MatchString(name) {
+			return nil, fmt.Errorf("unknown parameter (the name holds characters no parameter " +
+				"name has, so it is not shown; a value goes after an '=')")
+		}
+		if ix.extendsAName(name) {
+			// "--sink.nats.passwordhunter2": the '=' was forgotten and the
+			// value glued to the name, with or without a separator
+			// ("-hunter2", "_hunter2", ".hunter2"). Quoted, the error would
+			// print the secret (independent review of go-relplog-pg-server,
+			// 2026-10-13).
+			return nil, fmt.Errorf("unknown parameter (it starts with the name of a parameter " +
+				"and goes on, so it is not shown: the '=' between the name and the value may be missing)")
+		}
 		return nil, fmt.Errorf("unknown parameter %q", name)
 	}
 	return p, nil
 }
+
+// extendsAName reports whether name is a parameter name of the registry with
+// something glued after it.
+func (ix *index) extendsAName(name string) bool {
+	for n := range ix.byName {
+		if len(name) > len(n) && strings.HasPrefix(name, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownSectionOf reports whether name, read as "<section>.<key>", names a
+// section of the registry: "sink.nats.subjet" and "filter.min_severty" do,
+// "hunter2" and "x" do not (SPEC §16.2).
+func (ix *index) knownSectionOf(name string) bool {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 {
+		return false
+	}
+	return ix.knownSection(name[:i])
+}
+
+func (ix *index) knownSection(sec string) bool {
+	for _, p := range ix.byName {
+		if p.Sec == sec {
+			return true
+		}
+	}
+	return false
+}
+
+// iniKeyRE is what an INI key of this server looks like. It is narrower than
+// paramNameRE on purpose: an unknown INI key is named only when it has this
+// shape, because the INI is where a secret wraps onto a second line
+// ("token = eyJhbGciOiJI" then "UzI1NiJ9abcDEF==") and the continuation reads
+// as a key.
+var iniKeyRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// lookupINI is lookup for an INI entry. An unknown key is named only when its
+// section is one this server has, its key has the shape of a key, and the
+// line before it was not a secret: a key right after a password or a token is
+// most likely the rest of that value on the next line ("password = abc" then
+// "ffd3a9c1b2=") -- the error goes to stderr and, on a SIGHUP, to the server
+// log (SPEC §16.2; independent review of go-relplog-nats-server, 2026-10-13).
+func (ix *index) lookupINI(e iniEntry, afterSecret bool) (*Param, error) {
+	if p, ok := ix.byName[e.Name]; ok {
+		return p, nil
+	}
+	switch {
+	case afterSecret:
+		return nil, errors.New("unknown parameter right after a secret value; it is not shown, " +
+			"in case it is the rest of that value: a value must fit on one line")
+	case !iniKeyRE.MatchString(e.Key) || !ix.knownSection(e.Sec):
+		return nil, errors.New("unknown parameter (not shown: its section or its key is not one " +
+			"a parameter has; a value goes after an '=' on the same line)")
+	}
+	return ix.lookup(e.Name)
+}
+
+// paramNameRE is what a parameter name, known or not, can look like: the
+// dotted lowercase words of the registry, with room for a typo in case or a
+// dash. Anything else is not printed.
+var paramNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
 // sections returns section names in registry order, which is the order used by
 // --help and the effective-config dump.

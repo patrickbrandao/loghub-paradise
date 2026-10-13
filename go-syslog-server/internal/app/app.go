@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -219,7 +220,8 @@ type App struct {
 	admin   *Admin
 	emg     *emergency.Store
 
-	// transports in OPEN order: unix, udp, tcp, tls. They close in reverse.
+	// transports in OPEN order: unix, udp, tcp, tls. They close together
+	// (SPEC §13.4).
 	transports []namedTransport
 
 	// stopRecv cancels the receive context at shutdown phase 3. It is separate
@@ -247,6 +249,42 @@ type App struct {
 	// quitting records that the context was cancelled by SIGQUIT, which
 	// aborts at once instead of shutting down gracefully (SPEC §13.4).
 	quitting atomic.Bool
+
+	// quitNow is closed together with quitting. shutdownWith reads quitting
+	// once, at entry, and then waits on quitNow too: a SIGQUIT whose watcher
+	// stores the flag just after that read is still "now" (independent
+	// review of go-relplog-nats-server, 2026-10-13). nil (never closed) when
+	// SIGQUIT is not watched.
+	quitNow chan struct{}
+
+	// lossMu orders the abort against the moments the shutdown hands the
+	// loss counter around (enterDumpPhase, oweDump): one side counts each
+	// message, never both (SPEC §13.4). aborted is set by abortLoss under it,
+	// and is what tells an emergency dump still being written to give up
+	// (emergency.Store.SetAbandon): a dump counted lost must not come back at
+	// the next boot.
+	lossMu  sync.Mutex
+	aborted atomic.Bool
+
+	// dumping is the number of leftovers handed to the emergency dump while
+	// it is being written, for abortLoss; 0 otherwise. Drain takes the items
+	// out of the ring's accounting BEFORE the dump, so an abort that lands
+	// while the file is written would read the ring as (nearly) empty and
+	// count a fraction of a loss that is in fact the whole dump: os.Exit cuts
+	// the write short (SPEC §13.4, pendência 29 de 2026-10-11).
+	dumping atomic.Int64
+	// dumpPhase is set when the shutdown starts collecting the leftovers of a
+	// ring that does not outlive the process: from then on abortLoss counts
+	// dumping, never the ring's count (see there).
+	dumpPhase atomic.Bool
+
+	// beforeDump, when set, runs right before the emergency dump is written.
+	// It is nil in the binary; the tests use it to hold the shutdown inside
+	// the dump while they send a signal. beforeCollect, likewise, runs right
+	// after the dump phase started and before the leftovers are collected
+	// (Workers.Pending, Drain): the tests land an abort there.
+	beforeDump    func()
+	beforeCollect func()
 
 	// wrapSink, when set, decorates the real sink right after it is built. It
 	// is nil in the binary; the tests use it to produce a sink that stops
@@ -279,10 +317,12 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
 		defer cancel()
+		a.quitNow = make(chan struct{})
 		go func() {
 			select {
 			case <-a.quit:
 				a.quitting.Store(true)
+				close(a.quitNow)
 				cancel()
 			case <-lifeCtx.Done():
 			}
@@ -320,6 +360,11 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	a.admin = NewAdmin(a.metrics, a.cfg.Ring.HighWater)
 	if a.cfg.Admin.Enabled {
 		if err := a.admin.Listen(ctx, a.cfg.Admin.Bind); err != nil {
+			if ctx.Err() != nil {
+				// The signal context, not the address: see openTransports.
+				a.log.Info("interrupted while opening the admin listener")
+				return ExitAborted
+			}
 			a.log.Error("cannot bind the admin listener", "addr", a.cfg.Admin.Bind, "error", err)
 			return ExitConfig
 		}
@@ -335,6 +380,7 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	// --- step 6: the emergency directory exists BEFORE the incident -------
 	if a.cfg.Ring.Mode == config.RingModeMemory && a.cfg.Emergency.Enabled {
 		a.emg = emergency.NewStore(a.cfg.Emergency.Dir, a.id.From)
+		a.emg.SetAbandon(a.aborted.Load)
 		if err := a.emg.Prepare(); err != nil {
 			a.log.Error("cannot prepare the emergency directory; under a read-only root this "+
 				"means the path does not derive from server.data_dir",
@@ -384,8 +430,18 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 			a.log.Info("interrupted while waiting for the sink")
 			return ExitAborted
 		}
-		a.log.Error("sink did not become usable within sink.boot_timeout",
-			"timeout", a.cfg.Sink.BootTimeout.String(), "error", err)
+		if sink.IsFatal(err) {
+			// WaitReady gives up at once on a refusal that waiting will not
+			// change (credentials, a missing table or stream, the largest
+			// event above the destination's limit). Saying "within
+			// sink.boot_timeout" there would send the operator after the
+			// network and a timeout that never ran; the ring Redis has its own
+			// line for the same reason (pendência 27 de 2026-10-11).
+			a.log.Error("the sink refused this server permanently", "error", err)
+		} else {
+			a.log.Error("sink did not become usable within sink.boot_timeout",
+				"timeout", a.cfg.Sink.BootTimeout.String(), "error", err)
+		}
 		return ExitSink
 	}
 
@@ -600,9 +656,15 @@ func (a *App) buildSink() int {
 			Mode: a.cfg.SinkNATS.Mode, Stream: a.cfg.SinkNATS.Stream, Subjects: a.cfg.SinkNATS.Subjects,
 			Workspace: a.id.Space, CtlNamespace: a.cfg.LogHub.CtlNamespace,
 			ClientName: a.clientName(), ConnectTimeout: a.cfg.Sink.OpTimeout, OpTimeout: a.cfg.Sink.OpTimeout,
-			// Every publish this process can have in flight at once: the drain
-			// workers' batches plus the write-through receivers of ring=none.
-			MaxPending:    a.cfg.Sink.Workers*a.cfg.Sink.Batch + a.cfg.Ring.MaxInflight,
+			// Every publish this process can have in flight at once -- the
+			// drain workers' batches plus the write-through receivers of
+			// ring=none -- doubled: the futures of a tainted chunk keep
+			// counting until their own async timeout, which starts at the
+			// publish, a little after the worker's deadline, and a quick retry
+			// would stall on a full window and fail with
+			// ErrTooManyStalledMsgs (go-relplog-nats-server, independent
+			// review, 2026-10-13; SPEC §10.7).
+			MaxPending:    2 * (a.cfg.Sink.Workers*a.cfg.Sink.Batch + a.cfg.Ring.MaxInflight),
 			MaxEventBytes: maxEvent,
 		}, a.log.Logger, a.metrics)
 		if err == nil {
@@ -787,14 +849,26 @@ func (a *App) openTransports(bindCtx, recvCtx context.Context) int {
 		return ExitConfig
 	}
 
+	// bindFailed is the exit of a transport that could not be opened. A
+	// signal that cancelled the bind (a host name's lookup fails with
+	// "operation was canceled") is an interrupted boot, 130, not a bad
+	// address (independent review of go-relplog-nats-server, 2026-10-13).
+	bindFailed := func(transport, addr string, err error) int {
+		if bindCtx.Err() != nil {
+			a.log.Info("interrupted while opening the transports")
+			return ExitAborted
+		}
+		a.log.Error("cannot open the "+transport+" transport", "addr", addr, "error", err)
+		return ExitConfig
+	}
+
 	if a.cfg.Listen.Unix != "" {
 		d, err := receiver.NewUnix(bindCtx, receiver.UnixConfig{
 			Path: a.cfg.Listen.Unix, Mode: os.FileMode(a.cfg.Listen.UnixMode),
 			ReadBuffer: int(a.cfg.Listen.UnixReadBuffer),
 		}, a.ingest, a.metrics, a.log)
 		if err != nil {
-			a.log.Error("cannot open the unix transport", "path", a.cfg.Listen.Unix, "error", err)
-			return ExitConfig
+			return bindFailed("unix", a.cfg.Listen.Unix, err)
 		}
 		a.transports = append(a.transports, namedTransport{"unix", d})
 	}
@@ -805,8 +879,7 @@ func (a *App) openTransports(bindCtx, recvCtx context.Context) int {
 			ReadBuffer: int(a.cfg.Listen.UDPReadBuffer),
 		}, a.ingest, a.metrics, a.log)
 		if err != nil {
-			a.log.Error("cannot open the udp transport", "addr", a.cfg.Listen.UDP, "error", err)
-			return ExitConfig
+			return bindFailed("udp", a.cfg.Listen.UDP, err)
 		}
 		a.transports = append(a.transports, namedTransport{"udp", d})
 	}
@@ -822,8 +895,7 @@ func (a *App) openTransports(bindCtx, recvCtx context.Context) int {
 			Framing:      framing,
 		}, a.ingest, a.metrics, a.log)
 		if err != nil {
-			a.log.Error("cannot open the tcp transport", "addr", a.cfg.Listen.TCP, "error", err)
-			return ExitConfig
+			return bindFailed("tcp", a.cfg.Listen.TCP, err)
 		}
 		a.transports = append(a.transports, namedTransport{"tcp", t})
 	}
@@ -849,8 +921,7 @@ func (a *App) openTransports(bindCtx, recvCtx context.Context) int {
 			HandshakeTimeout: a.cfg.TLS.HandshakeTimeout,
 		}, a.ingest, a.metrics, a.log)
 		if err != nil {
-			a.log.Error("cannot open the tls transport", "addr", a.cfg.Listen.TLS, "error", err)
-			return ExitConfig
+			return bindFailed("tls", a.cfg.Listen.TLS, err)
 		}
 		a.transports = append(a.transports, namedTransport{"tls", t})
 	}
@@ -876,14 +947,27 @@ func (a *App) TransportAddr(name string) string {
 	return ""
 }
 
-// closeTransports closes in REVERSE open order: tls first, unix last.
+// closeTransports closes every transport (SPEC §13.4, phase 3).
+//
+// They are closed AT ONCE: each Close stops reading and gives its stuck
+// connections closeGrace (the stream transports) or waits for its readers (the
+// datagram ones). One after the other, the tcp connections kept reading -- and
+// accepting -- for as long as the tls ones took, and phase 3 could last one
+// closeGrace per stream transport instead of the one that stop_grace_period is
+// sized for (independent review of go-relplog-server, 2026-10-11).
 func (a *App) closeTransports() {
+	var wg sync.WaitGroup
 	for i := len(a.transports) - 1; i >= 0; i-- {
 		nt := a.transports[i]
-		if err := nt.t.Close(); err != nil {
-			a.log.Warn("closing a transport", "transport", nt.name, "error", err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := nt.t.Close(); err != nil {
+				a.log.Warn("closing a transport", "transport", nt.name, "error", err)
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 // persistentRing reports whether the ring keeps its content outside this
@@ -906,25 +990,92 @@ func (a *App) watchAbort() <-chan os.Signal {
 
 // shutdown runs the five phases of SPEC §13.4. A second signal skips straight
 // to the exit, accepting the loss.
+//
+// A FATAL shutdown starts with no signal at all, so the FIRST SIGTERM or
+// SIGINT that arrives during it -- a docker stop, a deploy, while the workers
+// are being collected or the dump is being written -- is not the second
+// signal of SPEC §13.4. Treating it as one turned the exit 3 with a dump of
+// SPEC §13.3 into an exit 130 that lost the ring (pendência 28 de
+// 2026-10-11). It is logged and the shutdown goes on; the next one aborts.
+// SIGQUIT is never tolerated: it means "now", in every phase.
 func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool, abort <-chan os.Signal) int {
-	done := make(chan int, 1)
-	go func() { done <- a.gracefulShutdown(stopWorkers, fatal) }()
+	return a.shutdownWith(func() int { return a.gracefulShutdown(stopWorkers, fatal) }, fatal, abort)
+}
 
-	select {
-	case code := <-done:
-		return code
-	case sig := <-abort:
-		a.log.Warn("second signal during shutdown; exiting immediately and accepting the loss",
-			"signal", sig.String())
+// shutdownWith is shutdown around any graceful procedure, so the signal rules
+// can be tested without a whole server.
+func (a *App) shutdownWith(graceful func() int, fatal bool, abort <-chan os.Signal) int {
+	// A SIGQUIT that arrived after the shutdown branch was taken and before
+	// abort was registered reached only the SIGQUIT watcher of run, which set
+	// quitting: it still means "now" (independent review of
+	// go-relplog-server, 2026-10-11). The loop below waits on quitNow for a
+	// watcher that stores the flag just after this read (independent review
+	// of go-relplog-nats-server, 2026-10-13).
+	if a.quitting.Load() {
+		a.log.Warn("SIGQUIT: exiting immediately and accepting the loss")
 		a.abortLoss()
 		return ExitAborted
+	}
+	done := make(chan int, 1)
+	go func() { done <- graceful() }()
+
+	tolerate := fatal
+	for {
+		select {
+		case code := <-done:
+			return code
+		case <-a.quitNow:
+			a.log.Warn("SIGQUIT during shutdown; exiting immediately and accepting the loss")
+			a.abortLoss()
+			return ExitAborted
+		case sig := <-abort:
+			if tolerate && sig != syscall.SIGQUIT {
+				tolerate = false
+				a.log.Warn("signal during the FATAL shutdown; it goes on to the emergency dump and "+
+					"exit 3, a second signal aborts it and accepts the loss", "signal", sig.String())
+				continue
+			}
+			a.log.Warn("second signal during shutdown; exiting immediately and accepting the loss",
+				"signal", sig.String())
+			a.abortLoss()
+			return ExitAborted
+		}
 	}
 }
 
 // abortLoss accounts for what an abort leaves behind: nothing with a ring that
 // keeps its content outside the process, everything still queued otherwise
 // (reason="abort", SPEC §13.4).
+//
+// Once the shutdown has collected the leftovers for the dump, the ring's own
+// count no longer holds them -- Drain committed them -- so while the dump is
+// being written its size is what is lost: the abort's os.Exit cuts the write
+// short (pendência 29 de 2026-10-11).
+//
+// From the moment the shutdown starts collecting them (dumpPhase), the
+// ring's count is no longer the measure: the held batches are still counted
+// there although they are going to the dump, and the drained ones no longer
+// are. The counter is the only measure then, and it is taken with Swap so
+// that exactly one side -- this abort, or dumpEmergency counting a failed or
+// disabled dump -- counts the same messages. Under lossMu, and only once:
+// aborted, set here, closes the dump phase (enterDumpPhase, oweDump) and
+// makes a dump still being written give up (emergency.Store.SetAbandon).
 func (a *App) abortLoss() {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	if a.aborted.Swap(true) {
+		return // counted already: one abort, one count
+	}
+	if a.dumpPhase.Load() {
+		if n := a.dumping.Swap(0); n > 0 {
+			a.metrics.EventsDroppedTotal[obs.EventDropAbort].Add(uint64(n))
+			a.log.Error("messages lost to the abort: the emergency dump was being written", "count", n)
+		}
+		return
+	}
+	if a.ring == nil {
+		return
+	}
 	st := a.ring.Stats()
 	if st.Items == 0 {
 		return
@@ -935,6 +1086,38 @@ func (a *App) abortLoss() {
 	}
 	a.metrics.EventsDroppedTotal[obs.EventDropAbort].Add(uint64(st.Items))
 	a.log.Error("messages lost to the abort", "count", st.Items)
+}
+
+// enterDumpPhase hands the loss counter from the ring's own count to dumping:
+// from here an abort counts dumping, not the ring (SPEC §13.4). Under lossMu,
+// so an abort lands wholly before (it counted the ring; false is returned) or
+// wholly after (it takes dumping). Done separately, an abort between the two
+// stores counted the ring and left dumping for a failed dump to count again
+// (independent review of go-relplog-nats-server, 2026-10-13).
+func (a *App) enterDumpPhase() bool {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	if a.aborted.Load() {
+		return false
+	}
+	a.dumping.Store(a.ring.Stats().Items)
+	a.dumpPhase.Store(true)
+	return true
+}
+
+// oweDump sets the counter to exactly what goes to the dump, unless an abort
+// already took it: then the messages were counted, the process is exiting,
+// and putting the number back would let a failed or disabled dump count them
+// a second time (independent review of go-relplog-nats-server, 2026-10-13:
+// 10 counted lost for 5).
+func (a *App) oweDump(n int) bool {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	if a.aborted.Load() {
+		return false
+	}
+	a.dumping.Store(int64(n))
+	return true
 }
 
 func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
@@ -982,6 +1165,20 @@ func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
 	stopWorkers()
 	a.workers.Wait()
 
+	if !a.persistentRing() {
+		// From here an abort loses whatever the ring still counts -- queued
+		// items and the batches the workers hold, which are the same
+		// population (SPEC §9.2) -- until the dump is safe. Set BEFORE the
+		// drain: in between, the drained items would be counted by nobody
+		// (independent review of go-relplog-server, 2026-10-11).
+		if !a.enterDumpPhase() {
+			return ExitAborted // the abort counted the ring; the process is exiting
+		}
+	}
+	if a.beforeCollect != nil {
+		a.beforeCollect()
+	}
+
 	// A worker retrying a failed batch holds items that are no longer in the
 	// ring (SPEC §10.2). Without this collection they would be lost.
 	leftover := a.workers.Pending()
@@ -1001,15 +1198,16 @@ func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
 		}
 	} else if len(leftover) > 0 {
 		a.log.Error("messages still pending after the drain", "count", len(leftover))
-		if !a.dumpEmergency(leftover) && a.emg == nil {
-			// No emergency store (emergency.enabled=false): SPEC §12.3 counts
-			// this exactly like a dump that failed. A dump that FAILED was
-			// already counted by dumpEmergency, and the same messages are not
-			// lost twice.
-			a.log.Error("emergency dumps are disabled; these messages are lost", "count", len(leftover))
-			a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Add(uint64(len(leftover)))
+		// From here until the dump is safe on disk (or counted lost), an abort
+		// loses exactly leftover (see abortLoss); dumpEmergency takes the
+		// counter back, and counts a disabled or failed dump itself.
+		if !a.oweDump(len(leftover)) {
+			return ExitAborted
 		}
+		a.dumpEmergency(leftover)
 		code = ExitSink
+	} else if !a.oweDump(0) {
+		return ExitAborted
 	}
 
 	// Phase 5: the beacon, the sink and the ring close through the defers in run.

@@ -516,12 +516,25 @@ func TestPostgresDroppedTableIsFatalNotLogic(t *testing.T) {
 
 // A wrong password is fatal at the first check (class 28), not retried until
 // boot_timeout.
+//
+// The server takes a connection slot BEFORE it checks the password: with the
+// whole suite in parallel against one PostgreSQL (max_connections 100), the
+// login can get 53300 "too many clients" -- network, correctly -- and the test
+// failed now and then (the flake found in go-relplog-pg-server, 2026-10-13).
+// A 53300 is waited out here; any other answer decides.
 func TestPostgresWrongPasswordIsFatal(t *testing.T) {
 	f := pgSetup(t)
 	cfg := f.cfg
 	cfg.Password = "definitely-wrong"
 	p := f.sink(cfg)
-	err := p.Health(context.Background())
+	var err error
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		err = p.Health(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "sqlstate=53300") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if !IsFatal(err) {
 		t.Fatalf("Health with a wrong password = %v (class %s), want fatal", err, ClassOf(err))
 	}

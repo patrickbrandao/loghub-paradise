@@ -44,6 +44,19 @@ func TestClassifyNATS(t *testing.T) {
 
 		{"authorization", nats.ErrAuthorization, ClassFatal},
 		{"auth expired", nats.ErrAuthExpired, ClassFatal},
+		// SPEC §22 pendência 19: the sentinels the table lacked, and what
+		// nats.Connect returns at the first CONNECT -- the server's own words,
+		// which its errors.Is never matched to the sentinels.
+		{"auth revoked", nats.ErrAuthRevoked, ClassFatal},
+		{"account auth expired", nats.ErrAccountAuthExpired, ClassFatal},
+		{"connect: user authentication expired", errors.New("nats: User Authentication Expired"), ClassFatal},
+		{"connect: user authentication revoked", errors.New("nats: User Authentication Revoked"), ClassFatal},
+		{"connect: account authentication expired", errors.New("nats: Account Authentication Expired"), ClassFatal},
+		{"connect: authorization violation", errors.New("nats: Authorization Violation"), ClassFatal},
+		// Control: a permissions violation is about one subject, the verdict's
+		// to judge (deniesTheDataPath), never a refusal of the connection.
+		{"permissions violation", fmt.Errorf("%w: Permissions Violation for Publish to \"x\"",
+			nats.ErrPermissionViolation), ClassNetwork},
 		{"closed", nats.ErrConnectionClosed, ClassFatal},
 		{"stream not found", jetstream.ErrStreamNotFound, ClassFatal},
 		{"jetstream not enabled", jetstream.ErrJetStreamNotEnabled, ClassFatal},
@@ -55,7 +68,22 @@ func TestClassifyNATS(t *testing.T) {
 		{"api sealed 10109", api(400, jsErrStreamSealed), ClassFatal},
 		{"api insufficient resources 10023", api(503, jsErrInsufficientResources), ClassFatal},
 		{"api store failed 10077", api(503, jsErrStreamStoreFailed), ClassFatal},
+		// A full discard=new stream, or one closing, is 10077 too: transient
+		// (independent review, 2026-10-11, against nats-server 2.14.6).
+		{"10077 max msgs", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages exceeded"}, ClassNetwork},
+		{"10077 max bytes", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum bytes exceeded"}, ClassNetwork},
+		{"10077 max per subject", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages per subject exceeded"}, ClassNetwork},
+		{"10077 store closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store closed"}, ClassNetwork},
+		{"10077 record too large", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "message too large"}, ClassFatal},
 		{"api unknown 4xx", api(400, 10999), ClassFatal},
+		// SPEC §22 pendência 18: transient though 4xx. 10158 (409) is a
+		// Nats-Msg-Id still in a Raft proposal, 10167 (429) a full ingest
+		// queue, and any 429 is backpressure; another 409 stays fatal.
+		{"api duplicate in process 10158", api(409, jsErrDuplicateInProcess), ClassNetwork},
+		{"api too many requests 10167", api(429, jsErrStreamTooManyRequests), ClassNetwork},
+		{"api unknown 429", api(429, 10210), ClassNetwork},
+		{"api unknown 409", api(409, 10999), ClassFatal},
+		{"wrapped api 10158", fmt.Errorf("ack: %w", api(409, jsErrDuplicateInProcess)), ClassNetwork},
 
 		{"max payload", nats.ErrMaxPayload, ClassLogic},
 		{"max bytes", jetstream.ErrMaxBytesExceeded, ClassLogic},
@@ -369,7 +397,7 @@ func TestNATSOnConnectHooks(t *testing.T) {
 // would time out as network forever with the sink UP. Refused at boot.
 func TestNATSValidateRefusesNoAck(t *testing.T) {
 	n := newTestNATS(t, nil)
-	err := n.validate(nil, &jetstream.StreamInfo{Config: jetstream.StreamConfig{
+	err := n.validate(1<<20, &jetstream.StreamInfo{Config: jetstream.StreamConfig{
 		Name: "LOGHUB_SYSLOG", Subjects: []string{"loghub.default.syslog", "loghub.default.syslog.>"}, NoAck: true,
 	}})
 	if !IsFatal(err) || !strings.Contains(err.Error(), "no_ack") {

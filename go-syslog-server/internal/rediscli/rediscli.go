@@ -142,12 +142,7 @@ func ClassifyReply(msg string) Class {
 		// changes on its own, and as `logic` they would discard a batch every
 		// few milliseconds, forever, in a process every probe calls healthy.
 		return Fatal
-	case strings.HasPrefix(upper, "LOADING"),
-		strings.HasPrefix(upper, "BUSY"),
-		strings.HasPrefix(upper, "MASTERDOWN"),
-		strings.HasPrefix(upper, "READONLY"),
-		strings.HasPrefix(upper, "CLUSTERDOWN"),
-		strings.HasPrefix(upper, "TRYAGAIN"):
+	case transientReply(upper):
 		// Alive but temporarily unable: failover, a loading dataset.
 		return Network
 	}
@@ -156,10 +151,26 @@ func ClassifyReply(msg string) Class {
 	return Network
 }
 
+// transientReply reports whether an upper-cased error reply is one of the
+// "alive but temporarily unable" answers of the table.
+func transientReply(upper string) bool {
+	for _, p := range []string{"LOADING", "BUSY", "MASTERDOWN", "READONLY", "CLUSTERDOWN", "TRYAGAIN"} {
+		if strings.HasPrefix(upper, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // Classify maps any error from rueidis onto a class.
 func Classify(err error) Class {
 	if err == nil {
 		return Network
+	}
+	if errors.Is(err, ErrEvictionPolicy) {
+		// Not a reply but a verdict on the server's configuration, reached by
+		// CheckEviction; it ends the boot like an OOM would (SPEC §9.5, §10.3).
+		return Fatal
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return Network
@@ -188,4 +199,109 @@ func SameServer(a, b Config) bool {
 		return slices.Compact(out)
 	}
 	return slices.Equal(norm(a.Addrs), norm(b.Addrs))
+}
+
+// ErrEvictionPolicy marks a Redis whose maxmemory-policy may evict keys that
+// have no TTL (allkeys-lru, allkeys-lfu, allkeys-random). Classify makes it
+// Fatal, so both users end the boot with exit 3 (SPEC §9.5, §10.3).
+//
+// Why fatal and not a warning: under such a policy a full Redis never answers
+// OOM -- the one reply that is fatal and stops the pipeline -- it DELETES keys
+// to make room, and a stream is one key. The whole stream goes at once: for
+// ring=redis every entry waiting in it and its byte counter (which then admits
+// more than the ceiling, or goes negative on the next commit); for sink=redis
+// every event already confirmed to the emitter. The service stays UP and no
+// metric moves. A warning would be read after the data is gone.
+var ErrEvictionPolicy = errors.New("redis: maxmemory-policy evicts keys without a TTL")
+
+// ErrPolicyUnknown means the policy could not be read: the ACL forbids both
+// INFO and CONFIG GET, or a proxy in front of Redis does not implement them.
+// The caller logs a WARN with the premise and carries on: refusing it would
+// lock out every deployment whose ACL is least-privilege, which is the
+// configuration a security review asks for.
+var ErrPolicyUnknown = errors.New("redis: maxmemory-policy could not be read")
+
+// EvictsUnexpiredKeys reports whether a maxmemory-policy may evict a key that
+// has no TTL. noeviction refuses writes with OOM instead; the volatile-*
+// policies only evict keys WITH a TTL, and neither user ever sets one on its
+// keys, so to them a volatile-* server at maxmemory behaves like noeviction.
+// Matching the prefix rather than three names keeps a future allkeys-* policy
+// refused rather than silently accepted.
+func EvictsUnexpiredKeys(policy string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(policy)), "allkeys-")
+}
+
+// policyFromInfo extracts maxmemory_policy from the text of INFO memory, or
+// returns false when the line is absent (a proxy, a fork of Redis).
+func policyFromInfo(info string) (string, bool) {
+	for _, line := range strings.Split(info, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), "maxmemory_policy:"); ok {
+			return strings.TrimSpace(v), true
+		}
+	}
+	return "", false
+}
+
+// CheckEviction reads the server's maxmemory-policy and refuses one that may
+// evict the stream (SPEC §9.5, §10.3). It returns the policy read and:
+//
+//	nil                         the policy keeps the keys: noeviction, volatile-*
+//	an ErrEvictionPolicy error  allkeys-*: fatal (Classify), exit 3
+//	an ErrPolicyUnknown error   unreadable: the caller WARNs and carries on
+//	any other error             the connection, or a transient reply: retry
+//
+// INFO memory comes first because it is what a managed Redis (which often
+// renames or blocks CONFIG) still answers, and because the ACL category of
+// INFO is narrower than that of CONFIG (@admin); CONFIG GET is the fallback
+// for a server whose INFO is filtered. Any other error REPLY to both is
+// "unreadable", not "retry": NOPERM or "unknown command" does not change by
+// waiting, and retrying it would hold the boot until sink.boot_timeout over a
+// check that is a precaution.
+//
+// The check reads one node. A Redis Cluster whose nodes disagree on the policy
+// is a configuration nobody runs on purpose, and checking every node would put
+// a fan-out in the boot of both users for it.
+func CheckEviction(ctx context.Context, c rueidis.Client) (string, error) {
+	info, ierr := c.Do(ctx, c.B().Info().Section("memory").Build()).ToString()
+	if ierr == nil {
+		if policy, ok := policyFromInfo(info); ok {
+			return policy, verdict(policy)
+		}
+	} else if !replyRefused(ierr) {
+		return "", ierr
+	}
+	kv, cerr := c.Do(ctx, c.B().ConfigGet().Parameter("maxmemory-policy").Build()).AsStrMap()
+	if cerr == nil {
+		if policy, ok := kv["maxmemory-policy"]; ok {
+			return policy, verdict(policy)
+		}
+	} else if !replyRefused(cerr) {
+		return "", cerr
+	}
+	reason := "INFO memory has no maxmemory_policy line"
+	if ierr != nil {
+		reason = ierr.Error()
+	}
+	if cerr != nil {
+		reason += "; CONFIG GET: " + cerr.Error()
+	}
+	return "", fmt.Errorf("%w (%s)", ErrPolicyUnknown, reason)
+}
+
+// verdict is the policy rule of CheckEviction.
+func verdict(policy string) error {
+	if EvictsUnexpiredKeys(policy) {
+		return fmt.Errorf("%w: maxmemory-policy is %s, under which a full Redis deletes the stream "+
+			"instead of answering OOM; set noeviction (or a volatile-* policy: these keys never "+
+			"have a TTL)", ErrEvictionPolicy, policy)
+	}
+	return nil
+}
+
+// replyRefused reports whether err is an error REPLY that waiting cannot
+// change (NOPERM, unknown command), as opposed to a transport failure or one
+// of the transient replies of the table, which the caller retries.
+func replyRefused(err error) bool {
+	rerr, ok := rueidis.IsRedisErr(err)
+	return ok && !transientReply(strings.ToUpper(rerr.Error()))
 }

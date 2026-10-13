@@ -143,21 +143,26 @@ func (i *Instrumented) Deliver(ctx context.Context, items []*item.Item, opTimeou
 			if taints(err) {
 				c.taint()
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			class := ClassOf(err)
-			if class == ClassFatal {
-				return err
-			}
 			if class == ClassLogic {
-				// Only what the destination did not store is lost (SPEC §10.2);
-				// writeChunk counted it the same way.
+				// Settled BEFORE the context check: writeChunk already counted
+				// the refusal (events_dropped{sink_logic}), so the ERROR with
+				// the uuids must come with it even when a SIGTERM lands during
+				// that write. Checked after, the count stood without the log
+				// that says which messages were lost (go-relplog-pg-server
+				// review, 2026-10-13). Only what the destination did not store
+				// is lost (SPEC §10.2); writeChunk counted it the same way.
 				stored, lost := settleLogic(err, c.Envelopes)
 				i.log.Error("the sink refused a chunk permanently; the messages are lost",
 					"count", len(lost), "stored", stored, "error", err, "uuids", lost)
 				i.countRefused(c)
 				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if class == ClassFatal {
+				return err
 			}
 			if werr := wait(attempt, err); werr != nil {
 				return werr
