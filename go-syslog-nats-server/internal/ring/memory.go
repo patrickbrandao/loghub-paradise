@@ -226,9 +226,29 @@ func (r *Memory) Drain() []*item.Item {
 	}
 }
 
-// Full is a cheap, racy pre-check for the receiver: true when an Enqueue right
-// now would fail on the item ceiling. Enqueue stays the authority.
-func (r *Memory) Full() bool { return r.items.Load() >= r.capItems }
+// FullFor is a cheap, racy pre-check for the receiver: true when an Enqueue of
+// an n-byte line right now would fail on EITHER ceiling. Enqueue stays the
+// authority.
+//
+// n is the length the receiver is about to copy (after truncation), and the
+// byte test is heldBytes of the item that copy would make: the pooled class of
+// n plus ItemOverhead. Checking the item ceiling alone let a TCP reader held
+// on ring.max_bytes mint a uuid, take a pooled buffer, copy the line and build
+// an item on every 50 ms retry -- and a UDP flood do the same per datagram --
+// only for Enqueue to refuse it (go-relplog-pg-server's independent review,
+// 2026-10-13; SPEC §5.7).
+//
+// A closed ring is never "full": Enqueue then reports ErrClosed, which the
+// receiver answers as the shutdown it is, not as backpressure.
+func (r *Memory) FullFor(n int) bool {
+	if r.closed.Load() {
+		return false
+	}
+	if r.items.Load() >= r.capItems {
+		return true
+	}
+	return r.capBytes > 0 && r.bytes.Load()+int64(item.PooledCap(n))+ItemOverhead > r.capBytes
+}
 
 func (r *Memory) Stats() Stats {
 	return Stats{

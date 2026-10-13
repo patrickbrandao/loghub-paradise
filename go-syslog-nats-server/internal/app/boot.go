@@ -50,17 +50,26 @@ func (a *App) reingest(ctx context.Context) int {
 		return ExitOK
 	}
 
+	// Exact and free: every listed file awaits reingestion. Its messages are
+	// only known once read, and are counted from the disk at the end. Set
+	// before the boot state that announces the reingestion, so whoever sees
+	// that state sees the count too.
+	a.metrics.EmergencyFiles.Set(int64(len(files)))
 	a.log.Warn("emergency dumps found from a previous run; reingesting before any transport opens",
 		"files", len(files), "dir", store.Dir())
 	a.admin.SetBootState("reingesting emergency dumps")
 
-	// One sink.boot_timeout for the whole reingestion, not one per file: with
-	// N dumps on disk and the sink failing, a deadline per file would hold
-	// every transport closed for N times the configured budget.
+	// One sink.boot_timeout WITHOUT PROGRESS for the whole reingestion, not
+	// one per file: with N dumps on disk and the sink failing, a deadline per
+	// file would hold every transport closed for N times the configured
+	// budget. Every delivered chunk moves it forward: a single deadline from
+	// the start made a healthy reingestion of a large dump that ran past
+	// boot_timeout exit 3 at the first transient failure, with no retry, and
+	// every boot after it deliver the same file from the start
+	// (go-relplog-pg-server's independent review, 2026-10-13; SPEC §12.2).
 	deadline := time.Now().Add(a.cfg.Sink.BootTimeout)
-	for i, path := range files {
-		a.metrics.EmergencyFiles.Set(int64(len(files) - i))
-		res, delivered, code := a.reingestFile(ctx, store, path, deadline)
+	for _, path := range files {
+		res, delivered, code := a.reingestFile(ctx, store, path, &deadline)
 		if code != ExitOK {
 			return code
 		}
@@ -72,23 +81,72 @@ func (a *App) reingest(ctx context.Context) int {
 
 		if res.Damaged() {
 			dst, qerr := store.Quarantine(path)
-			if qerr != nil {
-				a.log.Error("cannot quarantine a damaged dump", "path", path, "error", qerr)
-			} else {
-				a.log.Error("the dump was damaged; the intact lines were delivered and the "+
-					"file was quarantined", "path", dst,
-					"truncated_bytes", res.TruncatedBytes, "invalid_lines", res.Invalid,
-					"invalid_bytes", res.InvalidBytes)
-			}
-		} else if rerr := store.Remove(path); rerr != nil {
-			a.log.Error("cannot remove a reingested dump; it will be delivered again at the next "+
-				"boot (the stream absorbs it only within its duplicate_window)",
-				"path", path, "error", rerr)
+			a.reportQuarantine(path, dst, qerr, res)
+		} else {
+			a.reportRemoval(path, store.Remove(path))
 		}
 	}
-	a.metrics.EmergencyFiles.Set(0)
-	a.metrics.EmergencyEventsPending.Set(0)
+	// Recounted from the directory, never zeroed: a file that could not be
+	// read, removed or quarantined is still there, still pending, and an
+	// alert on these gauges must keep firing until somebody deals with it.
+	a.refreshEmergencyGauges(store)
 	return ExitOK
+}
+
+// reportQuarantine logs the outcome of Store.Quarantine for a damaged dump.
+//
+// A non-empty dst means the file WAS renamed, whatever qerr says: the error is
+// then only the directory fsync that followed (emergency.ErrNotDurable), so
+// the new name may not survive a power loss. Read as "not quarantined", that
+// case logged "cannot quarantine" with a path that no longer existed and
+// dropped the ERROR with the byte counts of what was lost (SPEC §12.2).
+func (a *App) reportQuarantine(path, dst string, qerr error, res *emergency.ReadResult) {
+	if dst == "" {
+		a.log.Error("cannot quarantine a damaged dump", "path", path, "error", qerr)
+		return
+	}
+	if qerr != nil {
+		a.log.Warn("the damaged dump was quarantined but the directory fsync failed; the new "+
+			"name may not survive a power loss", "path", dst, "error", qerr)
+	}
+	a.log.Error("the dump was damaged; the intact lines were delivered and the "+
+		"file was quarantined", "path", dst,
+		"truncated_bytes", res.TruncatedBytes, "invalid_lines", res.Invalid,
+		"invalid_bytes", res.InvalidBytes)
+}
+
+// reportRemoval logs the outcome of Store.Remove for a reingested dump. An
+// ErrNotDurable means the unlink happened and only the directory fsync after
+// it failed: the file is gone now, and "cannot remove" would be false. What
+// the operator must know is the other consequence -- after a power loss the
+// name may come back, and the next boot would publish the dump again.
+func (a *App) reportRemoval(path string, rerr error) {
+	switch {
+	case rerr == nil:
+	case errors.Is(rerr, emergency.ErrNotDurable):
+		a.log.Warn("the reingested dump was removed but the directory fsync failed; after a "+
+			"power loss it may reappear and be published again (the stream absorbs it only "+
+			"within its duplicate_window)", "path", path, "error", rerr)
+	default:
+		a.log.Error("cannot remove a reingested dump; it will be delivered again at the next "+
+			"boot (the stream absorbs it only within its duplicate_window)",
+			"path", path, "error", rerr)
+	}
+}
+
+// refreshEmergencyGauges sets syslog_emergency_files and
+// syslog_emergency_events_pending from what is on disk, the only honest
+// source (SPEC §12.2). Every listed file counts, one that cannot even be read
+// included; its messages are unknowable and count as none.
+func (a *App) refreshEmergencyGauges(store *emergency.Store) {
+	files, events, err := store.Count()
+	if err == nil {
+		a.metrics.EmergencyFiles.Set(int64(files))
+		a.metrics.EmergencyEventsPending.Set(events)
+		return
+	}
+	a.log.Warn("cannot count the emergency dumps; syslog_emergency_* keep their previous values",
+		"dir", store.Dir(), "error", err)
 }
 
 // reingestFile streams one dump into the sink, a chunk at a time (sink.batch
@@ -97,7 +155,7 @@ func (a *App) reingest(ctx context.Context) int {
 // returns what the reading skipped and how many envelopes were delivered; a
 // nil result means the file could not be read and stays in place.
 func (a *App) reingestFile(ctx context.Context, store *emergency.Store, path string,
-	deadline time.Time) (*emergency.ReadResult, int, int) {
+	deadline *time.Time) (*emergency.ReadResult, int, int) {
 	r, err := store.Open(path)
 	if err != nil {
 		a.log.Error("cannot read an emergency dump; leaving it in place", "path", path, "error", err)
@@ -120,13 +178,17 @@ func (a *App) reingestFile(ctx context.Context, store *emergency.Store, path str
 			res := r.Result()
 			return &res, delivered, ExitOK
 		}
-		a.metrics.EmergencyEventsPending.Set(int64(len(recs)))
-		if code := a.deliverDirect(ctx, envelopes(recs), deadline); code != ExitOK {
+		// syslog_emergency_events_pending is not touched here: the gauges
+		// say what is on disk, and are recounted from it at the end. Set to
+		// the chunk size, the last scrape before an exit 3 showed one chunk
+		// for a whole dump.
+		if code := a.deliverDirect(ctx, envelopes(recs), *deadline); code != ExitOK {
 			a.log.Error("cannot deliver an emergency dump; it stays on disk for the next boot",
 				"path", path, "delivered", delivered)
 			return nil, delivered, code
 		}
 		delivered += len(recs)
+		*deadline = time.Now().Add(a.cfg.Sink.BootTimeout)
 	}
 }
 
@@ -153,9 +215,9 @@ func envelopes(recs []emergency.Record) []sink.Envelope {
 //     logged there, and treated as delivered so the dump is removed. Exiting
 //     instead would leave the same dump for the next boot, which would refuse
 //     it the same way: a crash loop with every transport closed, forever.
-//   - network: the same chunk is retried with backoff until deadline (the
-//     reingestion's sink.boot_timeout). One transient failure is not a reason
-//     to give up the boot.
+//   - network: the same chunk is retried with backoff until deadline (one
+//     sink.boot_timeout since the last chunk delivered). One transient
+//     failure is not a reason to give up the boot.
 //   - fatal: exit 3.
 //
 // A cancelled context (SIGTERM during the boot) is 130, not 3.
@@ -201,16 +263,52 @@ func (a *App) deliverDirect(ctx context.Context, envs []sink.Envelope, deadline 
 //
 // The converter is a fresh one with the frozen conversion config: the workers
 // have stopped, and their converters went with them.
+//
+// It zeroes App.dumping as soon as the outcome is known and BEFORE anything is
+// counted: saved, an abort loses nothing more; failed, the loss is counted
+// here as emergency_failed, and an abort racing that count must not add the
+// same messages again as abort (Swap: one owner of the count, SPEC §13.4).
+//
+// A dump the abort already counted gives up (emergency.Store.SetAbandon), and
+// one that completed after the abort counts nothing more: the abort counted
+// every message, the malformed ones the dump leaves out included.
 func (a *App) dumpEmergency(items []*item.Item) bool {
-	if a.emg == nil || len(items) == 0 {
+	if len(items) == 0 {
+		a.dumping.Store(0)
 		return false
 	}
+	if a.emg == nil {
+		// No emergency store (emergency.enabled=false): SPEC §12.3 counts this
+		// exactly like a dump that failed -- unless an abort already took the
+		// counter and counted the same messages.
+		if a.dumping.Swap(0) > 0 {
+			a.log.Error("emergency dumps are disabled; these messages are lost", "count", len(items))
+			a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Add(uint64(len(items)))
+		}
+		return false
+	}
+	if a.beforeDump != nil {
+		a.beforeDump()
+	}
 	res, err := a.emg.Write(items, convert.New(a.convertConfig()), a.cfg.Syslog.AcceptMalformed)
+	owed := a.dumping.Swap(0)
 	if err != nil {
+		if owed == 0 {
+			return false // an abort counted them already
+		}
 		a.log.Error("EMERGENCY DUMP FAILED; these messages are lost",
 			"count", len(items), "dir", a.emg.Dir(), "error", err)
 		a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Add(uint64(len(items)))
 		return false
+	}
+	if owed == 0 {
+		// Published between the last abandon check and the abort: counted
+		// lost AND kept, an overcount the next boot corrects by delivering
+		// it, never a loss. Nothing more is counted (go-relplog-pg-server's
+		// independent review, 2026-10-13).
+		a.log.Warn("the emergency dump completed after an abort counted its messages lost; "+
+			"the next boot reingests it", "path", res.Path, "count", res.Written)
+		return true
 	}
 	if res.Refused > 0 {
 		// syslog.accept_malformed=false: the worker would have refused these
@@ -222,8 +320,11 @@ func (a *App) dumpEmergency(items []*item.Item) bool {
 	if res.Written > 0 {
 		a.log.Warn("pending messages written to an emergency dump; they will be reingested at the next boot",
 			"count", res.Written, "path", res.Path)
-		a.metrics.EmergencyFiles.Set(1)
-		a.metrics.EmergencyEventsPending.Set(int64(res.Written))
+		// Added, not set: a dump the boot could not reingest may still be on
+		// disk (unreadable, a failed removal), and the gauges say what is
+		// pending there, not what this one dump holds (SPEC §12.2).
+		a.metrics.EmergencyFiles.Inc()
+		a.metrics.EmergencyEventsPending.Add(int64(res.Written))
 	}
 	return true
 }

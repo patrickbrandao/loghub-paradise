@@ -25,10 +25,9 @@ func TestEBURLMapping(t *testing.T) {
 		{"postgresql://loghub:pw@pg-1:6432/logs?sslmode=disable", func(p SinkPostgres) bool {
 			return p.Addr == "pg-1:6432" && p.Database == "logs"
 		}},
-		{"postgres://pg-1/logs?sslmode=prefer", func(p SinkPostgres) bool {
-			// No userinfo: the registry default user stays, the password is
-			// empty -- the URL decides it.
-			return p.Addr == "pg-1:5432" && p.Username == "syslog" && p.Password == ""
+		{"postgres://loghub@pg-1/logs?sslmode=prefer", func(p SinkPostgres) bool {
+			// No password: it is empty -- the URL decides it.
+			return p.Addr == "pg-1:5432" && p.Username == "loghub" && p.Password == ""
 		}},
 		{"postgres://u:p@pg-1/logs?sslmode=allow", func(p SinkPostgres) bool {
 			return p.Addr == "pg-1:5432"
@@ -38,10 +37,6 @@ func TestEBURLMapping(t *testing.T) {
 		}},
 		{"postgres://u:p@[::1]:5433/logs", func(p SinkPostgres) bool {
 			return p.Addr == "[::1]:5433"
-		}},
-		{"postgres://u:p@pg-1", func(p SinkPostgres) bool {
-			// No path: the default database stays.
-			return p.Database == "syslog"
 		}},
 		{"postgres://u:p@/logs?host=/var/run/postgresql", func(p SinkPostgres) bool {
 			return p.Addr == "/var/run/postgresql" && p.Database == "logs"
@@ -149,7 +144,11 @@ func TestEBURLRefusesTLS(t *testing.T) {
 	// Control: the same URL with a plaintext-tolerant mode, or none, loads and
 	// fills the connection, so the refusal above is the mode and only the mode.
 	for _, mode := range []string{"", "disable", "allow", "prefer"} {
-		l := mustLoad(t, nil, map[string]string{"LOGHUB_EB_URL": base + mode})
+		u := base + mode
+		if mode == "" {
+			u = strings.TrimSuffix(base, "?sslmode=") // no sslmode at all; an empty one is refused
+		}
+		l := mustLoad(t, nil, map[string]string{"LOGHUB_EB_URL": u})
 		if l.Config.SinkPG.Addr != "pg-1:5432" || l.Config.SinkPG.Password != "pw" {
 			t.Errorf("sslmode=%q: filled %+v", mode, l.Config.SinkPG)
 		}
@@ -167,21 +166,21 @@ func TestEBURLConflicts(t *testing.T) {
 		env  map[string]string
 		want []string
 	}{
-		{[]string{"--sink.postgres.addr=other:5432"}, map[string]string{"LOGHUB_EB_URL": "postgres://pg-1/db"},
+		{[]string{"--sink.postgres.addr=other:5432"}, map[string]string{"LOGHUB_EB_URL": "postgres://u@pg-1/db"},
 			[]string{"sink.postgres.addr", "env LOGHUB_EB_URL", "flag --sink.postgres.addr"}},
 		// The same value is still a second source: the next edit of one of
 		// them would silently lose to the other.
-		{[]string{"--sink.postgres.addr=pg-1:5432"}, map[string]string{"LOGHUB_EB_URL": "postgres://pg-1/db"},
+		{[]string{"--sink.postgres.addr=pg-1:5432"}, map[string]string{"LOGHUB_EB_URL": "postgres://u@pg-1/db"},
 			[]string{"sink.postgres.addr"}},
-		{nil, map[string]string{"LOGHUB_EB_URL": "postgres://pg-1/db", "SYSLOG_SINK_POSTGRES_PASSWORD": "x"},
+		{nil, map[string]string{"LOGHUB_EB_URL": "postgres://u@pg-1/db", "SYSLOG_SINK_POSTGRES_PASSWORD": "x"},
 			[]string{"sink.postgres.password", "env SYSLOG_SINK_POSTGRES_PASSWORD"}},
 		{[]string{"--config=" + ini}, map[string]string{"LOGHUB_EB_URL": "postgres://u:p@pg-1/db"},
 			[]string{"sink.postgres.password", "file " + ini + " line 2"}},
-		{[]string{"--loghub.eb_url=postgres://pg-1/db", "--sink.postgres.username=other"}, nil,
+		{[]string{"--loghub.eb_url=postgres://u@pg-1/db", "--sink.postgres.username=other"}, nil,
 			[]string{"sink.postgres.username", "flag --loghub.eb_url", "flag --sink.postgres.username"}},
-		// The URL has no path, yet it still owns the database.
-		{[]string{"--sink.postgres.database=other"}, map[string]string{"LOGHUB_EB_URL": "postgres://pg-1"},
-			[]string{"sink.postgres.database"}},
+		// The URL has no password, yet it still owns it.
+		{[]string{"--sink.postgres.password=other"}, map[string]string{"LOGHUB_EB_URL": "postgres://u@pg-1/db"},
+			[]string{"sink.postgres.password"}},
 	} {
 		err := mustFail(t, tc.args, tc.env, tc.want[0])
 		for _, w := range tc.want[1:] {
@@ -231,25 +230,27 @@ func TestEBURLDump(t *testing.T) {
 		t.Fatalf("Effective = %q %q", l.Effective()["loghub.eb_url"], l.Effective()["sink.postgres.password"])
 	}
 
-	// Without a secret the dump reads back to the same configuration: the
-	// keys the URL decides are commented out -- filled ones and the ones it
-	// leaves at their default -- so the URL decides them again instead of
-	// conflicting with an explicit copy.
+	// With the URL given again, the dump reads back to the same
+	// configuration: the keys the URL decides are commented out -- filled
+	// ones and the ones it leaves at their default -- so the URL decides them
+	// again instead of conflicting with an explicit copy. The URL itself is
+	// redacted in the dump (a bare user too: it may be a pasted token), and
+	// since every URL now names a user (SPEC §10.9), it is given again here as
+	// the environment that wins over the file.
 	for _, u := range []string{
-		// No userinfo at all: even a bare user is redacted (it may be a
-		// pasted token), and a redacted dump is not re-loadable by design.
-		"postgres://pg-1/logs?sslmode=prefer",
-		"postgresql://pg-1:6432",
-		"postgres:///logs?host=/var/run/postgresql",
+		"postgres://app@pg-1/logs?sslmode=prefer",
+		"postgresql://app@pg-1:6432/logs",
+		"postgres://app@/logs?host=/var/run/postgresql",
 	} {
-		l = mustLoad(t, []string{"--sink.workers=3"}, map[string]string{"LOGHUB_EB_URL": u})
+		env := map[string]string{"LOGHUB_EB_URL": u}
+		l = mustLoad(t, []string{"--sink.workers=3"}, env)
 		buf.Reset()
 		if err := l.DumpINI(&buf); err != nil {
 			t.Fatal(err)
 		}
 		f := filepath.Join(t.TempDir(), "dump.ini")
 		writeFile(t, f, buf.String())
-		back := mustLoad(t, []string{"--config=" + f}, nil)
+		back := mustLoad(t, []string{"--config=" + f}, env)
 		if !reflect.DeepEqual(back.Config, l.Config) {
 			t.Fatalf("%s: dump did not round-trip\n got %+v\nwant %+v\n%s", u, back.Config, l.Config, buf.String())
 		}
@@ -262,15 +263,15 @@ func TestEBURLDump(t *testing.T) {
 			t.Fatalf("%s: read back, sink.postgres.addr comes from %v", u, back.Source["sink.postgres.addr"])
 		}
 	}
-	// A URL without userinfo leaves the user at its default, and the dump
-	// still comments it out: it is the URL's to decide.
-	l = mustLoad(t, nil, map[string]string{"LOGHUB_EB_URL": "postgres://pg-1/logs"})
+	// A URL without a password fills it empty, and the dump still comments it
+	// out: it is the URL's to decide.
+	l = mustLoad(t, nil, map[string]string{"LOGHUB_EB_URL": "postgres://app@pg-1/logs"})
 	buf.Reset()
 	if err := l.DumpINI(&buf); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "# decided by loghub.eb_url, which leaves it at its default") ||
-		!strings.Contains(buf.String(), "# username                     = syslog") {
+	if !strings.Contains(buf.String(), "# derived from loghub.eb_url") ||
+		!strings.Contains(buf.String(), "# password                     = ") {
 		t.Fatalf("default owned key not commented:\n%s", buf.String())
 	}
 }

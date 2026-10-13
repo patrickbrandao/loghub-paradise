@@ -77,18 +77,24 @@ func (i *Instrumented) Deliver(ctx context.Context, envs []Envelope, opTimeout t
 			if err == nil {
 				break
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			class := ClassOf(err)
-			if class == ClassFatal {
-				return err
-			}
 			if class == ClassLogic {
+				// Settled BEFORE the context check: write already counted the
+				// refusal (events_dropped{sink_logic}), so the ERROR with the
+				// uuids must come with it even when a SIGTERM lands during
+				// that write. Checked after, the count stood without the log
+				// that says which messages were lost (go-relplog-pg-server's
+				// independent review, 2026-10-13).
 				stored, lost := settleLogic(err, b.Envelopes)
 				i.log.Error("the sink refused a chunk permanently; the messages are lost",
 					"count", len(lost), "stored", stored, "error", err, "uuids", lost)
 				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if class == ClassFatal {
+				return err
 			}
 			// Counted only here, past the context check, as in the workers: a
 			// write cut short by the caller's own cancellation -- SIGTERM during

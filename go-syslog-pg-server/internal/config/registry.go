@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -97,13 +99,13 @@ func Registry(c *Config) []*Param {
 		{Sec: "listen", Key: "udp", Kind: KString, Def: ":1514", Ptr: &c.Listen.UDP,
 			Desc: "UDP address (RFC 5426); empty disables the transport"},
 		{Sec: "listen", Key: "udp_listeners", Kind: KInt, Def: "1", Ptr: &c.Listen.UDPListeners,
-			Desc: "number of UDP sockets; >1 enables SO_REUSEPORT and is the only way past one core"},
+			Desc: "number of UDP sockets, 1..256; >1 enables SO_REUSEPORT and is the only way past one core"},
 		{Sec: "listen", Key: "udp_read_buffer", Kind: KBytes, Def: "8MiB", Ptr: &c.Listen.UDPReadBuffer,
 			Desc: "SO_RCVBUF; what does not fit is dropped by the kernel before this process sees it. The effective value is read back and exposed"},
 		{Sec: "listen", Key: "tcp", Kind: KString, Def: ":1514", Ptr: &c.Listen.TCP,
 			Desc: "TCP address (RFC 6587); empty disables the transport"},
 		{Sec: "listen", Key: "tcp_listeners", Kind: KInt, Def: "1", Ptr: &c.Listen.TCPListeners,
-			Desc: "number of TCP listeners; >1 enables SO_REUSEPORT"},
+			Desc: "number of TCP listeners, 1..256; >1 enables SO_REUSEPORT"},
 		{Sec: "listen", Key: "unix", Kind: KString, Def: "", Ptr: &c.Listen.Unix,
 			Desc: "unix datagram socket path, absolute; /dev/log is the convention. The only write outside server.data_dir"},
 		{Sec: "listen", Key: "unix_mode", Kind: KOctal, Def: "0666", Ptr: &c.Listen.UnixMode,
@@ -168,7 +170,7 @@ func Registry(c *Config) []*Param {
 
 		// ------------------------------------------------------------------ ring
 		{Sec: "ring", Key: "capacity_items", Kind: KInt, Def: "65536", Ptr: &c.Ring.CapacityItems,
-			Desc: "item ceiling of the memory ring; with 200-byte messages this is the one that binds"},
+			Desc: "item ceiling of the memory ring, 1..16777216; with 200-byte messages this is the one that binds"},
 		{Sec: "ring", Key: "max_bytes", Kind: KBytes, Def: "512MiB", Ptr: &c.Ring.MaxBytes,
 			Desc: "byte ceiling, counting each item's raw buffer capacity plus 256 bytes; the JLH is the worker's memory, not the ring's"},
 		{Sec: "ring", Key: "high_water", Kind: KFloat, Def: "0.80", Ptr: &c.Ring.HighWater,
@@ -176,11 +178,11 @@ func Registry(c *Config) []*Param {
 
 		// ------------------------------------------------------------------ sink
 		{Sec: "sink", Key: "workers", Kind: KInt, Def: "4", Ptr: &c.Sink.Workers,
-			Desc: "drain goroutines, which also run the full conversion; each holds a pool connection out of a budget the whole fleet shares, so above 16 the boot warns"},
+			Desc: "drain goroutines, which also run the full conversion; each holds a pool connection out of a budget the whole fleet shares, so above 16 the boot warns; 1..1024"},
 		{Sec: "sink", Key: "batch", Kind: KInt, Def: "256", Ptr: &c.Sink.Batch,
-			Desc: "items per Dequeue, and rows per INSERT"},
+			Desc: "items per Dequeue, and rows per INSERT; 1..65536"},
 		{Sec: "sink", Key: "batch_max_bytes", Kind: KBytes, Def: "16MiB", Ptr: &c.Sink.BatchMaxBytes,
-			Desc: "ceiling of JLH bytes per chunk; the JLH reaches 12x the raw line, and workers x batch x worst JLH would pass 1GiB"},
+			Desc: "ceiling of JLH bytes per chunk; the JLH reaches 12x the raw line, and workers x batch x worst JLH would pass 1GiB; at most 256MiB, under libpq's 1GiB message"},
 		{Sec: "sink", Key: "batch_max_delay", Kind: KDuration, Def: "5ms", Ptr: &c.Sink.BatchMaxDelay,
 			Desc: "maximum wait to fill a batch; 0 = no wait"},
 		{Sec: "sink", Key: "op_timeout", Kind: KDuration, Def: "5s", Ptr: &c.Sink.OpTimeout,
@@ -214,7 +216,7 @@ func Registry(c *Config) []*Param {
 		{Sec: "sink.postgres", Key: "table", Kind: KString, Def: "loghub.inbox", Ptr: &c.SinkPG.Table,
 			Desc: "the LogHub queue (loghub.inbox DDL), name or schema.name in lowercase; never created by the server, only validated"},
 		{Sec: "sink.postgres", Key: "pool_size", Kind: KInt, Def: "0", Ptr: &c.SinkPG.PoolSize,
-			Desc: "connection pool ceiling; 0 derives sink.workers + 1"},
+			Desc: "connection pool ceiling, at least sink.workers + 1 (the health probe needs one more), at most 4096; 0 derives sink.workers + 1"},
 
 		// ---------------------------------------------------------------- loghub
 		{Sec: "loghub", Key: "eb_url", Kind: KString, Def: "", Ptr: &c.LogHub.EBURL, Redact: RedactURL,
@@ -297,10 +299,101 @@ func newIndex(params []*Param) *index {
 func (ix *index) lookup(name string) (*Param, error) {
 	p, ok := ix.byName[name]
 	if !ok {
+		// Named only when it has the shape of a name. What reaches here from
+		// an INI key or a flag is everything before the first '=', and a
+		// ':' typed for the '=' ("password: hunter2 = x",
+		// "--sink.postgres.password:hunter2") puts the value inside it; the
+		// error goes to stderr (SPEC §13.2).
+		if !paramNameRE.MatchString(name) {
+			return nil, fmt.Errorf("unknown parameter (the name holds characters no parameter " +
+				"name has, so it is not shown; a value goes after an '=')")
+		}
+		if removedParams[name] {
+			return nil, fmt.Errorf("unknown parameter %q: go-syslog-server has it, "+
+				"go-syslog-pg-server does not (SPEC §1.2)", name)
+		}
+		if ix.extendsAName(name) {
+			// "--sink.postgres.passwordhunter2": the '=' was forgotten and
+			// the value glued to the name, with or without a separator
+			// ("-hunter2", "_hunter2", ".hunter2"). Quoted, the error would
+			// print the secret (independent review, 2026-10-13).
+			return nil, fmt.Errorf("unknown parameter (it starts with the name of a parameter " +
+				"and goes on, so it is not shown: the '=' between the name and the value may be missing)")
+		}
 		return nil, fmt.Errorf("unknown parameter %q", name)
 	}
 	return p, nil
 }
+
+// extendsAName reports whether name is a parameter name of the registry with
+// something glued after it.
+func (ix *index) extendsAName(name string) bool {
+	for n := range ix.byName {
+		if len(name) > len(n) && strings.HasPrefix(name, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownSectionOf reports whether name, read as "<section>.<key>", names a
+// section of the registry -- or one of go-syslog-server that this server
+// dropped: "sink.postgres.tabel" and "filter.min_severity" do, "hunter2" and
+// "x" do not. A dropped section counts because a command line copied from
+// go-syslog-server is exactly where such a flag comes from, and the error
+// must name it instead of blaming the value before it (SPEC §13.2).
+func (ix *index) knownSectionOf(name string) bool {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 {
+		return false
+	}
+	return ix.knownSection(name[:i])
+}
+
+func (ix *index) knownSection(sec string) bool {
+	if removedSections[sec] {
+		return true
+	}
+	for _, p := range ix.byName {
+		if p.Sec == sec {
+			return true
+		}
+	}
+	return false
+}
+
+// iniKeyRE is what an INI key of this server, or of go-syslog-server, looks
+// like. It is narrower than paramNameRE on purpose: an unknown INI key is
+// named only when it has this shape, because the INI is where a secret wraps
+// onto a second line ("password = eyJhbGciOiJI" then "UzI1NiJ9abcDEF==") and
+// the continuation reads as a key.
+var iniKeyRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// lookupINI is lookup for an INI entry. An unknown key is named only when its
+// section is one this server (or go-syslog-server) has, its key has the shape
+// of a key, and the line before it was not a secret: a key right after a
+// password is most likely the rest of that value on the next line
+// ("password = abc" then "ffd3a9c1b2=") -- the error goes to stderr and, on a
+// SIGHUP, to the server log (SPEC §13.2, §16.2).
+func (ix *index) lookupINI(e iniEntry, afterSecret bool) (*Param, error) {
+	if p, ok := ix.byName[e.Name]; ok {
+		return p, nil
+	}
+	switch {
+	case afterSecret:
+		return nil, errors.New("unknown parameter right after a secret value; it is not shown, " +
+			"in case it is the rest of that value: a value must fit on one line")
+	case !iniKeyRE.MatchString(e.Key) || !ix.knownSection(e.Sec):
+		return nil, errors.New("unknown parameter (not shown: its section or its key is not one " +
+			"a parameter has; a value goes after an '=' on the same line)")
+	}
+	return ix.lookup(e.Name)
+}
+
+// paramNameRE is what a parameter name, known or not, can look like: the
+// dotted lowercase words of the registry, with room for a typo in case or a
+// dash. Anything else is not printed.
+var paramNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
 // sections returns section names in registry order, which is the order used by
 // --help and the effective-config dump.

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -16,6 +17,22 @@ import (
 // default in PostgreSQL -- that the whole fleet shares, and past a point a
 // larger pool trades throughput for lock contention inside the database.
 const dbWarnWorkers = 16
+
+// Ceilings of SPEC §13.2 for the keys that size memory or a count handed to a
+// library (go-relplog-pg-server's independent review, 2026-10-13, ported).
+// Without them a typo of a few digits panicked the boot (ring.capacity_items:
+// makechan), allocated a gigabyte per Dequeue (sink.batch), wrapped around in
+// the pool's int32 (sink.postgres.pool_size 4294967300 became 4) or built a
+// chunk whose Bind passes libpq's 1 GiB message limit and fails with no
+// SQLSTATE -- a network error retried forever (sink.batch_max_bytes).
+const (
+	maxRingItems     = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxSinkBatch     = 65536
+	maxBatchMaxBytes = 256 << 20
+	maxSinkWorkers   = 1024
+	maxPoolSize      = 4096
+	maxListeners     = 256
+)
 
 // pgIdent is what sink.postgres.table must look like: a plain lowercase
 // identifier, optionally schema-qualified. Lowercase only, so the name can be
@@ -121,8 +138,8 @@ func validateListeners(c *Config) error {
 		{"listen.udp_listeners", c.Listen.UDPListeners},
 		{"listen.tcp_listeners", c.Listen.TCPListeners},
 	} {
-		if n.v < 1 {
-			return fmt.Errorf("%s: %d is below 1", n.name, n.v)
+		if n.v < 1 || n.v > maxListeners {
+			return fmt.Errorf("%s: %d is outside 1..%d", n.name, n.v, maxListeners)
 		}
 	}
 	if c.Listen.Unix != "" && !filepath.IsAbs(c.Listen.Unix) {
@@ -198,8 +215,8 @@ func validateSyslog(c *Config) error {
 }
 
 func validateRanges(c *Config) error {
-	if c.Ring.CapacityItems < 1 {
-		return fmt.Errorf("ring.capacity_items: %d is below 1", c.Ring.CapacityItems)
+	if c.Ring.CapacityItems < 1 || c.Ring.CapacityItems > maxRingItems {
+		return fmt.Errorf("ring.capacity_items: %d is outside 1..%d", c.Ring.CapacityItems, maxRingItems)
 	}
 	if c.Ring.MaxBytes < 1 {
 		return fmt.Errorf("ring.max_bytes: must be positive")
@@ -207,14 +224,15 @@ func validateRanges(c *Config) error {
 	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
 		return fmt.Errorf("ring.high_water: %g is outside (0, 1]", c.Ring.HighWater)
 	}
-	if c.Sink.Workers < 1 {
-		return fmt.Errorf("sink.workers: %d is below 1", c.Sink.Workers)
+	if c.Sink.Workers < 1 || c.Sink.Workers > maxSinkWorkers {
+		return fmt.Errorf("sink.workers: %d is outside 1..%d", c.Sink.Workers, maxSinkWorkers)
 	}
-	if c.Sink.Batch < 1 {
-		return fmt.Errorf("sink.batch: %d is below 1", c.Sink.Batch)
+	if c.Sink.Batch < 1 || c.Sink.Batch > maxSinkBatch {
+		return fmt.Errorf("sink.batch: %d is outside 1..%d", c.Sink.Batch, maxSinkBatch)
 	}
-	if c.Sink.BatchMaxBytes < 1 {
-		return fmt.Errorf("sink.batch_max_bytes: must be positive")
+	if c.Sink.BatchMaxBytes < 1 || c.Sink.BatchMaxBytes > maxBatchMaxBytes {
+		return fmt.Errorf("sink.batch_max_bytes: %s is outside 1..256MiB (a chunk is one INSERT, "+
+			"and libpq refuses a message above 1GiB with no SQLSTATE)", FormatBytes(c.Sink.BatchMaxBytes))
 	}
 	if c.Sink.MaxRetries < 1 {
 		return fmt.Errorf("sink.max_retries: %d is below 1", c.Sink.MaxRetries)
@@ -293,6 +311,12 @@ func validatePostgres(c *Config) error {
 	host, port, err := net.SplitHostPort(d.Addr)
 	switch {
 	case strings.HasPrefix(d.Addr, "/"):
+		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
+		// which pgx then tries as a list: refused like "h1,h2" below.
+		if strings.ContainsAny(d.Addr, ",\t ") {
+			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
+				"with no comma or blank", d.Addr)
+		}
 		if err != nil {
 			break // a bare socket directory: port 5432
 		}
@@ -300,7 +324,7 @@ func validatePostgres(c *Config) error {
 			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
 				"must be 1..65535", d.Addr)
 		}
-	case err != nil || host == "" || strings.ContainsAny(host, ", ") || !validPort(port):
+	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
 		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
 			"1..65535) nor a unix socket directory starting with /", d.Addr)
 	}
@@ -308,14 +332,28 @@ func validatePostgres(c *Config) error {
 		return fmt.Errorf("sink.postgres.table: %q must be a lowercase identifier, "+
 			"optionally schema-qualified", d.Table)
 	}
-	if d.PoolSize < 0 {
-		return fmt.Errorf("sink.postgres.pool_size: %d is negative; 0 derives sink.workers + 1", d.PoolSize)
+	if d.PoolSize < 0 || d.PoolSize > maxPoolSize {
+		return fmt.Errorf("sink.postgres.pool_size: %d is outside 0..%d; 0 derives sink.workers + 1",
+			d.PoolSize, maxPoolSize)
 	}
 	return nil
 }
 
+// oneHost reports whether host, the part before the port, names one server: a
+// name or an IP literal. A ':' is only an IPv6 literal's: "[h:5432]:5433"
+// (what postgres://u@h:5432:5433/db becomes) passed as host "h:5432", a DNS
+// name no resolver has, retried for the whole sink.boot_timeout.
+func oneHost(host string) bool {
+	if !strings.Contains(host, ":") {
+		return true
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
+}
+
 // sinkWorkers applies the connection budget of SPEC §10.5: the pool is derived
-// from the workers, and a pool smaller than the workers is refused.
+// from the workers, and a pool without a connection to spare for the health
+// probe is refused.
 func (v *validator) sinkWorkers() error {
 	c := v.c
 	if c.Sink.Workers > dbWarnWorkers {
@@ -327,10 +365,15 @@ func (v *validator) sinkWorkers() error {
 		c.SinkPG.PoolSize = c.Sink.Workers + 1
 		v.notes["sink.postgres.pool_size"] = "derived: sink.workers + 1"
 	}
-	if c.SinkPG.PoolSize < c.Sink.Workers {
-		return fmt.Errorf("sink.postgres.pool_size=%d is below sink.workers=%d: a worker would "+
-			"block waiting for a connection another worker holds",
-			c.SinkPG.PoolSize, c.Sink.Workers)
+	// workers + 1, not workers: the health probe takes its connection out of
+	// the same pool. With pool_size = workers, slow but working writes held
+	// every connection, the probe timed out waiting for one, the sink went
+	// DOWN and, past fail_timeout, FATAL: exit 3 with nothing wrong with the
+	// database (go-relplog-pg-server's independent review, 2026-10-13).
+	if c.SinkPG.PoolSize < c.Sink.Workers+1 {
+		return fmt.Errorf("sink.postgres.pool_size=%d is below sink.workers + 1 = %d: every worker "+
+			"holds a connection while it writes, and the health probe needs one more",
+			c.SinkPG.PoolSize, c.Sink.Workers+1)
 	}
 	return nil
 }

@@ -1,0 +1,1046 @@
+package sink
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+// The fixes of the NATS sink ported from go-relplog-nats-server on 2026-10-13
+// (root CHANGELOG, "2026-10-13 — RP, RN" and "2026-10-12 — R", the "a portar"
+// lists for SN), and SPEC §21.1 items 5 to 8, which the same code closes. The
+// fake server and its helpers come with them. Each test failed on the code
+// before the port, or -- the mutation killers from RN -- guards a rule SN
+// already had. Nothing here needs a server except the tests that say so:
+// those against a server with limited permissions skip without
+// SYSLOG_TEST_NATS_PERM_URL (see natsPermSetup), the one against a server that
+// demands TLS without SYSLOG_TEST_NATS_TLS_URL, and the stream ones without
+// SYSLOG_TEST_NATS_URL.
+
+// ------------------------------------------------------------- fake server
+
+// natsFake is just enough of a NATS server to see what a client sends and to
+// answer it the way a real one would: it greets every connection with its
+// INFO, answers PING with PONG, records the subject of every PUB/HPUB, and
+// optionally answers each publish with an -ERR (pubReply) or, when it carries
+// a reply subject, with a JetStream PubAck (acks).
+type natsFake struct {
+	addr  string
+	first chan []byte
+	pubs  atomic.Int64
+
+	mu       sync.Mutex
+	info     string
+	pubReply string
+	acks     bool
+	// silent leaves every PING unanswered: a flush then waits for a PONG
+	// that never comes, until the connection drops.
+	silent bool
+	// replyFor, when set, answers a publish to subject with that -ERR line
+	// (or nothing, for ""), in place of pubReply.
+	replyFor func(subject string) string
+	// ackErr, when set, turns the ack of the n-th acknowledged publish
+	// (from 1) into that JetStream API error JSON (or a normal ack, for "").
+	ackErr func(n int) string
+	// noResponders answers every publish that has a reply subject with the
+	// 503 status a real server sends when no stream listens.
+	noResponders bool
+	conns        []net.Conn
+	subjects     []string
+}
+
+func startNATSFake(t *testing.T, info string) *natsFake {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	f := &natsFake{addr: ln.Addr().String(), first: make(chan []byte, 16), info: info}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go f.serve(c)
+		}
+	}()
+	return f
+}
+
+func natsFakeINFO(extra string) string {
+	return `{"server_id":"FAKE","server_name":"fake","version":"2.14.6","proto":1,"host":"127.0.0.1",` +
+		`"port":4222,"headers":true,"max_payload":1048576` + extra + `}`
+}
+
+func (f *natsFake) set(fn func(f *natsFake)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn(f)
+}
+
+// drop hangs up every connection, so a client reconnects.
+func (f *natsFake) drop() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.conns {
+		c.Close()
+	}
+	f.conns = nil
+}
+
+func (f *natsFake) published() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.subjects...)
+}
+
+func (f *natsFake) serve(c net.Conn) {
+	defer c.Close()
+	f.mu.Lock()
+	f.conns = append(f.conns, c)
+	info := f.info
+	f.mu.Unlock()
+	if _, err := c.Write([]byte("INFO " + info + "\r\n")); err != nil {
+		return
+	}
+	rd := bufio.NewReader(c)
+	subs := map[string]string{} // subject of each SUB -> its sid
+	var seq int
+	first := true
+	for {
+		line, err := rd.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if first {
+			select {
+			case f.first <- []byte(line):
+			default:
+			}
+			first = false
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "SUB":
+			if len(fields) >= 3 {
+				subs[fields[1]] = fields[len(fields)-1]
+			}
+		case "PING":
+			f.mu.Lock()
+			silent := f.silent
+			f.mu.Unlock()
+			if silent {
+				continue
+			}
+			if _, err := c.Write([]byte("PONG\r\n")); err != nil {
+				return
+			}
+		case "PUB", "HPUB":
+			// PUB <subject> [reply] <size>, HPUB <subject> [reply] <hdr> <total>:
+			// the payload is read whole, so its bytes are never taken for a
+			// protocol line.
+			size, _ := strconv.Atoi(fields[len(fields)-1])
+			if _, err := io.ReadFull(rd, make([]byte, size+2)); err != nil {
+				return
+			}
+			f.pubs.Add(1)
+			reply := ""
+			if (fields[0] == "PUB" && len(fields) == 4) || (fields[0] == "HPUB" && len(fields) == 5) {
+				reply = fields[2]
+			}
+			f.mu.Lock()
+			f.subjects = append(f.subjects, fields[1])
+			pubReply, acks, ackErr, noResp := f.pubReply, f.acks, f.ackErr, f.noResponders
+			if f.replyFor != nil {
+				pubReply = f.replyFor(fields[1])
+			}
+			f.mu.Unlock()
+			if pubReply != "" {
+				// A real server's -ERR for a denied publish, and nothing else:
+				// the message is never routed, so no ack follows.
+				if _, err := c.Write([]byte(pubReply)); err != nil {
+					return
+				}
+				continue
+			}
+			if noResp && reply != "" {
+				sid := subs[reply]
+				if i := strings.LastIndexByte(reply, '.'); sid == "" && i > 0 {
+					sid = subs[reply[:i]+".*"]
+				}
+				if sid != "" {
+					const status = "NATS/1.0 503\r\n\r\n"
+					if _, err := fmt.Fprintf(c, "HMSG %s %s %d %d\r\n%s\r\n", reply, sid,
+						len(status), len(status), status); err != nil {
+						return
+					}
+				}
+				continue
+			}
+			if acks && reply != "" {
+				sid := subs[reply]
+				if i := strings.LastIndexByte(reply, '.'); sid == "" && i > 0 {
+					// The async publish mux listens on _INBOX.<nuid>.*.
+					sid = subs[reply[:i]+".*"]
+				}
+				if sid != "" {
+					seq++
+					ack := fmt.Sprintf(`{"stream":"LOGHUB_SYSLOG","seq":%d}`, seq)
+					if ackErr != nil {
+						if e := ackErr(seq); e != "" {
+							ack = e
+						}
+					}
+					if _, err := fmt.Fprintf(c, "MSG %s %s %d\r\n%s\r\n", reply, sid, len(ack), ack); err != nil {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// natsLogBuf is a bytes.Buffer a logger and the test can share.
+type natsLogBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *natsLogBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *natsLogBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// fakeSink is a sink against srv in mode, logging into buf when given.
+func fakeSink(t *testing.T, srv *natsFake, mode string, buf *natsLogBuf, mut func(*NATSConfig)) *NATS {
+	t.Helper()
+	cfg := NATSConfig{URLs: []string{"nats://" + srv.addr}, Mode: mode, Stream: "LOGHUB_SYSLOG",
+		Workspace: "default", ConnectTimeout: 5 * time.Second, OpTimeout: 5 * time.Second}
+	if mode == NATSModeCore {
+		cfg.Stream = ""
+	}
+	if mut != nil {
+		mut(&cfg)
+	}
+	log := discard()
+	if buf != nil {
+		log = slog.New(slog.NewTextHandler(buf, nil))
+	}
+	n, err := NewNATS(cfg, log, metrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.Close() })
+	return n
+}
+
+// holdAsyncErrors delays the client's ErrorHandler, so only a synchronous read
+// of LastError can produce the verdict in time: with the handler racing the
+// round trip, a path that skipped the read passed now and then.
+func holdAsyncErrors(n *NATS) {
+	n.opts = append(n.opts, func(o *nats.Options) error {
+		async := o.AsyncErrorCB
+		o.AsyncErrorCB = func(c *nats.Conn, s *nats.Subscription, err error) {
+			time.Sleep(2 * time.Second)
+			async(c, s, err)
+		}
+		return nil
+	})
+}
+
+func permViolation(s string) error { return fmt.Errorf("%w: %s", nats.ErrPermissionViolation, s) }
+
+// SPEC §10.7 and §21.1 item 7 (go-syslog-server §22.1 item 14): which denials are a verdict on the data path. The text is
+// what nats.go hands the ErrorHandler for a server's -ERR.
+func TestNATSDeniesTheDataPath(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{permViolation(`Permissions Violation for Publish to "loghub.default.syslog"`), true},
+		{permViolation(`Permissions Violation for Publish to "loghub.acme.prod.syslog"`), true},
+		{permViolation(`Permissions Violation for Publish to "$JS.API.STREAM.INFO.LOGHUB_SYSLOG"`), true},
+		{permViolation(`Permissions Violation for Subscription to "_INBOX.Ab12Cd.*"`), true},
+		{permViolation(`Permissions Violation for Subscription to "_INBOX.x" using queue "q"`), true},
+		// The beacon is the control plane: never a verdict on the data,
+		// with the default namespace or one that ends like a data subject.
+		{permViolation(`Permissions Violation for Publish to "loghub._ctl.beacon"`), false},
+		{permViolation(`Permissions Violation for Publish to "loghub.ops.syslog.beacon"`), false},
+		{permViolation(`Permissions Violation for Publish to "loghub.ops.syslog.kern.beacon"`), false},
+		// Not the shape of a data subject. The facility-severity form of
+		// go-syslog-server is never published here (SPEC §1.2, §3.8).
+		{permViolation(`Permissions Violation for Publish to "loghub.default.syslog.authpriv.warning"`), false},
+		{permViolation(`Permissions Violation for Publish to "loghub.default.syslog.nope.info"`), false},
+		{permViolation(`Permissions Violation for Publish to "loghub.syslog"`), false},
+		{permViolation(`Permissions Violation for Publish to "other.thing"`), false},
+		// A subscription that is not this sink's.
+		{permViolation(`Permissions Violation for Subscription to "loghub.default.syslog"`), false},
+		// The text without the sentinel, and other errors.
+		{errors.New(`Permissions Violation for Publish to "loghub.default.syslog"`), false},
+		{nats.ErrTimeout, false},
+		{nil, false},
+	} {
+		if got := deniesTheDataPath(tc.err); got != tc.want {
+			t.Errorf("deniesTheDataPath(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// SPEC §10.7 and §21.1 item 7 (go-syslog-server §22.1 item 14): a denial on the data path reaches this sink only
+// asynchronously, so nothing ever turned FATAL and the ring filled behind a
+// sink that looked UP. The verdict is kept and returned by Health and by every
+// Write, which then publishes nothing; a denial on the beacon's subject is
+// not one.
+func TestNATSVerdictIsReturnedByHealthAndWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	srv := startNATSFake(t, natsFakeINFO(""))
+	n := fakeSink(t, srv, NATSModeCore, nil, nil)
+	if err := n.Health(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n.asyncError(permViolation(`Permissions Violation for Publish to "loghub._ctl.beacon"`))
+	if err := n.Health(ctx); err != nil {
+		t.Fatalf("Health after a beacon denial = %v: the control plane took the data down", err)
+	}
+	if err := n.Write(ctx, batchN(t, 2)); err != nil {
+		t.Fatalf("control: Write after a beacon denial = %v", err)
+	}
+	sent := srv.pubs.Load()
+
+	n.asyncError(permViolation(`Permissions Violation for Subscription to "_INBOX.abc.*"`))
+	if err := n.Health(ctx); !IsFatal(err) || !strings.Contains(err.Error(), "permissions violation") {
+		t.Fatalf("Health after a data-path denial = %v, want fatal naming it", err)
+	}
+	if err := n.Write(ctx, batchN(t, 1)); !IsFatal(err) {
+		t.Fatalf("Write after the verdict = %v, want fatal", err)
+	}
+	if got := srv.pubs.Load(); got != sent {
+		t.Errorf("Write after the verdict published %d messages, want none", got-sent)
+	}
+}
+
+// SPEC §10.7 and §21.1 item 7 (go-syslog-server §22.1 item 14), jetstream mode: a denied publish never gets an ack, so the
+// futures time out -- network, retried forever. The -ERR already sits in
+// LastError when they do, and the Write returns the verdict, fatal and still
+// tainting; the ErrorHandler is held back so only that read can do it.
+func TestNATSJetStreamDeniedPublishIsFatalAfterTheTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	srv := startNATSFake(t, natsFakeINFO(""))
+	srv.set(func(f *natsFake) {
+		f.pubReply = "-ERR 'Permissions Violation for Publish to \"loghub.default.syslog\"'\r\n"
+	})
+	n := fakeSink(t, srv, NATSModeJetStream, nil, func(c *NATSConfig) { c.OpTimeout = 500 * time.Millisecond })
+	holdAsyncErrors(n)
+	err := n.Write(ctx, batchN(t, 2))
+	if !IsFatal(err) || !strings.Contains(err.Error(), "ermissions") {
+		t.Fatalf("Write of a denied chunk = %v (class %s), want fatal naming the denial", err, ClassOf(err))
+	}
+	if !taints(err) {
+		t.Error("the verdict lost the taint: futures of the chunk may still be pending")
+	}
+}
+
+// SPEC §21.1 item 5 (go-syslog-server §22.1 item 17) (decided 2026-10-11): retention=interest acknowledges and keeps
+// nothing while no consumer is interested, so a confirmed chunk could be lost:
+// refused, fatal. workqueue and limits are the controls. max_msgs_per_subject
+// is only warned about, once per value, though validate runs on every check.
+func TestNATSValidateRetentionAndPerSubjectCap(t *testing.T) {
+	ok := jetstream.StreamConfig{Name: "LOGHUB_SYSLOG", Subjects: []string{"loghub.default.syslog"}}
+	n := newTestNATS(t, nil)
+	for _, r := range []jetstream.RetentionPolicy{jetstream.LimitsPolicy, jetstream.WorkQueuePolicy} {
+		cfg := ok
+		cfg.Retention = r
+		if err := n.validate(1<<20, &jetstream.StreamInfo{Config: cfg}); err != nil {
+			t.Errorf("retention=%s refused: %v", r, err)
+		}
+	}
+	interest := ok
+	interest.Retention = jetstream.InterestPolicy
+	if err := n.validate(1<<20, &jetstream.StreamInfo{Config: interest}); !IsFatal(err) ||
+		!strings.Contains(err.Error(), "retention=interest") {
+		t.Errorf("retention=interest = %v, want fatal naming it", err)
+	}
+
+	var buf natsLogBuf
+	w, err := NewNATS(NATSConfig{URLs: []string{"nats://127.0.0.1:1"}, Stream: "LOGHUB_SYSLOG", Workspace: "default"},
+		slog.New(slog.NewTextHandler(&buf, nil)), metrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	check := func(perSubject int64) {
+		t.Helper()
+		cfg := ok
+		cfg.MaxMsgsPerSubject = perSubject
+		if err := w.validate(1<<20, &jetstream.StreamInfo{Config: cfg}); err != nil {
+			t.Fatalf("max_msgs_per_subject=%d refused: %v", perSubject, err)
+		}
+	}
+	warnings := func() int { return strings.Count(buf.String(), "max_msgs_per_subject=") }
+	check(-1)
+	check(0)
+	if warnings() != 0 {
+		t.Fatalf("a warning without a per-subject cap:\n%s", buf.String())
+	}
+	check(10)
+	check(10)
+	check(10)
+	if warnings() != 1 {
+		t.Fatalf("%d warnings for one value over three checks, want 1:\n%s", warnings(), buf.String())
+	}
+	check(20)
+	check(-1)
+	check(20)
+	if warnings() != 3 {
+		t.Fatalf("%d warnings, want 3 (10, 20, and 20 again after it was lifted):\n%s", warnings(), buf.String())
+	}
+}
+
+// SPEC §21.1 item 8 (go-syslog-server §22.1 item 20): core mode publishes a dump of another space with no stream to
+// ask whether anyone listens: lost unless someone subscribes there, and the
+// dump removed as delivered. It is said once per foreign space, never per
+// message, and never for this instance's own space.
+func TestNATSCoreWarnsOnceAboutAForeignSpace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	srv := startNATSFake(t, natsFakeINFO(""))
+	var buf natsLogBuf
+	n := fakeSink(t, srv, NATSModeCore, &buf, nil)
+	if err := n.Write(ctx, batchN(t, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "another space") {
+		t.Fatalf("a warning for the own space:\n%s", buf.String())
+	}
+	for range 3 {
+		if err := n.Write(ctx, batchFrom(t, newItemIn("acme", line5424), newItemIn("acme", line3164))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := strings.Count(buf.String(), "subject=loghub.acme.syslog"); got != 1 {
+		t.Errorf("%d warnings for the foreign space, want 1:\n%s", got, buf.String())
+	}
+	// Control: the foreign envelopes did go out, on their own subject.
+	if got := strings.Count(strings.Join(srv.published(), " "), "loghub.acme.syslog"); got != 6 {
+		t.Errorf("%d publishes on the foreign subject, want 6", got)
+	}
+}
+
+// SPEC §21.1 item 8 (go-syslog-server §22.1 item 20): the own space is the hot path, and finding its subject --
+// with the comparison that tells a foreign space apart -- must not cost an
+// allocation per envelope: the subject strings are built once.
+func TestNATSOwnSubjectDoesNotAllocate(t *testing.T) {
+	n := newTestNATS(t, nil)
+	b := batchOf(t, line5424)
+	e := &b.Envelopes[0]
+	if allocs := testing.AllocsPerRun(1000, func() { _ = n.subject(e) }); allocs != 0 {
+		t.Errorf("%v allocations per subject of the own space, want 0", allocs)
+	}
+}
+
+// SPEC §10.7 (go-syslog-server §22.1 item 16), the other half: checking the contract on every health check
+// must not start to require the subject of another space a reingested dump
+// published on. Once that dump drained, narrowing the stream back to the own
+// space -- what the operator may do -- is not a FATAL.
+func TestNATSForeignSubjectIsNotPartOfTheContract(t *testing.T) {
+	f := natsSetup(t)
+	other := fmt.Sprintf("o%d", time.Now().UnixNano())
+	space, stream := f.newStream(func(c *jetstream.StreamConfig) {
+		c.Subjects = append(c.Subjects, "loghub."+other+".syslog")
+	})
+	cfg := f.cfg
+	cfg.Stream, cfg.Workspace = stream, space
+	p := f.sink(cfg)
+	f.ready(p)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := p.Write(ctx, batchFrom(t, f.items(other, 2)...)); err != nil {
+		t.Fatalf("Write of the foreign space: %v", err)
+	}
+	if n := f.count(stream); n != 2 {
+		t.Fatalf("%d messages, want 2", n)
+	}
+	sc := natsStreamConfigFor(t, stream, space)
+	if _, err := f.js.UpdateStream(ctx, sc); err != nil {
+		t.Fatalf("narrowing the stream: %v", err)
+	}
+	if err := p.Health(ctx); err != nil {
+		t.Fatalf("Health after the foreign subject left the stream = %v, want it healthy", err)
+	}
+	if err := p.Write(ctx, batchFrom(t, f.items(space, 1)...)); err != nil {
+		t.Errorf("control: Write of the own space after the narrowing: %v", err)
+	}
+}
+
+// SPEC §21.1 item 5 (go-syslog-server §22.1 item 17) against a real server: a stream with retention=interest and no
+// consumer acknowledges a publish and keeps nothing -- shown here, so the
+// refusal is about a real loss -- and Health refuses it, fatal.
+func TestNATSInterestStreamIsRefused(t *testing.T) {
+	f := natsSetup(t)
+	space, stream := f.newStream(func(c *jetstream.StreamConfig) { c.Retention = jetstream.InterestPolicy })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := f.js.Publish(ctx, "loghub."+space+".syslog", []byte("{}")); err != nil {
+		t.Fatalf("control: the interest stream refused a publish: %v", err)
+	}
+	if n := f.count(stream); n != 0 {
+		t.Fatalf("control: the interest stream kept %d messages with no consumer", n)
+	}
+	cfg := f.cfg
+	cfg.Stream, cfg.Workspace = stream, space
+	if err := f.sink(cfg).Health(ctx); !IsFatal(err) || !strings.Contains(err.Error(), "retention=interest") {
+		t.Fatalf("Health of an interest stream = %v, want fatal naming it", err)
+	}
+}
+
+// natsPermSetup addresses a JetStream server whose users have limited
+// permissions, by SYSLOG_TEST_NATS_PERM_URL (no user part), and creates a
+// stream for a fresh space as its admin. The server's configuration:
+//
+//	listen: 127.0.0.1:14524
+//	jetstream { store_dir: "/tmp/nats-perm" }
+//	authorization { users = [
+//	  { user: admin, password: admin }
+//	  { user: nopub, password: nopub, permissions: {
+//	      publish: { allow: [">"], deny: ["loghub.*.syslog"] },
+//	      subscribe: { allow: [">"] } } }
+//	  { user: noinbox, password: noinbox, permissions: {
+//	      publish: { allow: [">"] }, subscribe: { deny: ["_INBOX.>"] } } }
+//	  { user: nobeacon, password: nobeacon, permissions: {
+//	      publish: { allow: [">"], deny: ["*.beacon"] }, subscribe: { allow: [">"] } } }
+//	] }
+func natsPermSetup(t *testing.T) (url, space, stream string) {
+	t.Helper()
+	url = strings.TrimSpace(os.Getenv("SYSLOG_TEST_NATS_PERM_URL"))
+	if url == "" {
+		t.Skip("set SYSLOG_TEST_NATS_PERM_URL to a JetStream server with the users of natsPermSetup")
+	}
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"), nats.Timeout(5*time.Second))
+	if err != nil {
+		t.Fatalf("SYSLOG_TEST_NATS_PERM_URL is not reachable as admin: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := time.Now().UnixNano()
+	space, stream = fmt.Sprintf("p%d", n), fmt.Sprintf("SLS_PERM_%d", n)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := js.CreateStream(ctx, natsStreamConfigFor(t, stream, space)); err != nil {
+		t.Fatalf("creating stream %s: %v", stream, err)
+	}
+	t.Cleanup(func() { _ = js.DeleteStream(context.Background(), stream) })
+	return url, space, stream
+}
+
+func permSink(t *testing.T, url, user, space, stream, mode string) *NATS {
+	t.Helper()
+	cfg := NATSConfig{URLs: []string{url}, Username: user, Password: user, Mode: mode, Stream: stream,
+		Workspace: space, CtlNamespace: "sls_perm_ctl", ConnectTimeout: 5 * time.Second, OpTimeout: time.Second}
+	if mode == NATSModeCore {
+		cfg.Stream = ""
+	}
+	p, err := NewNATS(cfg, discard(), metrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	return p
+}
+
+// SPEC §10.7 and §21.1 item 7 (go-syslog-server §22.1 item 14) against a real server: a role denied the data subject, or the
+// _INBOX the acks and the API's answers come back on, is a permanent verdict
+// -- fatal from Write and Health -- in both modes; a role denied only the
+// beacon's subject keeps the data path healthy.
+func TestNATSPermissionDeniedIsFatal(t *testing.T) {
+	url, space, stream := natsPermSetup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	t.Run("publish denied, jetstream", func(t *testing.T) {
+		p := permSink(t, url, "nopub", space, stream, NATSModeJetStream)
+		if err := p.Health(ctx); err != nil {
+			t.Fatalf("control: Health before any publish: %v", err)
+		}
+		if err := p.Write(ctx, batchFrom(t, newItemIn(space, line5424))); !IsFatal(err) {
+			t.Fatalf("Write of a denied publish = %v (class %s), want fatal", err, ClassOf(err))
+		}
+		if err := p.Health(ctx); !IsFatal(err) {
+			t.Fatalf("Health after the denial = %v, want fatal", err)
+		}
+	})
+	t.Run("publish denied, core", func(t *testing.T) {
+		p := permSink(t, url, "nopub", space, stream, NATSModeCore)
+		if err := p.Health(ctx); err != nil {
+			t.Fatalf("control: Health before any publish: %v", err)
+		}
+		if err := p.Write(ctx, batchFrom(t, newItemIn(space, line5424))); !IsFatal(err) {
+			t.Fatalf("Write of a denied publish = %v (class %s), want fatal at once", err, ClassOf(err))
+		}
+	})
+	t.Run("inbox subscription denied", func(t *testing.T) {
+		p := permSink(t, url, "noinbox", space, stream, NATSModeJetStream)
+		hctx, hcancel := context.WithTimeout(ctx, 3*time.Second)
+		defer hcancel()
+		if err := p.Health(hctx); !IsFatal(err) || !strings.Contains(err.Error(), "_INBOX") {
+			t.Fatalf("Health with the ack inbox denied = %v (class %s), want fatal naming _INBOX", err, ClassOf(err))
+		}
+	})
+	t.Run("beacon denied", func(t *testing.T) {
+		p := permSink(t, url, "nobeacon", space, stream, NATSModeJetStream)
+		if err := p.Health(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.PublishCore("sls_perm_ctl.beacon", []byte("{}")); err != nil {
+			t.Fatalf("PublishCore: %v", err)
+		}
+		// The -ERR arrives asynchronously; the next round trips follow it.
+		if err := p.Write(ctx, batchFrom(t, newItemIn(space, line5424))); err != nil {
+			t.Fatalf("Write after a beacon denial = %v: the control plane took the data down", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if err := p.Health(ctx); err != nil {
+			t.Fatalf("Health after a beacon denial = %v", err)
+		}
+		p.mu.Lock()
+		last := p.nc.LastError()
+		p.mu.Unlock()
+		if !errors.Is(last, nats.ErrPermissionViolation) {
+			t.Errorf("control: the beacon was not denied (last error %v); the case proves nothing", last)
+		}
+	})
+}
+
+// SPEC §10.7 (go-syslog-server §22.1 item 19) against a real server: credentials refused at the first
+// CONNECT end the boot at once, fatal, instead of waiting out
+// sink.boot_timeout with the network's message.
+func TestNATSRefusedCredentialsAreFatal(t *testing.T) {
+	url, space, stream := natsPermSetup(t)
+	cfg := NATSConfig{URLs: []string{url}, Username: "admin", Password: "wrong", Stream: stream,
+		Workspace: space, ConnectTimeout: 5 * time.Second}
+	p, err := NewNATS(cfg, discard(), metrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	h := NewHealth(p, HealthConfig{Timeout: 5 * time.Second}, discard(), metrics())
+	start := time.Now()
+	err = h.WaitReady(context.Background(), 30*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	if !IsFatal(err) {
+		t.Fatalf("WaitReady with a wrong password = %v (class %s), want fatal", err, ClassOf(err))
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("the verdict took %v; it must not wait out the boot timeout", d)
+	}
+}
+
+// nats.go keeps only the last -ERR: a beacon denial arriving during a core
+// chunk may hide a data-path denial before it, so the chunk is not confirmed.
+// An old denial, a data-path one (the verdict handles it) or no error at all
+// change nothing (independent review, 2026-10-11).
+func TestMaskedDenial(t *testing.T) {
+	beacon := fmt.Errorf("%w: Permissions Violation for Publish to \"loghub._ctl.beacon\"", nats.ErrPermissionViolation)
+	data := fmt.Errorf("%w: Permissions Violation for Publish to \"loghub.default.syslog\"", nats.ErrPermissionViolation)
+	other := errors.New("nats: stale connection")
+	for _, c := range []struct {
+		name         string
+		before, last error
+		want         bool
+	}{
+		{"new beacon denial", nil, beacon, true},
+		{"new beacon denial after another error", other, beacon, true},
+		{"the same old beacon denial", beacon, beacon, false},
+		{"a data-path denial is the verdict's", nil, data, false},
+		{"not a denial", nil, other, false},
+		{"no error", nil, nil, false},
+	} {
+		if got := maskedDenial(c.before, c.last); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// natsStreamConfigFor reads docker/nats/stream.json -- the file operators hand
+// to nats stream add -- for a fresh stream and space, so the suite tests the
+// contract operators actually apply.
+func natsStreamConfigFor(t *testing.T, name, space string) jetstream.StreamConfig {
+	t.Helper()
+	b, err := os.ReadFile("../../docker/nats/stream.json")
+	if err != nil {
+		t.Fatalf("reading the canonical stream config: %v", err)
+	}
+	var cfg jetstream.StreamConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("parsing the canonical stream config: %v", err)
+	}
+	cfg.Name = name
+	for i, s := range cfg.Subjects {
+		cfg.Subjects[i] = strings.Replace(s, "loghub.default.", "loghub."+space+".", 1)
+	}
+	return cfg
+}
+
+// recordingProxy forwards one TCP connection at a time to upstream and keeps
+// every byte the client sent, so a test can see what went on the wire.
+type recordingProxy struct {
+	ln       net.Listener
+	upstream string
+	mu       sync.Mutex
+	sent     []byte
+}
+
+func newRecordingProxy(t *testing.T, upstream string) *recordingProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &recordingProxy{ln: ln, upstream: upstream}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.pipe(c)
+		}
+	}()
+	return p
+}
+
+func (p *recordingProxy) pipe(c net.Conn) {
+	defer c.Close()
+	up, err := net.DialTimeout("tcp", p.upstream, 5*time.Second)
+	if err != nil {
+		return
+	}
+	defer up.Close()
+	go func() { _, _ = io.Copy(c, up) }()
+	buf := make([]byte, 4096)
+	for {
+		n, err := c.Read(buf)
+		if n > 0 {
+			p.mu.Lock()
+			p.sent = append(p.sent, buf[:n]...)
+			p.mu.Unlock()
+			if _, werr := up.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (p *recordingProxy) bytes() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]byte(nil), p.sent...)
+}
+
+// SPEC §1.2, §10.7, against a REAL nats-server with `tls {}` (tls_required in
+// its INFO), by SYSLOG_TEST_NATS_TLS_URL (nats://host:port, the address of
+// that listener): nats.go would upgrade to TLS on its own; the refusing
+// TLSCertCB ends the connection before a ClientHello, and the check is FATAL
+// at once, naming the TLS -- in both modes. The recording proxy in front of the
+// server proves that not one TLS record (0x16) left the client. TESTING §8 item 4
+// ("dedução do código e do nats.go") closed here.
+func TestNATSRealServerRequiringTLSIsRefusedWithoutAHandshake(t *testing.T) {
+	raw := os.Getenv("SYSLOG_TEST_NATS_TLS_URL")
+	if raw == "" {
+		t.Skip("set SYSLOG_TEST_NATS_TLS_URL to a nats-server listener with tls {} to run")
+	}
+	upstream := strings.TrimPrefix(raw, "nats://")
+	for _, mode := range []string{NATSModeJetStream, NATSModeCore} {
+		t.Run(mode, func(t *testing.T) {
+			proxy := newRecordingProxy(t, upstream)
+			n := newTestNATS(t, func(c *NATSConfig) {
+				c.URLs, c.Mode, c.ConnectTimeout = []string{"nats://" + proxy.ln.Addr().String()}, mode, 5*time.Second
+				if mode == NATSModeCore {
+					c.Stream = ""
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			began := time.Now()
+			err := n.Health(ctx)
+			if !IsFatal(err) || !errors.Is(err, errNATSServerRequiresTLS) {
+				t.Fatalf("Health = %v (class %s), want the fatal TLS refusal", err, ClassOf(err))
+			}
+			if took := time.Since(began); took > 3*time.Second {
+				t.Errorf("the refusal took %s: it must not wait for a timeout", took)
+			}
+			time.Sleep(100 * time.Millisecond) // the proxy's last read
+			if sent := proxy.bytes(); len(sent) > 0 {
+				if sent[0] == 0x16 || bytes.Contains(sent, []byte{0x16, 0x03}) {
+					t.Fatalf("the client sent a TLS record to the real server (% x...)", sent[:min(len(sent), 8)])
+				}
+				t.Errorf("the client sent %q to a server it cannot talk to", sent)
+			}
+		})
+	}
+}
+
+// The flush of a core chunk -- or of the core health check -- that a dropped
+// connection interrupts returns ErrConnectionClosed from nats.go (the pending
+// PING's channel is closed) although the client is only RECONNECTING. Classed
+// as fatal by the table, a NATS blip in the middle of a flush was FATAL, a dump
+// and exit 3 instead of a retry (TESTING §8 item 1, the
+// same in go-webhook-nats-server and go-relplog-server). It is network now; a
+// connection that is closed for good stays fatal (the control).
+func TestNATSCoreFlushCutByAReconnectionIsNetwork(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(""))
+	n := fakeSink(t, srv, NATSModeCore, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := n.Health(ctx); err != nil {
+		t.Fatalf("control: Health = %v", err)
+	}
+	for _, op := range []string{"write", "health"} {
+		srv.set(func(f *natsFake) { f.silent = true })
+		done := make(chan error, 1)
+		go func() {
+			if op == "write" {
+				done <- n.Write(ctx, batchOf(t, line5424))
+			} else {
+				done <- n.Health(ctx)
+			}
+		}()
+		time.Sleep(200 * time.Millisecond) // the flush is waiting for its PONG
+		srv.set(func(f *natsFake) { f.silent = false })
+		srv.drop()
+		err := <-done
+		if err == nil || ClassOf(err) != ClassNetwork {
+			t.Fatalf("%s: a flush cut by a reconnection = %v (class %s), want network", op, err, ClassOf(err))
+		}
+		waitConnected(t, n)
+	}
+	// Control: once the connection is closed for good, the same error is fatal.
+	n.Close()
+	if err := n.flushErr(n.nc, "flush", nats.ErrConnectionClosed); !IsFatal(err) {
+		t.Fatalf("a flush on a closed connection = %v, want fatal", err)
+	}
+}
+
+func waitConnected(t *testing.T, n *NATS) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		n.mu.Lock()
+		nc := n.nc
+		n.mu.Unlock()
+		if nc != nil && nc.IsConnected() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the client did not reconnect")
+}
+
+// A server that starts demanding TLS after the boot: nats.go never reports it
+// through ReconnectErrCB (that is for a failed TCP dial), so Health answered
+// "connection is RECONNECTING", network, until the fuses -- or forever.
+func TestNATSReconnectToATLSOnlyServerIsAVerdict(t *testing.T) {
+	for _, mode := range []string{NATSModeCore, NATSModeJetStream} {
+		t.Run(mode, func(t *testing.T) {
+			srv := startNATSFake(t, natsFakeINFO(""))
+			n := fakeSink(t, srv, mode, nil, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if _, _, err := n.connect(); err != nil {
+				t.Fatal(err)
+			}
+			srv.set(func(f *natsFake) { f.info = natsFakeINFO(`,"tls_required":true`) })
+			srv.drop()
+			deadline := time.Now().Add(8 * time.Second)
+			var err error
+			for time.Now().Before(deadline) {
+				if err = n.Health(ctx); IsFatal(err) {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if !IsFatal(err) || !errors.Is(err, errNATSServerRequiresTLS) {
+				t.Fatalf("Health after reconnecting to a TLS-only server = %v (class %s), want the fatal TLS verdict",
+					err, ClassOf(err))
+			}
+		})
+	}
+}
+
+// A core flush that STARTS while the client reconnects is resolved by the new
+// server's PONG, but the chunk's PUBs went down the old socket: it was
+// confirmed although nothing says the server received it.
+func TestNATSCoreFlushAcrossAReconnectionIsNotConfirmed(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(""))
+	n := fakeSink(t, srv, NATSModeCore, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := n.Health(ctx); err != nil {
+		t.Fatalf("control: Health = %v", err)
+	}
+	beforeCoreFlush = func() {
+		srv.drop()
+		deadline := time.Now().Add(5 * time.Second)
+		for n.nc.IsConnected() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Cleanup(func() { beforeCoreFlush = nil })
+	err := n.Write(ctx, batchOf(t, line5424))
+	if err == nil || ClassOf(err) != ClassNetwork {
+		t.Fatalf("a chunk whose flush crossed a reconnection = %v (class %s), want network", err, ClassOf(err))
+	}
+	// Control: with the connection steady, the same write is confirmed.
+	beforeCoreFlush = nil
+	waitConnected(t, n)
+	if err := n.Write(ctx, batchOf(t, line5424)); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+}
+
+// Core: a denial of the beacon subject that lands between the chunk's PUBs
+// and the flush hides an earlier denial of the data path (nats.go keeps only
+// the last -ERR). The ErrorHandler is held back, so only writeCore's own
+// maskedDenial check can refuse to confirm the chunk.
+func TestNATSCoreMaskedDenialIsNotConfirmed(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(""))
+	n := fakeSink(t, srv, NATSModeCore, nil, nil)
+	holdAsyncErrors(n)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := n.Health(ctx); err != nil {
+		t.Fatalf("control: Health = %v", err)
+	}
+	srv.set(func(f *natsFake) {
+		f.replyFor = func(subject string) string {
+			return "-ERR 'Permissions Violation for Publish to \"" + subject + "\"'\r\n"
+		}
+	})
+	beforeCoreFlush = func() { _ = n.nc.Publish("loghub._ctl.beacon", []byte("{}")) }
+	t.Cleanup(func() { beforeCoreFlush = nil })
+	if err := n.Write(ctx, batchOf(t, line5424)); err == nil {
+		t.Fatal("a chunk the server denied was confirmed: the beacon's -ERR masked the data path's")
+	}
+}
+
+// Core Health reads LastError after its flush: a denial of the data path
+// becomes the verdict there even with the ErrorHandler late.
+func TestNATSCoreHealthReadsTheDenialItsFlushFollows(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(""))
+	n := fakeSink(t, srv, NATSModeCore, nil, nil)
+	holdAsyncErrors(n)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := n.Health(ctx); err != nil {
+		t.Fatalf("control: Health = %v", err)
+	}
+	srv.set(func(f *natsFake) {
+		f.pubReply = "-ERR 'Permissions Violation for Publish to \"loghub.default.syslog\"'\r\n"
+	})
+	if err := n.nc.Publish("loghub.default.syslog", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Health(ctx); !IsFatal(err) {
+		t.Fatalf("Health after a denied publish = %v, want the fatal verdict", err)
+	}
+}
+
+// JetStream: a publish that fails after another of the chunk is already in
+// the air must taint the chunk (that future still points at its buffer, SPEC
+// §15.2). A window of one makes the second publish stall and fail.
+func TestNATSPublishErrorAfterTheFirstTaints(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(`,"jetstream":true`))
+	n := fakeSink(t, srv, NATSModeJetStream, nil, func(c *NATSConfig) { c.MaxPending = 1 })
+	if _, _, err := n.connect(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := n.Write(ctx, batchOf(t, line5424, line5424))
+	if err == nil || !taints(err) {
+		t.Fatalf("Write = %v, taint=%v; want a tainted error", err, taints(err))
+	}
+}
+
+// JetStream: a logic refusal in an ack ends the chunk with Delivered, and the
+// error taints (SPEC §10.7 leaves the buffer of any failed write to the GC).
+func TestNATSLogicRefusalInAnAckTaints(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(`,"jetstream":true`))
+	srv.set(func(f *natsFake) {
+		f.acks = true
+		f.ackErr = func(n int) string {
+			if n == 2 {
+				return `{"error":{"code":400,"err_code":10054,"description":"message size exceeds maximum allowed"}}`
+			}
+			return ""
+		}
+	})
+	n := fakeSink(t, srv, NATSModeJetStream, nil, nil)
+	if _, _, err := n.connect(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := n.Write(ctx, batchOf(t, line5424, line5424, line5424))
+	var e *Error
+	if !errors.As(err, &e) || e.Class != ClassLogic || !taints(err) || len(e.Delivered) != 2 {
+		t.Fatalf("Write = %v (%+v), want a tainted logic refusal with 2 delivered", err, e)
+	}
+}
+
+// WithRetryAttempts(0): a "no responders" answer must not make the library
+// publish the message again on its own -- the retry would re-read msg.Data
+// after Write returned (SPEC §15.2). Exactly one PUB reaches the server.
+func TestNATSLibraryNeverRepublishes(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(`,"jetstream":true`))
+	srv.set(func(f *natsFake) { f.noResponders = true })
+	n := fakeSink(t, srv, NATSModeJetStream, nil, func(c *NATSConfig) { c.OpTimeout = 2 * time.Second })
+	if _, _, err := n.connect(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	before := srv.pubs.Load()
+	if err := n.Write(ctx, batchOf(t, line5424)); err == nil {
+		t.Fatal("a publish nobody acknowledged was confirmed")
+	}
+	time.Sleep(700 * time.Millisecond) // the library's retry wait is 250 ms
+	if got := srv.pubs.Load() - before; got != 1 {
+		t.Fatalf("%d PUBs for one message: the library republished it", got)
+	}
+}

@@ -516,6 +516,34 @@ func TestDeliverLogicRefusalCountsAndMovesOn(t *testing.T) {
 	}
 }
 
+// go-relplog-pg-server's independent review of 2026-10-13, ported: a logic refusal returned by a write during
+// which the caller's context ended (SIGTERM in the reingestion) is still
+// settled -- counted AND logged with its uuids -- and the call moves on. The
+// context check came first, so the refusal was counted by write and never
+// logged, and the call returned the cancellation instead.
+func TestDeliverLogicRefusalWinsOverTheCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hs := &hookSink{write: func(context.Context, *Batch) error {
+		cancel() // the signal lands during the write
+		return logicErr("insert", errors.New("value too long"))
+	}}
+	m := metrics()
+	h := &recHandler{}
+	d := NewInstrumented(hs, nil, workerCfg(4), slog.New(h), m)
+	envs := batchN(t, 2).Envelopes
+	if err := d.Deliver(ctx, envs, time.Second, noWait(t)); err != nil {
+		t.Fatalf("the refused chunk returned %v, want it settled", err)
+	}
+	if m.EventsDroppedTotal[obs.EventDropSinkLogic].Load() != 2 {
+		t.Fatalf("dropped %d, want 2", m.EventsDroppedTotal[obs.EventDropSinkLogic].Load())
+	}
+	v, ok := h.attr("refused a chunk permanently", "uuids")
+	if lost := fmt.Sprint(v.Any()); !ok || !strings.Contains(lost, envs[0].UUID()) || !strings.Contains(lost, envs[1].UUID()) {
+		t.Fatalf("the counted refusal was not logged with its uuids: %q", lost)
+	}
+}
+
 // SPEC §10.2: a network failure asks wait, then retries the SAME chunk -- the
 // same envelopes, the same bytes, nothing rebuilt -- each attempt under its own
 // opTimeout. A timeout is retried like any network failure but counted apart

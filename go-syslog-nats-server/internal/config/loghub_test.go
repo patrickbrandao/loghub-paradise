@@ -114,8 +114,9 @@ func TestEBURLUnsupportedOrMalformed(t *testing.T) {
 			t.Errorf("%q: err = %v", u, err)
 		}
 	}
-	// Empty means "not set": nothing is filled.
-	for _, v := range []string{"", "   "} {
+	// Empty means "not set": nothing is filled. Only blanks is set to nothing
+	// visible, refused (TestEBURLOnlyBlanksIsRefused).
+	for _, v := range []string{""} {
 		l := mustLoad(t, nil, map[string]string{"LOGHUB_EB_URL": v})
 		if !reflect.DeepEqual(l.Config.SinkNATS.URLs, []string{"nats://127.0.0.1:4222"}) ||
 			l.Source["sink.nats.urls"] != FromDefault {

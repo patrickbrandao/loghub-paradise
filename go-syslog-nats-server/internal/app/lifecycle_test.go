@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net"
@@ -13,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/patrickbrandao/loghub-paradise/go-syslog-nats-server/internal/item"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-nats-server/internal/obs"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-nats-server/internal/ring"
 )
@@ -200,29 +198,6 @@ func TestSinkDownRefusesPerTransport(t *testing.T) {
 	}
 	if d := m.MessagesDroppedTotal[obs.DropSinkDown].Load(); d != 1 {
 		t.Errorf("sink_down drops = %d, want only the UDP one", d)
-	}
-}
-
-// Review A #3: Drain commits the ring's accounting before the dump, so an
-// abort that lands while the dump is written read zero and counted nothing,
-// while os.Exit cut the dump short. The leftovers handed to the dump are what
-// such an abort loses; once the dump finished, an abort loses nothing more.
-func TestAbortDuringTheDumpCountsTheLeftovers(t *testing.T) {
-	a := &App{log: obs.NewLogger(io.Discard, "text", "info"), metrics: obs.NewMetrics(obs.Info{})}
-	a.ring = ring.NewMemory(100, 1<<20, 0)
-	for i := 0; i < 7; i++ {
-		_ = a.ring.Enqueue(context.Background(), item.New(item.Head{}, make([]byte, 10), -1))
-	}
-	leftover := a.ring.Drain()
-	// Control: without the dump's count, the ring alone says nothing is lost.
-	a.abortLoss()
-	if got := a.metrics.EventsDroppedTotal[obs.EventDropAbort].Load(); got != 0 {
-		t.Fatalf("control: abort counted %d before the dump started", got)
-	}
-	a.dumping.Store(int64(len(leftover)))
-	a.abortLoss()
-	if got := a.metrics.EventsDroppedTotal[obs.EventDropAbort].Load(); got != uint64(len(leftover)) {
-		t.Fatalf("abort counted %d of the %d messages whose dump was cut short", got, len(leftover))
 	}
 }
 

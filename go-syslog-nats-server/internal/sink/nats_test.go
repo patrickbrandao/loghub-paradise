@@ -58,6 +58,10 @@ func TestClassifyNATS(t *testing.T) {
 		{"connect: user authentication revoked", errors.New("nats: User Authentication Revoked"), ClassFatal},
 		{"connect: account authentication expired", errors.New("nats: Account Authentication Expired"), ClassFatal},
 		{"connect: authorization violation", errors.New("nats: Authorization Violation"), ClassFatal},
+		// Control: a permissions violation is about one subject, the verdict's
+		// to judge (deniesTheDataPath), never a refusal of the connection.
+		{"permissions violation", fmt.Errorf("%w: Permissions Violation for Publish to \"x\"",
+			nats.ErrPermissionViolation), ClassNetwork},
 		{"closed", nats.ErrConnectionClosed, ClassFatal},
 		{"stream not found", jetstream.ErrStreamNotFound, ClassFatal},
 		{"jetstream not enabled", jetstream.ErrJetStreamNotEnabled, ClassFatal},
@@ -69,7 +73,23 @@ func TestClassifyNATS(t *testing.T) {
 		{"api sealed 10109", api(400, jsErrStreamSealed), ClassFatal},
 		{"api insufficient resources 10023", api(503, jsErrInsufficientResources), ClassFatal},
 		{"api store failed 10077", api(503, jsErrStreamStoreFailed), ClassFatal},
+		// A full discard=new stream, or one closing, is 10077 too: transient
+		// (ported from go-relplog-nats-server, 2026-10-13; R's independent
+		// review, 2026-10-11, against nats-server 2.14.6).
+		{"10077 max msgs", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages exceeded"}, ClassNetwork},
+		{"10077 max bytes", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum bytes exceeded"}, ClassNetwork},
+		{"10077 max per subject", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages per subject exceeded"}, ClassNetwork},
+		{"10077 store closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store closed"}, ClassNetwork},
+		{"10077 record too large", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "message too large"}, ClassFatal},
 		{"api unknown 4xx", api(400, 10999), ClassFatal},
+		// SPEC §21.1 item 6 (closed): transient though 4xx. 10158 (409) is a
+		// Nats-Msg-Id still in a Raft proposal, 10167 (429) a full ingest
+		// queue, and any 429 is backpressure; another 409 stays fatal.
+		{"api duplicate in process 10158", api(409, jsErrDuplicateInProcess), ClassNetwork},
+		{"api too many requests 10167", api(429, jsErrStreamTooManyRequests), ClassNetwork},
+		{"api unknown 429", api(429, 10210), ClassNetwork},
+		{"api unknown 409", api(409, 10999), ClassFatal},
+		{"wrapped api 10158", fmt.Errorf("ack: %w", api(409, jsErrDuplicateInProcess)), ClassNetwork},
 
 		{"max payload", nats.ErrMaxPayload, ClassLogic},
 		{"max bytes", jetstream.ErrMaxBytesExceeded, ClassLogic},
@@ -198,8 +218,10 @@ func TestNATSSubjects(t *testing.T) {
 		}
 		return true
 	})
-	if spaces != 2 {
-		t.Errorf("%d spaces cached, want 2", spaces)
+	// The own space never reaches the map: it is the hot path, one string
+	// comparison (SPEC §21.1 item 8, closed); the foreign one is cached.
+	if spaces != 1 {
+		t.Errorf("%d spaces cached, want 1 (only the foreign one)", spaces)
 	}
 	if got := n.coverageSubject(); got != "loghub.default.syslog" {
 		t.Errorf("coverage subject = %q", got)
@@ -821,7 +843,9 @@ func TestNATSPermissionViolationOnTheDataPathIsFatal(t *testing.T) {
 		{viol(`Permissions Violation for Publish to "loghub.acme.syslog"`), true},
 		{viol(`Permissions Violation for Publish to "loghub.a.b.syslog"`), true},
 		{viol(`Permissions Violation for Publish to "$JS.API.STREAM.INFO.LOGHUB_SYSLOG"`), true},
-		{viol(`Permissions Violation for Subscription to "_INBOX.x"`), false},
+		// The acks and the API's answers arrive on _INBOX: denied there, every
+		// chunk times out (SPEC §21.1 item 7, closed).
+		{viol(`Permissions Violation for Subscription to "_INBOX.x"`), true},
 		{viol(`Permissions Violation for Publish to "loghub._ctl.beacon"`), false},
 		{errors.New(`Permissions Violation for Publish to "loghub.acme.syslog"`), false}, // not the sentinel
 		{nats.ErrTimeout, false},

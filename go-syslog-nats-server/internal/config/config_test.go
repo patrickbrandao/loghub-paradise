@@ -623,15 +623,14 @@ func TestNATSURLSchemes(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct{ urls, scheme string }{
-		{"tls://n:4222", `"tls"`},
-		{"ws://n:8080", `"ws"`},
-		{"wss://n:8443", `"wss"`},
-		{"TLS://n:4222", `"tls"`},
-		{"n:4222", `"none"`},
-		{"127.0.0.1:4222", `"none"`},
-		{"nats://a:4222,tls://b:4222", `"tls"`},
-		{"nats://a:4222,b:4222", `"none"`},
-		{"http://n:8222", `"http"`},
+		{"tls://n:4222", `"tls://"`},
+		{"ws://n:8080", `"ws://"`},
+		{"wss://n:8443", `"wss://"`},
+		{"TLS://n:4222", `"tls://"`},
+		{"n:4222", `no scheme`},
+		{"127.0.0.1:4222", `no scheme`},
+		{"nats://a:4222,tls://b:4222", `"tls://"`},
+		{"http://n:8222", `"http://"`},
 	} {
 		err := mustFail(t, []string{"--sink.nats.urls=" + tc.urls}, nil, "sink.nats.urls")
 		for _, w := range []string{"nats://", "no TLS", tc.scheme} {
@@ -1224,10 +1223,11 @@ func TestURLErrorsQuoteNothingOfTheURL(t *testing.T) {
 	// The secret that parses: a password that reads as a port and a path, or a
 	// token that reads as a host. No credentials at all, dialled until
 	// boot_timeout -- and the dial error quoted the host, the token up to the
-	// slash. sink.nats.urls refuses it like LOGHUB_EB_URL always did.
+	// slash. sink.nats.urls refuses it like LOGHUB_EB_URL always did, and since
+	// go-relplog-server the '@' past the authority names the escape to use.
 	for _, u := range []string{"nats://user:1234/5678@n1:4222", "nats://user:1234#5678@n1:4222",
 		"nats://user:1234?5678@n1:4222"} {
-		err := mustFail(t, []string{"--sink.nats.urls=" + u}, nil, "path, a query or a fragment")
+		err := mustFail(t, []string{"--sink.nats.urls=" + u}, nil, "%2F, %3F, %23")
 		if strings.Contains(err.Error(), "5678") {
 			t.Errorf("%q: err = %v", u, err)
 		}
@@ -1296,12 +1296,22 @@ func TestParserErrorsDoNotEchoValues(t *testing.T) {
 		l.Config.SinkNATS.Stream != "LOGHUB_X" {
 		t.Errorf("separated values: workers=%d stream=%q", l.Config.Sink.Workers, l.Config.SinkNATS.Stream)
 	}
-	mustFail(t, []string{"--sink.workers", "-1"}, nil, "-1 is below 1")
-	mustFail(t, []string{"--sink.nats.stream", "-h"}, nil, "the next argument is the flag --h")
+	mustFail(t, []string{"--sink.workers", "-1"}, nil, "-1 is outside 1..256")
+	// "-h" after a flag that wants a value is not named: a two-character
+	// value starting with a dash looks the same (go-relplog-pg-server's
+	// independent review, 2026-10-13); "--help" is.
+	if err := mustFail(t, []string{"--sink.nats.password", "-h"}, nil, "starts with a dash"); strings.Contains(err.Error(), "--h") {
+		t.Errorf("a one-dash next argument named: %v", err)
+	}
+	mustFail(t, []string{"--sink.nats.stream", "--help"}, nil, "the next argument is the flag --help")
 	mustFail(t, []string{"--sink.nats.password=", "--admin.enabled", "extra"}, nil, `"extra"`)
 	mustFail(t, []string{"--sink.nats.password=", "hunter2"}, nil, "right after the '='")
 	mustFail(t, []string{"--sink.nats.password", "=", "hunter2"}, nil, "right after the '='")
 	mustFail(t, []string{"--sink.nats.password=foo", "hunter2"}, nil, "goes in quotes")
-	mustFail(t, []string{"--sink.workers=4", "--typo.key=1"}, nil, `"typo.key"`)
+	// After a value, an unknown flag outside every section may be the tail of
+	// that value the shell split: not named (knownSectionOf, from
+	// go-relplog-server). A typo inside a known section still is.
+	mustFail(t, []string{"--sink.workers=4", "--typo.key=1"}, nil, "unexpected argument after --sink.workers")
+	mustFail(t, []string{"--sink.workers=4", "--sink.wrkers=1"}, nil, `"sink.wrkers"`)
 	mustFail(t, []string{"--sink.nats.password", "--sink.workers=4"}, nil, "the flag --sink.workers")
 }

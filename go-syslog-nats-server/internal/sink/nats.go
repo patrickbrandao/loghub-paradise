@@ -57,7 +57,7 @@ type NATSConfig struct {
 	// the worker's own deadline.
 	OpTimeout time.Duration
 	// MaxPending is the ceiling of async publishes in flight per process:
-	// sink.workers × sink.batch (SPEC §10.7).
+	// 2 × sink.workers × sink.batch (SPEC §10.7).
 	MaxPending int
 	// MaxEventBytes is the worst JLH (MaxEventBytes(L), SPEC §3.9), computed by
 	// the app. The boot compares it plus the header block with max_payload, the
@@ -121,12 +121,20 @@ type NATS struct {
 	hookMu sync.Mutex
 	hooks  []func()
 
-	// subjects caches the subject of each space seen. The space comes from the
-	// item head, written by the identity of the instance that RECEIVED the
-	// message -- never by an emitter -- so the keys are this instance's
-	// Workspace and those of the emergency dumps it reingests, which an
+	// own is the subject of this instance's space, built once: the hot path
+	// finds it by one string comparison, with no map lookup and no
+	// allocation, and the same comparison is what tells a foreign space apart
+	// (writeCore). subjects caches the subject of every OTHER space seen. The
+	// space comes from the item head, written by the identity of the instance
+	// that RECEIVED the message -- never by an emitter -- so those keys are the
+	// Workspaces of the emergency dumps this instance reingests, which an
 	// operator controls.
+	own      string
 	subjects sync.Map // string -> string
+
+	// blind holds the foreign spaces core mode has warned about (writeCore):
+	// one WARN per space, never one per message (SPEC §14.2).
+	blind sync.Map // string -> struct{}
 
 	// asyncErrLog samples the client's asynchronous errors. A publish
 	// permission denied produces one per message, and SPEC §14.2 allows no
@@ -136,19 +144,25 @@ type NATS struct {
 	validated atomic.Bool
 	closed    atomic.Bool
 
+	// perSubjectWarned is the max_msgs_per_subject last warned about, so the
+	// validation that runs on every health check says it once per value, not
+	// once per check.
+	perSubjectWarned atomic.Int64
+
 	// verdict is a permanent refusal the client reported asynchronously -- a
-	// permissions violation on the data subjects or the JetStream API, a
-	// reconnection to a server that demands TLS -- which no synchronous call
-	// returns: a denied publish only times out (jetstream) or vanishes (core),
-	// and a denied stream info only times out. Health turns it into FATAL.
+	// permissions violation on the data path, a reconnection to a server that
+	// demands TLS -- which no synchronous call returns: a denied publish only
+	// times out (jetstream) or vanishes (core), and a denied stream info or ack
+	// subscription only times out. Health and every Write turn it into FATAL
+	// (SPEC §10.7).
 	verdict atomic.Pointer[error]
 }
 
 // NewNATS prepares the client without connecting: the connection is opened by
 // the first health check, and the boot's WaitReady owns the retry loop
-// (SPEC §10.7). The errors here are configuration errors -- a credentials
-// file that does not exist, two authentication methods -- never a network
-// condition.
+// (SPEC §10.7). The errors here are configuration errors -- a URL that is not
+// nats://, a credentials file that does not exist, two authentication methods
+// -- never a network condition.
 func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 5 * time.Second
@@ -212,6 +226,7 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 	}
 
 	n := &NATS{cfg: cfg, log: log, m: m, asyncErrLog: obs.NewSampler(30 * time.Second)}
+	n.own = natsSubject(cfg.Workspace)
 	opts := []nats.Option{
 		nats.Name(cfg.ClientName),
 		nats.Timeout(cfg.ConnectTimeout),
@@ -235,6 +250,16 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 			}
 			log.Warn("nats disconnected", "error", err)
 		}),
+		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
+			// nats.go calls this only for a reconnection whose TCP dial
+			// failed; the refusal of a server that demands TLS comes later,
+			// in the handshake, and is caught by noteLastError from Health.
+			// Kept for a client version that reports it here.
+			if errors.Is(err, errNATSServerRequiresTLS) {
+				n.setVerdict(err)
+			}
+			n.asyncError(err)
+		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			m.SinkNATSReconnectsTotal.Inc()
 			log.Warn("nats reconnected", "url", connectedURL(nc))
@@ -251,14 +276,6 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 			log.Error("nats connection closed by the client; it will not reconnect", "error", nc.LastError())
 		}),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-			n.asyncError(err)
-		}),
-		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
-			// Without this the eventual FATAL of a server that started to
-			// demand TLS after the boot read "connection is RECONNECTING".
-			if errors.Is(err, errNATSServerRequiresTLS) {
-				n.setVerdict(err)
-			}
 			n.asyncError(err)
 		}),
 	}
@@ -303,7 +320,7 @@ func (n *NATS) Type() string { return "nats" }
 
 // asyncError logs an asynchronous client error, at most once per interval,
 // with the count of what was suppressed in between, and keeps a permanent
-// refusal for Health (see verdict).
+// refusal of the data path as the verdict.
 func (n *NATS) asyncError(err error) {
 	if deniesTheDataPath(err) {
 		n.setVerdict(err)
@@ -315,8 +332,8 @@ func (n *NATS) asyncError(err error) {
 
 func (n *NATS) setVerdict(err error) { n.verdict.CompareAndSwap(nil, &err) }
 
-// verdictErr is the verdict as the fatal error every operation returns once
-// it is set: Health, and every Write in both modes (SPEC §10.7). A Write that
+// verdictErr is the verdict as the fatal error every operation returns once it
+// is set: Health, and every Write in both modes (SPEC §10.7). A Write that
 // ignored it would publish -- and, in core mode, confirm -- chunks the server
 // has already refused, until the next health check.
 func (n *NATS) verdictErr(op string) error {
@@ -326,21 +343,110 @@ func (n *NATS) verdictErr(op string) error {
 	return nil
 }
 
+// noteLastError keeps the connection's last error as the verdict when it is a
+// denial of the data path. The ErrorHandler runs on the client's callback
+// goroutine, after the reader has already stored the -ERR in LastError; a
+// caller that has just seen its own round trip complete reads it here instead
+// of racing the handler.
+func (n *NATS) noteLastError(nc *nats.Conn) {
+	last := nc.LastError()
+	// A server that demands TLS refuses this client for good. Seen only here
+	// after the boot: nats.go calls ReconnectErrCB only when the TCP dial of
+	// a reconnection fails, while the TLSCertCB refusal happens later, in the
+	// connect handshake, and lands in LastError with the status RECONNECTING.
+	// Without this the FATAL came from the fuses, ~20 s later, reading
+	// "connection is RECONNECTING" -- or never, with both fuses off
+	// (independent review, 2026-10-13; SPEC §10.7).
+	if deniesTheDataPath(last) || errors.Is(last, errNATSServerRequiresTLS) {
+		n.setVerdict(last)
+	}
+}
+
+// escalate turns a network failure into the verdict once one is set. A publish
+// the server denied never gets an ack, so the future ends in a timeout --
+// network, retried forever with the sink UP -- and a denied ack subscription
+// or stream info ends the same way. With the verdict in hand that timeout is
+// known to be permanent. The taint is kept: futures may still be pending.
+func (n *NATS) escalate(nc *nats.Conn, op string, err error) error {
+	if ClassOf(err) != ClassNetwork {
+		return err
+	}
+	if nc != nil {
+		n.noteLastError(nc)
+	}
+	v := n.verdictErr(op)
+	if v == nil {
+		return err
+	}
+	if taints(err) {
+		return tainting(v)
+	}
+	return v
+}
+
 // deniesTheDataPath reports a permissions violation on what the data path
-// needs: a publish to a loghub.<space>.syslog subject, or anything on the
-// JetStream API ($JS.API.>, which carries both the stream info of Health and
-// the publish acks). A denial on the beacon's subject is NOT one: the control
-// plane failing must not take the data down with it (SPEC §11).
+// needs (SPEC §10.7): a publish to a data subject -- loghub.<space>.syslog, of
+// any space, since a reingested dump publishes on its own -- anything on the JetStream API ($JS.API.>, which carries the
+// stream info of Health), and a subscription on _INBOX, where the publish acks
+// and the API's answers arrive: denied there, every ack is lost and every
+// chunk times out. Nothing else on this connection subscribes (the beacon
+// only publishes), so an _INBOX denial is always the data path's.
+//
+// A denial on the beacon's subject is NOT one: the control plane failing must
+// not take the data down with it (SPEC §11).
 func deniesTheDataPath(err error) bool {
-	if !errors.Is(err, nats.ErrPermissionViolation) {
+	if err == nil || !errors.Is(err, nats.ErrPermissionViolation) {
 		return false
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "$JS.API") {
 		return true
 	}
-	i := strings.Index(msg, `"loghub.`)
-	return i >= 0 && strings.Contains(msg[i:], `.syslog"`)
+	// "Permissions Violation for Publish to "<subject>"", or "for Subscription
+	// to "<subject>"" (with a queue, more text follows the quotes). The
+	// operation is matched without case: the client keeps the server's words.
+	i := strings.Index(msg, ` to "`)
+	if i < 0 {
+		return false
+	}
+	subject, _, ok := strings.Cut(msg[i+len(` to "`):], `"`)
+	if !ok {
+		return false
+	}
+	head := strings.ToLower(msg[:i])
+	switch {
+	case strings.HasSuffix(head, "for subscription"):
+		return strings.HasPrefix(subject, "_INBOX.")
+	case strings.HasSuffix(head, "for publish"):
+		// The beacon's <ctl_namespace>.beacon never has the shape: its last
+		// token is not "syslog", whatever the namespace. A prefix match on
+		// "loghub." would have caught it with the default namespace,
+		// loghub._ctl.
+		return isDataSubject(subject)
+	}
+	return false
+}
+
+// isDataSubject reports whether subject has the shape of the data subject of
+// SPEC §3.8, loghub.<space>.syslog, of any space. The facility-severity form of
+// go-syslog-server is never published here (SPEC §1.2), so it is not data.
+func isDataSubject(subject string) bool {
+	return strings.HasPrefix(subject, "loghub.") && strings.HasSuffix(subject, ".syslog") &&
+		len(subject) > len("loghub..syslog")
+}
+
+// connectedURL is the server this connection reached, scheme and host only.
+// nats.go's ConnectedUrlRedacted hides a password and nothing else: a URL whose
+// user part is a token (nats://<token>@host, which LOGHUB_EB_URL accepts,
+// SPEC §10.9) came out whole, in the INFO line of every boot and the WARN of
+// every reconnect. A URL that does not parse is never echoed: the bare address
+// stands in for it.
+func connectedURL(nc *nats.Conn) string {
+	u, err := url.Parse(nc.ConnectedUrl())
+	if err != nil || u.Host == "" {
+		return nc.ConnectedAddr()
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // connect opens the connection on first use and then runs the connect hooks
@@ -423,18 +529,6 @@ func (n *NATS) PublishCore(subject string, data []byte) error {
 	return nil
 }
 
-// connectedURL is the server this connection reached, scheme and host only.
-// nats.go's ConnectedUrlRedacted hides a password and nothing else: a URL
-// whose user part is a token (nats://token@host, SPEC §10.9) came out whole,
-// in the INFO line of every boot and the WARN of every reconnect.
-func connectedURL(nc *nats.Conn) string {
-	u, err := url.Parse(nc.ConnectedUrl())
-	if err != nil || u.Host == "" {
-		return nc.ConnectedAddr()
-	}
-	return u.Scheme + "://" + u.Host
-}
-
 // ServerAddr returns host:port of the server the connection is on, or "" when
 // it is not connected. The beacon dials it by UDP, without traffic, to learn
 // which local address routes there (SPEC §11).
@@ -448,16 +542,26 @@ func (n *NATS) ServerAddr() string {
 	return nc.ConnectedAddr()
 }
 
-// subject is where one envelope goes: loghub.<space>.syslog (SPEC §3.8). It is
-// derived, never configured: the rule loghub.{space}.{type} is the JLH's.
-func (n *NATS) subject(e *Envelope) string {
-	space := e.Item.Head.Space
+// natsSubject is the one subject of a space (SPEC §3.8).
+func natsSubject(space string) string { return "loghub." + space + ".syslog" }
+
+// subjectFor is the subject of space. The own space is the hot path: a string
+// comparison, no lookup. Any other comes from a dump and is cached, so no
+// envelope ever builds its subject string.
+func (n *NATS) subjectFor(space string) string {
+	if space == n.cfg.Workspace {
+		return n.own
+	}
 	if v, ok := n.subjects.Load(space); ok {
 		return v.(string)
 	}
-	v, _ := n.subjects.LoadOrStore(space, "loghub."+space+".syslog")
+	v, _ := n.subjects.LoadOrStore(space, natsSubject(space))
 	return v.(string)
 }
+
+// subject is where one envelope goes: loghub.<space>.syslog (SPEC §3.8). It is
+// derived, never configured: the rule loghub.{space}.{type} is the JLH's.
+func (n *NATS) subject(e *Envelope) string { return n.subjectFor(e.Item.Head.Space) }
 
 // message builds the wire shape of SPEC §3.8 around the envelope's JLH.
 //
@@ -495,7 +599,7 @@ func (n *NATS) Write(ctx context.Context, b *Batch) error {
 	if n.cfg.Mode == NATSModeCore {
 		return n.writeCore(ctx, nc, b)
 	}
-	return n.writeJetStream(ctx, js, b)
+	return n.writeJetStream(ctx, nc, js, b)
 }
 
 // writeJetStream publishes one PublishMsgAsync per envelope, and only once the
@@ -506,19 +610,22 @@ func (n *NATS) Write(ctx context.Context, b *Batch) error {
 // every future resolved (a nil return). Every error after the first publish is
 // marked as tainting: futures may still be pending, and the buffer must be left
 // to the GC (SPEC §10.7, §15.2).
-func (n *NATS) writeJetStream(ctx context.Context, js jetstream.JetStream, b *Batch) error {
+func (n *NATS) writeJetStream(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, b *Batch) error {
 	// refused is the first message refused for good (logic: too large, 10054
 	// from the stream or ErrMaxPayload from the client before it leaves) and
 	// rejected marks every such index. One such refusal does not stop the
 	// chunk: the other messages are still published and their futures say
 	// which ones the stream STORED, and those are not lost (SPEC §10.2,
-	// Error.Delivered). Stopping at a publish-time refusal left every later
-	// envelope unpublished yet confirmed, and counted the earlier ones lost.
+	// Error.Delivered). Stopping at a publish-time refusal -- a reconnection
+	// to a node with a smaller max_payload, a dump line from a life with a
+	// larger syslog.max_message_bytes -- left every later envelope
+	// unpublished yet confirmed, and counted the earlier ones, stored, lost.
 	var refused *Error
-	rejected := make([]bool, len(b.Envelopes))
+	var rejected []bool
 	reject := func(i int, op string, err error) {
 		if refused == nil {
 			refused = &Error{Class: ClassLogic, Op: op + " uuid=" + b.Envelopes[i].UUID(), Err: err}
+			rejected = make([]bool, len(b.Envelopes))
 		}
 		rejected[i] = true
 	}
@@ -541,9 +648,9 @@ func (n *NATS) writeJetStream(ctx context.Context, js jetstream.JetStream, b *Ba
 			}
 			err = classifyNATS("publish", err)
 			if published > 0 {
-				return tainting(err)
+				err = tainting(err)
 			}
-			return err
+			return n.escalate(nc, "publish", err)
 		}
 		futs[i] = f
 		published++
@@ -568,11 +675,11 @@ func (n *NATS) writeJetStream(ctx context.Context, js jetstream.JetStream, b *Ba
 			if c != ClassLogic {
 				// Retried (network) or the end (fatal) as a whole chunk: which
 				// futures resolved does not matter, and some are still pending.
-				return tainting(classifyNATS(op, err))
+				return n.escalate(nc, "ack", tainting(classifyNATS(op, err)))
 			}
 			reject(i, "ack", err)
 		case <-ctx.Done():
-			return tainting(networkErr("ack", ctx.Err()))
+			return n.escalate(nc, "ack", tainting(networkErr("ack", ctx.Err())))
 		}
 	}
 	if dups > 0 {
@@ -606,44 +713,111 @@ func delivered(rejected []bool) []int {
 // the chunk buffer after this returns. Success means the server RECEIVED the
 // messages, not that anyone stored them.
 //
-// A message refused before it leaves (ErrMaxPayload: larger than this
-// server's max_payload) is refused alone, as in jetstream mode: the rest of the
-// chunk is still published, and only the refused ones are lost.
+// A message refused before it leaves (ErrMaxPayload: larger than this server's
+// max_payload) is refused alone, as in jetstream mode: the rest of the chunk is
+// still published, and only the refused ones are lost (SPEC §10.2).
 func (n *NATS) writeCore(ctx context.Context, nc *nats.Conn, b *Batch) error {
 	var refused *Error
-	rejected := make([]bool, len(b.Envelopes))
+	var rejected []bool
+	before := nc.LastError()
+	reconnects := nc.Stats().Reconnects
 	for i := range b.Envelopes {
-		if err := nc.PublishMsg(n.message(&b.Envelopes[i])); err != nil {
+		e := &b.Envelopes[i]
+		if space := e.Item.Head.Space; space != n.cfg.Workspace {
+			n.warnForeign(space)
+		}
+		if err := nc.PublishMsg(n.message(e)); err != nil {
 			if classifyNATSError(err) == ClassLogic {
 				if refused == nil {
-					refused = &Error{Class: ClassLogic, Op: "publish uuid=" + b.Envelopes[i].UUID(), Err: err}
+					refused = &Error{Class: ClassLogic, Op: "publish uuid=" + e.UUID(), Err: err}
+					rejected = make([]bool, len(b.Envelopes))
 				}
 				rejected[i] = true
 				continue
 			}
-			return classifyNATS("publish", err)
+			return n.escalate(nc, "publish", classifyNATS("publish", err))
 		}
 	}
+	if beforeCoreFlush != nil {
+		beforeCoreFlush()
+	}
 	if err := n.flush(ctx, nc); err != nil {
-		return classifyNATS("flush", err)
+		return n.escalate(nc, "flush", n.flushErr(nc, "flush", err))
+	}
+	if nc.Stats().Reconnects != reconnects {
+		// The connection was re-established during the chunk. A flush that
+		// STARTED while the client was reconnecting queues its PING for the
+		// new server, whose PONG resolves it -- but the PUBs went down the
+		// old socket. A success would claim the server received them.
+		// Uncertain, so not confirmed: the retry publishes them again
+		// (independent review, 2026-10-13; SPEC §10.7).
+		return &Error{Class: ClassNetwork, Op: "flush",
+			Err: errors.New("the connection was re-established during the chunk; its messages may not have reached the server")}
 	}
 	// A denied publish never fails PublishMsg: the server answers with an
 	// -ERR, and it comes before the PONG of the flush, so LastError holds it
 	// by now, without a race against the ErrorHandler. Without this, a chunk
 	// the server refused was confirmed, counted as written and released --
 	// lost -- and so was every chunk until the next health check turned the
-	// verdict into FATAL (SPEC §10.7).
-	if last := nc.LastError(); deniesTheDataPath(last) {
-		n.setVerdict(last)
-	}
+	// verdict into FATAL (SPEC §10.7, invariant §20.18).
+	n.noteLastError(nc)
 	if err := n.verdictErr("publish"); err != nil {
 		return err
+	}
+	if last := nc.LastError(); maskedDenial(before, last) {
+		// nats.go keeps only the LAST -ERR: a denial of the beacon subject
+		// that landed between this chunk's PUBs and the flush's PING hides
+		// a denial of the data path that came before it, and the chunk would
+		// be confirmed although the server refused it. Uncertain, so not
+		// confirmed: the retry finds the verdict the ErrorHandler set by then,
+		// or succeeds (independent review, 2026-10-11).
+		return &Error{Class: ClassNetwork, Op: "publish",
+			Err: fmt.Errorf("a permission denial arrived during the chunk and may hide one of the data path: %w", last)}
 	}
 	if refused != nil {
 		refused.Delivered = delivered(rejected)
 		return refused
 	}
 	return nil
+}
+
+// warnForeign says, once per space, that core mode is publishing an envelope of
+// another space -- the reingestion of an emergency dump from a life with
+// another Workspace. With no stream behind it there is nothing to ask whether
+// anyone listens on that subject: unless something subscribes there it is
+// lost, and the dump is removed as delivered (SPEC §12.2 covers only
+// jetstream). Said once, the loss is at least not silent. The caller compares
+// the space with the Workspace first, so the own space -- the hot path --
+// never reaches the map.
+func (n *NATS) warnForeign(space string) {
+	if _, seen := n.blind.LoadOrStore(space, struct{}{}); seen {
+		return
+	}
+	subject := n.subjectFor(space)
+	n.log.Warn("nats core mode: publishing envelopes of another space (an emergency dump from "+
+		"another Workspace); with no stream behind them they are lost unless something "+
+		"subscribes to their subject (docs/SPEC.md §10.7)",
+		"subject", subject, "space", space, "workspace", n.cfg.Workspace)
+}
+
+// beforeCoreFlush runs between the publications of a core chunk and its
+// flush. Tests only: nil in the binary.
+var beforeCoreFlush func()
+
+// flushErr classifies the error of a flush. nats.go fails a pending flush with
+// ErrConnectionClosed when the connection DROPS -- the channel of its PING is
+// closed -- although the client is only RECONNECTING and will be back. The
+// table classes ErrConnectionClosed as fatal (a client that closed for good),
+// so a NATS blip in the middle of the flush of a core chunk, or of the core
+// health check, was FATAL, a dump and exit 3 instead of a retry (TESTING §8
+// item 1, seen in the port of N's fixes, 2026-10-11; fixed in
+// go-relplog-nats-server and ported back, 2026-10-13). It is network while the
+// connection is not closed; closed for good, it stays fatal (SPEC §10.7).
+func (n *NATS) flushErr(nc *nats.Conn, op string, err error) error {
+	if errors.Is(err, nats.ErrConnectionClosed) && nc != nil && !nc.IsClosed() {
+		return networkErr(op, fmt.Errorf("the connection dropped during the flush and is reconnecting: %w", err))
+	}
+	return classifyNATS(op, err)
 }
 
 // flush bounds the round trip by the caller's deadline, or by sink.op_timeout
@@ -659,9 +833,9 @@ func (n *NATS) flush(ctx context.Context, nc *nats.Conn) error {
 // for its info; in core mode it flushes (SPEC §10.7). A PING would answer
 // happily with JetStream disabled, and the state would never leave UP.
 //
-// Every successful check also runs the validation of SPEC §10.7: the stream
-// contract in jetstream mode, max_payload in core mode. Only its log line is
-// once.
+// Every successful check also runs the validation of SPEC §10.7 -- the stream
+// contract in jetstream mode, max_payload in core mode -- against what it has
+// just fetched. Only its log line is once.
 func (n *NATS) Health(ctx context.Context) error {
 	if n.closed.Load() {
 		return ErrClosed
@@ -684,12 +858,19 @@ func (n *NATS) Health(ctx context.Context) error {
 		}
 		return fatalErr("health", fmt.Errorf("connection closed for good: %w", last))
 	default:
-		return networkErr("health", fmt.Errorf("connection is %s", st))
+		// escalate reads LastError: what keeps the client RECONNECTING may be
+		// permanent (a server that now demands TLS, see noteLastError).
+		return n.escalate(nc, "health", networkErr("health", fmt.Errorf("connection is %s", st)))
 	}
 
 	if n.cfg.Mode == NATSModeCore {
 		if err := n.flush(ctx, nc); err != nil {
-			return classifyNATS("flush", err)
+			return n.escalate(nc, "health", n.flushErr(nc, "health", err))
+		}
+		// The flush's PONG follows any -ERR the server sent before it.
+		n.noteLastError(nc)
+		if err := n.verdictErr("health"); err != nil {
+			return err
 		}
 		// On every check, not once: a reconnection may land on a server with
 		// a smaller max_payload, and every larger message would then be
@@ -706,14 +887,20 @@ func (n *NATS) Health(ctx context.Context) error {
 
 	stream, err := js.Stream(ctx, n.cfg.Stream)
 	if err != nil {
-		return n.streamErr(err)
+		// A denied stream info, or a denied _INBOX subscription its answer
+		// needed, only times out; the verdict says it is permanent.
+		return n.escalate(nc, "health", n.streamErr(err))
 	}
 	// The whole contract on every check, against the info this call has
 	// already fetched (no extra round trip). Checked once, a stream edited
-	// underneath -- its subjects narrowed, no_ack turned on -- answered every
-	// publish with a timeout, network, retried forever while this check kept
-	// the sink UP and the ring filled (SPEC §10.7). validated only gates the
-	// log line and the no-responders verdict of streamErr.
+	// underneath -- its subjects narrowed, no_ack turned on, a smaller
+	// max_msg_size, loghub.> -- answered every publish with a timeout or a
+	// refusal, network or logic, forever, while this check kept the sink UP
+	// (SPEC §10.7). Only this instance's own subject is required: a dump of
+	// another space, reingested at boot, never makes its subject part of the
+	// contract, so narrowing the stream after that dump drained -- what the
+	// operator may do -- is not a FATAL. validated only gates the log line and
+	// the no-responders verdict of streamErr.
 	info := stream.CachedInfo()
 	if err := n.validate(nc.MaxPayload(), info); err != nil {
 		return err
@@ -729,25 +916,20 @@ func (n *NATS) Health(ctx context.Context) error {
 	return nil
 }
 
-// coverageSubject is what the stream must cover: the subject of this
-// instance's space (SPEC §10.7).
-func (n *NATS) coverageSubject() string { return "loghub." + n.cfg.Workspace + ".syslog" }
-
 // streamErr classifies a failure to fetch the stream's info.
 func (n *NATS) streamErr(err error) error {
 	if !n.validated.Load() && errors.Is(err, nats.ErrNoResponders) {
 		// Nobody answers the JetStream API at the first check: JetStream is
 		// off on this server (an account without it answers 10039, fatal on
 		// its own), or no JetStream server is reachable from it -- a leaf
-		// whose hub is down. The client cannot tell the two apart:
-		// jetstream's AccountInfo, asked here until 2026-10-11, maps no
-		// responders to "not enabled" itself, and its request to
-		// $JS.API.INFO turned a role without that permission into a
-		// permanent verdict (the review of the port into
-		// go-webhook-fast-server). Either way nothing can be confirmed now,
-		// and as network the boot waited out sink.boot_timeout to exit with
-		// the wrong reason (SPEC §10.7). After a validated check, the same
-		// answer is a blip: network.
+		// whose hub is down. The client cannot tell the two apart: jetstream's
+		// AccountInfo, asked here until 2026-10-11, maps no responders to "not
+		// enabled" itself, and its request to $JS.API.INFO, denied to a role
+		// of least privilege, now becomes a permanent verdict on the data path
+		// (deniesTheDataPath). Either way nothing can be confirmed now, and as
+		// network the boot waited out sink.boot_timeout to exit with the wrong
+		// reason (SPEC §10.7). After a validated check the same answer is a
+		// blip: network.
 		return fatalErr("validate", fmt.Errorf(
 			"nobody answers the JetStream API: JetStream is disabled on this server, or no "+
 				"JetStream server is reachable from it; sink.nats.mode = jetstream needs it "+
@@ -755,6 +937,10 @@ func (n *NATS) streamErr(err error) error {
 	}
 	return classifyNATS("stream", err)
 }
+
+// coverageSubject is what the stream must cover: the subject of this
+// instance's space (SPEC §10.7).
+func (n *NATS) coverageSubject() string { return n.own }
 
 // maxMessageBytes is what the largest message this server can publish counts
 // against max_payload: the worst JLH in Data, plus the header block, whose
@@ -781,6 +967,29 @@ func (n *NATS) validate(maxPayload int64, info *jetstream.StreamInfo) error {
 	cfg := info.Config
 	if cfg.Sealed {
 		return fatalErr("validate", fmt.Errorf("stream %q is sealed and accepts no publishes", n.cfg.Stream))
+	}
+	if cfg.Retention == jetstream.InterestPolicy {
+		// With interest retention a message nobody is interested in is
+		// acknowledged with an ordinary PubAck and not kept: with no consumer
+		// bound -- before the first one, or while every one is deleted -- each
+		// chunk is confirmed, released from the ring and lost, with no error
+		// and no counter (invariant §20.18). The PubAck is what lets the ring
+		// forget a message, so a stream that may discard on acceptance cannot
+		// be this sink's (decided in go-syslog-server, 2026-10-11; ported from
+		// go-relplog-nats-server, 2026-10-13, closing SPEC §21.1 item 5).
+		return fatalErr("validate", fmt.Errorf(
+			"stream %q has retention=interest: it acknowledges and keeps nothing while no consumer is "+
+				"interested, so a confirmed chunk could be lost (docs/SPEC.md §10.7); use "+
+				"retention=limits (or workqueue)", n.cfg.Stream))
+	}
+	// Every event of a space shares one subject: a per-subject cap keeps only
+	// the last few of a whole space and silently discards the rest as they
+	// arrive, each one acknowledged. Legitimate for a "latest only" stream, which is why it is
+	// a warning and not a refusal -- said once per value, not once per check.
+	if v := max(cfg.MaxMsgsPerSubject, 0); n.perSubjectWarned.Swap(v) != v && v > 0 {
+		n.log.Warn("stream keeps at most max_msgs_per_subject messages per subject; every event of "+
+			"a space shares one subject, so older events are discarded as new ones are acknowledged "+
+			"(docs/SPEC.md §10.7)", "stream", n.cfg.Stream, "max_msgs_per_subject", v)
 	}
 	if cfg.NoAck {
 		// A stream that never acknowledges turns every PublishMsgAsync future
@@ -852,9 +1061,11 @@ func (n *NATS) validateSize(maxPayload int64, cfg *jetstream.StreamConfig) error
 	subject := len(n.coverageSubject())
 	record := need + int64(subject) + 64
 	// A stream that refuses new messages when full, smaller than one record:
-	// the first large message is 10077, fatal, and every boot after the dump
-	// validates and then fails its reingestion the same way. With discard old
-	// the stream makes room instead.
+	// the first large message is refused for good, and every boot after the
+	// dump validates and then fails its reingestion the same way. With discard
+	// old the stream makes room instead. And the 10077 of a full stream is
+	// network now (storeFailedIsTransient), so here it would hold the ring
+	// forever instead.
 	if cfg.Discard == jetstream.DiscardNew && cfg.MaxBytes > 0 && cfg.MaxBytes < record {
 		return fatalErr("validate", fmt.Errorf(
 			"stream %q max_bytes=%d with discard=new is below the largest message this server can "+
@@ -925,9 +1136,11 @@ const (
 	jsErrMessageExceedsMaximum = 10054
 	jsErrStreamNotFound        = 10059
 	jsErrStreamNotMatch        = 10060
-	jsErrStreamStoreFailed     = 10077
+	jsErrStreamStoreFailed     = 10077 // see storeFailedIsTransient
 	jsErrHeaderExceedsMaximum  = 10097
 	jsErrStreamSealed          = 10109
+	jsErrDuplicateInProcess    = 10158
+	jsErrStreamTooManyRequests = 10167
 )
 
 // errNATSServerRequiresTLS is the verdict on a server whose INFO says
@@ -938,10 +1151,13 @@ var errNATSServerRequiresTLS = errors.New("the NATS server requires TLS, and thi
 	"(docs/SPEC.md §1.2); point sink.nats.urls at a listener without TLS")
 
 // isAuthRefusal recognises a refusal of the credentials at CONNECT, which
-// nats.go returns with the server's own words: its errors.Is compares the
-// whole text, so "User Authentication Expired" never matched ErrAuthExpired
-// ("authentication expired"), was classed network, and the boot waited out
-// sink.boot_timeout to exit with the wrong reason (SPEC §10.7).
+// nats.go returns with the server's own words: its errors.Is compares the whole
+// text, so "User Authentication Expired" never matched ErrAuthExpired
+// ("authentication expired"), and "Revoked" matched nothing, so both were
+// classed network and the boot waited out sink.boot_timeout to exit with the
+// wrong reason (SPEC §10.7). Only phrases about the credentials themselves:
+// "permissions violation" is about one subject, and it is the verdict's to
+// judge (deniesTheDataPath), never a refusal of the whole connection.
 func isAuthRefusal(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "authorization violation") ||
@@ -993,6 +1209,9 @@ func classifyNATSError(err error) Class {
 	var jsErr jetstream.JetStreamError
 	if errors.As(err, &jsErr) {
 		if api := jsErr.APIError(); api != nil {
+			if api.ErrorCode == jsErrStreamStoreFailed && storeFailedIsTransient(api.Description) {
+				return ClassNetwork
+			}
 			switch api.ErrorCode {
 			case jsErrStreamNotFound, jsErrJetStreamNotEnabled, jsErrJetStreamNotEnabledFA,
 				jsErrStreamNotMatch, jsErrStreamSealed,
@@ -1004,9 +1223,24 @@ func classifyNATSError(err error) Class {
 				// rather than the fatal of an unknown 4xx: were it ever
 				// reached, it would be about that message, not the stream.
 				return ClassLogic
+			case jsErrDuplicateInProcess, jsErrStreamTooManyRequests:
+				// Transient, though 4xx. 10158 (409): the same Nats-Msg-Id is
+				// still in a Raft proposal -- the retry, after a deadline, of a
+				// publish a clustered stream has not finished storing; it
+				// passes on its own, and the retry then is a duplicate. 10167
+				// (429): the stream's ingest queue is full. As the fatal of an
+				// unknown 4xx either was a dump and exit 3, maybe on the whole
+				// fleet at once.
+				return ClassNetwork
 			}
-			// A 4xx is the server refusing the request's form, which repeats on
-			// every attempt; a 5xx is the server's own trouble.
+			// Any 429 is backpressure, never the request's form: the batch
+			// publish inflight ceilings (10210, 10211) pass once the server
+			// catches up, like 10167.
+			if api.Code == 429 {
+				return ClassNetwork
+			}
+			// Any other 4xx is the server refusing the request's form, which
+			// repeats on every attempt; a 5xx is the server's own trouble.
 			if api.Code >= 400 && api.Code < 500 {
 				return ClassFatal
 			}
@@ -1016,4 +1250,45 @@ func classifyNATSError(err error) Class {
 	// Unknown is retried rather than dropped: a filling ring is visible, a
 	// discarded chunk is not (invariant §20.18).
 	return ClassNetwork
+}
+
+// storeFailedIsTransient tells the 10077 of a stream that is merely full, or
+// closing, from a store that cannot take the message at all. nats-server
+// answers every store refusal with 10077 (processJetStreamMsg), and the
+// description is the store's own error: "maximum messages exceeded", "maximum
+// bytes exceeded" and "maximum messages per subject exceeded" are a stream
+// with discard=new that is full -- backpressure, which clears as soon as a
+// consumer acknowledges -- and "store closed" a stream or server shutting
+// down (a rolling restart of NATS). As fatal they were a dump and exit 3, and
+// the stored part of the chunk duplicated at reingestion (independent review,
+// 2026-10-11). A record too large for the store stays fatal: retrying cannot
+// make it fit, and validateSize refuses the configurations that produce it.
+func storeFailedIsTransient(desc string) bool {
+	d := strings.ToLower(desc)
+	return strings.Contains(d, "maximum messages exceeded") ||
+		strings.Contains(d, "maximum bytes exceeded") ||
+		strings.Contains(d, "maximum messages per subject exceeded") ||
+		strings.Contains(d, "store closed")
+}
+
+// maskedDenial reports a permission denial that arrived during a core chunk
+// (last is a new error, not the one before it) and is not one of the data
+// path: the one case where LastError can hide the denial that matters.
+func maskedDenial(before, last error) bool {
+	if last == nil || !errors.Is(last, nats.ErrPermissionViolation) || deniesTheDataPath(last) {
+		return false
+	}
+	return !sameError(before, last)
+}
+
+// sameError compares two errors by identity -- every -ERR the client stores
+// is a new value -- without panicking on an error type that is not
+// comparable.
+func sameError(a, b error) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return a == b
 }

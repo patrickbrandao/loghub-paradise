@@ -201,3 +201,29 @@ e os compose ring × sink (aqui há um).
   como no N, a brecha da cauda com traço depois de um valor não vazio
   (`--x=a -b`): escondê-la esconderia os erros de digitação (TESTING §8
   item 13).
+
+## 7. Porte das correções do RP e do R (2026-10-13)
+
+As correções da revisão independente do `go-relplog-pg-server` (RP) e as do
+`go-relplog-server` (R) que valiam aqui, conferidas uma a uma (CHANGELOG,
+entradas "2026-10-13 — RP, RN" e "2026-10-12 — R"). Sem entrevista: as escolhas
+são as que o RP já registrou nas DECISOES dele; contestáveis.
+
+- **A `LOGHUB_EB_URL` exige usuário e banco** (SPEC §10.9), em vez do padrão do
+  registry (`syslog`) ou da libpq (o usuário do sistema): a URL é dona das duas
+  chaves, e duas leituras dela não podem chegar a dois bancos. Muda o que era
+  aceito: uma URL sem usuário ou sem caminho passa a ser exit 1.
+- **`sink.postgres.pool_size` ≥ `sink.workers + 1`** (SPEC §10.5), não
+  `≥ workers`: a sonda de saúde precisa de uma conexão. Um `pool_size` igual aos
+  workers, aceito antes, passa a ser exit 1.
+- **Tetos de configuração** (SPEC §13.2): os do RP, com `listen.udp_listeners`
+  junto do `tcp_listeners` (1–256). Folgados de propósito.
+- **O prazo da reingestão conta sem progresso** (SPEC §12.2): muda a regra deste
+  servidor (um prazo único desde o início), como no RP e no RN.
+- **Não portado, por não se aplicar:** o RP deixa de enfileirar uma transação
+  cuja sessão acabou durante a montagem (o `librelp` a retransmitiria). Aqui o
+  que foi lido já saiu do emissor, e o contexto cancelado ainda enfileira
+  (SPEC §5.7).
+- **Ficaram para depois** (SPEC §22.1 itens 5 e 6), por não estarem na lista
+  do porte: `23502` fatal e o prazo próprio da validação do boot, que o RP já
+  tem.

@@ -736,6 +736,25 @@ func (p *Postgres) validate(ctx context.Context) error {
 				"(docs/SPEC.md §10.5)", p.regname, extra))
 	}
 
+	// No INSERT or UPDATE rule. PostgreSQL refuses "INSERT ... ON CONFLICT"
+	// on a table with one (0A000, feature_not_supported): every chunk would
+	// fail with the sink UP and /readyz green (go-relplog-pg-server's
+	// independent review, 2026-10-13). A rule ON DELETE or ON SELECT (a
+	// view's) does not touch the INSERT and is left alone.
+	var rules string
+	if err := p.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT string_agg(quote_ident(rulename), ', ' ORDER BY rulename)
+		                   FROM pg_catalog.pg_rewrite
+		                  WHERE ev_class = to_regclass($1) AND ev_type IN ('2', '3')), '')`,
+		p.regname).Scan(&rules); err != nil {
+		return classifyPostgres("validate", err)
+	}
+	if rules != "" {
+		return fatalErr("validate", fmt.Errorf(
+			"table %s has an INSERT or UPDATE rule (%s); INSERT ... ON CONFLICT cannot run on such a "+
+				"table (0A000): drop the rule, or use a trigger (docs/SPEC.md §10.5)", p.regname, rules))
+	}
+
 	// INSERT, and SELECT on uuid: ON CONFLICT (uuid) reads the arbiter
 	// column, and a role with INSERT alone fails the first chunk with 42501.
 	var canInsert, canSelectUUID bool
@@ -812,10 +831,11 @@ func classifyPostgres(op string, err error) error {
 
 // classifySQLState is the SQLSTATE table of SPEC §10.5:
 //
-//	08, 53, 57, 40                    network
-//	22, 23 (outside the ON CONFLICT)  logic
-//	42 (schema), 28, 2F, 3D, 42501, 25006 fatal
-//	anything else                     network
+//	08, 53, 57, 40                          network
+//	22, 23 (outside the ON CONFLICT)        logic
+//	42 (schema), 28, 2F, 3D, 42501, 25006,
+//	0A000                                   fatal
+//	anything else                           network
 //
 // The line that matters most: everything in class 42 is FATAL, never logic. A
 // dropped table or a missing unique index would otherwise be a logic error --
@@ -824,7 +844,15 @@ func classifyPostgres(op string, err error) error {
 // 5 ms, forever, with a perfectly healthy-looking process (invariant §20.18).
 // This table and TestClassifySQLState change together.
 func classifySQLState(code string) Class {
-	if code == "25006" { // read_only_sql_transaction: a promoted replica, or configured so
+	switch code {
+	case "25006": // read_only_sql_transaction: a promoted replica, or configured so
+		return ClassFatal
+	case "0A000":
+		// feature_not_supported: what INSERT ... ON CONFLICT gets from a table
+		// with an INSERT or UPDATE rule, refused at boot by validate. A rule
+		// created after the boot fails every chunk the same way; as network
+		// it was retried forever with the sink UP (go-relplog-pg-server's
+		// independent review, 2026-10-13).
 		return ClassFatal
 	}
 	if len(code) < 2 {

@@ -186,12 +186,17 @@ completa roda no **worker de dreno**.
 A ordem da recepção é estrita, e a primeira condição que falha encerra a
 mensagem: vazia (§5.6) → truncamento (§5.5) → sink DOWN (§13.3) → **ring
 cheio** → `uuid`, cabeçalho e cópia para um buffer do pool → `ring.Enqueue`. O
-"ring cheio" é uma pré-checagem barata e sem trava (`ring.Memory.Full`: itens ≥
-`capacity_items`), feita **antes** do `uuid`, da cópia e do item: uma mensagem
-recusada com o ring cheio (uma enxurrada de UDP, a retentativa do TCP a cada
-50 ms) custa ~25 ns e nenhuma alocação, em vez de ~115 ns e duas. Ela pode errar
-nos dois sentidos numa corrida; **o `Enqueue` continua sendo a autoridade** (os
-dois tetos, §9.2).
+"ring cheio" é uma pré-checagem barata e sem trava (`ring.Memory.FullFor(n)`:
+itens ≥ `capacity_items`, **ou** os bytes do ring mais a classe do pool de `n`
+— o tamanho já truncado — e o `ItemOverhead` acima de `max_bytes`), feita
+**antes** do `uuid`, da cópia e do item: uma mensagem recusada com o ring cheio
+(uma enxurrada de UDP, a retentativa do TCP a cada 50 ms) custa ~25 ns e nenhuma
+alocação, em vez de ~115 ns e duas. Conferir só o teto de itens deixava o ring
+cheio por `max_bytes` cunhar `uuid`, copiar e montar o item a cada retentativa,
+para o `Enqueue` recusar (revisão independente do `go-relplog-pg-server`,
+2026-10-13, portada). Um ring fechado nunca está "cheio": o `Enqueue` responde
+`ErrClosed`, que é o shutdown. Ela pode errar nos dois sentidos numa corrida;
+**o `Enqueue` continua sendo a autoridade** (os dois tetos, §9.2).
 
 No pai o PRI era lido na recepção, porque o filtro dependia dele. Sem filtro
 (§1.2), **a recepção não lê a mensagem**: nenhum byte do conteúdo é
@@ -778,6 +783,15 @@ retentativa reavalia só o que pode mudar sozinho — o estado do sink e o espa�
 no ring, primeiro pela pré-checagem sem alocação (§2.2) — e reusa o `uuid` já
 cunhado (§3.1). (No pai, filtro e rate-limit
 também decidiam uma vez por mensagem; os dois saíram, §1.2.)
+
+**O fim do contexto não impede o `Enqueue`.** O `go-relplog-pg-server` deixa de
+enfileirar uma transação cuja sessão acabou enquanto ela era montada, porque o
+`librelp` retransmite o que nunca teve resposta e a cópia no ring seria
+duplicata. Aqui não há resposta a reter: uma linha que este servidor **leu** já
+saiu do emissor, e descartá-la na entrega ao ring seria perda, não
+desduplicação. Por isso, com o contexto cancelado (o shutdown da fase 3 de
+§13.4), o que foi lido termina de entrar no ring
+(`TestIngestCancelledContextStillEnqueues`). Decisão do porte de 2026-10-13.
 
 ---
 
@@ -1410,6 +1424,17 @@ conexão termina antes de qualquer `ClientHello`, com o erro
 aceitará o texto claro deste, então o boot sai com 3 na hora, nomeando o TLS,
 em vez de retentar até `sink.boot_timeout`.
 
+**Depois do boot também.** Um servidor que passa a exigir TLS numa reconexão
+nunca chega ao `ReconnectErrHandler` (o `nats.go` só o chama quando a discagem
+TCP falha; a recusa do `TLSCertCB` acontece depois, no *handshake*, e fica só no
+`LastError`, com o estado `RECONNECTING`). Por isso o `Health`, ao ver o cliente
+`RECONNECTING`, lê o `LastError` (`noteLastError`, `escalate`) e faz dele o
+veredito, FATAL nomeando o TLS. Antes, a checagem dizia "connection is
+RECONNECTING", `network`, e o FATAL vinha dos fusíveis, com o motivo errado — ou
+nunca, com os dois fusíveis desligados (revisão independente do
+`go-relplog-nats-server`, 2026-10-13, portada;
+`TestNATSReconnectToATLSOnlyServerIsAVerdict`).
+
 **Conexão:** `MaxReconnects(-1)` (os fusíveis de §13.3 decidem quando desistir;
 um cliente que se fechasse sozinho depois de N tentativas transformaria uma
 queda longa num estado irrecuperável, sem dump), `ReconnectWait(500ms)` e
@@ -1442,9 +1467,15 @@ importam:
 - `WithPublishAsyncTimeout(sink.op_timeout)`: sem ele, um futuro sem resposta
   segura a mensagem e o buffer do pedaço para sempre.
 
-`WithPublishAsyncMaxPending` = `sink.workers × sink.batch`: tudo o que os
-workers podem ter no ar ao mesmo tempo (a reingestão roda antes de eles
-começarem). `Data` aponta para o buffer do pedaço, que só volta ao pool depois
+`WithPublishAsyncMaxPending` = `2 × sink.workers × sink.batch`: o dobro do
+que os workers podem ter no ar ao mesmo tempo (a reingestão roda antes de eles
+começarem). A folga existe porque os futuros de um pedaço contaminado
+continuam contando até o próprio prazo assíncrono, que começa na publicação,
+um pouco depois do prazo do worker: sem ela, uma retentativa rápida parava na
+janela cheia e falhava com `ErrTooManyStalledMsgs` (revisão independente do
+`go-relplog-nats-server`, 2026-10-13, portada). Com os tetos de §13.2
+(`sink.workers` ≤ 256, `sink.batch` ≤ 65 536) o número fica em no máximo
+33 554 432, um `int` positivo em qualquer plataforma. `Data` aponta para o buffer do pedaço, que só volta ao pool depois
 de todos os futuros resolverem; qualquer erro depois da primeira publicação
 deixa o buffer para o GC (§15.2).
 
@@ -1461,6 +1492,22 @@ significa que o servidor NATS **recebeu** as mensagens, não que alguém as
 guardou: sem stream, uma mensagem sem assinante some, e não há deduplicação.
 Combina com o UDP, que já é lossy. O boot registra `WARN` com essa frase, e a
 primeira checagem um `INFO` com a maior mensagem e o `max_payload`.
+
+**Um *flush* que atravessa uma reconexão não confirma** (`core`). O `nats.go`
+falha um *flush* pendente com `ErrConnectionClosed` quando a conexão **cai**,
+embora o cliente só esteja reconectando: o `flushErr` o classifica como
+`network` enquanto a conexão não está `CLOSED` (no `Write` e no `Health`); antes
+era `fatal`, e um soluço do NATS no meio do *flush* era FATAL, dump e exit 3. E
+um *flush* que **começa** durante a reconexão é resolvido pelo `PONG` do servidor
+novo, embora os `PUB` do pedaço tenham ido pelo socket velho: o `writeCore`
+compara o número de reconexões antes da primeira publicação e depois do
+*flush*, e se ele mudou o pedaço é `network`, não confirmado (portados do
+`go-relplog-nats-server`, 2026-10-13).
+
+**Em `core`, um envelope de outro `space`** (um dump de outra vida) gera um
+`WARN` por `space` estrangeiro, uma vez: sem stream, ele se perde se ninguém
+assinar o subject. A comparação é entre o `space` do item e o Workspace; o
+subject próprio é montado uma vez, sem nada no caminho quente.
 
 **Subject** (§3.8): sempre `loghub.<space>.syslog`, derivado do `space` do
 item. Não há `sink.nats.subjects` (§1.2, decisão 4).
@@ -1482,7 +1529,9 @@ reduzido — respondia toda publicação com um prazo estourado ou uma recusa,
 | Não está selado | `Sealed = false` |
 | Confirma publicações | `NoAck = false`: um stream com `no_ack` transformaria todo futuro em `ErrAsyncPublishTimeout` (`network`), retentado para sempre, com o ring enchendo e o sink UP |
 | A maior mensagem cabe | `nc.MaxPayload()` e o `max_msg_size` do stream (quando > 0) contra a maior mensagem de §3.9; com `storage: file`, o registro contra os 32 MiB do file store (`10077`) |
-| O stream cabe uma mensagem | com `discard: new` e `max_bytes` > 0, o registro (maior mensagem + subject + 64 B, §3.9) contra o `max_bytes`: o primeiro evento grande seria `10077`, fatal, e todo boot depois do dump validaria e cairia na reingestão do mesmo jeito. Com `discard: old` o stream abre espaço, e passa |
+| O stream cabe uma mensagem | com `discard: new` e `max_bytes` > 0, o registro (maior mensagem + subject + 64 B, §3.9) contra o `max_bytes`: abaixo de um registro, o maior evento seria recusado para sempre, e o `10077` de um stream cheio, que é `network` (abaixo), seguraria o ring sem fim. Com `discard: old` o stream abre espaço, e passa |
+| A retenção guarda o que confirma | `retention: interest` é FATAL: sem consumidor interessado, o servidor responde com `PubAck` normal e não guarda nada, e o pedaço seria confirmado e perdido. `limits` e `workqueue` são aceitos (portado do `go-relplog-nats-server`, 2026-10-13) |
+| Teto por subject | `max_msgs_per_subject > 0` só gera `WARN`, uma vez por valor: todo evento de um `space` divide um subject, e os mais antigos são descartados conforme os novos são confirmados |
 
 Com tudo aceito, o log traz `stream validated` com o stream, os subjects, o
 `storage`, as réplicas, a `duplicate_window`, a maior mensagem e o
@@ -1512,9 +1561,11 @@ acima, em toda checagem.
 | Erro | Classe |
 |---|---|
 | prazo ou cancelamento, `ErrTimeout`, `ErrNoResponders`, `ErrNoServers`, `ErrDisconnected`, `ErrConnectionReconnecting`, `ErrReconnectBufExceeded`, `ErrNoStreamResponse`, `ErrAsyncPublishTimeout`, `ErrTooManyStalledMsgs` | `network` |
-| `ErrAuthorization`, `ErrAuthExpired`, `ErrAuthRevoked`, `ErrAccountAuthExpired`, e o texto do servidor no `CONNECT` com "authorization violation", "authentication expired" ou "authentication revoked" (o `errors.Is` do `nats.go` compara o texto inteiro, e "User Authentication Expired" nunca casava com o sentinela: o boot esperava o `boot_timeout` e saía com o motivo errado), `ErrConnectionClosed`, servidor que exige TLS (`errNATSServerRequiresTLS`), `ErrStreamNotFound` (`10059`), JetStream desligado (`10076`, `10039`), stream esperado não confere (`10060`), selado (`10109`), recursos (`10023`), armazenamento (`10077`) | **`fatal`** |
+| `10077` cuja descrição é de um stream **cheio** com `discard: new` ("maximum messages exceeded", "maximum bytes exceeded", "maximum messages per subject exceeded") ou **fechando** ("store closed", um restart do NATS) | `network`: backpressure, passa quando um consumidor confirma ou o servidor volta (revisão independente do `go-relplog-server`, portada; como `fatal` eram dump, exit 3 e duplicatas na reingestão) |
+| `10158` (409: o mesmo `Nats-Msg-Id` ainda numa proposta Raft, na retentativa depois de um prazo num stream em cluster), `10167` (429: a fila de entrada do stream cheia) e todo outro erro da API com código 429 | `network`: passam sozinhos (antes, "outro 4xx" os fazia FATAL, dump e exit 3, talvez na frota inteira) |
+| `ErrAuthorization`, `ErrAuthExpired`, `ErrAuthRevoked`, `ErrAccountAuthExpired`, e o texto do servidor no `CONNECT` com "authorization violation", "authentication expired" ou "authentication revoked" (o `errors.Is` do `nats.go` compara o texto inteiro, e "User Authentication Expired" nunca casava com o sentinela: o boot esperava o `boot_timeout` e saía com o motivo errado), `ErrConnectionClosed` com a conexão `CLOSED` (só reconectando, `network`: o `flushErr` acima), servidor que exige TLS (`errNATSServerRequiresTLS`), `ErrStreamNotFound` (`10059`), JetStream desligado (`10076`, `10039`), stream esperado não confere (`10060`), selado (`10109`), recursos (`10023`), outro armazenamento (`10077`: um registro que o store não aceita) | **`fatal`** |
 | `ErrMaxPayload` (recusada no cliente: só aquela mensagem, §10.2), `ErrMaxBytesExceeded`, `10054`, `10097` | `logic` |
-| violação de permissão (`ErrPermissionViolation`) numa publicação em `loghub.<space>.syslog` ou na API `$JS.API`, vista pelo `ErrorHandler` | **`fatal`**, pelo veredito (abaixo) |
+| violação de permissão (`ErrPermissionViolation`) numa publicação em `loghub.<space>.syslog` (de qualquer `space`), na API `$JS.API` ou na assinatura de `_INBOX.`, vista pelo `ErrorHandler` | **`fatal`**, pelo veredito (abaixo) |
 | outro erro da API com código 4xx | `fatal` |
 | outro erro da API com código 5xx, qualquer outro | `network` |
 
@@ -1532,9 +1583,25 @@ antes do `PONG` do *flush*, então o `LastError()` da conexão já o tem quando 
 fica retido para o dump. Antes, esse pedaço era confirmado, contado como escrito
 e perdido, e assim todos os seguintes até a próxima checagem de saúde. Uma
 negação no subject do **beacon não é veredito**: o plano de controle não pode derrubar o plano de dados (§11). O
-`ReconnectErrHandler` transforma em veredito, também, uma reconexão recusada
-porque o servidor passou a exigir TLS (o FATAL dizia antes "connection is
-RECONNECTING").
+`ReconnectErrHandler` transforma em veredito, também, uma reconexão cuja
+discagem foi recusada; a recusa do TLS, que vem depois, no *handshake*, é lida
+do `LastError` (acima).
+
+A negação de **assinatura em `_INBOX.`**, por onde voltam os `PubAck` e as
+respostas da API, também é veredito: sem ela nenhuma confirmação chega, e o
+`StreamInfo` estourava o prazo como `network` até o `boot_timeout`. Em
+`jetstream`, o prazo do futuro de um publish negado vira o veredito, com o
+pedaço contaminado: o primeiro pedaço negado é fatal só depois do
+`sink.op_timeout`; em `core`, na hora.
+
+**Negação mascarada (`core`).** O `nats.go` guarda só o **último** `-ERR`. Uma
+negação do subject do beacon que chega entre os `PUB` de um pedaço e o `PING`
+do *flush* esconde uma negação do caminho de dados que veio antes dela, e o
+pedaço seria confirmado embora o servidor o tivesse recusado. Uma negação
+**nova** durante o pedaço que não é do caminho de dados (`maskedDenial`) torna o
+pedaço incerto: `network`, não confirmado; a retentativa encontra o veredito
+que o `ErrorHandler` já gravou, ou passa (revisão independente do
+`go-relplog-server`, portada do `go-relplog-nats-server`).
 
 O `ErrMaxBytesExceeded` só existe em consumidores *pull*: o ramo dele na
 classificação é inalcançável aqui e fica por simetria com o pai.
@@ -1591,6 +1658,19 @@ senha até a primeira `/`, `#`, `?` ou `,`). O
 `--dump-config` mostra os valores derivados como comentário, com o *userinfo*
 redigido (`nats://usuario:***@host`; um usuário sem senha pode ser um token e é
 redigido inteiro), para que o dump relido não dispare o conflito.
+
+**Recusas portadas do `go-relplog-server` e do `go-relplog-nats-server`**
+(2026-10-13), exit 1 sem citar a URL, aqui e em `sink.nats.urls`: um `@` depois
+do primeiro `/`, `?` ou `#` da autoridade (um usuário ou senha com um desses
+caracteres sem codificar encurta a autoridade: `nats://app:39182#Zs3@n1` discava
+`app:39182` sem senha), com a dica de `%2F`, `%3F` e `%23`; um host com escape
+(`%`), com a mensagem de que um host NATS é um nome ou um IP literal, em vez de
+"invalid percent-escape"; uma entrada sem esquema depois da primeira, com a
+dica de que uma `,` no usuário, na senha ou no token parte a lista; e a
+`LOGHUB_EB_URL` só com espaços (definida e vazia de conteúdo: o operador que
+quis desligá-la não saberia que as chaves `[sink.nats]` é que valem; vazia
+continua "não definida"). O esquema recusado é citado com o `://`
+(`"tls://"`), e a falta dele como "no scheme".
 
 ### 10.10 `sink.type = clickhouse`
 
@@ -1859,8 +1939,12 @@ A entrega segue as classes dos workers pedaço a pedaço (§13.1 passo 9): `logi
 conta, loga e segue para o pedaço seguinte, e o arquivo é tratado como
 entregue (sair deixaria o mesmo arquivo para o boot seguinte, num *crashloop*
 com todos os transportes fechados); `network` reenvia o mesmo pedaço com backoff
-dentro de **um** `sink.boot_timeout` para a reingestão inteira, e estourado sai
-com 3 **sem remover o arquivo**; `fatal` sai com 3.
+dentro de **um** `sink.boot_timeout` **sem progresso** para a reingestão
+inteira (todo pedaço entregue empurra o prazo; um prazo único desde o início se
+gastava com sucessos, e uma reingestão saudável de um dump grande que passasse
+do `boot_timeout` saía com 3 no primeiro soluço, revisão independente do
+`go-relplog-pg-server`, 2026-10-13, portada), e estourado sai com 3 **sem
+remover o arquivo**; `fatal` sai com 3.
 
 **Um dump de uma vida com outro Workspace** é publicado em
 `loghub.<space da linha>.syslog`, que a validação do boot não conferiu (ela
@@ -1868,7 +1952,28 @@ prova só o subject do próprio `space`). Sem stream que o cubra, o JetStream n�
 responde e a entrega falha como `network` até `sink.boot_timeout`: o boot sai
 com 3 e o arquivo fica. Coberto por outro stream, o `WithExpectStream` o recusa
 (`10060`), fatal. O operador decide se cria o stream ou move o dump. Em `core`,
-a mensagem vai para quem assinar aquele subject, ou para ninguém.
+a mensagem vai para quem assinar aquele subject, ou para ninguém, com um `WARN`
+por `space` estrangeiro, uma vez (§10.7).
+
+**Os gauges dizem o que está no disco.** `syslog_emergency_files` é o número de
+arquivos listados, posto antes do estado de boot que anuncia a reingestão;
+`syslog_emergency_events_pending` não é tocado durante ela (posto no tamanho do
+pedaço, a última leitura antes de um exit 3 mostrava um pedaço por um dump
+inteiro). No fim, os dois são **recontados do diretório** (`Store.Count`, que
+lê cada arquivo com o leitor da reingestão), nunca zerados: um arquivo ilegível,
+ou cuja remoção ou quarentena falhou, continua pendente, contado como um arquivo
+sem envelopes, e um alerta neles continua disparando. O dump do shutdown
+**soma** aos gauges (pode haver um arquivo de antes no disco).
+
+**Remoção e quarentena com o `fsync` do diretório falho.** `Remove` e
+`Quarantine` devolvem `emergency.ErrNotDurable` quando o `unlink` ou o `rename`
+aconteceu e só o `fsync` do diretório depois dele falhou (inclusive ao abrir o
+diretório): o boot loga `WARN` (o nome pode voltar depois de uma queda de
+energia, e o dump seria publicado de novo, deduplicado pelo stream só dentro da
+`duplicate_window`) e, na quarentena, ainda o `ERROR` com
+as contagens de bytes sob o nome novo. Antes, "cannot remove … it will be
+delivered again" para um arquivo que já não existia, ou "cannot quarantine"
+com o caminho antigo e sem as contagens.
 
 ### 12.3 Falha do próprio dump
 
@@ -1877,6 +1982,12 @@ Disco cheio, sem permissão, `fsync` recusado, `emergency.enabled = false`:
 exit 3. `emergency.dir` é criado **no boot**, com uma escrita de prova: um
 diretório criado durante o incidente falha durante o incidente, e um problema
 de permissão achado no dump é uma mensagem perdida em vez de um boot recusado.
+
+**Um dump que o abort já contou como perdido desiste** (`Store.SetAbandon`): a
+escrita confere o abort entre linhas (a cada 1024) e antes de publicar, e
+remove o temporário em vez de deixar no disco um arquivo que o boot seguinte
+reingeriria. Um dump publicado entre a última conferência e o abort fica contado
+como perdido **e** guardado: sobra, nunca perda, e nada mais é contado (§13.4).
 
 ---
 
@@ -1923,6 +2034,11 @@ de permissão achado no dump é uma mensagem perdida em vez de um boot recusado.
 12. /readyz 200
 ```
 
+Um sinal que cancela o `bind` da porta admin (passo 5) ou de um transporte
+(passo 11) — a resolução de um nome de host falha com "operation was
+canceled" — é um boot interrompido, **130**, não um endereço ruim (1) (revisão
+independente do `go-relplog-pg-server`, 2026-10-13, portada).
+
 **Identidade antes de tudo que escreve.** `lhident.Initialize()` roda **uma
 vez**, no `main`, depois das flags que encerram o programa e antes de abrir
 qualquer recurso com `defer` ou criar goroutine (regra 2 da skill). A app recebe
@@ -1949,7 +2065,7 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | Combinação | Efeito |
 |---|---|
 | Nenhum `listen.*` | exit 1 |
-| `listen.udp` ou `listen.tcp` fora de `host:port` (`:1514` serve); `*_listeners` < 1 | exit 1. UDP e TCP podem dividir a porta (são protocolos distintos; 1514 nos dois é o padrão) |
+| `listen.udp` ou `listen.tcp` fora de `host:port` (`:1514` serve); `*_listeners` fora de 1–256 | exit 1. UDP e TCP podem dividir a porta (são protocolos distintos; 1514 nos dois é o padrão) |
 | `admin.enabled = true` com `admin.bind` vazio ou fora de `host:port` | exit 1 (vazio publicaria `/metrics` em todas as interfaces numa porta aleatória; desligar é `admin.enabled = false`) |
 | Número real `NaN` ou `±Inf` em qualquer parâmetro | exit 1 (o `NaN` passa por toda comparação de faixa) |
 | `emergency.dir` fora de `server.data_dir` | `WARN` (§20.16) |
@@ -1961,6 +2077,7 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | `syslog.rfc3164_timezone` desconhecido para o `time.LoadLocation`, ou `Local` | exit 1 (a imagem embute `time/tzdata`; `Local` dependeria do host) |
 | `syslog.legacy_charset` fora de `""`, `cp1252`, `latin1`, `windows-1252`, `iso-8859-1` | exit 1 |
 | `syslog.max_message_bytes` < 480 ou > 16 MiB; `sd_max_elements` ou `sd_max_params` < 1 | exit 1 (480 é o mínimo da RFC 5424) |
+| **Tetos** (revisões independentes do `go-relplog-pg-server` e do `go-relplog-nats-server`, 2026-10-13, portadas): `ring.capacity_items` > 16 777 216, `sink.workers` > 256 (todos dividem a única conexão NATS), `sink.batch` > 65 536, `sink.batch_max_bytes` > 256 MiB | exit 1. Sem eles, um erro de digitação de poucos dígitos derrubava o boot em pânico (`makechan`), alocava um gigabyte por `Dequeue` ou dava a volta no `int` do `PublishAsyncMaxPending` (`2 × workers × batch`, §10.7). Os números são folgados: só barram o erro de digitação |
 | `ring.capacity_items`, `ring.max_bytes`, `sink.workers`, `sink.batch`, `sink.batch_max_bytes`, `sink.max_retries` abaixo de 1; `ring.high_water` fora de (0, 1]; `log.access_sample` fora de [0, 1]; `tcp.max_conns*` negativo; `retry_backoff_max < retry_backoff_min` | exit 1 |
 | `sink.nats.urls` vazia, ou com uma entrada que não seja `nats://` (`tls://`, `ws://`, `wss://`, `host:porta` sem esquema) | exit 1, citando só o esquema, nunca a URL (§1.2) |
 | uma entrada de `sink.nats.urls` que não é URL válida (um `%`, `/`, `#`, `?` ou `,` sem escape num usuário, senha ou token) ou sem host | exit 1, sem repetir **nada** da entrada — nem o trecho que o erro do `net/url` cita: `invalid port ":Sup3r" after host` é a senha até a primeira `/`, e ia para o stderr do contêiner — com a dica "percent-encode %, /, #, ? and , in a user, password or token". Uma entrada com caminho, consulta ou fragmento também é exit 1 (a regra da `LOGHUB_EB_URL`, §10.9): é o que pega o segredo que parseia — `nats://tok/en@host` é o host `tok` e um caminho, sem credencial nenhuma, e o erro de discagem do cliente citava esse host, o token até a barra, em cada log até o `boot_timeout`. Antes da revisão, a falha acontecia dentro do `nats.Connect`, como `network`, retentada até o `boot_timeout` e com a URL (e a senha) citada em cada linha de log |
@@ -1976,7 +2093,12 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | `GOMEMLIMIT` ausente, ou `< ring.max_bytes × 2` | `WARN` (§15.4) |
 | parâmetro desconhecido na linha de comando ou no INI | exit 1. Isto inclui toda chave do pai que saiu (`ring.mode`, `sink.type`, `[tls]`, `[filter]`, `[ratelimit]`, `sink.nats.subjects`, `sink.nats.tls`, `tls_ca`, `tls_insecure`, `[sink.postgres]`...): um INI do `go-syslog-server` não sobe aqui em silêncio |
 | linha do INI que não é `[seção]` nem `chave = valor` (um cabeçalho sem `]` inclusive); argumento da linha de comando que não começa com `-` | exit 1, nomeando o número da linha ou só o que vem antes do `=` do argumento, **nunca o conteúdo**: `password: x` (sem `=`) ou `sink.nats.password=x` (sem `--`) iam inteiros para o stderr do contêiner |
-| flag sem valor seguida de outra flag (`--sink.workers --sink.nats.password=x`, um `$WORKERS` vazio num script); valor depois de um espaço (`--sink.nats.password= x`, `--sink.nats.password = x`, `--sink.nats.password= -x`); valor que o shell partiu num espaço (`--sink.nats.password=$P`, com espaço em `$P`); valor que começa com `--` na forma separada (`--sink.nats.password --x`) | exit 1, nunca com o valor: um argumento que começa com `--` (ou `-` com o nome de um parâmetro ou de um *switch*) nunca é tomado como valor de outra flag, e só é nomeado se for uma flag deste servidor; o argumento depois de um valor vazio ou de um `=` sozinho não é citado, nem como nome de flag desconhecida; uma palavra solta depois de qualquer valor não é citada. Um valor que começa com `-` vai depois do `=`. Fica uma brecha, de propósito: a cauda partida que começa com traço depois de um valor **não** vazio (`--sink.nats.password=a -b`) sai como parâmetro desconhecido, porque escondê-la esconderia todo erro de digitação de uma flag (`--sink.workers=4 --tipo.errado=1`) (revisão independente do porte, 2026-10-11; os três últimos caminhos, da revisão do porte de volta ao `go-webhook-nats-server`, no mesmo dia) |
+| flag sem valor seguida de outra flag (`--sink.workers --sink.nats.password=x`, um `$WORKERS` vazio num script); valor depois de um espaço (`--sink.nats.password= x`, `--sink.nats.password = x`, `--sink.nats.password= -x`); valor que o shell partiu num espaço (`--sink.nats.password=$P`, com espaço em `$P`); valor que começa com `--` na forma separada (`--sink.nats.password --x`) | exit 1, nunca com o valor: um argumento que começa com `--` (ou `-` com o nome de um parâmetro ou de um *switch*) nunca é tomado como valor de outra flag, e só é nomeado se for uma flag deste servidor; o argumento depois de um valor vazio ou de um `=` sozinho não é citado, nem como nome de flag desconhecida; uma palavra solta depois de qualquer valor não é citada. Um valor que começa com `-` vai depois do `=`. A cauda partida que começa com traço depois de um valor **não** vazio (`--sink.nats.password=a -b`) só é nomeada quando tem a forma `<seção>.<chave>` de uma seção que este servidor tem, ou que saiu do pai (`--sink.nats.subjet`, `--filter.min_severity`): um erro de digitação dentro de uma seção conhecida continua nomeado, e `-hunter2` ou `--x=y` não (`knownSectionOf`, do `go-relplog-server`, portado em 2026-10-13). Um `-h`/`-v` de um traço depois de uma flag que quer valor não é nomeado (é como um valor de dois caracteres começando com traço se parece); `--help` é (o parser do `go-webhook-nats-server`, portado em 2026-10-11) |
+| `--help`, `--version` ou `--dump-config` com valor (`--dump-config=false`) | exit 1, sem citar o valor: um *switch* não tem valor, e um valor ignorado pode dizer o contrário (despejava e saía 0) |
+| `--config=` vazio | exit 1: caía no `SYSLOG_CONFIG`, o contrário do que diz |
+| nome de parâmetro com algo colado depois (`--sink.nats.passwordhunter2`, `…password-hunter2`), ou com caracteres que nome nenhum tem (`password: hunter2 = x`, `--sink.nats.password:hunter2`) | exit 1 como parâmetro desconhecido, **sem** citar o nome: o `=` esquecido põe o valor dentro dele |
+| no INI, chave desconhecida logo depois de um segredo (`password = abc` e, na linha seguinte, `ffd3a9c1b2=`), ou cuja seção não existe aqui nem no pai, ou que não tem a forma de uma chave (`^[a-z0-9_]{1,64}$`) | exit 1 nomeando só a linha: é o resto de um valor que quebrou de linha, e o erro vai ao stderr e, num `SIGHUP`, ao log |
+| BOM UTF-8 no começo do INI | ignorado (alguns editores do Windows o gravam; mantido, a linha 1 era "expected 'key = value'" sem nada visível) |
 | variável de ambiente do pai que este servidor não tem (`SYSLOG_LISTEN_TLS`, `SYSLOG_TLS_*`, `SYSLOG_FILTER_*`, `SYSLOG_RATELIMIT_*`, `SYSLOG_SINK_TYPE`, `SYSLOG_RING_MODE`, `SYSLOG_SINK_NATS_SUBJECTS`, `SYSLOG_SINK_NATS_TLS*`, as dos outros sinks e rings...) | **um** `WARN` que nomeia todas e diz que são ignoradas (`internal/config/removed.go`, §16.2). Não é erro porque um mesmo `.env` pode alimentar mais de um servidor da família; sem o aviso, o env é lido só pelos nomes do registry e elas sumiriam em silêncio, e quem trocou um servidor pelo outro acreditaria ter um listener TLS, um filtro ou subjects granulares |
 
 ### 13.3 Saúde do sink
@@ -2034,13 +2156,30 @@ fase 5  o que sobrou vai para o dump (§12); para o beacon, fecha o sink e o
   perda. Conta em `reason="abort"` o que o ring ainda tinha **e** o que já fora
   entregue ao dump em andamento (o `Drain` já os tirou da contabilidade do
   ring; antes da revisão independente do `go-syslog-pg-server`, um abort durante
-o dump contava 0).
+  o dump contava 0).
+- **Um dono só para a contagem da perda** (revisões independentes do
+  `go-relplog-server` e do `go-relplog-pg-server`, portadas em 2026-10-13).
+  Antes de recolher as sobras (`Workers.Pending`, `Drain`), o shutdown entra na
+  **fase do dump** (`enterDumpPhase`): daí em diante o abort conta o contador
+  `dumping`, nunca o do ring, que deixa de dizer a verdade (os lotes retidos
+  ainda estão nele, os drenados já não). O contador recebe exatamente o que vai
+  ao dump (`oweDump`), e o dump o toma de volta com `Swap` (salvo, nada mais se
+  perde; falho ou desligado, ele conta `emergency_failed`). As passagens e o
+  abort são ordenados por um mutex (`lossMu`), e o abort é registrado uma vez
+  (`aborted`): um abort entre duas passagens contava o ring e deixava o
+  contador para um dump falho contar de novo (10 perdidas para 5). Depois do
+  abort nenhuma passagem acontece e o dump desiste (§12.3).
 - **Shutdown por FATAL** (que começa sem sinal nenhum): o **primeiro**
   `SIGTERM`/`SIGINT` é tolerado — logado, e o dump continua —, e só um segundo
   aborta. Um orquestrador que manda `SIGTERM` ao ver o processo sair do ar não
   pode cortar o dump que salva o ring. `SIGQUIT` aborta
-  sempre, inclusive fora do shutdown: no boot e com o servidor no ar, saída
-  imediata com 130.
+  sempre, **nunca é tolerado**, inclusive fora do shutdown: no boot e com o
+  servidor no ar, saída imediata com 130. Um `SIGQUIT` que chega depois de o
+  shutdown começar e antes de o observador do segundo sinal existir chega só ao
+  observador do `run`: o shutdown confere `quitting` na entrada e, depois, espera
+  também o canal `quitNow`, fechado junto com a flag, para o `SIGQUIT` gravado
+  logo depois dessa leitura (portado do `go-relplog-server` e do
+  `go-relplog-pg-server`).
 - **Sink FATAL durante a fase 4** (o `SIGTERM` chegou com o sink UP e ele virou
   FATAL no dreno): a espera termina na hora, em vez de gastar o `drain_timeout`
   num dreno que não acontece mais; o que sobrou vai para o dump, e a saída é
@@ -2120,7 +2259,7 @@ stream.
 | `syslog_beacons_total` | counter | `result` (ok, error) (§11) |
 | `syslog_events_written_total` | counter | — |
 | `syslog_events_dropped_total` | counter | `reason` (sink_logic, malformed, emergency_failed, abort): conjunto **distinto** de `messages_dropped`; as quatro séries existem desde o boot, em zero, como todo label de conjunto fechado (um `rate()` precisa da série antes do primeiro evento) |
-| `syslog_emergency_files`, `syslog_emergency_events_pending` | gauge | — |
+| `syslog_emergency_files`, `syslog_emergency_events_pending` | gauge | — (arquivos e envelopes pendentes no disco, recontados do diretório no fim da reingestão e somados a cada dump; durante a reingestão, `files` é o número de arquivos listados e `events_pending` não muda, §12.2) |
 | `syslog_build_info` | gauge | `version`, `commit`, `go` |
 | `syslog_config_info` | gauge | `ring_mode` (sempre `memory`), `sink_type` (sempre `nats`), `transports` |
 | `syslog_identity_info` | gauge | `from`, `space`, `agent_name` (fixos por processo, não vêm do emissor) |
@@ -2251,8 +2390,14 @@ registry: são lidas pelo `go-loghub-ident`, e o `--dump-config` mostra o que o
 **ambiente** diz numa seção informativa `[identity]`, sem resolver nada
 (§13.1 passo 1: o dump não toca identidade nem disco).
 
+**O `--dump-config` relido reproduz a config**: um valor **derivado** que
+ficou no padrão (`emergency.dir` de `server.data_dir`) sai comentado, com a nota; escrito como chave, viraria
+explícito na releitura e deixaria de acompanhar o que o deriva (revisão
+independente do `go-relplog-pg-server`, 2026-10-13, portada).
+
 **Chaves do pai que saíram.** Na linha de comando ou no INI são parâmetro
-desconhecido, exit 1. No ambiente, onde o registry lê só os próprios nomes e
+desconhecido, exit 1, e o erro diz de onde a chave vem ("go-syslog-server has
+it", `removedParams`, a mesma lista do env em grafia pontuada). No ambiente, onde o registry lê só os próprios nomes e
 nunca varre o resto, elas sumiriam em silêncio; por isso o boot confere a lista
 de `internal/config/removed.go` (as de TLS, filtro, rate-limit, `sink.type`,
 `ring.mode`, `sink.nats.subjects`, `sink.nats.tls*` e as dos outros sinks e
@@ -2279,6 +2424,11 @@ que saíram, §1.2.)
 Toda chave de `[syslog]` **exige restart**: ela muda a conversão, e o JLH de um
 item não pode depender de **quando** ele foi drenado (§3.5). A identidade fica
 congelada.
+
+Sinônimos são um valor só: `syslog.legacy_charset = windows-1252` num INI cujo
+boot disse `cp1252` (ou `iso-8859-1` e `latin1`) não mudou nada, e o `SIGHUP`
+não o relata como "requires a restart" (revisão independente do
+`go-relplog-pg-server`, 2026-10-13, portada; `TestCharsetSynonymsAreOneValue`).
 
 Duas referências: chave recarregável comparada com o que está **em execução**
 (para que reverter ao valor de boot seja aplicado); chave de restart comparada
@@ -2365,10 +2515,10 @@ beacon periódico; o de conexão continua, §11).
 | Chave | Padrão | Descrição |
 |---|---|---|
 | `udp` | `:1514` | RFC 5426 |
-| `udp_listeners` | `1` | `>1` habilita `SO_REUSEPORT`; o único jeito de passar de um núcleo |
+| `udp_listeners` | `1` | 1–256; `>1` habilita `SO_REUSEPORT`; o único jeito de passar de um núcleo |
 | `udp_read_buffer` | `8MiB` | `SO_RCVBUF`; o efetivo é lido de volta e exposto |
 | `tcp` | `:1514` | RFC 6587 |
-| `tcp_listeners` | `1` | `>1` habilita `SO_REUSEPORT` |
+| `tcp_listeners` | `1` | 1–256; `>1` habilita `SO_REUSEPORT` |
 | `unix` | `""` | socket datagram, caminho absoluto; `/dev/log` é o costume. A única escrita fora de `server.data_dir` |
 | `unix_mode` | `0666` | octal; todo processo precisa poder logar |
 | `unix_read_buffer` | `8MiB` | `SO_RCVBUF` do socket unix |
@@ -2420,7 +2570,7 @@ Removido no go-syslog-nats-server (§1.2).
 
 | Chave | Padrão | Descrição |
 |---|---|---|
-| `capacity_items` | `65536` | teto de itens; com mensagens de 200 bytes é o que pega primeiro |
+| `capacity_items` | `65536` | teto de itens, 1–16 777 216; com mensagens de 200 bytes é o que pega primeiro |
 | `max_bytes` | `512MiB` | teto de bytes: o `cap` de cada buffer cru + 256 B por item (§9.2); o JLH não conta |
 | `high_water` | `0.80` | fração de qualquer teto acima da qual o `/readyz` falha |
 
@@ -2438,9 +2588,9 @@ Removido no go-syslog-nats-server (§1.2).
 
 | Chave | Padrão | Descrição |
 |---|---|---|
-| `workers` | `8` | goroutines de dreno, que também convertem; dividem a única conexão NATS |
-| `batch` | `256` | itens por `Dequeue`; as publicações assíncronas de um pedaço ficam no ar juntas |
-| `batch_max_bytes` | `16MiB` | teto de JLH por pedaço |
+| `workers` | `8` | goroutines de dreno, que também convertem; dividem a única conexão NATS; 1–256 |
+| `batch` | `256` | itens por `Dequeue`; as publicações assíncronas de um pedaço ficam no ar juntas; 1–65 536 |
+| `batch_max_bytes` | `16MiB` | teto de JLH por pedaço; no máximo 256 MiB (o pedaço fica inteiro na memória enquanto os futuros pendem) |
 | `batch_max_delay` | `5ms` | espera máxima para completar um lote; `0` = sem espera |
 | `op_timeout` | `5s` | prazo de uma escrita (as confirmações do pedaço), da discagem e de um futuro assíncrono |
 | `health_interval` | `2s` | período da checagem; também a latência de UP→DOWN |
@@ -2901,55 +3051,9 @@ deixa a regra na seção citada, com teste.
    Direção, a decidir: conferir a faixa também na 3164 (`timestamp-invalid`,
    `timestamp` omitido, hostname e TAG preservados) como desvio D9 de §1.3, ou
    escrever em §6.5.1 que, como na referência, o offset não é conferido.
-5. **Stream com `retention: interest` (§10.7).** A validação do stream não
-   confere a retenção. Num stream `interest` sem consumidor interessado no
-   subject, o `nats-server` responde um `PubAck` normal e não grava nada: o
-   evento é confirmado, sai do ring e some sem contagem nem log, com o sink UP.
-   Direção: recusar `retention = interest` como as demais linhas da tabela de
-   validação (FATAL, no boot e em toda checagem); aceitar quem o usa de
-   propósito, com consumidores duráveis sempre presentes, é decisão a
-   registrar. Opcional: um `WARN` com `max_msgs_per_subject > 0`, porque todo
-   evento de um `space` divide um subject.
-6. **4xx transitórios da API classificados como `fatal` (§10.7).** "Outro erro
-   da API com código 4xx" é `fatal`, mas dois 4xx são transitórios: `10158`
-   (409, o `Nats-Msg-Id` da primeira tentativa ainda numa proposta Raft
-   pendente: a retentativa de um prazo estourado num stream em cluster) e
-   `10167` (429, a fila de entrada do stream cheia). Um soluço do NATS vira
-   FATAL, dump e exit 3, ao mesmo tempo em toda instância que publica no
-   stream. Direção: os dois como `network` (avaliar todo 429), com linhas na
-   tabela e casos em `TestClassifyNATS`.
-7. **Assinatura negada em `_INBOX` não é veredito (§10.7).** Os `PubAck` e as
-   respostas da API chegam na caixa `_INBOX.` do cliente, não na `$JS.API.>`, e
-   uma negação de *subscribe* ali não vira veredito: o `StreamInfo` estoura o
-   prazo como `network`, e o boot espera o `boot_timeout` inteiro e sai culpando
-   a rede. Direção: tratar como veredito a negação de `Subscription to
-   "_INBOX.` (sem ela nenhuma confirmação chega) e corrigir o comentário de
-   `deniesTheDataPath`, que supõe os acks na `$JS.API`.
-8. **Dump de outro Workspace em `core`, sem aviso (§12.2).** Em `core`, as linhas
-   de um dump de outro `space` vão para um subject que provavelmente ninguém
-   assina, e o arquivo é removido como entregue, sem nenhum sinal ao operador.
-   Direção: um `WARN` por subject estrangeiro, uma vez, comparando o `space` do
-   item com o Workspace (sem montar o subject no caminho quente), como no
-   `go-webhook-nats-server`.
-9. **Gauges de emergência zerados com dump no disco (§12.2, §14.1).** No fim da
-   reingestão, `syslog_emergency_files` e `syslog_emergency_events_pending` vão
-   a zero mesmo quando um arquivo ficou no diretório (ilegível, ou com a remoção
-   ou a quarentena falhando), e um alerta sobre `syslog_emergency_files > 0` não
-   dispara. Direção: recontar no fim pelo `List()` do diretório, arquivos
-   legíveis ou não.
-10. **Log falso de remoção e de quarentena no boot (§12.2).** `Store.Remove` e
-    `Store.Quarantine` devolvem o erro do `fsync` do diretório depois de o
-    `unlink` ou o `rename` já terem acontecido, e o boot loga "cannot remove a
-    reingested dump; it will be delivered again" para um arquivo que já não
-    existe, ou "cannot quarantine" com o caminho antigo e sem as contagens de
-    bytes. Na escrita, a falha do `fsync` do diretório cita o nome temporário,
-    que também já não existe. Direção: o boot distinguir "feito, sem `fsync`"
-    (destino devolvido; `lstat` sem o arquivo) e logar `WARN`; a escrita citar
-    o nome final. A regra de §12.1 (o `fsync` do diretório decide o dump) não
-    muda.
-11. **`SIGQUIT` tolerado no shutdown por FATAL (§13.4).** A tolerância ao
-    primeiro sinal não exclui o `SIGQUIT`, que §13.4 manda abortar sempre: num
-    shutdown por FATAL ele é engolido, e o processo segue com o dump até
-    terminar (exit 3) ou até um segundo sinal. Direção: tolerar só
-    `SIGTERM`/`SIGINT`, com um teste em que o `SIGQUIT` é o primeiro sinal de um
-    shutdown por FATAL e a saída é 130.
+
+Os itens 5 a 11 de antes (`retention: interest` aceito, 4xx transitórios da API
+como `fatal`, assinatura negada em `_INBOX` sem veredito, dump de outro
+Workspace em `core` sem aviso, gauges de emergência zerados com dump no disco,
+log falso de remoção e de quarentena, `SIGQUIT` tolerado no shutdown por FATAL)
+foram corrigidos no porte de 2026-10-13 e vivem em §10.7, §12.2 e §13.4.

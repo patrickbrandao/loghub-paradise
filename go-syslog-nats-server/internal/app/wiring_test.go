@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-nats-server/internal/config"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-nats-server/internal/obs"
 )
 
@@ -163,4 +164,16 @@ func TestMoreBootRefusalsExitOne(t *testing.T) {
 			t.Fatalf("exit %d", code)
 		}
 	})
+}
+
+// SPEC §10.7: the async-publish window is twice what the workers can have in
+// flight. With exactly workers x batch, a quick retry of a tainted chunk --
+// whose futures still count until their own timeout -- stalled on a full
+// window (go-relplog-nats-server's independent review, 2026-10-13).
+func TestMaxPendingHasTwiceTheWorkersBatches(t *testing.T) {
+	c := &config.Config{}
+	c.Sink.Workers, c.Sink.Batch = 8, 256
+	if got := maxPending(c); got != 2*8*256 {
+		t.Fatalf("maxPending = %d, want %d", got, 2*8*256)
+	}
 }

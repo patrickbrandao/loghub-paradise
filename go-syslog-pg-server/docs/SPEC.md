@@ -176,12 +176,17 @@ completa roda no **worker de dreno**.
 A ordem da recepção é estrita, e a primeira condição que falha encerra a
 mensagem: vazia (§5.6) → truncamento (§5.5) → sink DOWN (§13.3) → **ring
 cheio** → `uuid`, cabeçalho e cópia para um buffer do pool → `ring.Enqueue`. O
-"ring cheio" é uma pré-checagem barata e sem trava (`ring.Memory.Full`: itens ≥
-`capacity_items`), feita **antes** do `uuid`, da cópia e do item: uma mensagem
-recusada com o ring cheio (uma enxurrada de UDP, a retentativa do TCP a cada
-50 ms) custa ~25 ns e nenhuma alocação, em vez de ~115 ns e duas. Ela pode errar
-nos dois sentidos numa corrida; **o `Enqueue` continua sendo a autoridade** (os
-dois tetos, §9.2).
+"ring cheio" é uma pré-checagem barata e sem trava (`ring.Memory.FullFor(n)`:
+itens ≥ `capacity_items`, **ou** os bytes do ring mais a classe do pool de `n`
+— o tamanho já truncado — e o `ItemOverhead` acima de `max_bytes`), feita
+**antes** do `uuid`, da cópia e do item: uma mensagem recusada com o ring cheio
+(uma enxurrada de UDP, a retentativa do TCP a cada 50 ms) custa ~25 ns e nenhuma
+alocação, em vez de ~115 ns e duas. Conferir só o teto de itens deixava o ring
+cheio por `max_bytes` cunhar `uuid`, copiar e montar o item a cada retentativa,
+para o `Enqueue` recusar (revisão independente do `go-relplog-pg-server`,
+2026-10-13, portada). Um ring fechado nunca está "cheio": o `Enqueue` responde
+`ErrClosed`, que é o shutdown. Ela pode errar nos dois sentidos numa corrida;
+**o `Enqueue` continua sendo a autoridade** (os dois tetos, §9.2).
 
 No pai o PRI era lido na recepção, porque o filtro dependia dele. Sem filtro
 (§1.2), **a recepção não lê a mensagem**: nenhum byte do conteúdo é
@@ -839,6 +844,15 @@ no ring, primeiro pela pré-checagem sem alocação (§2.2) — e reusa o `uuid`
 cunhado (§3.1). (No pai, filtro e rate-limit
 também decidiam uma vez por mensagem; os dois saíram, §1.2.)
 
+**O fim do contexto não impede o `Enqueue`.** O `go-relplog-pg-server` deixa de
+enfileirar uma transação cuja sessão acabou enquanto ela era montada, porque o
+`librelp` retransmite o que nunca teve resposta e a cópia no ring seria
+duplicata. Aqui não há resposta a reter: uma linha que este servidor **leu** já
+saiu do emissor, e descartá-la na entrega ao ring seria perda, não
+desduplicação. Por isso, com o contexto cancelado (o shutdown da fase 3 de
+§13.4), o que foi lido termina de entrar no ring
+(`TestIngestCancelledContextStillEnqueues`). Decisão do porte de 2026-10-13.
+
 ---
 
 ## 6. Conversão
@@ -1472,7 +1486,17 @@ instâncias** e entre produtores LogHub, a `loghub.inbox` de §3.7.1.
   com `WARN` num destino SQL; aqui o padrão já é o valor certo). Acima de 16,
   `WARN`: cada worker prende uma conexão de um orçamento (100 por padrão no
   PostgreSQL) que a frota inteira divide. `pool_size = 0` deriva `workers + 1`;
-  um `pool_size` abaixo de `workers` é exit 1.
+  um `pool_size` abaixo de `workers + 1` é exit 1: a sonda de saúde tira a
+  conexão dela do mesmo pool, e com `pool_size = workers` escritas lentas mas
+  boas prendiam todas, a sonda estourava o prazo esperando uma, o sink ia a
+  DOWN e, passado o `fail_timeout`, a FATAL com o banco saudável (revisão
+  independente do `go-relplog-pg-server`, 2026-10-13, portada).
+- **Sem `RULE` de INSERT ou UPDATE na fila.** O PostgreSQL recusa `INSERT … ON
+  CONFLICT` numa tabela com uma (`0A000`, *feature_not_supported*): a validação
+  do boot confere `pg_rewrite` (`ev_type` 2 e 3) e recusa nomeando as regras,
+  FATAL; uma regra `ON DELETE` ou `ON SELECT` não toca o `INSERT` e passa. Uma
+  regra criada depois do boot falha todo pedaço com `0A000`, que é `fatal` na
+  tabela abaixo (como `network`, era retentada para sempre com o sink UP).
 - **Validação no boot**, na primeira checagem válida, cada recusa FATAL imediato
   (exit 3, sem esperar `boot_timeout`): a tabela existe; as dez colunas com tipos
   compatíveis (`uuid` em `uuid` e `from_uuid`; `smallint`/`integer`/`bigint` em
@@ -1519,7 +1543,7 @@ instâncias** e entre produtores LogHub, a `loghub.inbox` de §3.7.1.
 |---|---|
 | `08`, `53`, `57`, `40` | `network` |
 | `22`, `23` (fora do `ON CONFLICT`) | `logic` |
-| **`42`** (esquema), **`3D`** (o banco não existe), `28`, `2F`, `42501`, `25006`, `23514` sem constraint nomeada | **`fatal`** |
+| **`42`** (esquema), **`3D`** (o banco não existe), `28`, `2F`, `42501`, `25006`, `0A000`, `23514` sem constraint nomeada | **`fatal`** |
 | qualquer outra | `network` |
 
 **A classe `42` é fatal e nunca `logic`**: uma tabela dropada classificada como
@@ -1575,9 +1599,45 @@ parâmetro repetido também é recusado**: em `sslmode=disable&sslmode=require` 
 recusa do TLS dizendo o contrário. Com socket, a porta da URL é mantida:
 `postgres://u:p@:5433/db?host=/run/pg` dá `addr = /run/pg:5433`.
 
+**Recusas portadas do `go-relplog-server` e do `go-relplog-pg-server`**
+(revisões independentes de 2026-10-11 e 2026-10-13, portadas em 2026-10-13),
+todas exit 1 sem citar a URL:
+
+- **Usuário e banco são obrigatórios** (DECISOES §7). Sem eles, a libpq tomaria
+  o usuário do sistema e um banco de mesmo nome, e este servidor o padrão do
+  registry (`syslog`): duas leituras da mesma URL, dois bancos. A URL é dona
+  das duas chaves, então o operador não podia corrigir em outro lugar.
+- **`?sslmode=` vazio**: a libpq o recusa, e lido como "ausente" a URL dizia
+  duas coisas a dois leitores.
+- **`host=` com `,`, `:` ou branco**: a libpq lê `host=` literalmente
+  (`/run/pg,/x` são dois servidores, `/run/pg:5433` um diretório com `:` no
+  nome).
+- **Um `@` depois do primeiro `/`, `?` ou `#` da autoridade**, com a dica de
+  `%2F`, `%3F` e `%23`: é um usuário ou senha com um desses caracteres sem
+  codificar, que encurta a autoridade (`postgres://app:39182#Zs3@db/x` discava
+  `app:39182` sem senha).
+- **Fragmento**: a libpq não tem; um `#` é uma senha cortada ou uma consulta
+  jogada fora (um `?sslmode=require` depois dele nunca chegaria à recusa do
+  TLS).
+- **Host com escape** (`postgres://%2Frun%2Fpg/db`): o parser do Go o recusa, e
+  "invalid percent-escape" mandava o operador atrás da senha; a mensagem manda
+  usar `?host=/dir`. Um `://` repetido diz que o da senha precisa ser
+  codificado (`%3A%2F%2F`).
+- **Só com espaços**: definida e vazia de conteúdo, o operador que quis
+  desligá-la não saberia que as chaves `[sink.postgres]` é que valem. Vazia
+  (`LOGHUB_EB_URL=`) continua "não definida".
+- Nenhum texto do parser de URL vai ao erro (o `url.Error` cita a entrada, e o
+  erro interno dele cita a senha até a barra), e um parâmetro de consulta
+  recusado só é nomeado se for um nome da libpq (lista fixa): uma senha colada
+  depois de um `?` ou `&` também é uma "chave". O valor de um `sslmode`
+  desconhecido não é citado.
+
 **`sink.postgres.addr`, venha da URL ou não, é um servidor só:** `host:porta`
-com host não vazio, sem vírgula e porta 1–65535 sem zero à esquerda; ou um
-diretório de socket começando com `/`, com um `:porta` opcional na mesma faixa. Nenhuma
+com host não vazio, sem vírgula, espaço ou tab, sem `:` a não ser num IPv6
+literal (`[h:5432]:5433`, o que `postgres://u@h:5432:5433/db` vira, era um nome
+DNS que ninguém resolve, retentado o `boot_timeout` inteiro), e porta 1–65535
+sem zero à esquerda; ou um diretório de socket começando com `/`, sem vírgula
+nem branco, com um `:porta` opcional na mesma faixa. Nenhuma
 mensagem de erro cita a URL (ela pode ter senha). O `--dump-config` mostra os
 valores derivados como comentário, com a senha redigida, para que o dump relido
 não dispare o conflito.
@@ -1723,7 +1783,31 @@ outro nome são ignorados.
 sink.batch_max_bytes)`), cada pedaço entregue antes de o próximo ser lido. Um
 dump de JLH chega a ~12× o ring que o produziu (§3.9); carregado inteiro, ele
 matava o boot por OOM, e o boot seguinte tentava de novo, em laço. Um único
-`sink.boot_timeout` cobre a reingestão inteira, não um por arquivo.
+`sink.boot_timeout` **sem progresso** cobre a reingestão inteira, não um por
+arquivo: todo pedaço entregue empurra o prazo. Um prazo único desde o início se
+gastava com sucessos, e uma reingestão saudável de um dump grande que passasse
+do `boot_timeout` saía com 3 no primeiro soluço, sem retentativa, e todo boot
+seguinte recomeçava o mesmo arquivo (revisão independente do
+`go-relplog-pg-server`, 2026-10-13, portada).
+
+**Os gauges dizem o que está no disco.** `syslog_emergency_files` é o número de
+arquivos listados, posto antes do estado de boot que anuncia a reingestão;
+`syslog_emergency_events_pending` não é tocado durante ela (posto no tamanho do
+pedaço, a última leitura antes de um exit 3 mostrava um pedaço por um dump
+inteiro). No fim, os dois são **recontados do diretório** (`Store.Count`, que
+lê cada arquivo com o leitor da reingestão), nunca zerados: um arquivo ilegível,
+ou cuja remoção ou quarentena falhou, continua pendente, contado como um arquivo
+sem envelopes, e um alerta neles continua disparando. O dump do shutdown
+**soma** aos gauges (pode haver um arquivo de antes no disco).
+
+**Remoção e quarentena com o `fsync` do diretório falho.** `Remove` e
+`Quarantine` devolvem `emergency.ErrNotDurable` quando o `unlink` ou o `rename`
+aconteceu e só o `fsync` do diretório depois dele falhou (inclusive ao abrir o
+diretório): o boot loga `WARN` (o nome pode voltar depois de uma queda de
+energia, e o dump seria entregue de novo) e, na quarentena, ainda o `ERROR` com
+as contagens de bytes sob o nome novo. Antes, "cannot remove … it will be
+delivered again" para um arquivo que já não existia, ou "cannot quarantine"
+com o caminho antigo e sem as contagens.
 
 **Sem conversão.** A linha é entregue como está; as colunas da `loghub.inbox`
 (`uuid`, `from_uuid`, `space`, `level`, `sid`, `event_at`/`event_nsec`, §3.7.1)
@@ -1804,6 +1888,12 @@ exit 3. `emergency.dir` é criado **no boot**, com uma escrita de prova: um
 diretório criado durante o incidente falha durante o incidente, e um problema
 de permissão achado no dump é uma mensagem perdida em vez de um boot recusado.
 
+**Um dump que o abort já contou como perdido desiste** (`Store.SetAbandon`): a
+escrita confere o abort entre linhas (a cada 1024) e antes de publicar, e
+remove o temporário em vez de deixar no disco um arquivo que o boot seguinte
+reingeriria. Um dump publicado entre a última conferência e o abort fica contado
+como perdido **e** guardado: sobra, nunca perda, e nada mais é contado (§13.4).
+
 ---
 
 ## 13. Ciclo de vida
@@ -1839,6 +1929,11 @@ de permissão achado no dump é uma mensagem perdida em vez de um boot recusado.
 11. /readyz 200
 ```
 
+Um sinal que cancela o `bind` da porta admin (passo 5) ou de um transporte
+(passo 10) — a resolução de um nome de host falha com "operation was
+canceled" — é um boot interrompido, **130**, não um endereço ruim (1) (revisão
+independente do `go-relplog-pg-server`, 2026-10-13, portada).
+
 **Identidade antes de tudo que escreve.** `lhident.Initialize()` roda **uma
 vez**, no `main`, depois das flags que encerram o programa e antes de abrir
 qualquer recurso com `defer` ou criar goroutine (regra 2 da skill). A app recebe
@@ -1865,7 +1960,7 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | Combinação | Efeito |
 |---|---|
 | Nenhum `listen.*` | exit 1 |
-| `listen.udp` ou `listen.tcp` fora de `host:port` (`:1514` serve); `*_listeners` < 1 | exit 1. UDP e TCP podem dividir a porta (são protocolos distintos; 1514 nos dois é o padrão) |
+| `listen.udp` ou `listen.tcp` fora de `host:port` (`:1514` serve); `*_listeners` fora de 1–256 | exit 1. UDP e TCP podem dividir a porta (são protocolos distintos; 1514 nos dois é o padrão) |
 | `admin.enabled = true` com `admin.bind` vazio ou fora de `host:port` | exit 1 (vazio publicaria `/metrics` em todas as interfaces numa porta aleatória; desligar é `admin.enabled = false`) |
 | Número real `NaN` ou `±Inf` em qualquer parâmetro | exit 1 (o `NaN` passa por toda comparação de faixa) |
 | `emergency.dir` fora de `server.data_dir` | `WARN` (§20.16) |
@@ -1877,16 +1972,22 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | `syslog.rfc3164_timezone` desconhecido para o `time.LoadLocation`, ou `Local` | exit 1 (a imagem embute `time/tzdata`; `Local` dependeria do host) |
 | `syslog.legacy_charset` fora de `""`, `cp1252`, `latin1`, `windows-1252`, `iso-8859-1` | exit 1 |
 | `syslog.max_message_bytes` < 480 ou > 16 MiB; `sd_max_elements` ou `sd_max_params` < 1 | exit 1 (480 é o mínimo da RFC 5424) |
+| **Tetos** (revisão independente do `go-relplog-pg-server`, 2026-10-13, portada): `ring.capacity_items` > 16 777 216, `sink.workers` > 1024, `sink.batch` > 65 536, `sink.batch_max_bytes` > 256 MiB, `sink.postgres.pool_size` > 4096 | exit 1. Sem eles, um erro de digitação de poucos dígitos derrubava o boot em pânico (`makechan`), alocava um gigabyte por `Dequeue`, dava a volta no `int32` do pool (4294967300 virava 4) ou montava um pedaço cujo `Bind` passa do limite de 1 GiB da libpq e falha sem SQLSTATE, `network` para sempre. Os números são folgados: só barram o erro de digitação |
 | `ring.capacity_items`, `ring.max_bytes`, `sink.workers`, `sink.batch`, `sink.batch_max_bytes`, `sink.max_retries` abaixo de 1; `ring.high_water` fora de (0, 1]; `log.access_sample` fora de [0, 1]; `tcp.max_conns*` negativo; `retry_backoff_max < retry_backoff_min` | exit 1 |
 | `sink.workers > 16` | `WARN` (§10.5) |
-| `sink.postgres.pool_size` negativo, ou abaixo de `sink.workers` | exit 1 (`0` deriva `workers + 1`) |
+| `sink.postgres.pool_size` negativo, ou abaixo de `sink.workers + 1` | exit 1 (`0` deriva `workers + 1`; a sonda de saúde precisa de uma conexão, §10.5) |
 | `sink.postgres.addr`, `username` ou `database` vazios; `addr` que não é um servidor só (`host:porta` com host não vazio, sem vírgula, porta 1–65535 sem zero à esquerda, ou diretório começando com `/` com `:porta` opcional, §10.9); `table` que não é identificador em minúsculas (com esquema opcional) | exit 1 |
-| `LOGHUB_EB_URL` em conflito, com esquema que não é `postgres://`/`postgresql://`, com `sslmode` que pede TLS, com parâmetro desconhecido ou repetido (§10.9) | exit 1 |
+| `LOGHUB_EB_URL` em conflito, com esquema que não é `postgres://`/`postgresql://`, com `sslmode` que pede TLS ou vazio, com parâmetro desconhecido ou repetido, com fragmento, com `@` depois de `/`, `?` ou `#`, sem usuário ou sem banco, com `host=` que não é um diretório só, ou só com espaços (§10.9) | exit 1, sem citar a URL |
 | durações zero onde zero não é "sem limite" (§16.5) | exit 1 |
 | `GOMEMLIMIT` ausente, ou `< ring.max_bytes × 2` | `WARN` (§15.4) |
 | parâmetro desconhecido na linha de comando ou no INI | exit 1. Isto inclui toda chave do pai que saiu (`ring.mode`, `sink.type`, `[tls]`, `[filter]`, `[ratelimit]`, `[sink.nats]`...): um INI do `go-syslog-server` não sobe aqui em silêncio |
 | linha do INI que não é `[seção]` nem `chave = valor` (um cabeçalho sem `]` inclusive); argumento da linha de comando que não começa com `-` | exit 1, nomeando o número da linha ou só o que vem antes do `=` do argumento, **nunca o conteúdo**: `password: x` (sem `=`) ou `sink.postgres.password=x` (sem `--`) iam inteiros para o stderr do contêiner, no boot e a cada `SIGHUP` (porte do `go-syslog-nats-server`, 2026-10-11) |
-| flag sem valor seguida de outra flag (`--sink.workers --sink.postgres.password=x`, um `$WORKERS` vazio num script); valor depois de um espaço (`--sink.postgres.password= x`, `--sink.postgres.password = x`, `--sink.postgres.password= -x`); valor que o shell partiu num espaço (`--sink.postgres.password=$P`, com espaço em `$P`); valor que começa com `--` na forma separada (`--sink.postgres.password --x`) | exit 1, nunca com o valor: um argumento que começa com `--` (ou `-` com o nome de um parâmetro ou de um *switch*) nunca é tomado como valor de outra flag, e só é nomeado se for uma flag deste servidor; o argumento depois de um valor vazio ou de um `=` sozinho não é citado, nem como nome de flag desconhecida; uma palavra solta depois de qualquer valor não é citada. Um valor que começa com `-` vai depois do `=`. Fica uma brecha, de propósito: a cauda partida que começa com traço depois de um valor **não** vazio (`--sink.postgres.password=a -b`) sai como parâmetro desconhecido, porque escondê-la esconderia todo erro de digitação de uma flag (`--sink.workers=4 --tipo.errado=1`) (o parser do `go-webhook-nats-server`, portado em 2026-10-11) |
+| flag sem valor seguida de outra flag (`--sink.workers --sink.postgres.password=x`, um `$WORKERS` vazio num script); valor depois de um espaço (`--sink.postgres.password= x`, `--sink.postgres.password = x`, `--sink.postgres.password= -x`); valor que o shell partiu num espaço (`--sink.postgres.password=$P`, com espaço em `$P`); valor que começa com `--` na forma separada (`--sink.postgres.password --x`) | exit 1, nunca com o valor: um argumento que começa com `--` (ou `-` com o nome de um parâmetro ou de um *switch*) nunca é tomado como valor de outra flag, e só é nomeado se for uma flag deste servidor; o argumento depois de um valor vazio ou de um `=` sozinho não é citado, nem como nome de flag desconhecida; uma palavra solta depois de qualquer valor não é citada. Um valor que começa com `-` vai depois do `=`. A cauda partida que começa com traço depois de um valor **não** vazio (`--sink.postgres.password=a -b`) só é nomeada quando tem a forma `<seção>.<chave>` de uma seção que este servidor tem, ou que saiu do pai (`--sink.postgres.tabel`, `--filter.min_severity`): um erro de digitação dentro de uma seção conhecida continua nomeado, e `-hunter2` ou `--x=y` não (`knownSectionOf`, do `go-relplog-server`, portado em 2026-10-13). Um `-h`/`-v` de um traço depois de uma flag que quer valor não é nomeado (é como um valor de dois caracteres começando com traço se parece); `--help` é (o parser do `go-webhook-nats-server`, portado em 2026-10-11) |
+| `--help`, `--version` ou `--dump-config` com valor (`--dump-config=false`) | exit 1, sem citar o valor: um *switch* não tem valor, e um valor ignorado pode dizer o contrário (despejava e saía 0) |
+| `--config=` vazio | exit 1: caía no `SYSLOG_CONFIG`, o contrário do que diz |
+| nome de parâmetro com algo colado depois (`--sink.postgres.passwordhunter2`, `…password-hunter2`), ou com caracteres que nome nenhum tem (`password: hunter2 = x`, `--sink.postgres.password:hunter2`) | exit 1 como parâmetro desconhecido, **sem** citar o nome: o `=` esquecido põe o valor dentro dele |
+| no INI, chave desconhecida logo depois de um segredo (`password = abc` e, na linha seguinte, `ffd3a9c1b2=`), ou cuja seção não existe aqui nem no pai, ou que não tem a forma de uma chave (`^[a-z0-9_]{1,64}$`) | exit 1 nomeando só a linha: é o resto de um valor que quebrou de linha, e o erro vai ao stderr e, num `SIGHUP`, ao log |
+| BOM UTF-8 no começo do INI | ignorado (alguns editores do Windows o gravam; mantido, a linha 1 era "expected 'key = value'" sem nada visível) |
 | variável de ambiente do pai que este servidor não tem (`SYSLOG_LISTEN_TLS`, `SYSLOG_TLS_*`, `SYSLOG_FILTER_*`, `SYSLOG_RATELIMIT_*`, `SYSLOG_SINK_TYPE`, `SYSLOG_RING_MODE`, as dos outros sinks e rings, `LOGHUB_BEACON_INTERVAL`, `LOGHUB_CTL_NAMESPACE`...) | **um** `WARN` que nomeia todas e diz que são ignoradas (`internal/config/removed.go`, §16.2). Não é erro porque um mesmo `.env` pode alimentar os dois servidores; sem o aviso, o env é lido só pelos nomes do registry e elas sumiriam em silêncio, e quem trocou um servidor pelo outro acreditaria ter um listener TLS ou um filtro |
 
 ### 13.3 Saúde do sink
@@ -1939,12 +2040,29 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
   perda. Conta em `reason="abort"` o que o ring ainda tinha **e** o que já fora
   entregue ao dump em andamento (o `Drain` já os tirou da contabilidade do
   ring; antes da revisão, um abort durante o dump contava 0).
+- **Um dono só para a contagem da perda** (revisões independentes do
+  `go-relplog-server` e do `go-relplog-pg-server`, portadas em 2026-10-13).
+  Antes de recolher as sobras (`Workers.Pending`, `Drain`), o shutdown entra na
+  **fase do dump** (`enterDumpPhase`): daí em diante o abort conta o contador
+  `dumping`, nunca o do ring, que deixa de dizer a verdade (os lotes retidos
+  ainda estão nele, os drenados já não). O contador recebe exatamente o que vai
+  ao dump (`oweDump`), e o dump o toma de volta com `Swap` (salvo, nada mais se
+  perde; falho ou desligado, ele conta `emergency_failed`). As passagens e o
+  abort são ordenados por um mutex (`lossMu`), e o abort é registrado uma vez
+  (`aborted`): um abort entre duas passagens contava o ring e deixava o
+  contador para um dump falho contar de novo (10 perdidas para 5). Depois do
+  abort nenhuma passagem acontece e o dump desiste (§12.3).
 - **Shutdown por FATAL** (que começa sem sinal nenhum): o **primeiro**
   `SIGTERM`/`SIGINT` é tolerado — logado, e o dump continua —, e só um segundo
   aborta. Um orquestrador que manda `SIGTERM` ao ver o processo sair do ar não
   pode cortar o dump que salva o ring. `SIGQUIT` aborta
-  sempre, inclusive fora do shutdown: no boot e com o servidor no ar, saída
-  imediata com 130.
+  sempre, **nunca é tolerado**, inclusive fora do shutdown: no boot e com o
+  servidor no ar, saída imediata com 130. Um `SIGQUIT` que chega depois de o
+  shutdown começar e antes de o observador do segundo sinal existir chega só ao
+  observador do `run`: o shutdown confere `quitting` na entrada e, depois, espera
+  também o canal `quitNow`, fechado junto com a flag, para o `SIGQUIT` gravado
+  logo depois dessa leitura (portado do `go-relplog-server` e do
+  `go-relplog-pg-server`).
 - **Sink FATAL durante a fase 4** (o `SIGTERM` chegou com o sink UP e ele virou
   FATAL no dreno): a espera termina na hora, em vez de gastar o `drain_timeout`
   num dreno que não acontece mais; o que sobrou vai para o dump, e a saída é
@@ -2024,7 +2142,7 @@ definitivo.
 | `syslog_sink_postgres_pool_waits_total` | counter | — |
 | `syslog_events_written_total` | counter | — |
 | `syslog_events_dropped_total` | counter | `reason` (sink_logic, malformed, emergency_failed, abort): conjunto **distinto** de `messages_dropped`; as quatro séries existem desde o boot, em zero, como todo label de conjunto fechado (um `rate()` precisa da série antes do primeiro evento) |
-| `syslog_emergency_files`, `syslog_emergency_events_pending` | gauge | — (arquivos a reingerir; envelopes do pedaço em voo durante a reingestão, ou a contagem do dump depois de um dump) |
+| `syslog_emergency_files`, `syslog_emergency_events_pending` | gauge | — (arquivos e envelopes pendentes no disco, recontados do diretório no fim da reingestão e somados a cada dump; durante a reingestão, `files` é o número de arquivos listados e `events_pending` não muda, §12.2) |
 | `syslog_build_info` | gauge | `version`, `commit`, `go` |
 | `syslog_config_info` | gauge | `ring_mode` (sempre `memory`), `sink_type` (sempre `postgres`), `transports` |
 | `syslog_identity_info` | gauge | `from`, `space`, `agent_name` (fixos por processo, não vêm do emissor) |
@@ -2152,8 +2270,15 @@ registry: são lidas pelo `go-loghub-ident`, e o `--dump-config` mostra o que o
 **ambiente** diz numa seção informativa `[identity]`, sem resolver nada
 (§13.1 passo 1: o dump não toca identidade nem disco).
 
+**O `--dump-config` relido reproduz a config**: um valor **derivado** que
+ficou no padrão (`sink.postgres.pool_size` de `sink.workers`, `emergency.dir`
+de `server.data_dir`) sai comentado, com a nota; escrito como chave, viraria
+explícito na releitura e deixaria de acompanhar o que o deriva (revisão
+independente do `go-relplog-pg-server`, 2026-10-13, portada).
+
 **Chaves do pai que saíram.** Na linha de comando ou no INI são parâmetro
-desconhecido, exit 1. No ambiente, onde o registry lê só os próprios nomes e
+desconhecido, exit 1, e o erro diz de onde a chave vem ("go-syslog-server has
+it", `removedParams`, a mesma lista do env em grafia pontuada). No ambiente, onde o registry lê só os próprios nomes e
 nunca varre o resto, elas sumiriam em silêncio; por isso o boot confere a lista
 de `internal/config/removed.go` (as de TLS, filtro, rate-limit, `sink.type`,
 `ring.mode`, dos outros sinks e rings, `LOGHUB_BEACON_INTERVAL` e
@@ -2179,6 +2304,11 @@ que saíram, §1.2.)
 Toda chave de `[syslog]` **exige restart**: ela muda a conversão, e o JLH de um
 item não pode depender de **quando** ele foi drenado (§3.5). A identidade fica
 congelada.
+
+Sinônimos são um valor só: `syslog.legacy_charset = windows-1252` num INI cujo
+boot disse `cp1252` (ou `iso-8859-1` e `latin1`) não mudou nada, e o `SIGHUP`
+não o relata como "requires a restart" (revisão independente do
+`go-relplog-pg-server`, 2026-10-13, portada; `TestCharsetSynonymsAreOneValue`).
 
 Duas referências: chave recarregável comparada com o que está **em execução**
 (para que reverter ao valor de boot seja aplicado); chave de restart comparada
@@ -2259,10 +2389,10 @@ por tempo) e `tcp.idle_timeout` (sem limite).
 | Chave | Padrão | Descrição |
 |---|---|---|
 | `udp` | `:1514` | RFC 5426 |
-| `udp_listeners` | `1` | `>1` habilita `SO_REUSEPORT`; o único jeito de passar de um núcleo |
+| `udp_listeners` | `1` | 1–256; `>1` habilita `SO_REUSEPORT`; o único jeito de passar de um núcleo |
 | `udp_read_buffer` | `8MiB` | `SO_RCVBUF`; o efetivo é lido de volta e exposto |
 | `tcp` | `:1514` | RFC 6587 |
-| `tcp_listeners` | `1` | `>1` habilita `SO_REUSEPORT` |
+| `tcp_listeners` | `1` | 1–256; `>1` habilita `SO_REUSEPORT` |
 | `unix` | `""` | socket datagram, caminho absoluto; `/dev/log` é o costume. A única escrita fora de `server.data_dir` |
 | `unix_mode` | `0666` | octal; todo processo precisa poder logar |
 | `unix_read_buffer` | `8MiB` | `SO_RCVBUF` do socket unix |
@@ -2314,7 +2444,7 @@ Removido no go-syslog-pg-server (§1.2).
 
 | Chave | Padrão | Descrição |
 |---|---|---|
-| `capacity_items` | `65536` | teto de itens; com mensagens de 200 bytes é o que pega primeiro |
+| `capacity_items` | `65536` | teto de itens, 1–16 777 216; com mensagens de 200 bytes é o que pega primeiro |
 | `max_bytes` | `512MiB` | teto de bytes: o `cap` de cada buffer cru + 256 B por item (§9.2); o JLH não conta |
 | `high_water` | `0.80` | fração de qualquer teto acima da qual o `/readyz` falha |
 
@@ -2332,9 +2462,9 @@ Removido no go-syslog-pg-server (§1.2).
 
 | Chave | Padrão | Descrição |
 |---|---|---|
-| `workers` | `4` | goroutines de dreno, que também convertem; cada uma prende uma conexão; `WARN` acima de 16 |
-| `batch` | `256` | itens por `Dequeue` e linhas por `INSERT` |
-| `batch_max_bytes` | `16MiB` | teto de JLH por pedaço |
+| `workers` | `4` | goroutines de dreno, que também convertem; cada uma prende uma conexão; `WARN` acima de 16; 1–1024 |
+| `batch` | `256` | itens por `Dequeue` e linhas por `INSERT`; 1–65 536 |
+| `batch_max_bytes` | `16MiB` | teto de JLH por pedaço; no máximo 256 MiB, abaixo da mensagem de 1 GiB da libpq |
 | `batch_max_delay` | `5ms` | espera máxima para completar um lote; `0` = sem espera |
 | `op_timeout` | `5s` | prazo de uma escrita e da discagem |
 | `health_interval` | `2s` | período da checagem; também a latência de UP→DOWN |
@@ -2370,7 +2500,7 @@ Só `[sink.postgres]`; `[sink.mysql]` foi removido (§1.2). Não há chaves de T
 | `password` | `""` | redigida no `--dump-config` |
 | `database` | `syslog` | |
 | `table` | `loghub.inbox` | a fila (§3.7.1), `nome` ou `esquema.nome` em minúsculas; nunca criada, só validada |
-| `pool_size` | `0` | teto do pool; `0` deriva `sink.workers + 1` |
+| `pool_size` | `0` | teto do pool, ao menos `sink.workers + 1` (a sonda de saúde precisa de uma), no máximo 4096; `0` deriva `sink.workers + 1` |
 
 #### `[sink.clickhouse]`
 
@@ -2791,7 +2921,7 @@ sai daqui e a regra vai para a seção que ele cita, spec primeiro.
    3; o boot seguinte já recusa a coluna extra obrigatória pelo nome), com a
    tabela de §10.5 e `TestClassifySQLState` mudando juntas; um trigger que anula
    uma coluna só em certas linhas passa a derrubar o processo, e isso fica
-   escrito.
+   escrito. O `go-relplog-pg-server` já tem a correção (2026-10-13), a portar.
 6. **A validação do boot corre no prazo da sonda de saúde** (§10.5, §13.1 passo
    7). O `Health` roda a validação com o contexto de `sink.health_timeout` (1 s),
    e ela custa ~18 idas e voltas (conexão, SCRAM e as consultas de catálogo,
@@ -2799,36 +2929,11 @@ sai daqui e a regra vai para a seção que ele cita, spec primeiro.
    nenhuma tentativa termina, e o boot sai com 3 no `boot_timeout` culpando a
    rede. Subir `health_timeout` contorna, mas afrouxa a detecção de queda.
    Direção: a validação com prazo próprio de `sink.op_timeout`, ainda seguindo o
-   cancelamento do boot.
-7. **Erros da `LOGHUB_EB_URL` ainda citam trechos dela** (§10.9). O erro de URL
-   inválida repete o texto interno do `url.Error` (`invalid port ":<x>" after
-   host`, que numa senha com `/` é a senha até a barra; o erro de escape cita
-   três caracteres), e o nome de um parâmetro de consulta desconhecido e o valor
-   de um `sslmode` desconhecido são citados, que numa senha com `?` são o resto
-   dela, o host e o banco. A senha vai ao stderr a cada reinício. Direção:
-   nenhum texto do parser no erro, e um nome de parâmetro citado só se estiver
-   numa lista fixa de nomes da libpq, com a dica de codificar `?`, `/` e `#` na
-   senha.
-8. **Logs falsos depois de um `fsync` de diretório que falhou** (§12.1, §12.2).
-   `Remove` e `Quarantine` devolvem o erro do `fsync` depois de o arquivo já ter
-   sido apagado ou renomeado, e o boot os lê como falha da operação: loga que o
-   dump "será entregue de novo" quando ele já não existe, ou "não pôde ir para a
-   quarentena" com o caminho antigo, sem o `ERROR` com as contagens de bytes. E
-   o erro do `fsync` do diretório depois da publicação cita o nome temporário,
-   que já não existe. Só o log engana: a política (o `fsync` decide o dump,
-   §12.3) é deliberada. Direção: distinguir "feito, sem `fsync`" (destino
-   devolvido pelo `Quarantine`, `Lstat` sem o arquivo no `Remove`) com um `WARN`,
-   e citar o nome final.
-9. **`syslog_emergency_files` zera com dump no disco** (§12.2, §14.1). No fim da
-   reingestão o gauge vai a 0 mesmo quando um dump ficou para trás (ilegível, ou
-   com a remoção ou a quarentena falhando): um alerta em
-   `syslog_emergency_files > 0` não dispara, e só um `ERROR` do boot avisa.
-   Direção: terminar com a contagem de `List()`, os arquivos que restam,
-   legíveis ou não; `syslog_emergency_events_pending` continua zerado, porque é
-   o pedaço em voo.
-10. **O `SIGQUIT` é tolerado no shutdown por FATAL** (§13.4). A tolerância ao
-    primeiro sinal não distingue o sinal, e um `kill -QUIT` durante o dump do
-    FATAL só aborta no segundo sinal, contra o "`SIGQUIT` aborta sempre" de
-    §13.4 e §13.5; o dump segue até o fim, sem perda. Direção: tolerar só
-    `SIGTERM`/`SIGINT`, com um teste em que o `SIGQUIT` é o primeiro sinal de um
-    shutdown fatal e sai com 130.
+   cancelamento do boot (`ValidateTimeout`, `validationContext` e
+   `withLifetime` do `go-relplog-pg-server`, a portar).
+
+Os itens 7 a 10 de antes (erros da `LOGHUB_EB_URL` com trechos dela, logs
+falsos depois de um `fsync` de diretório falho, `syslog_emergency_files` zerado
+com dump no disco, `SIGQUIT` tolerado no shutdown por FATAL) foram corrigidos no
+porte de 2026-10-13 e vivem em §10.9, §12.2 e §13.4.
+

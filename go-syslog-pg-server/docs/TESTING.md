@@ -265,10 +265,9 @@ Registradas por honestidade, não por esquecimento.
     2026-10-07, deixados para depois):
     - o `SIGHUP` relata como "requires a restart" chaves **derivadas**
       (`sink.postgres.pool_size` quando muda `sink.workers`, `emergency.dir`
-      quando muda `server.data_dir`) e os sinônimos do charset legado
-      (`windows-1252` × `cp1252`);
-    - o `--dump-config` imprime o `pool_size` derivado sem o comentário de
-      origem;
+      quando muda `server.data_dir`). Os sinônimos do charset legado e o
+      derivado sem comentário no `--dump-config` foram corrigidos em
+      2026-10-13 (§9);
     - `proxy.*` e `tcp.*` são aceitos com `listen.tcp` vazio, sem aviso;
     - `listen.tcp` e `admin.bind` na mesma porta só falham ao abrir o
       transporte, não na validação;
@@ -283,11 +282,12 @@ Registradas por honestidade, não por esquecimento.
       `SO_REUSEPORT` eles disputam a mesma linha de cache (revisão C da
       recepção, 2026-10-07, que não achou defeito de correção).
 13. **Uma brecha deixada no parser de flags** (SPEC §13.2, como no N e no
-    `go-syslog-nats-server`): a cauda de um valor que o shell partiu num espaço,
-    quando começa com traço e vem depois de um valor não vazio
-    (`--sink.postgres.password=a -b`), sai como parâmetro desconhecido, com o
-    nome. Escondê-la esconderia todo erro de digitação de uma flag depois de
-    outra.
+    `go-syslog-nats-server`), estreitada em 2026-10-13: a cauda de um valor que o
+    shell partiu num espaço, quando começa com traço, vem depois de um valor não
+    vazio **e** tem a forma `<seção>.<chave>` de uma seção deste servidor ou do
+    pai (`--sink.postgres.password=a --sink.postgres.b`), sai como parâmetro
+    desconhecido, com o nome. Escondê-la esconderia os erros de digitação dentro
+    de uma seção conhecida.
 14. **Defeitos conhecidos do código**, cada um com a consequência e a direção da
     correção, ficam em SPEC §22.1; a correção de um deles vem com o teste que o
     reproduz.
@@ -360,3 +360,34 @@ numa cópia do módulo (mutação) e derrubou o teste.
 A mutação deste porte achou um caminho do `flags.go` sem teste, também no N:
 tirar o `assigned(v)` do `--config` não derrubava nada. Caso novo,
 `--config= x` (o argumento depois do `=` vazio não é citado).
+
+### Porte das correções do RP e do R (2026-10-13)
+
+As correções das revisões independentes do `go-relplog-pg-server` (RP) e do
+`go-relplog-server` (R) que valiam aqui (CHANGELOG da raiz, "A portar" das
+entradas "2026-10-13 — RP, RN" e "2026-10-12 — R"), portadas com os testes do
+RP. **Conferência por mutação:** os testes novos de `internal/config` rodaram
+contra o código de config de antes (numa cópia do módulo) e cada um falhou; no
+resto, cada correção foi revertida sozinha numa cópia do módulo, e os 20
+mutantes (`A1`–`A13`, `E1`–`E2`, `R1`–`R2`, `K1`–`K3`) derrubaram os testes da
+tabela. `-race` verde com PostgreSQL 18.
+
+| Achado | Consequência sem a correção | Teste |
+|---|---|---|
+| Abort durante a coleta das sobras ou entre as passagens do contador contava o ring e deixava o contador para um dump falho ou desligado contar de novo; abort com itens drenados contava só o lote retido (SPEC §13.4) | `abort` + `emergency_failed` somando 2N, ou contando 1 de 9 | `TestAbortDuringTheDrainIsCountedOnce`, `TestAbortBeforeTheDumpPhaseKeepsItClosed`, `TestAbortDuringTheCollectionCountsOnceAndDumpsNothing`, `TestAbortDuringTheDumpWithItemsDrainedFromTheRing`, `TestAbortBetweenTheDrainAndTheDumpCountsEverything`, `TestAbortAndFailedDumpCountOnce`, `TestAbortAndDisabledDumpCountOnce`, `TestAbortAfterASavedDumpCountsNothing` |
+| Dump publicado depois de o abort o contar como perdido (SPEC §12.3) | o boot seguinte reingeria mensagens contadas como perdidas | `TestDumpAfterTheAbortIsAbandoned`, `TestAbortDuringTheCollectionPublishesNoDump`, `TestAbortAfterTheLastAbandonCheckCountsNothingMore`, `TestFatalShutdownSignals` |
+| `SIGQUIT` tolerado no shutdown por FATAL; `SIGQUIT` entre o início do shutdown e o observador do segundo sinal perdido (antes e depois da leitura de `quitting`) | dump até o fim contra o "aborta sempre"; o `SIGQUIT` não abortava | `TestFatalShutdownSignals`, `TestLateSIGQUITStillAborts`, `TestSIGQUITAfterTheEntryCheckStillAborts`, `TestSIGQUITWhileServingCountsTheRing` |
+| Sinal durante o `bind` de um nome de host (admin ou transporte) | exit 1 culpando o endereço, em vez de 130 | `TestCancelledBindIsAnAbortNotAConfigError`, `TestSignalBeforeTheBindExits130` |
+| `Remove`/`Quarantine` com o `fsync` (ou a abertura) do diretório falho depois do `unlink`/`rename` | log falso de "cannot remove"/"cannot quarantine", sem as contagens (SPEC §22.1 item 8 de antes) | `TestRemoveWithAnUnopenableDirectoryIsRemoved`, `TestRemoveSyncsTheDirectory`, `TestQuarantineWithAFailedDirectoryFsyncIsQuarantined` |
+| Prazo único da reingestão desde o início | reingestão saudável e longa saía com 3 no primeiro soluço | `TestLongReingestionStillRetriesATransientFailure` |
+| `syslog_emergency_events_pending` posto no tamanho do pedaço; gauges zerados no fim; dump do shutdown os substituía | a última leitura mostrava um pedaço por um dump; alerta silenciado com dump no disco (item 9 de antes) | `TestPendingGaugeIsNotTheChunkDuringReingestion`, `TestReingestionDoesNotShowTheChunkAsPending`, `TestShutdownDumpAddsToTheGauges`, `TestCount` |
+| Pré-checagem do ring cheio só pelo teto de itens | com `ring.max_bytes` limitando, cada retentativa e cada datagrama cunhava `uuid`, copiava e montava o item | `TestIngestByteCeilingIsRefusedBeforeTheCopy`, `TestIngestByteCeilingChargesTheTruncatedLine`, `TestIngestClosedFullRingIsTheShutdown`; e a regra que **não** veio (`TestIngestCancelledContextStillEnqueues`) |
+| `Deliver` conferia o contexto antes da recusa `logic` | um SIGTERM na reingestão contava a perda sem o log dos uuids | `TestDeliverLogicRefusalWinsOverTheCancellation` |
+| `RULE` de INSERT/UPDATE na fila passava no boot; `0A000` era `network` | todo pedaço falhava para sempre com o sink UP | `TestPostgresRulesAreRefusedAtBoot`, `TestClassifySQLState` |
+| `pool_size = workers` aceito | sonda sem conexão: DOWN e FATAL com o banco sadio | `TestSinkWorkersAndPool`, `TestPostgresHealthHasAConnectionWhileTheWorkersWrite` (a propriedade, no banco real) |
+| Sem tetos de config | pânico no boot, gigabyte por `Dequeue`, `int32` dando a volta, `Bind` acima de 1 GiB sem SQLSTATE | `TestConfigCeilings` |
+| Valor colado ao nome, *switch* com valor, `--config=` vazio, BOM, continuação de segredo no INI, cauda de valor nomeada fora de seção conhecida, flag removida depois de uma com valor, `-h` depois de flag que quer valor | segredo no stderr; `--dump-config=false` despejava; `--config=` caía no env; linha 1 inválida sem motivo visível | `TestGluedValueIsNotPrinted`, `TestSwitchesTakeNoValue`, `TestEmptyConfigFlagIsRefused`, `TestINIByteOrderMarkIsIgnored`, `TestINIUnknownKeyNeverPrintsASecretContinuation`, `TestRemovedFlagAfterAValuedFlagIsNamed`, `TestRemovedParamsAreTheRemovedEnv`, `TestParserErrorsDoNotEchoValues`, `TestReviewFlagTailEcho` |
+| `LOGHUB_EB_URL`: sem usuário/banco, `sslmode=` vazio, `host=` com `,`/`:`, `@` depois de `/?#`, fragmento, host com escape, só espaços, texto do parser e nomes de chave no erro | segundo banco por adivinhação; senha no stderr; `?sslmode=require` escondido no fragmento (item 7 de antes) | `TestEBURLMustNameItsParts`, `TestSlashInTheUserinfoIsRefusedWithoutEcho`, `TestReviewPGFragmentDumpLeaks`, `TestConfigErrorsDoNotEchoSecrets`, `TestEBURLMapping`, `TestEBURLRefusesTLS` |
+| `sink.postgres.addr` com tab, `[h:5432]:5433` ou socket com `,` | um nome DNS que ninguém resolve, retentado o `boot_timeout` | `TestPostgresAddrNamesOneServer` |
+| Derivado escrito como chave no `--dump-config`; sinônimos do charset como mudança no `SIGHUP` | o dump relido congelava o derivado; restart pedido para nada | `TestDumpCommentsDerivedValues`, `TestCharsetSynonymsAreOneValue` |
+

@@ -30,10 +30,18 @@ type ebValue struct{ name, raw string }
 // owned key is exit 1 naming both sources.
 func applyEBURL(l *Loaded, ix *index) error {
 	c := l.Config
-	if strings.TrimSpace(c.LogHub.EBURL) == "" {
+	if c.LogHub.EBURL == "" {
 		return nil
 	}
 	ebOrigin := l.Origin["loghub.eb_url"]
+	if strings.TrimSpace(c.LogHub.EBURL) == "" {
+		// Set, to nothing visible: an operator who meant to unset it would
+		// not know the [sink.nats] keys are what runs, and the dump showed
+		// the blanks as if they were a URL (independent review of
+		// go-relplog-pg-server, 2026-10-13).
+		return fmt.Errorf("loghub.eb_url (%s) holds only blanks: unset it, or give a nats:// URL",
+			ebOrigin)
+	}
 
 	t, err := parseEBURL(c.LogHub.EBURL)
 	if err != nil {
@@ -106,17 +114,66 @@ const percentEncodeHint = "percent-encode %, /, #, ? and , in a user, password o
 // the whole input, and its inner error still quotes a piece of it: an
 // unescaped '/' in a password gives `invalid port ":Sup3r" after host`, which
 // is the password up to the slash ('#', '?' and the ',' of a list cut it the
-// same way). So nothing of the parser's text is kept, only its kind.
+// same way), and an EscapeError quotes the escape. So nothing of the parser's
+// text is kept, only its kind.
 func parseURL(s string) (*url.URL, error) {
+	if slashedUserinfo(s) {
+		// "nats://u:12/ss@h" parses: the authority ends at the first '/' (or
+		// '?', '#'), so the host is "u:12" (12 a port), the password's tail
+		// lands in the path, query or fragment, and a piece of the password
+		// surfaces later in a dial error or the dump. None of the URL is
+		// quoted here either (go-relplog-server, SPEC §16.2).
+		return nil, errors.New("not a valid URL: an '@' after the first '/', '?' or '#' means one of " +
+			"them in the user or password that is not percent-encoded (%2F, %3F, %23)")
+	}
 	u, err := url.Parse(s)
 	if err != nil {
 		var ee url.EscapeError
 		if errors.As(err, &ee) {
+			if strings.Contains(authorityHost(s), "%") {
+				// Go's parser refuses an escape in a host, and "invalid
+				// percent-escape" sent the operator after the password
+				// (independent review of go-relplog-pg-server, 2026-10-13).
+				return nil, errors.New("not a valid URL: a percent-encoded host is not supported; " +
+					"a NATS host is a name or an IP literal")
+			}
 			return nil, errors.New("not a valid URL: it holds an invalid percent-escape")
 		}
 		return nil, errors.New("not a valid URL")
 	}
 	return u, nil
+}
+
+// authorityHost is the host part of s's authority, on the text: what follows
+// the last '@' before the first '/', '?' or '#' after "://".
+func authorityHost(s string) string {
+	_, rest, ok := strings.Cut(s, "://")
+	if !ok {
+		return ""
+	}
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		rest = rest[:end]
+	}
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		rest = rest[at+1:]
+	}
+	return rest
+}
+
+// slashedUserinfo reports an '@' past the end of the authority: after the
+// first '/', '?' or '#' that follows "://" -- in the path, the query or the
+// fragment. No nats:// URL holds a literal '@' there (it has no path, query
+// or fragment at all), so it can only be a userinfo that an unescaped '/', '?'
+// or '#' in the password cut short: the authority then ends early, the user
+// name becomes the host and the start of the password the port
+// ("nats://app:39182#Zsecret9@nats-1" would dial app:39182 with no password).
+func slashedUserinfo(s string) bool {
+	_, rest, ok := strings.Cut(s, "://")
+	if !ok {
+		return false
+	}
+	end := strings.IndexAny(rest, "/?#")
+	return end >= 0 && strings.Contains(rest[end:], "@")
 }
 
 // parseNATSURL fills sink.nats.urls with the URL itself (user and password

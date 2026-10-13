@@ -500,9 +500,9 @@ func TestSinkWorkersAndPool(t *testing.T) {
 		t.Fatalf("17 workers: workers = %d pool = %d", l.Config.Sink.Workers, l.Config.SinkPG.PoolSize)
 	}
 
-	// An explicit pool is respected, equal to the workers included, and is not
-	// noted as derived.
-	for _, pool := range []string{"8", "9", "40"} {
+	// An explicit pool is respected, workers + 1 included, and is not noted as
+	// derived.
+	for _, pool := range []string{"9", "40"} {
 		l := mustLoad(t, []string{"--sink.workers=8", "--sink.postgres.pool_size=" + pool}, nil)
 		if got := l.Config.SinkPG.PoolSize; strconv.Itoa(got) != pool || l.Notes["sink.postgres.pool_size"] != "" {
 			t.Fatalf("pool %s: got %d, note %q", pool, got, l.Notes["sink.postgres.pool_size"])
@@ -510,8 +510,12 @@ func TestSinkWorkersAndPool(t *testing.T) {
 	}
 	// A pool below the workers makes one wait on another's connection.
 	mustFail(t, []string{"--sink.workers=8", "--sink.postgres.pool_size=4"}, nil, "pool_size=4")
-	mustFail(t, []string{"--sink.workers=8", "--sink.postgres.pool_size=7"}, nil, "below sink.workers=8")
-	mustFail(t, []string{"--sink.postgres.pool_size=-1"}, nil, "negative")
+	mustFail(t, []string{"--sink.workers=8", "--sink.postgres.pool_size=7"}, nil, "below sink.workers + 1 = 9")
+	// Equal to the workers leaves the health probe without a connection while
+	// every worker writes (go-relplog-pg-server's independent review,
+	// 2026-10-13; SPEC §10.5).
+	mustFail(t, []string{"--sink.workers=8", "--sink.postgres.pool_size=8"}, nil, "health probe")
+	mustFail(t, []string{"--sink.postgres.pool_size=-1"}, nil, "outside 0..4096")
 	mustFail(t, []string{"--sink.workers=0"}, nil, "sink.workers")
 }
 
@@ -666,13 +670,25 @@ func TestParserErrorsDoNotEchoValues(t *testing.T) {
 		l.Config.SinkPG.Table != "x.inbox" {
 		t.Errorf("separated values: workers=%d table=%q", l.Config.Sink.Workers, l.Config.SinkPG.Table)
 	}
-	mustFail(t, []string{"--sink.workers", "-1"}, nil, "-1 is below 1")
-	mustFail(t, []string{"--sink.postgres.table", "-h"}, nil, "the next argument is the flag --h")
+	mustFail(t, []string{"--sink.workers", "-1"}, nil, "-1 is outside 1..1024")
+	// "-h" after a flag that wants a value is not named: a two-character
+	// value starting with a dash looks the same (go-relplog-pg-server's
+	// independent review, 2026-10-13); "--help" is.
+	if err := mustFail(t, []string{"--sink.postgres.password", "-h"}, nil, "starts with a dash"); strings.Contains(err.Error(), "--h") {
+		t.Errorf("a one-dash next argument named: %v", err)
+	}
+	mustFail(t, []string{"--sink.postgres.table", "--help"}, nil, "the next argument is the flag --help")
 	mustFail(t, []string{"--sink.postgres.password=", "--admin.enabled", "extra"}, nil, `"extra"`)
 	mustFail(t, []string{"--sink.postgres.password=", "hunter2"}, nil, "right after the '='")
 	mustFail(t, []string{"--sink.postgres.password", "=", "hunter2"}, nil, "right after the '='")
 	mustFail(t, []string{"--sink.postgres.password=foo", "hunter2"}, nil, "goes in quotes")
-	mustFail(t, []string{"--sink.workers=4", "--typo.key=1"}, nil, `"typo.key"`)
+	mustFail(t, []string{"--sink.workers=4", "--sink.postgres.tabel=1"}, nil, `"sink.postgres.tabel"`)
+	// After a value, an unknown flag outside every section of this server may
+	// be the tail of that value split by the shell: not named
+	// (knownSectionOf, SPEC §16.2).
+	if err := mustFail(t, []string{"--sink.workers=4", "--typo.key=1"}, nil, "goes in quotes"); strings.Contains(err.Error(), "typo.key") {
+		t.Errorf("a possible tail of a value was named: %v", err)
+	}
 	mustFail(t, []string{"--sink.postgres.password", "--sink.workers=4"}, nil, "the flag --sink.workers")
 }
 

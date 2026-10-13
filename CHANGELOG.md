@@ -16,6 +16,52 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-10-13 — SP, SN: porte das correções do RP, do RN e do R
+
+Pedido: portar para o SP e o SN os "A portar" das entradas "2026-10-13 — RP, RN"
+e "2026-10-12 — R" que os citam, cada item com teste que falha antes. SP
+primeiro; o código comum foi para o SN por fusão de três vias (base = SP antigo,
+deles = SP novo, nosso = SN) e readaptado na redação do NATS; o sink NATS veio
+do RN. Decisões em `docs/DECISOES.md` §7 de cada um; regras nas SPECs.
+
+- **Comuns:** posse única da perda do abort (`lossMu`, `enterDumpPhase`,
+  `oweDump`, `Swap`, `SetAbandon`), `SIGQUIT` nunca tolerado e o tardio por
+  `quitNow`, bind (admin e transportes) cancelado = 130, `ErrNotDurable` no
+  `Remove`/`Quarantine` (WARN em vez de log falso), prazo da reingestão **sem
+  progresso**, gauges de emergência recontados do disco (e somados no dump),
+  `FullFor` pelos dois tetos, `Deliver` com `logic` antes do `ctx`, tetos de
+  config, parsers (valor colado, *switch* com valor, `--config=` vazio, BOM,
+  continuação de segredo, `knownSectionOf`), derivado comentado no
+  `--dump-config`, sinônimos de charset no `SIGHUP`.
+- **SP:** `pool_size ≥ workers + 1`, `RULE` recusada no boot e `0A000` fatal,
+  `addr` com tab/`,`/`[h:p]:p`, e a `LOGHUB_EB_URL` do RP inteira (usuário e
+  banco obrigatórios, `sslmode=` vazio, `host=`, `@` depois de `/?#`,
+  fragmento, nenhum texto do parser no erro). Fecha SPEC §22.1 itens 7–10.
+- **SN:** veredito do TLS depois do boot via `LastError`, *flush* `core` que
+  atravessa reconexão não confirma (`flushErr` + contagem de reconexões),
+  negação mascarada, `10077` de stream cheio/fechando como `network`,
+  `MaxPending` 2×, `sink.workers` ≤ 256, URLs NATS do RN. O sink do RN trouxe
+  junto as pendências 5–8 do próprio SN (`retention: interest`, 429/`10158`/
+  `10167`, `_INBOX`, `space` estrangeiro), com teste; fecha §21.1 itens 5–11.
+- **Não se aplica:** o `ctx` antes do `Enqueue` do RP. No syslog uma linha lida
+  já saiu do emissor; descartá-la seria perda, não desduplicação (SPEC §5.7,
+  `TestIngestCancelledContextStillEnqueues`).
+- **Ficou** (SP §22.1 itens 5 e 6, fora da lista): `23502` fatal e o prazo
+  próprio da validação do boot (`withLifetime`), que o RP já tem.
+
+**Resultado:** `-race` verde — SP com PostgreSQL 18: 392 testes de topo + 279
+subtestes; SN com nats-server 2.14.6 (JetStream, sem JetStream, permissões,
+`tls {}`): 427 + 339. Pulados só os emissores reais (sem
+`SYSLOG_TEST_EMITTERS`) e o vetor `arquivo-sem-pri` (D5). Mutação: testes de
+config contra o código antigo (17 falham em cada módulo), 20 mutantes do código
+comum no SP e 20 no SN, 15 do sink NATS — todos mortos. SP↔SN continuam
+diferindo só onde o destino exige (diff conferido arquivo a arquivo).
+
+**Lição.** Os testes portados de RELP esperavam o `200 OK`; com syslog o envio
+TCP volta antes de as linhas estarem no ring, e o teste de aborto via 1 de 9.
+Ao portar teste entre protocolos, espere a aceitação (`sendLFAccepted`), não a
+escrita.
+
 ## 2026-10-13 — RP, RN: `go-relplog-pg-server` e `go-relplog-nats-server`, cortes do R
 
 Pedido: a partir do R, criar os dois servidores RELP simplificados nos moldes
