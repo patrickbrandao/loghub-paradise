@@ -1561,7 +1561,7 @@ acima, em toda checagem.
 | Erro | Classe |
 |---|---|
 | prazo ou cancelamento, `ErrTimeout`, `ErrNoResponders`, `ErrNoServers`, `ErrDisconnected`, `ErrConnectionReconnecting`, `ErrReconnectBufExceeded`, `ErrNoStreamResponse`, `ErrAsyncPublishTimeout`, `ErrTooManyStalledMsgs` | `network` |
-| `10077` cuja descrição é de um stream **cheio** com `discard: new` ("maximum messages exceeded", "maximum bytes exceeded", "maximum messages per subject exceeded") ou **fechando** ("store closed", um restart do NATS) | `network`: backpressure, passa quando um consumidor confirma ou o servidor volta (revisão independente do `go-relplog-server`, portada; como `fatal` eram dump, exit 3 e duplicatas na reingestão) |
+| `10077` cuja descrição é de um stream **cheio** com `discard: new` ("maximum messages exceeded", "maximum bytes exceeded", "maximum messages per subject exceeded") ou **fechando** ("store is closed", o `ErrStoreClosed` de `server/store.go` do nats-server 2.14.6, num restart do NATS; só "store closed", texto que nenhum servidor manda, era conferido, e o 10077 de um store fechando era `fatal` — revisão independente do `go-syslog-server`, 2026-10-13, C2) | `network`: backpressure, passa quando um consumidor confirma ou o servidor volta (revisão independente do `go-relplog-server`, portada; como `fatal` eram dump, exit 3 e duplicatas na reingestão) |
 | `10158` (409: o mesmo `Nats-Msg-Id` ainda numa proposta Raft, na retentativa depois de um prazo num stream em cluster), `10167` (429: a fila de entrada do stream cheia) e todo outro erro da API com código 429 | `network`: passam sozinhos (antes, "outro 4xx" os fazia FATAL, dump e exit 3, talvez na frota inteira) |
 | `ErrAuthorization`, `ErrAuthExpired`, `ErrAuthRevoked`, `ErrAccountAuthExpired`, e o texto do servidor no `CONNECT` com "authorization violation", "authentication expired" ou "authentication revoked" (o `errors.Is` do `nats.go` compara o texto inteiro, e "User Authentication Expired" nunca casava com o sentinela: o boot esperava o `boot_timeout` e saía com o motivo errado), `ErrConnectionClosed` com a conexão `CLOSED` (só reconectando, `network`: o `flushErr` acima), servidor que exige TLS (`errNATSServerRequiresTLS`), `ErrStreamNotFound` (`10059`), JetStream desligado (`10076`, `10039`), stream esperado não confere (`10060`), selado (`10109`), recursos (`10023`), outro armazenamento (`10077`: um registro que o store não aceita) | **`fatal`** |
 | `ErrMaxPayload` (recusada no cliente: só aquela mensagem, §10.2), `ErrMaxBytesExceeded`, `10054`, `10097` | `logic` |
@@ -2038,6 +2038,11 @@ Um sinal que cancela o `bind` da porta admin (passo 5) ou de um transporte
 (passo 11) — a resolução de um nome de host falha com "operation was
 canceled" — é um boot interrompido, **130**, não um endereço ruim (1) (revisão
 independente do `go-relplog-pg-server`, 2026-10-13, portada).
+Com IP literal ou socket unix nenhuma resolução falha e os `bind` passam: o
+sinal é conferido depois de todos os `bind` do passo 11 e antes do primeiro
+`Start`, e também é **130** (antes o servidor abria, o `/readyz` dava 200 e o
+shutdown que seguia saía 0; revisão independente do `go-syslog-server`,
+2026-10-13, A1; `TestSignalBeforeALiteralBindExits130`).
 
 **Identidade antes de tudo que escreve.** `lhident.Initialize()` roda **uma
 vez**, no `main`, depois das flags que encerram o programa e antes de abrir
@@ -2169,6 +2174,14 @@ fase 5  o que sobrou vai para o dump (§12); para o beacon, fecha o sink e o
   (`aborted`): um abort entre duas passagens contava o ring e deixava o
   contador para um dump falho contar de novo (10 perdidas para 5). Depois do
   abort nenhuma passagem acontece e o dump desiste (§12.3).
+- **O dump toma o contador de volta sob o mesmo mutex** (`settleDump`,
+  revisão independente do `go-syslog-server`, 2026-10-13, A2): o aborto
+  publica `aborted` antes de tomar o contador, e um dump que via a marca
+  nesse meio — desistia (`ErrAbandoned`) ou, desligado, nada tinha a
+  escrever — tomava o contador primeiro: `emergency_failed = n` e
+  `abort = 0`, a perda contada uma vez mas atribuída ao disco. Sob o
+  `lossMu`, ou o aborto terminou (o dump acha 0) ou nem começou (o dump
+  conta, o aborto acha 0) (`TestAbortInsideTheDumpKeepsItsReason`).
 - **Shutdown por FATAL** (que começa sem sinal nenhum): o **primeiro**
   `SIGTERM`/`SIGINT` é tolerado — logado, e o dump continua —, e só um segundo
   aborta. Um orquestrador que manda `SIGTERM` ao ver o processo sair do ar não
@@ -2204,7 +2217,7 @@ fase 5  o que sobrou vai para o dump (§12); para o beacon, fecha o sink e o
 | `1` | erro de configuração ou de inicialização não relacionada ao NATS (inclui toda URL que não seja `nats://`, a `LOGHUB_EB_URL` com `tls://` e um `.creds` inexistente) |
 | `3` | NATS indisponível ou inutilizável: sink FATAL (inclusive um servidor que exige TLS), `boot_timeout` ou `drain_timeout` estourados, validação de §10.7 recusada, dump que falhou |
 | `100`–`114` | falha de identidade, emitida pelo `go-loghub-ident` (`DATADIR`, `MACHINE_ID`, `MACHINE_ID_FILE`, `AGENT_NAME`, `AGENT_UUID`, `HOSTNAME`, `WORKSPACE`; 112 = `Initialize()` duas vezes); a tabela completa está na skill `go-loghub-ident` e em `docker/README.md` |
-| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 7–9 do boot |
+| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 7–9 do boot, e o que cancela os *bind* da porta admin (passo 5) ou dos transportes (passo 11, §13.1) |
 
 ---
 
@@ -3040,7 +3053,12 @@ deixa a regra na seção citada, com teste.
    pela metade), `syslog_messages_dropped_total{reason="proxy"}` em `required`
    e um `WARN` que culpa o balanceador. Nenhum dado se perde, mas um alerta
    sobre `reason="proxy"` dispara a cada deploy. Direção: com erro na leitura e
-   o transporte fechando, sair sem contar nem logar. À parte, a avaliar: um
+   o transporte fechando, sair sem contar nem logar. Na forma do S, conferida na
+   revisão independente do `go-syslog-server` (2026-10-13, E1): `closing &&
+   (err != nil || mode == required)`, nunca `(err != nil || !found) &&
+   closing` (a do R), que em `optional` sem cabeçalho fechava a conexão e
+   perdia sem contar as linhas já no buffer. Aqui não há `closing` nessa
+   leitura: o defeito não existe, e a pendência segue. À parte, a avaliar: um
    prazo que vence no meio da **assinatura** devolve "sem cabeçalho", e em
    `optional` os bytes já lidos seguem como mensagem `malformed`.
 4. **Offset fora de faixa aceito na RFC 3164 (§6.5.1, §6.9).** A RFC 5424 recusa

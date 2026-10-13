@@ -1256,17 +1256,22 @@ func classifyNATSError(err error) Class {
 // description is the store's own error: "maximum messages exceeded", "maximum
 // bytes exceeded" and "maximum messages per subject exceeded" are a stream
 // with discard=new that is full -- backpressure, which clears as soon as a
-// consumer acknowledges -- and "store closed" a stream or server shutting
-// down (a rolling restart of NATS). As fatal they were a dump and exit 3, and
-// the stored part of the chunk duplicated at reingestion (independent review,
-// 2026-10-11). A record too large for the store stays fatal: retrying cannot
-// make it fit, and validateSize refuses the configurations that produce it.
+// consumer acknowledges -- and "store is closed" (ErrStoreClosed,
+// server/store.go of nats-server 2.14.6) a stream or server shutting down (a
+// rolling restart of NATS). As fatal they were a dump and exit 3, and the
+// stored part of the chunk duplicated at reingestion (independent review,
+// 2026-10-11). Only "store closed" was matched at first, a text no
+// nats-server sends, so the closing store stayed fatal (independent review of
+// go-syslog-server, 2026-10-13, C2); that spelling stays, harmless. A record
+// too large for the store stays fatal: retrying cannot make it fit, and
+// validateSize refuses the configurations that produce it.
 func storeFailedIsTransient(desc string) bool {
 	d := strings.ToLower(desc)
 	return strings.Contains(d, "maximum messages exceeded") ||
 		strings.Contains(d, "maximum bytes exceeded") ||
 		strings.Contains(d, "maximum messages per subject exceeded") ||
-		strings.Contains(d, "store closed")
+		strings.Contains(d, "store closed") ||
+		strings.Contains(d, "store is closed")
 }
 
 // maskedDenial reports a permission denial that arrived during a core chunk

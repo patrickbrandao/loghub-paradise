@@ -275,6 +275,10 @@ type App struct {
 	// (Workers.Pending, Drain): the tests land an abort there.
 	beforeDump    func()
 	beforeCollect func()
+	// inAbort, likewise, runs inside abortLoss in the dump phase, right after
+	// the abort is published and before it takes the dump's count: the tests
+	// land the dump's own count there (settleDump).
+	inAbort func()
 
 	// wrapSink, when set, decorates the real sink right after it is built. It
 	// is nil in the binary; the tests use it to produce a sink that stops
@@ -656,6 +660,17 @@ func (a *App) openTransports(bindCtx, recvCtx context.Context) int {
 		a.transports = append(a.transports, namedTransport{"tcp", t})
 	}
 
+	// A signal that landed while the binds ran but did not fail them -- a
+	// literal IP or a unix path looks nothing up -- is still an interrupted
+	// boot: checked here, before a single connection is accepted. Without it
+	// the server opened, /readyz said 200 and the shutdown that followed
+	// exited 0 instead of 130 (independent review of go-syslog-server,
+	// 2026-10-13, A1; SPEC §13.1, §13.5).
+	if bindCtx.Err() != nil {
+		a.log.Info("interrupted while opening the transports")
+		return ExitAborted
+	}
+
 	for _, nt := range a.transports {
 		nt.t.Start(recvCtx)
 		// The configured number and the wire number differ inside a container
@@ -787,6 +802,9 @@ func (a *App) abortLoss() {
 		return // counted already: one abort, one count
 	}
 	if a.dumpPhase.Load() {
+		if a.inAbort != nil {
+			a.inAbort()
+		}
 		if n := a.dumping.Swap(0); n > 0 {
 			a.metrics.EventsDroppedTotal[obs.EventDropAbort].Add(uint64(n))
 			a.log.Error("messages lost to the abort: the emergency dump was being written", "count", n)
@@ -832,6 +850,20 @@ func (a *App) oweDump(n int) bool {
 	}
 	a.dumping.Store(int64(n))
 	return true
+}
+
+// settleDump takes the dump's count back once its outcome is known, under
+// lossMu like every other hand-over of the counter. abortLoss publishes aborted
+// -- which a dump being written reads to give up (Store.SetAbandon) -- before
+// it takes dumping; outside the lock the dump could see the abort, give up and
+// take the count first: emergency_failed=n and abort=0, the loss counted once
+// but blamed on the disk (independent review of go-syslog-server, 2026-10-13,
+// A2). Under it, the abort either finished (0 here: it counted) or has not
+// started (the dump counts, the abort finds 0).
+func (a *App) settleDump() int64 {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	return a.dumping.Swap(0)
 }
 
 func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {

@@ -194,6 +194,11 @@ func TestEBURLMustNameItsParts(t *testing.T) {
 		{"postgres://u:Zsecret@h", "names no database"},
 		{"postgres://u:Zsecret@h/", "names no database"},
 		{"postgres://u:Zsecret@h/db?sslmode=", "sslmode of the PostgreSQL URL is empty"},
+		// An empty host= is "not set" to libpq and pgx (their default socket
+		// or localhost), "h" to this server (independent review of
+		// go-syslog-server, 2026-10-13, B4).
+		{"postgres://u:Zsecret@h/db?host=", "host= of the PostgreSQL URL is empty"},
+		{"postgres://u:Zsecret@h:5433/db?sslmode=disable&host=", "host= of the PostgreSQL URL is empty"},
 		{"postgres://u:Zsecret@%2Frun%2Fpg/db", "percent-encoded host"},
 		{"postgres://u:Zs://ecret@h/db", "must be percent-encoded"},
 		{"   ", "only blanks"},

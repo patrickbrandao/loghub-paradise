@@ -152,6 +152,7 @@ go test -run XXX -bench . -benchmem ./internal/convert ./internal/receiver
 | `Convert/rfc3164` | 740 ns/op (103 MB/s) | 0 B, 0 allocs | conversão + JLH completo, no buffer do pedaço |
 | `Convert/rfc5424` | 1,04 µs/op (166 MB/s) | 0 B, 0 allocs | idem, com SD |
 | `SchemaValidate/rfc5424` | 83 µs/op | 82 KiB, 1 924 allocs | o custo que D3 tira do caminho quente: ~80× a conversão |
+| `RELPReaderFrames/200`, `/12288`, `/24576`, `/61440` | 84 ns, 350 ns, 520 ns, 1,14 µs | 0 B, 0 allocs em todos | frames `syslog` seguidos pelo `bufio.Reader` de 4 KiB da sessão. Antes da correção E2 (§9.4) o buffer acima de 16 KiB era solto antes de todo frame: `/24576` 12,3 µs, 55 KB, 5 allocs; `/61440` 37,7 µs, 129 KB, 6 allocs |
 
 Medido em 2026-10-13, na rodada final da revisão independente, com
 `-count=1` (a rodada anterior, com as revisões rodando na mesma máquina, deu
@@ -416,6 +417,25 @@ diferirem onde o SP e o SN diferem. As arestas que ficaram estão em SPEC §22.1
 | 36 | Docs (13 + 7 itens): §22.1 dizia "nenhuma" e contradizia TESTING/DECISOES; colisão da 9103 com R **e** RN; tabela dos códigos 100–114 apontava para o README do SP; `stop_grace_period` "+ 6 s de folga"; `@` cru na senha dito exit 1; `-run` do §3 deixava onze testes de fora; textos velhos de filtro, de outro ring e de `ring=sqlite`; `SIGHUP` "recarrega `[log]`"; `.env.example` sem as variáveis do demo e do `log.format`; `item.ItemOverhead` | corrigidos | por leitura |
 | 37 | Suspeita de *flake* em `TestPostgresWrongPasswordIsFatal` sob execução paralela | investigado: o PostgreSQL reserva a vaga de conexão **antes** de conferir a senha, e com as vagas esgotadas (`max_connections` 100, várias suítes em paralelo) o login errado recebe `53300 too many clients` (`network`, corretamente), não `28P01`; reproduzido com 100 sessões abertas e `psql` com senha errada. O teste espera passar um `53300`; o código não muda | `TestPostgresWrongPasswordIsFatal` (300 repetições com a app e o sink em paralelo, verdes) |
 
+### 9.4 Correções transversais da revisão independente do `go-syslog-server` (2026-10-13)
+
+Os itens transversais (X1–X4) do plano da revisão independente do porte do
+`go-syslog-server` (S), e a conferência de C3, D1, E1, E2 e A2-minor; a mesma
+implementação no irmão (regra de sincronia, `diff` conferido). **Conferência
+por mutação**, cada correção revertida sozinha: o teste da linha falha
+(`exited 0, want 130`; `abort 0, emergency_failed 5 for 5`; `err = <nil>` no
+`?host=`; o buffer solto com o frame seguinte já no `bufio.Reader`).
+
+| Item | Achado | Consequência sem a correção | Teste |
+|---|---|---|---|
+| X1 (A1 do S) | Sinal depois da reingestão e antes do *accept* com IP literal: nenhum *bind* falha | o servidor abria, o `/readyz` dava 200 e o shutdown saía **0**, não 130 (SPEC §13.1, §13.5) | `TestSignalBeforeALiteralBindExits130` (IP literal; o nome de host segue em `TestSignalBeforeTheBindExits130`) |
+| X2 (A2 do S) | O aborto publica `aborted` antes de tomar o contador; o dump que via a marca nesse meio (abandonado, ou desligado) o tomava primeiro | `emergency_failed = n`, `abort = 0`: a perda contada uma vez, atribuída ao disco (SPEC §13.4) | `TestAbortInsideTheDumpKeepsItsReason` (dump abandonado e dump desligado; o gancho `inAbort` força a intercalação) |
+| X4 (B4 do S) | `?host=` vazio na `LOGHUB_EB_URL` aceito: a libpq e o pgx discam o padrão deles (`pgx.ParseConfig` dá `/private/tmp`), este servidor o host da autoridade | uma URL, dois servidores (SPEC §10.9) | `TestEBURLMustNameItsParts` (dois casos novos) |
+| D1 do S | A sonda de saúde sem conexão no pool | **não se aplica**, conferido: ring só memória, os escritores são os `sink.workers`, o `+ 1` basta (SPEC §10.5) | `TestPoolLeavesTheProbeAConnection`: três escritas presas num `LOCK TABLE` (contadas em `pg_stat_activity`), a sonda responde com `pool_size = 4`; o controle `pool_size = 3` a deixa sem conexão |
+| E2 do S | O leitor RELP soltava o buffer acima de 16 KiB antes de **todo** frame | um emissor de linhas de 16–64 KiB refazia o crescimento por frame: 24 KiB custavam 12,3 µs, 55 KB e 5 alocações, contra 0,52 µs e 0 (SPEC §5.2) | `TestRELPReaderKeepsTheBufferWhileFramesFollow`, `TestRELPReaderReleasesALargeBuffer` (agora com o emissor parado entre os frames), `BenchmarkRELPReaderFrames` (§5) |
+| E1 do S | `closing` com PROXY `optional` | **não aplicado**, por instrução: no RELP as linhas no buffer nunca tiveram `200`, e o `librelp` as retransmite | — |
+| A2-minor do S | Comentário de ordem reversa com fechamento paralelo; log do aborto com o ring Redis | **não se aplica**: o comentário diz "AT ONCE", como o código; não há Redis | — |
+
 ---
 
 ## 10. Resultado da rodada final (2026-10-13)
@@ -439,3 +459,16 @@ rsyslog 8.2410 com `librelp` 1.11 (Alpine 3.22).
 | Mutação | cada correção da revisão conferida revertendo-a: o teste correspondente falha (§9.3) |
 | Binário | 11,9 MB com `-trimpath -ldflags='-s -w'` (o do Dockerfile); 17,3 MB sem |
 | Não rodou | fuzz de 10 min (§8 item 1); `docker compose --profile demo` (o Docker do módulo não mudou nesta rodada, só textos); carga ponta a ponta (§8 item 2) |
+
+### Depois das correções transversais de §9.4 (2026-10-13)
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `RELPLOG_TEST_PG_DSN=... RELPLOG_TEST_EMITTERS=1 go test -race -count=1 ./...` | **verde duas vezes seguidas** (55 s e 54 s), sem *flake* |
+| Testes | **407** de primeiro nível e **286** subtestes passaram, **1** pulado (`TestGoldenVectors/arquivo-sem-pri`, D5), 0 falhas (402 e 281 antes: os 5 de primeiro nível novos são os de §9.4) |
+| Por pacote (primeiro nível / subtestes) | `app` 70/65, `config` 63/0, `convert` 15/70, `emergency` 28/45, `ident` 2/0, `item` 5/0, `jlh` 4/0, `jlhcheck` 4/0, `obs` 9/0, `receiver` 101/33, `ring` 13/0, `sink` 93/73 |
+| Emissores reais | `TestEmittersRELPInClear` (12,3 s), `TestEmittersRELPBackpressureRetransmits` (6,0 s), `TestEmittersRELPSurvivesARestart` (3,7 s), verdes nas duas rodadas |
+| Fuzz | `FuzzFrame` 60 s, sem falha (1,66 milhão de execuções); o único alvo cujo código mudou (`relpframe.go`) |
+| Mutação | cada correção revertida sozinha: o teste da linha falha (ver acima) |
+| Não rodou | fuzz de 10 min; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |

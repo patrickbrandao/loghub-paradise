@@ -282,3 +282,37 @@ a uma. Sem entrevista; as escolhas são as que o RN já registrou, contestáveis
 - **O prazo da reingestão conta sem progresso** (SPEC §12.2), como no RN.
 - **Não portado, por não se aplicar:** o fim da sessão antes do `Enqueue` (SPEC
   §5.7), como no `go-syslog-pg-server`.
+
+---
+
+## 8. Correções transversais da revisão independente do `go-syslog-server` (2026-10-13)
+
+Itens X1–X4 do plano da revisão do porte do S, mais a conferência de C3, D1,
+E1, E2 e A2-minor. A mesma implementação no irmão (regra de sincronia).
+
+- **X1, o sinal entre os *bind* e o primeiro *accept*** (SPEC §13.1, §13.5):
+  conferido uma vez, depois de todos os *bind* e antes do primeiro `Start`
+  (`bindCtx.Err()` → 130). Com IP literal ou socket unix nenhum *bind* falha,
+  e o servidor abria e saía 0 no shutdown que seguia.
+- **X2, o motivo do aborto** (SPEC §13.4): das duas opções do plano, o
+  `Swap` do dump **sob o `lossMu`** (`settleDump`, nos dois ramos: dump
+  desligado e dump escrito), não reordenar o `abortLoss`. É a regra que já
+  valia para `enterDumpPhase` e `oweDump` — toda passagem do contador sob o
+  mutex — e não depende da ordem das duas escritas dentro do aborto. O
+  gancho `inAbort` (nulo no binário, como `beforeDump`) existe só para o teste
+  forçar a intercalação.
+- **X3, `"store is closed"`**: o texto do `ErrStoreClosed` do nats-server
+  2.14.6 (`server/store.go:43`) entra em `storeFailedIsTransient`; o
+  `"store closed"`, que nenhum servidor manda, fica (inofensivo).
+- **C3, teto do `MaxPending`**: não se aplica. Não há `ring.max_inflight`
+  (sem `ring=none`), e `2 × workers × batch` já é limitado pelos tetos de
+  `sink.workers` (256) e `sink.batch` (65 536): no máximo 33 554 432.
+- **E2**: não se aplica. A moldura RFC 6587 cresce pelas classes 2/8/64 KiB e
+  nunca solta o buffer (não há `frameKeepCap` aqui), então não há
+  realocação por frame; o custo por conexão ociosa segue na pendência do
+  `streamReadBuffer` (SPEC §21.1, item 1).
+- **E1**: não se aplica. A leitura do cabeçalho PROXY não confere `closing`
+  (a pendência "shutdown contado como falha do PROXY" segue aberta); a forma
+  certa, se for corrigida, ficou escrita nela.
+- **A2-minor**: não se aplica. `closeTransports` fecha em ordem reversa, como o
+  comentário diz, e não há ring Redis.

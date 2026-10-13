@@ -737,7 +737,15 @@ onde o oráculo para.
   tem 4 KiB (o leitor só usa `ReadByte` e leituras contadas; o maior `Peek` é o
   do PROXY, de 12 bytes) e o escritor de respostas, outros 4 KiB; depois de um
   frame grande, o leitor descarta o buffer acima de 16 KiB em vez de segurá-lo
-  enquanto a conexão viver ociosa. Com `max_conns = 0`, o custo de N conexões
+  enquanto a conexão viver ociosa — mas só quando nada do frame seguinte está
+  no `bufio.Reader` (o emissor parou e a leitura seguinte pode esperar o
+  `idle_timeout`). Descartado antes de **todo** frame, um emissor de linhas de
+  24 KiB refazia o crescimento inteiro por frame (2+4+8+16+24 KiB e as cópias:
+  55 KB e 5 alocações por frame, 12 µs contra 0,5 µs) para um buffer que voltaria a
+  crescer (revisão independente do `go-syslog-server`, 2026-10-13, E2;
+  `BenchmarkRELPReaderFrames`, TESTING §4). O buffer cresce dobrando a partir
+  de 2 KiB até o tamanho do frame, não pelas classes do pool: um frame de até
+  16 KiB nunca passa do teto. Com `max_conns = 0`, o custo de N conexões
   caladas é cerca de N × 10 KiB mais as goroutines, fora de `ring.max_bytes`.
 
 ### 5.3 Tamanho e truncamento (decisão 13 do S)
@@ -1859,7 +1867,7 @@ acima, em toda checagem.
 | Erro | Classe |
 |---|---|
 | prazo ou cancelamento, `ErrTimeout`, `ErrNoResponders`, `ErrNoServers`, `ErrDisconnected`, `ErrConnectionReconnecting`, `ErrReconnectBufExceeded`, `ErrNoStreamResponse`, `ErrAsyncPublishTimeout`, `ErrTooManyStalledMsgs` | `network` |
-| `10077` cuja descrição é de um stream **cheio** com `discard: new` ("maximum messages exceeded", "maximum bytes exceeded", "maximum messages per subject exceeded") ou **fechando** ("store closed", um restart do NATS) | `network`: backpressure, passa quando um consumidor confirma ou o servidor volta (revisão independente do R, 2026-10-11; como `fatal` eram dump, exit 3 e duplicatas do pedaço já gravado na reingestão) |
+| `10077` cuja descrição é de um stream **cheio** com `discard: new` ("maximum messages exceeded", "maximum bytes exceeded", "maximum messages per subject exceeded") ou **fechando** ("store is closed", o `ErrStoreClosed` de `server/store.go` do nats-server 2.14.6, num restart do NATS; só "store closed", texto que nenhum servidor manda, era conferido, e o 10077 de um store fechando era `fatal` — revisão independente do `go-syslog-server`, 2026-10-13, C2) | `network`: backpressure, passa quando um consumidor confirma ou o servidor volta (revisão independente do R, 2026-10-11; como `fatal` eram dump, exit 3 e duplicatas do pedaço já gravado na reingestão) |
 | `10158` (409: o mesmo `Nats-Msg-Id` ainda numa proposta Raft, na retentativa depois de um prazo num stream em cluster), `10167` (429: a fila de entrada do stream cheia) e todo outro erro da API com código 429 | `network`: passam sozinhos (pendência 18 do S, corrigida no R; antes, "outro 4xx" os fazia FATAL, dump e exit 3, talvez na frota inteira) |
 | `ErrAuthorization`, `ErrAuthExpired`, `ErrAuthRevoked`, `ErrAccountAuthExpired`, e o texto do servidor no `CONNECT` com "authorization violation", "authentication expired" ou "authentication revoked" (o `errors.Is` do `nats.go` compara o texto inteiro, e "User Authentication Expired" nunca casava com o sentinela: o boot esperava o `boot_timeout` e saía com o motivo errado; **nunca** "permissions violation", que é de um subject e vai pelo veredito), `ErrConnectionClosed` com a conexão `CLOSED` (com ela só reconectando, `network`: o `flushErr` acima), servidor que exige TLS (`errNATSServerRequiresTLS`), `ErrStreamNotFound` (`10059`), JetStream desligado (`10076`, `10039`), stream esperado não confere (`10060`), selado (`10109`), recursos (`10023`), outro armazenamento (`10077`: um registro que o store não aceita) | **`fatal`** |
 | `ErrMaxPayload` (recusada no cliente: só aquela mensagem, §10.2), `ErrMaxBytesExceeded`, `10054`, `10097` | `logic` |
@@ -2488,6 +2496,14 @@ fase 5  o que sobrou vai para o dump (§12); para o beacon, fecha o ring e o
   `Pending`/`Drain` era desfeito pela escrita seguinte, `Store(len(leftover))`:
   10 contadas perdidas para 5 (revisão independente, 2026-10-13,
   `TestAbortDuringTheDrainIsCountedOnce`; o R tem o mesmo código, a portar).
+- **O dump toma o contador de volta sob o mesmo mutex** (`settleDump`,
+  revisão independente do `go-syslog-server`, 2026-10-13, A2): o aborto
+  publica `aborted` antes de tomar o contador, e um dump que via a marca
+  nesse meio — desistia (`ErrAbandoned`) ou, desligado, nada tinha a
+  escrever — tomava o contador primeiro: `emergency_failed = n` e
+  `abort = 0`, a perda contada uma vez mas atribuída ao disco. Sob o
+  `lossMu`, ou o aborto terminou (o dump acha 0) ou nem começou (o dump
+  conta, o aborto acha 0) (`TestAbortInsideTheDumpKeepsItsReason`).
 - **Um dump contado como perdido não volta.** O aborto marca o processo como
   abortado, e o `Store.Write` em andamento confere essa marca no começo, a cada
   1024 linhas e antes de publicar o arquivo: desiste e remove o temporário. Antes, o
@@ -2533,7 +2549,7 @@ fase 5  o que sobrou vai para o dump (§12); para o beacon, fecha o ring e o
 | `1` | erro de configuração ou de inicialização não relacionada ao NATS (inclui toda URL que não seja `nats://`, a `LOGHUB_EB_URL` com `tls://` e um `.creds` inexistente) |
 | `3` | NATS indisponível ou inutilizável: sink FATAL (inclusive um servidor que exige TLS), `boot_timeout` ou `drain_timeout` estourados, validação de §10.7 recusada, dump que falhou |
 | `100`–`114` | falha de identidade, emitida pelo `go-loghub-ident` (`DATADIR`, `MACHINE_ID`, `MACHINE_ID_FILE`, `AGENT_NAME`, `AGENT_UUID`, `HOSTNAME`, `WORKSPACE`; 112 = `Initialize()` duas vezes); a tabela completa está na skill `go-loghub-ident` e em `docker/README.md` |
-| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 5–12 do boot. Um sinal que cancela o *bind* da porta admin (passo 5) ou do transporte (passo 12) é 130, não 1: com um nome em `admin.bind` ou `listen.tcp` a resolução falha com "operation was canceled", que não é endereço ruim (revisão independente de 2026-10-13; `TestCancelledBindIsAnAbortNotAConfigError`, e `TestSignalBeforeTheBindExits130`, portado do RP, para o transporte) |
+| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 5–12 do boot. Um sinal que cancela o *bind* da porta admin (passo 5) ou do transporte (passo 12) é 130, não 1: com um nome em `admin.bind` ou `listen.tcp` a resolução falha com "operation was canceled", que não é endereço ruim (revisão independente de 2026-10-13; `TestCancelledBindIsAnAbortNotAConfigError`, e `TestSignalBeforeTheBindExits130`, portado do RP, para o transporte). Com IP literal em `listen.tcp` nenhuma resolução falha e o *bind* passa: o sinal é conferido depois do *bind* e antes do primeiro *accept*, e também é 130 (antes o servidor abria, o `/readyz` dava 200 e o shutdown saía 0; revisão independente do `go-syslog-server`, 2026-10-13, A1; `TestSignalBeforeALiteralBindExits130`) |
 
 ---
 

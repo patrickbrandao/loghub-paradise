@@ -1490,7 +1490,14 @@ instâncias** e entre produtores LogHub, a `loghub.inbox` de §3.7.1.
   conexão dela do mesmo pool, e com `pool_size = workers` escritas lentas mas
   boas prendiam todas, a sonda estourava o prazo esperando uma, o sink ia a
   DOWN e, passado o `fail_timeout`, a FATAL com o banco saudável (revisão
-  independente do `go-relplog-pg-server`, 2026-10-13, portada).
+  independente do `go-relplog-pg-server`, 2026-10-13, portada). O `+ 1` basta aqui, e só aqui (conferido na revisão independente do
+  `go-syslog-server`, 2026-10-13, D1, onde o `ring=none` faz dos receptores,
+  até `ring.max_inflight`, os escritores e o `+ 1` não protege nada): o ring é
+  só memória, quem escreve são os `sink.workers`, um `Write` (uma conexão) por
+  vez cada, a reingestão roda antes deles e da sonda, e a sonda é uma só
+  (`TestPoolLeavesTheProbeAConnection`, contra o PostgreSQL real: três
+  escritas presas num `LOCK TABLE`, conferidas em `pg_stat_activity`, e a
+  sonda responde com `pool_size = 4`; com `pool_size = 3`, não).
 - **Sem `RULE` de INSERT ou UPDATE na fila.** O PostgreSQL recusa `INSERT … ON
   CONFLICT` numa tabela com uma (`0A000`, *feature_not_supported*): a validação
   do boot confere `pg_rewrite` (`ev_type` 2 e 3) e recusa nomeando as regras,
@@ -1630,6 +1637,10 @@ todas exit 1 sem citar a URL:
   das duas chaves, então o operador não podia corrigir em outro lugar.
 - **`?sslmode=` vazio**: a libpq o recusa, e lido como "ausente" a URL dizia
   duas coisas a dois leitores.
+- **`?host=` vazio** (revisão independente do `go-syslog-server`, 2026-10-13,
+  B4): a libpq e o pgx o leem como "ausente" e discam o padrão deles (o socket
+  do diretório compilado, ou `localhost`), e este servidor discava o host da
+  autoridade: duas leituras da mesma URL, dois servidores.
 - **`host=` com `,`, `:` ou branco**: a libpq lê `host=` literalmente
   (`/run/pg,/x` são dois servidores, `/run/pg:5433` um diretório com `:` no
   nome).
@@ -1955,6 +1966,11 @@ Um sinal que cancela o `bind` da porta admin (passo 5) ou de um transporte
 (passo 10) — a resolução de um nome de host falha com "operation was
 canceled" — é um boot interrompido, **130**, não um endereço ruim (1) (revisão
 independente do `go-relplog-pg-server`, 2026-10-13, portada).
+Com IP literal ou socket unix nenhuma resolução falha e os `bind` passam: o
+sinal é conferido depois de todos os `bind` do passo 10 e antes do primeiro
+`Start`, e também é **130** (antes o servidor abria, o `/readyz` dava 200 e o
+shutdown que seguia saía 0; revisão independente do `go-syslog-server`,
+2026-10-13, A1; `TestSignalBeforeALiteralBindExits130`).
 
 **Identidade antes de tudo que escreve.** `lhident.Initialize()` roda **uma
 vez**, no `main`, depois das flags que encerram o programa e antes de abrir
@@ -1999,7 +2015,7 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | `sink.workers > 16` | `WARN` (§10.5) |
 | `sink.postgres.pool_size` negativo, ou abaixo de `sink.workers + 1` | exit 1 (`0` deriva `workers + 1`; a sonda de saúde precisa de uma conexão, §10.5) |
 | `sink.postgres.addr`, `username` ou `database` vazios; `addr` que não é um servidor só (`host:porta` com host não vazio, sem vírgula, porta 1–65535 sem zero à esquerda, ou diretório começando com `/` com `:porta` opcional, §10.9); `table` que não é identificador em minúsculas (com esquema opcional) | exit 1 |
-| `LOGHUB_EB_URL` em conflito, com esquema que não é `postgres://`/`postgresql://`, com `sslmode` que pede TLS ou vazio, com parâmetro desconhecido ou repetido, com fragmento, com `@` depois de `/`, `?` ou `#`, sem usuário ou sem banco, com `host=` que não é um diretório só, ou só com espaços (§10.9) | exit 1, sem citar a URL |
+| `LOGHUB_EB_URL` em conflito, com esquema que não é `postgres://`/`postgresql://`, com `sslmode` que pede TLS ou vazio, com parâmetro desconhecido ou repetido, com fragmento, com `@` depois de `/`, `?` ou `#`, sem usuário ou sem banco, com `host=` vazio ou que não é um diretório só, ou só com espaços (§10.9) | exit 1, sem citar a URL |
 | durações zero onde zero não é "sem limite" (§16.5) | exit 1 |
 | `GOMEMLIMIT` ausente, ou `< ring.max_bytes × 2` | `WARN` (§15.4) |
 | parâmetro desconhecido na linha de comando ou no INI | exit 1. Isto inclui toda chave do pai que saiu (`ring.mode`, `sink.type`, `[tls]`, `[filter]`, `[ratelimit]`, `[sink.nats]`...): um INI do `go-syslog-server` não sobe aqui em silêncio |
@@ -2074,6 +2090,14 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
   (`aborted`): um abort entre duas passagens contava o ring e deixava o
   contador para um dump falho contar de novo (10 perdidas para 5). Depois do
   abort nenhuma passagem acontece e o dump desiste (§12.3).
+- **O dump toma o contador de volta sob o mesmo mutex** (`settleDump`,
+  revisão independente do `go-syslog-server`, 2026-10-13, A2): o aborto
+  publica `aborted` antes de tomar o contador, e um dump que via a marca
+  nesse meio — desistia (`ErrAbandoned`) ou, desligado, nada tinha a
+  escrever — tomava o contador primeiro: `emergency_failed = n` e
+  `abort = 0`, a perda contada uma vez mas atribuída ao disco. Sob o
+  `lossMu`, ou o aborto terminou (o dump acha 0) ou nem começou (o dump
+  conta, o aborto acha 0) (`TestAbortInsideTheDumpKeepsItsReason`).
 - **Shutdown por FATAL** (que começa sem sinal nenhum): o **primeiro**
   `SIGTERM`/`SIGINT` é tolerado — logado, e o dump continua —, e só um segundo
   aborta. Um orquestrador que manda `SIGTERM` ao ver o processo sair do ar não
@@ -2109,7 +2133,7 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
 | `1` | erro de configuração ou de inicialização não relacionada ao banco (inclui a `LOGHUB_EB_URL` com `sslmode` que pede TLS) |
 | `3` | banco indisponível ou inutilizável: sink FATAL, `boot_timeout` ou `drain_timeout` estourados, validação de §10.5 recusada, dump que falhou |
 | `100`–`114` | falha de identidade, emitida pelo `go-loghub-ident` (`DATADIR`, `MACHINE_ID`, `MACHINE_ID_FILE`, `AGENT_NAME`, `AGENT_UUID`, `HOSTNAME`, `WORKSPACE`; 112 = `Initialize()` duas vezes); a tabela completa está na skill `go-loghub-ident` e em `docker/README.md` |
-| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 7–9 do boot |
+| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 7–9 do boot, e o que cancela os *bind* da porta admin (passo 5) ou dos transportes (passo 10, §13.1) |
 
 ---
 
@@ -2916,7 +2940,12 @@ sai daqui e a regra vai para a seção que ele cita, spec primeiro.
    metade, e em `required` também `messages_dropped_total{reason="proxy"}` com
    um `WARN` que culpa o balanceador: todo deploy parece uma falha dele, sem
    perda de dado. Direção: um erro de `ReadProxyHeader` com `closing` ligado
-   encerra a conexão sem contar nem logar nada.
+   encerra a conexão sem contar nem logar nada. Na forma do S, conferida na revisão
+   independente do `go-syslog-server` (2026-10-13, E1): `closing && (err != nil
+   || mode == required)`, nunca `(err != nil || !found) && closing` (a do R),
+   que em `optional` sem cabeçalho fechava a conexão e perdia sem contar as
+   linhas já no buffer. Aqui não há `closing` nessa leitura: o defeito não
+   existe, e a pendência segue.
 3. **Custo fixo de 64 KiB por conexão TCP** (§4.4, §5.4). O `bufio.Reader` de
    cada conexão (`streamReadBuffer`) é alocado no accept e fica preso enquanto
    ela viver, ociosa ou não; com `tcp.max_conns = 0` por padrão, milhares de

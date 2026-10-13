@@ -482,3 +482,36 @@ verde com nats-server 2.14.6 (JetStream, sem JetStream, permissões, `tls {}`).
 | Posse do aborto, `SIGQUIT`, bind, emergência, reingestão, ring, `Deliver` (os mesmos do `go-syslog-pg-server`) | — | os de §9 do `go-syslog-pg-server`, com os mesmos nomes (`port_review_*_test.go`, `port_lifecycle_test.go`, `publish_test.go`, `review_port_test.go`) |
 | Lacunas (mutantes que sobreviviam no RN) | — | `TestNATSPublishErrorAfterTheFirstTaints`, `TestNATSLogicRefusalInAnAckTaints`, `TestNATSLibraryNeverRepublishes`, `TestNATSRefusedCredentialsAreFatal`, `TestNATSRealServerRequiringTLSIsRefusedWithoutAHandshake` |
 
+### Correções transversais da revisão independente do `go-syslog-server` (2026-10-13)
+
+Os itens transversais (X1–X4) do plano da revisão independente do porte do
+`go-syslog-server` (S), e a conferência de C3, D1, E1, E2 e A2-minor; a mesma
+implementação no irmão (regra de sincronia, `diff` conferido). **Conferência
+por mutação**, cada correção revertida sozinha: o teste da linha falha
+(`exited 0, want 130` nos dois subtestes; `abort 0, emergency_failed 5 for
+5`; o subteste `10077_store_is_closed`). **Não provado** contra um servidor
+real: o `10077` com "store is closed" vem do texto do `nats-server` 2.14.6
+(`server/store.go:43`), não de um stream fechando durante um publish.
+
+| Item | Achado | Consequência sem a correção | Teste |
+|---|---|---|---|
+| X1 (A1 do S) | Sinal depois da reingestão e antes do *accept* com IP literal ou socket unix: nenhum *bind* falha | o servidor abria, o `/readyz` dava 200 e o shutdown saía **0**, não 130 (SPEC §13.1, §13.5) | `TestSignalBeforeALiteralBindExits130` (IPs literais e socket unix) |
+| X2 (A2 do S) | O aborto publica `aborted` antes de tomar o contador; o dump que via a marca nesse meio (abandonado, ou desligado) o tomava primeiro | `emergency_failed = n`, `abort = 0`: a perda contada uma vez, atribuída ao disco (SPEC §13.4) | `TestAbortInsideTheDumpKeepsItsReason` (dump abandonado e dump desligado; o gancho `inAbort` força a intercalação) |
+| X3 (C2 do S) | `storeFailedIsTransient` conferia "store closed"; o nats-server 2.14.6 manda "store is closed" (`server/store.go:43`) | o `10077` de um store fechando era `fatal`: dump, exit 3 e duplicatas na reingestão a cada restart do NATS (SPEC §10.7) | `TestClassifyNATS/10077_store_is_closed` |
+| C3 do S | Teto do que entra no `MaxPending` | **não se aplica**: sem `ring.max_inflight`; `2 × workers × batch` já limitado por `sink.workers` ≤ 256 e `sink.batch` ≤ 65 536 | `TestConfigCeilings`, `TestMaxPendingHasTwiceTheWorkersBatches` (já existentes) |
+| E2 do S | `frameKeepCap` contra as classes 2/8/64 KiB | **não se aplica**: aqui a moldura cresce pelas classes e nunca solta o buffer (não há `frameKeepCap`), sem realocação por frame | — |
+| E1 do S | `closing` com PROXY `optional` perdendo as linhas em buffer | **não se aplica**: a leitura do cabeçalho não confere `closing` (a pendência do shutdown contado como falha do PROXY segue, com a forma certa escrita nela) | — |
+| A2-minor do S | Comentário de ordem reversa com fechamento paralelo; log do aborto com o ring Redis | **não se aplica**: o fechamento é em ordem reversa, como o comentário diz; não há Redis | — |
+
+Rodada final, nats-server 2.14.6, Apple M2, Go 1.27.1:
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `SYSLOG_TEST_NATS_*` (os quatro: 14622 JetStream, 14623 sem JetStream, 14624 permissões, 14625 `tls {}`) `SYSLOG_TEST_EMITTERS=1 go test -race -count=1 ./...` | **verde duas vezes seguidas** (59 s e 61 s), sem *flake* |
+| Testes | **431** de primeiro nível e **344** subtestes passaram, **1** pulado (`TestGoldenVectors/arquivo-sem-pri`, D5), 0 falhas |
+| Por pacote (primeiro nível / subtestes) | `app` 69/74, `config` 64/0, `control` 8/0, `convert` 15/70, `emergency` 28/45, `ident` 2/0, `item` 5/0, `jlh` 4/0, `jlhcheck` 4/0, `obs` 10/0, `receiver` 110/50, `ring` 13/0, `sink` 99/105 |
+| Emissores reais | `TestEmittersRsyslog` (15,8 s), `TestEmittersSyslogNG` (21,0 s), verdes nas duas rodadas |
+| Fuzz | nenhum: nenhum alvo de fuzz cobre o código que mudou (`app`, `sink/nats.go`) |
+| Mutação | cada correção revertida sozinha: o teste da linha falha (ver acima) |
+| Não rodou | fuzz de 10 min; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |

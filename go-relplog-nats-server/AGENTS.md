@@ -265,7 +265,9 @@ e, num rsyslog: `action(type="omrelp" target="127.0.0.1" port="20514")`.
   o dump. Depois do `unlink` de uma remoção, a falha do `fsync` (ou do `open` do
   diretório) é `ErrNotDurable`, não "cannot remove".
 - **Uma perda é contada uma vez.** O aborto e o dump falho trocam o contador por
-  `Swap` e as passagens dele são ordenadas por `lossMu`; um dump contado como
+  `Swap` e as passagens dele (a do dump inclusive, `settleDump`) são ordenadas
+  por `lossMu`: fora dele, um dump que via `aborted` antes de o aborto tomar o
+  contador contava `emergency_failed` no lugar de `abort`; um dump contado como
   perdido pelo aborto é abandonado (`Store.SetAbandon`), ou voltaria no boot.
 - **Shutdown por FATAL tolera o primeiro `SIGTERM`/`SIGINT`**, nunca `SIGQUIT`;
   um `SIGQUIT` tardio chega pelo `quitNow`.
