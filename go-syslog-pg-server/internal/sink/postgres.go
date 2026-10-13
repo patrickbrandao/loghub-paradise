@@ -39,7 +39,11 @@ type PostgresConfig struct {
 	Table          string // name or schema.name, lowercase
 	PoolSize       int
 	ConnectTimeout time.Duration
-	AppName        string // application_name, visible in pg_stat_activity
+	// ValidateTimeout bounds the one-time boot validation of SPEC §10.5:
+	// sink.op_timeout, not the health check's deadline. Zero takes
+	// ConnectTimeout, which the app sets to sink.op_timeout.
+	ValidateTimeout time.Duration
+	AppName         string // application_name, visible in pg_stat_activity
 }
 
 // Postgres enqueues into the LogHub queue loghub.inbox (SPEC §3.7.1, §10.5).
@@ -147,6 +151,9 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	}
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 5 * time.Second
+	}
+	if cfg.ValidateTimeout <= 0 {
+		cfg.ValidateTimeout = cfg.ConnectTimeout
 	}
 	if cfg.Table == "" {
 		cfg.Table = DefaultPostgresTable
@@ -539,7 +546,16 @@ func (p *Postgres) Health(ctx context.Context) error {
 			// refused at once (SPEC §10.5, exit 3).
 			return fatalErr("validate", errInRecovery)
 		}
-		if err := p.validate(ctx); err != nil {
+		// The validation is a dozen round trips, so it runs under a deadline
+		// of its own, sink.op_timeout, and not under sink.health_timeout: one
+		// second of twelve round trips failed every attempt against a server
+		// ~55 ms away, and the boot retried a validation that could never
+		// finish until sink.boot_timeout, exit 3 blaming the network. A
+		// cancelled boot still reaches it (validationContext).
+		vctx, cancel := validationContext(ctx, p.cfg.ValidateTimeout)
+		err := p.validate(vctx)
+		cancel()
+		if err != nil {
 			return err
 		}
 		p.validated.Store(true)
@@ -831,11 +847,14 @@ func classifyPostgres(op string, err error) error {
 
 // classifySQLState is the SQLSTATE table of SPEC §10.5:
 //
-//	08, 53, 57, 40                          network
-//	22, 23 (outside the ON CONFLICT)        logic
-//	42 (schema), 28, 2F, 3D, 42501, 25006,
-//	0A000                                   fatal
-//	anything else                           network
+//	08, 53, 57, 40                                network
+//	22, 23 (outside the ON CONFLICT)              logic
+//	42 (schema), 28, 2F, 3D, 42501, 25006, 23502,
+//	0A000, 23514 without a constraint name        fatal
+//	anything else                                 network
+//
+// (23514 without a name is decided by classifyPostgres, which sees the
+// constraint name; this table sees only the code.)
 //
 // The line that matters most: everything in class 42 is FATAL, never logic. A
 // dropped table or a missing unique index would otherwise be a logic error --
@@ -853,6 +872,13 @@ func classifySQLState(code string) Class {
 		// created after the boot fails every chunk the same way; as network
 		// it was retried forever with the sink UP (go-relplog-pg-server's
 		// independent review, 2026-10-13).
+		return ClassFatal
+	case "23502":
+		// not_null_violation is class 23 but never THIS data: the sink fills
+		// all ten columns of the contract and none of its values is NULL, so a
+		// 23502 after the boot comes from the TABLE -- a required column added,
+		// a DEFAULT dropped, a trigger writing NULL. As logic it would drop
+		// every chunk, one every few milliseconds, with the sink UP (§20.18).
 		return ClassFatal
 	}
 	if len(code) < 2 {
@@ -873,4 +899,51 @@ func classifySQLState(code string) Class {
 	// Unknown is retried rather than dropped: a filling ring is visible, a
 	// discarded chunk is not (invariant §20.18).
 	return ClassNetwork
+}
+
+// lifetimeKey carries, inside a health check's context, the context the check
+// was derived from: the boot's, or the process's. A sink whose boot
+// validation has to outlive the check's own deadline watches this one for
+// cancellation instead (validationContext), because once the check's deadline
+// has passed, the check context can no longer report that the boot was
+// cancelled. The PostgreSQL sink uses it.
+type lifetimeKey struct{}
+
+// withLifetime records ctx as the lifetime of the checks derived from it:
+// Health.WaitReady and Health.check wrap their context in it before adding
+// sink.health_timeout. Without it, validationContext falls back to watching
+// the check context itself (see there for what that misses).
+func withLifetime(ctx context.Context) context.Context {
+	return context.WithValue(ctx, lifetimeKey{}, ctx)
+}
+
+// validationContext gives a boot validation its own deadline (SPEC §10.5). The check that triggers it runs under
+// sink.health_timeout -- one second by default -- and the validation is a
+// dozen round trips: against a server ~55 ms away no attempt fitted, and the
+// boot retried a validation that could never finish until sink.boot_timeout,
+// then exited 3 blaming the network. So the parent's DEADLINE is dropped
+// (WithoutCancel) and replaced by timeout, while a real CANCELLATION -- the
+// boot interrupted by SIGTERM -- is still forwarded: a bare WithoutCancel kept
+// a SIGTERM waiting for the whole sink.op_timeout.
+//
+// The cancellation is watched on the check's lifetime context (withLifetime)
+// when there is one: AfterFunc fires once, and a check context whose
+// one-second deadline has already passed would never report a SIGTERM that
+// arrives during the remaining seconds of the validation (found while
+// building go-webhook-pg-server, 2026-10-07). Without a lifetime the check
+// context is watched, minus its deadline: a cancellation inside the check's
+// own window is forwarded, a later one is not.
+func validationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	var stop func() bool
+	if life, ok := parent.Value(lifetimeKey{}).(context.Context); ok {
+		stop = context.AfterFunc(life, cancel)
+	} else {
+		stop = context.AfterFunc(parent, func() {
+			if !errors.Is(context.Cause(parent), context.DeadlineExceeded) {
+				cancel()
+			}
+		})
+	}
+	return ctx, func() { stop(); cancel() }
 }

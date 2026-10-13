@@ -152,6 +152,9 @@ func (h *Health) Run(ctx context.Context) {
 }
 
 func (h *Health) check(ctx context.Context) {
+	// No lifetime is carried (withLifetime of go-syslog-pg-server): the NATS
+	// sink validates the stream inside this check, on the StreamInfo it has
+	// just fetched, so no validation outlives sink.health_timeout.
 	cctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
 	start := time.Now()
 	err := h.sink.Health(cctx)

@@ -16,6 +16,29 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-10-13 — SP: `23502` fatal e prazo próprio da validação do boot (porte do RP)
+
+Os dois itens que o porte anterior deixou (SP §22.1 itens 5 e 6), do RP, com os
+testes dele.
+
+- **`23502` é `fatal`.** O SP nunca manda `NULL`; um `not_null_violation` depois
+  do boot é a tabela (coluna obrigatória acrescentada, `DEFAULT` retirado,
+  trigger), e como `logic` descartava todo pedaço com o sink UP. Tabela de SPEC
+  §10.5 e `TestClassifySQLState` mudaram juntas.
+- **A validação do boot roda com `sink.op_timeout`**, não no
+  `sink.health_timeout` (1 s) da checagem: a ~55 ms de RTT ela nunca cabia.
+  `PostgresConfig.ValidateTimeout` + `validationContext` + `withLifetime` no
+  `Health` (um `SIGTERM` no boot ainda a interrompe).
+- **SN: não se aplica.** O sink NATS valida o stream dentro da checagem, sobre o
+  `StreamInfo` que acabou de buscar; nenhuma validação passa do
+  `health_timeout`. Só o comentário do RN entrou no `health.go`, e SP↔SN seguem
+  diferindo só ali.
+
+**Resultado:** cada correção revertida sozinha derruba os testes portados (6
+mutantes); `-race` do SP verde com PostgreSQL 18. **Lição:** "fora da lista"
+num porte vira pendência esquecida: a lista de "a portar" deve sair do diff do
+irmão, não só do CHANGELOG.
+
 ## 2026-10-13 — S: porte das correções do R, RP e RN
 
 Pedido: trazer para o `go-syslog-server` os "a portar" das entradas R e RP, RN

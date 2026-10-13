@@ -544,7 +544,8 @@ func (a *App) buildSink() int {
 		Addr: a.cfg.SinkPG.Addr, Username: a.cfg.SinkPG.Username,
 		Password: a.cfg.SinkPG.Password, Database: a.cfg.SinkPG.Database,
 		Table: a.cfg.SinkPG.Table, PoolSize: a.cfg.SinkPG.PoolSize,
-		ConnectTimeout: a.cfg.Sink.OpTimeout, AppName: a.clientName(),
+		ConnectTimeout: a.cfg.Sink.OpTimeout, ValidateTimeout: a.cfg.Sink.OpTimeout,
+		AppName: a.clientName(),
 	}, a.log.Logger, a.metrics)
 	if err != nil {
 		a.log.Error("cannot configure the sink", "error", err)

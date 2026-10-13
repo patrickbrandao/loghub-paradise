@@ -226,4 +226,12 @@ são as que o RP já registrou nas DECISOES dele; contestáveis.
   (SPEC §5.7).
 - **Ficaram para depois** (SPEC §22.1 itens 5 e 6), por não estarem na lista
   do porte: `23502` fatal e o prazo próprio da validação do boot, que o RP já
-  tem.
+  tem. Portados no mesmo dia (abaixo).
+- **`23502` é `fatal`** (SPEC §10.5), não `logic`: este servidor nunca manda
+  `NULL`, então a recusa é da tabela, e como `logic` descartaria todo pedaço com
+  o sink UP. Muda o que era aceito: um trigger que anula uma coluna só em certas
+  linhas derruba o processo (dump e exit 3) em vez de descartar aqueles pedaços.
+- **A validação do boot roda com `sink.op_timeout`** (SPEC §10.5, §13.1 passo
+  7), não no `sink.health_timeout` da checagem que a dispara, e ainda segue o
+  cancelamento do boot (`withLifetime`/`validationContext`, como no RP). Sem
+  chave nova: o RP também reusa `op_timeout`.
