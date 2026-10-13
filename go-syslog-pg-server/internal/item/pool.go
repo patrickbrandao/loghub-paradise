@@ -104,3 +104,15 @@ func CopyRaw(b []byte) ([]byte, int) {
 	buf, class := GetRaw(len(b))
 	return append(buf, b...), class
 }
+
+// PooledCap is the capacity GetRaw(n) will hand out: the class size for a
+// pooled length, n itself above the largest class. It lets a caller charge a
+// byte budget for the memory a copy really holds BEFORE taking the buffer
+// (SPEC §9.2: the ring's byte ceiling counts what is held, not what was asked
+// for).
+func PooledCap(n int) int {
+	if c := classFor(n); c >= 0 {
+		return classSizes[c]
+	}
+	return n
+}

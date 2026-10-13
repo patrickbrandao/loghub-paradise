@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -14,6 +15,33 @@ import (
 // whitespace, no wildcards, no separators. Wildcards are refused because this
 // server PUBLISHES, and a wildcard is not a publishable subject.
 var natsToken = regexp.MustCompile(`^[^\s.*>/\\]+$`)
+
+// Ceilings of SPEC §13.2 for the keys that size memory or a count handed to a
+// library (go-relplog-pg-server's and go-relplog-nats-server's independent review,
+// 2026-10-13, ported).
+// Without them a typo of a few digits panicked the boot (ring.capacity_items:
+// makechan) or allocated a gigabyte per Dequeue (sink.batch). The two NATS
+// ones are this server's own (docs/DECISOES.md §2.2):
+//
+//   - sink.workers: every worker publishes on the ONE NATS connection, whose
+//     writes go through one mutex and one socket, so past a few dozen workers
+//     only contention grows. And the client is told 2 x workers x batch as
+//     its PublishAsyncMaxPending (SPEC §10.7): with these ceilings that is at
+//     most 2 x 256 x 65536 = 33554432 futures, an int on every platform,
+//     where unbounded keys could wrap it negative and fail the boot with an
+//     error about an option nobody set.
+//   - sink.batch_max_bytes: NATS has no limit per chunk -- each envelope is
+//     its own PUB, bounded by max_payload (at most 64 MiB in nats-server) --
+//     so the ceiling only bounds memory: a chunk is held whole while its
+//     futures are pending, and a tainted one until they time out. 256 MiB,
+//     the number of the family, is far above any chunk worth building.
+const (
+	maxRingItems     = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxSinkBatch     = 65536
+	maxBatchMaxBytes = 256 << 20
+	maxSinkWorkers   = 256
+	maxListeners     = 256
+)
 
 // Validate checks every configuration-only constraint of SPEC §13.2 and §16.5
 // and returns the WARN-level findings. An error is exit code 1: the process
@@ -114,8 +142,8 @@ func validateListeners(c *Config) error {
 		{"listen.udp_listeners", c.Listen.UDPListeners},
 		{"listen.tcp_listeners", c.Listen.TCPListeners},
 	} {
-		if n.v < 1 {
-			return fmt.Errorf("%s: %d is below 1", n.name, n.v)
+		if n.v < 1 || n.v > maxListeners {
+			return fmt.Errorf("%s: %d is outside 1..%d", n.name, n.v, maxListeners)
 		}
 	}
 	if c.Listen.Unix != "" && !filepath.IsAbs(c.Listen.Unix) {
@@ -191,8 +219,8 @@ func validateSyslog(c *Config) error {
 }
 
 func validateRanges(c *Config) error {
-	if c.Ring.CapacityItems < 1 {
-		return fmt.Errorf("ring.capacity_items: %d is below 1", c.Ring.CapacityItems)
+	if c.Ring.CapacityItems < 1 || c.Ring.CapacityItems > maxRingItems {
+		return fmt.Errorf("ring.capacity_items: %d is outside 1..%d", c.Ring.CapacityItems, maxRingItems)
 	}
 	if c.Ring.MaxBytes < 1 {
 		return fmt.Errorf("ring.max_bytes: must be positive")
@@ -200,14 +228,16 @@ func validateRanges(c *Config) error {
 	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
 		return fmt.Errorf("ring.high_water: %g is outside (0, 1]", c.Ring.HighWater)
 	}
-	if c.Sink.Workers < 1 {
-		return fmt.Errorf("sink.workers: %d is below 1", c.Sink.Workers)
+	if c.Sink.Workers < 1 || c.Sink.Workers > maxSinkWorkers {
+		return fmt.Errorf("sink.workers: %d is outside 1..%d (they share one NATS connection)",
+			c.Sink.Workers, maxSinkWorkers)
 	}
-	if c.Sink.Batch < 1 {
-		return fmt.Errorf("sink.batch: %d is below 1", c.Sink.Batch)
+	if c.Sink.Batch < 1 || c.Sink.Batch > maxSinkBatch {
+		return fmt.Errorf("sink.batch: %d is outside 1..%d", c.Sink.Batch, maxSinkBatch)
 	}
-	if c.Sink.BatchMaxBytes < 1 {
-		return fmt.Errorf("sink.batch_max_bytes: must be positive")
+	if c.Sink.BatchMaxBytes < 1 || c.Sink.BatchMaxBytes > maxBatchMaxBytes {
+		return fmt.Errorf("sink.batch_max_bytes: %s is outside 1..256MiB (a chunk is held whole "+
+			"while its publishes are pending)", FormatBytes(c.Sink.BatchMaxBytes))
 	}
 	if c.Sink.MaxRetries < 1 {
 		return fmt.Errorf("sink.max_retries: %d is below 1", c.Sink.MaxRetries)
@@ -281,11 +311,19 @@ func validateNATS(c *Config) error {
 	// a NATS one: anything but nats:// is refused here rather than dialled
 	// into a handshake the client was never configured for.
 	userinfo := false
-	for _, u := range n.URLs {
+	for i, u := range n.URLs {
 		scheme, _, ok := strings.Cut(u, "://")
+		if !ok && i > 0 {
+			// The list is split at commas, so an unescaped ',' in a password
+			// ("nats://u:12,cret@h") leaves a piece with no scheme. Saying
+			// only "no scheme" would send the operator looking for a bare
+			// host:port that is not there.
+			return fmt.Errorf("sink.nats.urls: an entry has no scheme; every URL must be nats://, "+
+				"and a ',' in a user, password or token splits the list (%s)", percentEncodeHint)
+		}
 		if !ok || !strings.EqualFold(scheme, "nats") {
 			return fmt.Errorf("sink.nats.urls: every URL must be nats:// (tls://, ws:// and wss:// "+
-				"are refused: this server has no TLS); got an entry with scheme %q", schemeOf(u))
+				"are refused: this server has no TLS); got an entry with %s", describeScheme(u))
 		}
 		// Parsed here, with an error that never quotes the URL: the client's
 		// own parse would fail at connect time, classed network, retried for
@@ -358,6 +396,19 @@ func validateNATS(c *Config) error {
 		}
 	}
 	return nil
+}
+
+// describeScheme is schemeOf for a message: a real scheme is quoted, the two
+// placeholders are not, so "none" never reads as a scheme someone typed.
+func describeScheme(u string) string {
+	switch s := schemeOf(u); s {
+	case "none":
+		return "no scheme"
+	case "unrecognised":
+		return "an unrecognised scheme"
+	default:
+		return "scheme " + strconv.Quote(s+"://")
+	}
 }
 
 // schemeOf names a URL's scheme for an error without echoing the URL, which may

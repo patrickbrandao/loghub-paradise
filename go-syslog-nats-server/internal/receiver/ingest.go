@@ -147,7 +147,8 @@ type IngestConfig struct {
 //
 //  1. empty                   zero octets is not a message (SPEC §5.6)
 //  2. truncation              keep max_message_bytes, size stays original
-//  3. sink DOWN, ring full     fail fast, even with an empty ring
+//  3. sink DOWN, ring full     fail fast, even with an empty ring; full on
+//     either ceiling, for the truncated length
 //  4. uuid, head, copy into a pooled buffer
 //  5. ring.Enqueue            never blocks
 //
@@ -158,7 +159,7 @@ type IngestConfig struct {
 // parse.
 type Ingest struct {
 	ring ring.Ring
-	full func() bool // the ring's cheap pre-check, when it has one
+	full func(n int) bool // the ring's cheap pre-check for an n-byte line, when it has one
 	sink SinkState
 	m    *obs.Metrics
 	log  *obs.Logger
@@ -179,8 +180,8 @@ func NewIngest(r ring.Ring, s SinkState, m *obs.Metrics, log *obs.Logger, cfg In
 	}
 	in := &Ingest{ring: r, sink: s, m: m, log: log, cfg: cfg, max: limit,
 		failLog: obs.NewSampler(30 * time.Second)}
-	if f, ok := r.(interface{ Full() bool }); ok {
-		in.full = f.Full
+	if f, ok := r.(interface{ FullFor(n int) bool }); ok {
+		in.full = f.FullFor
 	}
 	return in
 }
@@ -265,10 +266,11 @@ func (in *Ingest) try(ctx context.Context, raw []byte, w *Wire) Outcome {
 	}
 	// A full ring is refused before the uuid, the copy and the item: on a UDP
 	// flood, or a TCP reader retrying every 50 ms, the refusal would otherwise
-	// cost as much as an acceptance. The check is racy on purpose -- Enqueue
-	// below is still the authority, and a slot freed in between only costs one
-	// retry.
-	if in.full != nil && in.full() {
+	// cost as much as an acceptance. Full on EITHER ceiling, for the line about
+	// to be copied: ring.max_bytes binds as well as ring.capacity_items. The
+	// check is racy on purpose -- Enqueue below is still the authority, and a
+	// slot freed in between only costs one retry.
+	if in.full != nil && in.full(len(raw)) {
 		return RingFull
 	}
 

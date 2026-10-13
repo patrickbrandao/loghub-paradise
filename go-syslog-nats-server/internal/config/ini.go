@@ -16,6 +16,8 @@ const identitySection = "identity"
 // errors can point at the offending line.
 type iniEntry struct {
 	Name string // canonical dotted name
+	Sec  string // the [section] it was under
+	Key  string // what came before the '=', trimmed
 	Raw  string
 	Line int
 }
@@ -46,7 +48,15 @@ func parseINI(r io.Reader) ([]iniEntry, error) {
 
 	for sc.Scan() {
 		lineNo++
-		line := strings.TrimSpace(sc.Text())
+		text := sc.Text()
+		if lineNo == 1 {
+			// A UTF-8 byte-order mark, which some Windows editors write, is
+			// not part of the first line: kept, it made the line "expected
+			// 'key = value'" with nothing visible to say why (independent
+			// review, 2026-10-13).
+			text = strings.TrimPrefix(text, "\ufeff")
+		}
+		line := strings.TrimSpace(text)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
@@ -85,10 +95,16 @@ func parseINI(r io.Reader) ([]iniEntry, error) {
 			return nil, fmt.Errorf("line %d: empty key", lineNo)
 		}
 		if section == "" {
+			// Named only when it looks like a key, for the reason of lookup.
+			if !iniKeyRE.MatchString(key) {
+				return nil, fmt.Errorf("line %d: a key appears before any [section]", lineNo)
+			}
 			return nil, fmt.Errorf("line %d: key %q appears before any [section]", lineNo, key)
 		}
 		out = append(out, iniEntry{
 			Name: section + "." + key,
+			Sec:  section,
+			Key:  key,
 			Raw:  unquote(strings.TrimSpace(line[eq+1:])),
 			Line: lineNo,
 		})

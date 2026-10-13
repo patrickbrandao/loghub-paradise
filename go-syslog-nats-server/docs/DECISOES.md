@@ -263,3 +263,22 @@ um com SPEC, teste e mutação (TESTING §9); todos contestáveis.
 - **Não se aplica:** o defeito do `LOGHUB_EB_URL` no compose do N. Aqui as
   chaves donas são escritas sem valor (`KEY:`) e o README manda apagá-las para
   usar a URL; conferido com `docker compose config` (TESTING §8 item 15).
+
+## 7. Porte das correções do RN, do RP e do R (2026-10-13)
+
+As correções das revisões independentes do `go-relplog-nats-server` (RN), do
+`go-relplog-pg-server` e do `go-relplog-server` que valiam aqui, conferidas uma
+a uma. Sem entrevista; as escolhas são as que o RN já registrou, contestáveis.
+
+- **Código comum primeiro no `go-syslog-pg-server`**, copiado para cá por fusão
+  de três vias e readaptado na redação do NATS (a regra de sincronia SP↔SN).
+- **`sink.workers` ≤ 256** (o teto do RN, não o 1024 do SP): todos os workers
+  dividem a única conexão NATS, e `2 × workers × batch` (o
+  `PublishAsyncMaxPending`, SPEC §10.7) precisa caber num `int`.
+- **`retention: interest` é FATAL**, `10158`/`10167`/429 são `network`,
+  assinatura negada em `_INBOX` é veredito e um `space` estrangeiro em `core`
+  gera um `WARN`: as pendências 5 a 8 da SPEC §21.1, com a direção já escrita lá,
+  vieram junto do sink do RN porque o código era o mesmo.
+- **O prazo da reingestão conta sem progresso** (SPEC §12.2), como no RN.
+- **Não portado, por não se aplicar:** o fim da sessão antes do `Enqueue` (SPEC
+  §5.7), como no `go-syslog-pg-server`.

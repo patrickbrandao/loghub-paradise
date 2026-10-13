@@ -42,6 +42,10 @@ func TestClassifySQLState(t *testing.T) {
 		"28P01", // invalid_password
 		"2F005", // function executed no return statement
 		"3D000", // invalid_catalog_name: the database does not exist
+		// 0A000 feature_not_supported: ON CONFLICT on a table with an INSERT
+		// or UPDATE rule; as network it was retried forever (ported from
+		// go-relplog-pg-server's review of 2026-10-13).
+		"0A000",
 	}
 	for _, c := range fatal {
 		if got := classifySQLState(c); got != ClassFatal {

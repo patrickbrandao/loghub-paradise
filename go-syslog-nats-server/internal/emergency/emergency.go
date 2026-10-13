@@ -57,13 +57,27 @@ const (
 
 // Store reads and writes dumps in one directory.
 type Store struct {
-	dir   string
-	agent string
+	dir     string
+	agent   string
+	abandon func() bool
 }
 
 // NewStore builds a store for emergency.dir. agentUUID is the instance's
 // AgentUUID, which names the files it writes (SPEC §12.1).
 func NewStore(dir, agentUUID string) *Store { return &Store{dir: dir, agent: agentUUID} }
+
+// SetAbandon installs the check a Write in progress consults: true means the
+// process was aborted and counted the dump's messages lost, so the dump gives
+// up and removes its temporary file instead of publishing a file the next boot
+// would reingest (SPEC §13.4). Checked between lines and before the publish;
+// a dump that publishes between the last check and the abort is both counted
+// and kept, an overcount, never a loss.
+func (s *Store) SetAbandon(f func() bool) { s.abandon = f }
+
+func (s *Store) abandoned() bool { return s.abandon != nil && s.abandon() }
+
+// ErrAbandoned is Write giving up because the process was aborted.
+var ErrAbandoned = errors.New("emergency: dump abandoned: the process was aborted")
 
 // Dir reports the configured directory.
 func (s *Store) Dir() string { return s.dir }
@@ -124,6 +138,9 @@ func (s *Store) Write(items []*item.Item, conv *convert.Converter, acceptMalform
 	if len(items) == 0 {
 		return res, nil
 	}
+	if s.abandoned() {
+		return res, ErrAbandoned
+	}
 	if err := os.MkdirAll(s.dir, 0o750); err != nil {
 		return res, fmt.Errorf("emergency: cannot create %s: %w", s.dir, err)
 	}
@@ -140,7 +157,11 @@ func (s *Store) Write(items []*item.Item, conv *convert.Converter, acceptMalform
 
 	w := bufio.NewWriterSize(f, 1<<20)
 	var line []byte
-	for _, it := range items {
+	for i, it := range items {
+		if i&1023 == 1023 && s.abandoned() {
+			f.Close()
+			return WriteResult{}, s.abort(tmp, ErrAbandoned)
+		}
 		if it == nil {
 			continue
 		}
@@ -177,6 +198,9 @@ func (s *Store) Write(items []*item.Item, conv *convert.Converter, acceptMalform
 	}
 	if err := f.Close(); err != nil {
 		return WriteResult{}, s.abort(tmp, err)
+	}
+	if s.abandoned() {
+		return WriteResult{}, s.abort(tmp, ErrAbandoned)
 	}
 	if err := publish(tmp, path); err != nil {
 		return WriteResult{}, s.abort(tmp, err)
@@ -780,6 +804,13 @@ func isLowerHex(c byte) bool { return c >= '0' && c <= '9' || c >= 'a' && c <= '
 
 // Remove deletes a fully reingested dump: only after every one of its records
 // was confirmed (SPEC §12.2).
+//
+// The directory is fsynced after the unlink. Without it a power loss right
+// after the reingestion can bring the name back, and the next boot publishes
+// the whole dump a second time under the same uuids -- deduplicated by the
+// stream only inside its duplicate_window, a duplicate everywhere else (core
+// NATS, a later boot). An error wrapping ErrNotDurable means the file WAS
+// removed and only that durability is in doubt; the caller logs it at WARN.
 func (s *Store) Remove(path string) error {
 	if err := os.Remove(path); err != nil {
 		return err
@@ -791,6 +822,15 @@ func (s *Store) Remove(path string) error {
 // records have already been reingested; what remains is unrecoverable by this
 // program but may still be worth a human's attention, and deleting evidence of
 // a crash is not this program's call.
+//
+// A non-empty name means the file WAS quarantined, whatever the error says:
+// the rename happened, and the error, if any, is the directory fsync that
+// followed (errors.Is(err, ErrNotDurable)), which only means the new name may
+// not survive a power loss. The caller logs that at WARN and still reports
+// the quarantine -- the ERROR with the discarded byte counts -- under the new
+// name. Read as "not quarantined", it logged "cannot quarantine" with a path
+// that no longer existed and dropped the count of what was lost (SPEC §12.2).
+// An empty name means the file is still where it was.
 func (s *Store) Quarantine(path string) (string, error) {
 	dst := path + corruptExt
 	if err := os.Rename(path, dst); err != nil {
@@ -814,13 +854,70 @@ func (s *Store) Quarantine(path string) (string, error) {
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return err
+		// Also not durable, not undone: Remove and Quarantine call this AFTER
+		// the unlink or the rename succeeded, and reporting "cannot remove"
+		// for a file that is gone would be false (independent review,
+		// 2026-10-13). In Write it is still a failed dump.
+		return fmt.Errorf("%w: cannot open directory %s to fsync it: %w", ErrNotDurable, dir, err)
 	}
 	defer d.Close()
 	if err := dirSync(d); err != nil {
-		return fmt.Errorf("fsync of directory %s: %w", dir, err)
+		return fmt.Errorf("%w: fsync of directory %s: %w", ErrNotDurable, dir, err)
 	}
 	return nil
+}
+
+// ErrNotDurable marks the failure of a directory fsync after the operation on
+// the directory entry itself succeeded: the unlink of Remove or the rename of
+// Quarantine happened, and only its durability is in doubt. Write's error may
+// wrap it too, but there the fsync decides the dump: the file is removed and
+// the dump has failed (SPEC §12.3).
+var ErrNotDurable = errors.New("emergency: the directory entry may not be durable")
+
+// Count reports how many dump files are pending and how many envelopes they
+// hold, for the syslog_emergency_files and syslog_emergency_events_pending
+// gauges (SPEC §12.2: recounted from the directory at the end of the
+// reingestion, never zeroed). A file that cannot be read still counts as one
+// file, with no envelopes: its messages are unknowable, and an alert on the
+// gauges must keep firing until somebody deals with it.
+//
+// It streams every file with the reader of the reingestion -- a line counts
+// only if ParseLine accepts it, as the reingestion would -- and never holds
+// more than one line. It runs at boot, once, after the reingestion.
+func (s *Store) Count() (files int, events int64, err error) {
+	paths, err := s.List()
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, p := range paths {
+		files++
+		n, err := countFile(p)
+		if err != nil {
+			continue
+		}
+		events += n
+	}
+	return files, events, nil
+}
+
+func countFile(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	r := newReader(f, f, MaxLine)
+	defer r.Close()
+	var n int64
+	for {
+		_, ok, err := r.next()
+		if err != nil {
+			return n, err
+		}
+		if !ok {
+			return n, nil
+		}
+		n++
+	}
 }
 
 // dirSync is (*os.File).Sync, behind a variable only so the tests can make a

@@ -268,10 +268,18 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 5180   # o logger do ma
   passo remove o temporário e é exit 3; um `.tmp` que sobra nunca é listado.
 - **A reingestão é em fluxo.** `Store.Open` + `Reader.Next(batch, max_bytes)`,
   nunca o arquivo inteiro: o dump chega a ~12× o ring, e carregá-lo matava o boot
-  por OOM em laço. Um único `boot_timeout` para a reingestão inteira.
+  por OOM em laço. Um único `boot_timeout` **sem progresso** para a reingestão
+  inteira (cada pedaço entregue o empurra).
 - **Shutdown por FATAL tolera o primeiro sinal.** Ele começa sem sinal; o
   primeiro `SIGTERM` não pode cortar o dump, só o segundo aborta. E o abort conta
   em `abort` o que já fora entregue ao dump, não só o que ficou no ring.
+- **A perda do abort tem um dono só** (SPEC §13.4). Da fase do dump em diante
+  o abort conta o contador `dumping`, nunca o ring; as passagens
+  (`enterDumpPhase`, `oweDump`) e o abort vão sob `lossMu`, o dump o toma com
+  `Swap`, e um dump já contado como perdido desiste (`SetAbandon`). Conte cada
+  mensagem num lado só, e teste o abort caindo em **cada** janela (os ganchos
+  `beforeCollect`, `beforeDump`): a corrida esperada não aparece. `SIGQUIT`
+  nunca é tolerado, e um `SIGQUIT` tardio chega por `quitNow`.
 - **SIGHUP** compara chave recarregável com o que está em execução e chave de
   restart com o boot. Só `[log]` recarrega.
 - **Chave do pai no env some em silêncio** se não estiver em `removed.go`: o

@@ -199,8 +199,20 @@ JetStream para o FATAL imediato de SPEC §10.7:
 go run github.com/nats-io/nats-server/v2@v2.14.6 -js -sd "$(mktemp -d)" -p 14222 &   # sem o lh-nats
 go run github.com/nats-io/nats-server/v2@v2.14.6 -p 14223 &                         # SEM JetStream
 SYSLOG_TEST_NATS_URL=nats://127.0.0.1:14222 SYSLOG_TEST_NATS_NOJS_URL=nats://127.0.0.1:14223 \
+SYSLOG_TEST_NATS_PERM_URL=nats://127.0.0.1:14224 SYSLOG_TEST_NATS_TLS_URL=nats://127.0.0.1:14225 \
   go test -race -timeout 900s ./internal/sink/ ./internal/control/ ./internal/app/
 ```
+
+Os dois últimos (desde 2026-10-13, pulam sem eles) são um servidor com
+JetStream e permissões — os usuários de `natsPermSetup` em
+`internal/sink/review_port_test.go`: `admin`/`admin`; `nopub` negando publish em
+`loghub.*.syslog`; `noinbox` negando sub em `_INBOX.>`; `nobeacon` negando pub
+em `*.beacon`, todos com a senha igual ao nome — e um com `tls {}` (certificado
+RSA autoassinado; o LibreSSL do macOS gera um EC que o `nats-server` recusa).
+Os mesmos arquivos de configuração estão em `../go-relplog-nats-server/docs/TESTING.md`
+§6. O servidor falso `natsFake` (mesmo arquivo) responde `INFO`/`PONG`, manda
+`-ERR` por publish ou por subject, `PubAck` com erro de API no n-ésimo, 503
+"sem respondedores" e `PING` sem resposta.
 
 Os dois servidores são sem TLS, como tudo aqui. Cada teste trabalha num `space`
 próprio, com um stream próprio apagado no fim: na app, criado a partir de
@@ -278,32 +290,18 @@ Registradas por honestidade, não por esquecimento.
      consumidores *pull*);
    - uma corrida teórica entre `Health` e `Close` pode deixar uma conexão sem
      fechar, no fim do processo;
-   - (visto em 2026-10-11, no porte das correções do N) um *flush*
-     interrompido por uma desconexão volta do `nats.go` como
-     `ErrConnectionClosed` (o canal do `PING` pendente é fechado, e o estado é
-     `RECONNECTING`, não `CLOSED`), que a tabela de SPEC §10.7 classifica como
-     `fatal`: em `core`, uma queda do NATS no meio do *flush* da checagem de
-     saúde ou de um pedaço vira FATAL, dump e exit 3, em vez de DOWN e
-     retentativa. Reproduzido contra o servidor falso dos testes (por isso
-     `TestNATSCoreMaxPayloadIsCheckedOnEveryCheck` espera o gancho de
-     reconexão antes de checar); o `go-webhook-nats-server` tem o mesmo;
-   - (revisão independente do porte, 2026-10-11) em `core`, o `LastError()`
-     guarda um erro só: um `-ERR` de outro subject (o beacon, num papel que nega
-     os dois) que chegue entre a negação de um pedaço e o `PONG` do *flush* a
-     substitui, e o pedaço negado é confirmado; o veredito só vem depois, pelo
-     `ErrorHandler`. Correção proposta: guardar o `LastError()` de antes da
-     publicação e, se depois do *flush* ele mudou para uma violação que não é do
-     caminho de dados, devolver `network` (o pedaço fica retido e a retentativa
-     vê o veredito). O N tem o mesmo.
+   - o *flush* interrompido por uma desconexão (`ErrConnectionClosed` com o
+     cliente `RECONNECTING`) e o `LastError()` mascarado em `core`, listados
+     aqui até 2026-10-13, foram corrigidos no porte do RN (§9).
    O código herdado do `go-syslog-pg-server` passou pela revisão de lá.
 2. **Fuzz de 10 min por alvo não rodou** neste módulo. Os números de §3 são do
    pai (5 min por alvo); o `FuzzRead` do leitor JSON Lines não teve rodada longa
    nenhuma.
 3. **Carga nunca medida.** Não há gerador de carga; os critérios de SPEC §18.8
    são alvos. Os benchmarks de §4 não foram remedidos.
-4. **Servidor NATS que exige TLS** (`tls_required` no `INFO`): a recusa pelo
-   `TLSCertCB`, sem `ClientHello`, e o FATAL imediato precisam de um servidor
-   real com TLS ligado; até haver o teste, é dedução do código e do `nats.go`.
+4. **Servidor NATS que exige TLS**: fechado em 2026-10-13 por
+   `TestNATSRealServerRequiringTLSIsRefusedWithoutAHandshake` (servidor real com
+   `tls {}`, atrás de um proxy que grava os bytes: nenhum registro TLS sai).
 5. **Cluster NATS** (várias URLs, troca de servidor no meio da carga) não foi
    testado; só um servidor, caindo e voltando.
 6. **Dump de outro Workspace** (conhecido, não corrigido, por desenho): se
@@ -330,8 +328,8 @@ Registradas por honestidade, não por esquecimento.
 14. **Conhecidos e não corrigidos**, herdados do `go-syslog-pg-server` (achados
     da revisão independente de lá, 2026-10-07):
     - o `SIGHUP` relata como "requires a restart" chaves **derivadas**
-      (`emergency.dir` quando muda `server.data_dir`) e os sinônimos do charset
-      legado (`windows-1252` × `cp1252`);
+      (`emergency.dir` quando muda `server.data_dir`). Os sinônimos do charset
+      legado foram corrigidos em 2026-10-13 (§9);
     - `proxy.*` e `tcp.*` são aceitos com `listen.tcp` vazio, sem aviso;
     - `listen.tcp` e `admin.bind` na mesma porta só falham ao abrir o
       transporte, não na validação;
@@ -355,11 +353,13 @@ Registradas por honestidade, não por esquecimento.
     fonte e travando a URL) não existe aqui. O compose não repassa
     `SYSLOG_SINK_NATS_CREDENTIALS` (nem monta um `.creds`): autenticação por
     `.creds` no Docker não é suportada por este compose.
-16. **Uma brecha deixada no parser de flags** (SPEC §13.2, como no N): a cauda
-    de um valor que o shell partiu num espaço, quando começa com traço e vem
-    depois de um valor não vazio (`--sink.nats.password=a -b`), sai como
-    parâmetro desconhecido, com o nome. Escondê-la esconderia todo erro de
-    digitação de uma flag depois de outra.
+16. **Uma brecha deixada no parser de flags** (SPEC §13.2, como no N),
+    estreitada em 2026-10-13: a cauda de um valor que o shell partiu num espaço,
+    quando começa com traço, vem depois de um valor não vazio **e** tem a forma
+    `<seção>.<chave>` de uma seção deste servidor ou do pai
+    (`--sink.nats.password=a --sink.nats.b`), sai como parâmetro desconhecido,
+    com o nome. Escondê-la esconderia os erros de digitação dentro de uma seção
+    conhecida.
 17. **Defeitos conhecidos do código, ainda não corrigidos**, ficam em SPEC
     §21.1, cada um com a consequência e a direção da correção. Quem corrige um
     o tira de lá, com um teste que falha sem a correção.
@@ -446,3 +446,39 @@ mutação numa cópia do módulo:
 A mutação deste porte achou um caminho do `flags.go` sem teste, também no N:
 tirar o `assigned(v)` do `--config` não derrubava nada. Caso novo,
 `--config= x` (o argumento depois do `=` vazio não é citado).
+
+### Porte das correções do RN, do RP e do R (2026-10-13)
+
+As correções das revisões independentes do `go-relplog-nats-server` (RN), do
+`go-relplog-pg-server` (RP) e do `go-relplog-server` (R) que valiam aqui (CHANGELOG
+da raiz, "A portar" das entradas "2026-10-13 — RP, RN" e "2026-10-12 — R"). O
+código comum veio do `go-syslog-pg-server`, portado primeiro (TESTING §9 de lá,
+mesma tabela para o que é comum: posse do aborto, `quitNow`, bind cancelado,
+`ErrNotDurable`, prazo da reingestão sem progresso, gauges, `FullFor`, `Deliver`,
+parsers, dump, `SIGHUP`), por fusão de três vias e com a redação do NATS; o sink
+NATS veio do RN. **Conferência por mutação:** os testes novos de
+`internal/config` rodaram contra o código de config de antes e cada um falhou;
+o `nats.go` de antes, com um calço só para compilar, derrubou 18 testes de topo;
+no resto, 20 mutantes do código comum (`A1`–`A13`, `E1`–`E2`, `R1`–`R2`, `K1`,
+`N1`–`N2`) e 15 do sink NATS, um por correção, derrubaram os testes. `-race`
+verde com nats-server 2.14.6 (JetStream, sem JetStream, permissões, `tls {}`).
+
+| Achado | Consequência sem a correção | Teste |
+|---|---|---|
+| Servidor que passa a exigir TLS depois do boot: o `ReconnectErrHandler` nunca vê a recusa (é do *handshake*), só o `LastError` | FATAL só pelos fusíveis, com "connection is RECONNECTING" — ou nunca | `TestNATSReconnectToATLSOnlyServerIsAVerdict` |
+| *Flush* de `core` que **começa** durante a reconexão confirmava o pedaço cujos `PUB` foram pelo socket velho | pedaço confirmado sem prova de que o servidor o recebeu | `TestNATSCoreFlushAcrossAReconnectionIsNotConfirmed` |
+| *Flush* cortado por uma queda voltava `ErrConnectionClosed`, `fatal` | soluço do NATS = FATAL, dump e exit 3 | `TestNATSCoreFlushCutByAReconnectionIsNetwork` |
+| Negação do beacon entre os `PUB` e o `PONG` mascarava a do caminho de dados | pedaço negado confirmado e perdido | `TestNATSCoreMaskedDenialIsNotConfirmed`, `TestMaskedDenial` |
+| `jetstream`: o prazo do futuro de um publish negado era `network`; `core`: o `Health` não lia o `LastError` depois do *flush* | retentado para sempre com o sink UP | `TestNATSJetStreamDeniedPublishIsFatalAfterTheTimeout`, `TestNATSCoreHealthReadsTheDenialItsFlushFollows`, `TestNATSPermissionDeniedIsFatal` |
+| `10077` de stream cheio (`discard: new`) ou fechando era `fatal` | dump, exit 3 e duplicatas na reingestão a cada pico ou restart do NATS | `TestClassifyNATS` |
+| `10158`, `10167` e todo 429 eram `fatal` (SPEC §21.1 item 6 de antes) | FATAL na frota inteira num soluço do cluster | `TestClassifyNATS` |
+| `retention: interest` aceito (item 5 de antes); `max_msgs_per_subject` sem aviso | eventos confirmados e não guardados | `TestNATSValidateRetentionAndPerSubjectCap`, `TestNATSInterestStreamIsRefused` |
+| Assinatura negada em `_INBOX` não era veredito (item 7 de antes) | boot esperava o `boot_timeout` culpando a rede | `TestNATSDeniesTheDataPath`, `TestNATSVerdictIsReturnedByHealthAndWrite`, `TestNATSPermissionDeniedIsFatal/inbox_subscription_denied` |
+| Dump de outro Workspace em `core` sem aviso (item 8 de antes) | perda silenciosa do dump | `TestNATSCoreWarnsOnceAboutAForeignSpace`, `TestNATSOwnSubjectDoesNotAllocate`, `TestNATSSubjects` |
+| `MaxPending` = `workers × batch`, sem folga | retentativa rápida parava na janela de futuros (`ErrTooManyStalledMsgs`) | `TestMaxPendingHasTwiceTheWorkersBatches` |
+| Sem tetos de config (`sink.workers` ≤ 256 aqui) | pânico no boot; `2 × workers × batch` dando a volta no `int` | `TestConfigCeilings` |
+| `sink.nats.urls`/`LOGHUB_EB_URL`: `@` depois de `/?#`, host com escape, `,` na senha partindo a lista, só espaços, esquema citado sem `://` | senha encurtando a autoridade; mensagem que mandava procurar outra coisa | `TestSlashInTheUserinfoIsRefusedWithoutEcho`, `TestNATSURLsAreParsedWithoutEcho`, `TestCommaInAPasswordSplitsTheURLListWithAHint`, `TestEBURLOnlyBlanksIsRefused`, `TestNATSURLSchemes`, `TestURLErrorsQuoteNothingOfTheURL` |
+| Parsers, dump e `SIGHUP` (os mesmos do `go-syslog-pg-server`) | — | `TestGluedValueIsNotPrinted`, `TestSwitchesTakeNoValue`, `TestEmptyConfigFlagIsRefused`, `TestINIByteOrderMarkIsIgnored`, `TestINIUnknownKeyNeverPrintsASecretContinuation`, `TestRemovedFlagAfterAValuedFlagIsNamed`, `TestRemovedParamsAreTheRemovedEnv`, `TestDumpCommentsDerivedValues`, `TestCharsetSynonymsAreOneValue`, `TestParserErrorsDoNotEchoValues` |
+| Posse do aborto, `SIGQUIT`, bind, emergência, reingestão, ring, `Deliver` (os mesmos do `go-syslog-pg-server`) | — | os de §9 do `go-syslog-pg-server`, com os mesmos nomes (`port_review_*_test.go`, `port_lifecycle_test.go`, `publish_test.go`, `review_port_test.go`) |
+| Lacunas (mutantes que sobreviviam no RN) | — | `TestNATSPublishErrorAfterTheFirstTaints`, `TestNATSLogicRefusalInAnAckTaints`, `TestNATSLibraryNeverRepublishes`, `TestNATSRefusedCredentialsAreFatal`, `TestNATSRealServerRequiringTLSIsRefusedWithoutAHandshake` |
+

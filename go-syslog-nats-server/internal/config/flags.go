@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -58,7 +59,7 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			}
 			if after != "" {
 				return nil, m, fmt.Errorf("unexpected argument after --%s: a value with a space goes "+
-					"in quotes, and this server takes only --name=value options", after)
+					"in quotes, and options are --name=value or --name value", after)
 			}
 			// Only what precedes a '=': "sink.nats.password=x" without its
 			// dashes would otherwise print the password (SPEC §13.2).
@@ -66,9 +67,9 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			if k, _, cut := strings.Cut(arg, "="); cut {
 				shown = k + "=..."
 			}
-			return nil, m, fmt.Errorf("unexpected argument %q: this server takes only --name=value options", shown)
+			return nil, m, fmt.Errorf("unexpected argument %q: options are --name=value or --name value", shown)
 		}
-		prev := loose
+		prev, prevAfter := loose, after
 		loose, after = "", ""
 		body := strings.TrimLeft(arg, "-")
 
@@ -94,34 +95,53 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			}
 			v := args[i]
 			if next, ok := flagName(ix, v); ok {
-				if knownFlag(ix, next) {
+				// Named only when it was written with two dashes: "-h" or
+				// "-v" is also what a two-character value starting with a
+				// dash looks like ("--sink.nats.password -h").
+				if knownFlag(ix, next) && strings.HasPrefix(v, "--") {
 					return "", fmt.Errorf("flag --%s requires a value; the next argument is the flag --%s",
 						name, next)
 				}
-				// Not a flag of this server: a typo, or a value that starts
-				// with "--" ("--sink.nats.password --x"). Either way it is not
+				// Not a flag of this server (or one written with one dash): a
+				// typo, or a value that starts with a dash
+				// ("--sink.nats.password --x"). Either way it is not
 				// printed.
-				return "", fmt.Errorf("flag --%s requires a value; the next argument starts with \"--\" "+
-					"and is no flag of this server: a value like that goes right after the '='", name)
+				return "", fmt.Errorf("flag --%s requires a value; the next argument starts with a dash "+
+					"like a flag: a value like that goes right after the '='", name)
 			}
 			i++
 			return v, nil
 		}
 
 		switch name {
-		case "help", "h":
-			m.Help = true
-			continue
-		case "version", "v":
-			m.Version = true
-			continue
-		case "dump-config":
-			m.DumpConfig = true
+		case "help", "h", "version", "v", "dump-config":
+			if hasVal {
+				// "--dump-config=false" dumped and exited 0: a switch takes
+				// no value, and an ignored one may mean the opposite. The
+				// value is not shown (independent review, 2026-10-13).
+				return nil, m, fmt.Errorf("flag --%s takes no value", name)
+			}
+			switch name {
+			case "help", "h":
+				m.Help = true
+			case "version", "v":
+				m.Version = true
+			default:
+				m.DumpConfig = true
+			}
 			continue
 		case "config":
 			v, err := takeValue()
 			if err != nil {
 				return nil, m, err
+			}
+			if v == "" {
+				// An explicit empty --config fell back to SYSLOG_CONFIG,
+				// the opposite of what it says (independent review,
+				// 2026-10-13). The argument after it is not shown: it may
+				// be the value typed after a space.
+				return nil, m, errors.New("flag --config has an empty value: name the file right " +
+					"after the '=', or leave --config out")
 			}
 			m.ConfigFile = v
 			assigned(v)
@@ -133,6 +153,15 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			if prev != "" {
 				// After an empty value, an unknown "-x" is that value.
 				return nil, m, looseErr(prev)
+			}
+			if prevAfter != "" && !ix.knownSectionOf(name) {
+				// After a value, an unknown "-x" may be the tail of that value
+				// the shell split at a space ("--sink.nats.password=abc
+				// -hunter2", "... abc --x=y"): it is named only when it is a
+				// typo inside a section this server has ("--sink.nats.subjet"),
+				// never otherwise (SPEC §16.2).
+				return nil, m, fmt.Errorf("unexpected argument after --%s: a value with a space goes "+
+					"in quotes, and options are --name=value or --name value", prevAfter)
 			}
 			return nil, m, fmt.Errorf("%w (try --help)", err)
 		}
