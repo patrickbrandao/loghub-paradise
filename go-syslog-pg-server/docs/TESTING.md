@@ -202,15 +202,21 @@ o consumo `FOR UPDATE SKIP LOCKED` em ordem de `uuid`, a escrita de envelopes
 **reingeridos** (colunas tiradas do cabeçalho da linha,
 `TestPostgresWritesReingestedEnvelopes`), o `PGSSLMODE=require` do ambiente
 ignorado (`TestPostgresIgnoresPGSSLMODE`), a classificação por SQLSTATE (classe
-`42` fatal, senha errada fatal, sessão somente leitura fatal) e a validação do
-boot: tabela, tipos, índice único exatamente sobre `(uuid)`, outros índices
+`42` fatal, senha errada fatal, sessão somente leitura fatal, `23502` de uma
+coluna obrigatória acrescentada depois do boot fatal,
+`TestPostgresNotNullViolationIsFatal`), a validação do boot com prazo próprio
+atrás de um proxy que atrasa cada pacote (`TestPostgresValidationHasItsOwnDeadline`:
+passa de um prazo de checagem curto, e um boot cancelado no meio a interrompe) e
+a validação do boot: tabela, tipos, índice único exatamente sobre `(uuid)`, outros índices
 únicos e exclusão recusados, tabela particionada recusada, banco `LATIN1`
 recusado, privilégio, coluna extra obrigatória.
 
 Sem servidor: `TestPostgresInboxFileIsTheSkillDDL` confere o hash da DDL da
 skill em `docker/postgres/inbox.sql` (não edite o bloco da DDL),
 `TestNewPostgresIgnoresTheLibpqEnvironment` o pool livre do ambiente libpq e
-sem TLS, `TestClassifySQLState` a tabela de SPEC §10.5, e `FuzzInboxPayload` e
+sem TLS, `TestClassifySQLState` a tabela de SPEC §10.5 (`23502` fatal inclusive),
+`TestValidationContext*` e `TestHealthChecksCarryTheirLifetime` o prazo próprio
+da validação e o cancelamento que ainda chega a ela, e `FuzzInboxPayload` e
 `FuzzJSONBSafe` a troca do NUL. Em `internal/config`, `TestEBURLRefusesTLS`
 prova que `sslmode=require`, `verify-ca` e `verify-full` são exit 1 e que
 `disable`, `allow`, `prefer` e a ausência passam.
@@ -391,3 +397,22 @@ tabela. `-race` verde com PostgreSQL 18.
 | `sink.postgres.addr` com tab, `[h:5432]:5433` ou socket com `,` | um nome DNS que ninguém resolve, retentado o `boot_timeout` | `TestPostgresAddrNamesOneServer` |
 | Derivado escrito como chave no `--dump-config`; sinônimos do charset como mudança no `SIGHUP` | o dump relido congelava o derivado; restart pedido para nada | `TestDumpCommentsDerivedValues`, `TestCharsetSynonymsAreOneValue` |
 
+### `23502` e o prazo da validação (2026-10-13)
+
+Os itens 5 e 6 de SPEC §22.1, portados do `go-relplog-pg-server` com os testes
+dele (`review_port_rp_test.go`, `review_port_rp_pg_test.go`). **Conferência por
+mutação**, cada uma sozinha e revertida: sem o `case "23502"` caem
+`TestClassifySQLState` e `TestPostgresNotNullViolationIsFatal`; com
+`p.validate(ctx)` no lugar do contexto próprio cai
+`TestPostgresValidationHasItsOwnDeadline`; sem `withLifetime` no `Health` cai
+`TestHealthChecksCarryTheirLifetime`; com a vida ignorada em
+`validationContext` cai `TestValidationContextFollowsABootCancelledAfterTheCheckDeadline`;
+com um `WithoutCancel` puro caem os dois `FollowsA…` e o subteste do boot
+cancelado no banco real. `-race` verde com PostgreSQL 18. Não provado por
+teste: o `ValidateTimeout: a.cfg.Sink.OpTimeout` do app, que hoje coincide com o
+padrão (`ConnectTimeout`, também `op_timeout`).
+
+| Achado | Consequência sem a correção | Teste |
+|---|---|---|
+| `23502` em execução era `logic` | coluna `NOT NULL` acrescentada depois do boot: todo pedaço descartado com o sink UP, para sempre | `TestClassifySQLState`, `TestPostgresNotNullViolationIsFatal` |
+| Validação do boot no `sink.health_timeout` (1 s) | a ~55 ms de RTT nenhuma tentativa terminava; exit 3 no `boot_timeout` culpando a rede | `TestPostgresValidationHasItsOwnDeadline`, `TestValidationContext*`, `TestHealthChecksCarryTheirLifetime` |

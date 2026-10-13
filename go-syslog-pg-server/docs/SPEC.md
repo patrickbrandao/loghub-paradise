@@ -1527,8 +1527,8 @@ instâncias** e entre produtores LogHub, a `loghub.inbox` de §3.7.1.
   impõe unicidade.
   **Coluna extra obrigatória:** é FATAL se uma coluna fora das dez for `NOT
   NULL` sem default, não identidade e não gerada. Sem isso, a validação passava e
-  toda escrita virava `23502`, `logic`: lotes descartados para sempre com o sink
-  UP (§20.18). `received_at` passa porque tem `DEFAULT now()`. Pelo catálogo, não
+  toda escrita virava `23502`, que só derruba o processo depois de o boot ter
+  dado a fila por boa (§20.18). `received_at` passa porque tem `DEFAULT now()`. Pelo catálogo, não
   por sonda: uma sonda dispararia triggers do operador e consumiria sequências,
   e a recusa dela não nomeia a coluna.
 - Em tempo de execução, um `23514` que não nomeia constraint (a partição que
@@ -1543,8 +1543,29 @@ instâncias** e entre produtores LogHub, a `loghub.inbox` de §3.7.1.
 |---|---|
 | `08`, `53`, `57`, `40` | `network` |
 | `22`, `23` (fora do `ON CONFLICT`) | `logic` |
-| **`42`** (esquema), **`3D`** (o banco não existe), `28`, `2F`, `42501`, `25006`, `0A000`, `23514` sem constraint nomeada | **`fatal`** |
+| **`42`** (esquema), **`3D`** (o banco não existe), `28`, `2F`, `42501`, `25006`, **`23502`**, `0A000`, `23514` sem constraint nomeada | **`fatal`** |
 | qualquer outra | `network` |
+
+`23502` (`not_null_violation`) é `fatal` (porte do `go-relplog-pg-server`,
+2026-10-13; antes §22.1 item 5): o servidor nunca manda `NULL` nas dez colunas,
+então ele vem da **tabela** — uma coluna `NOT NULL` acrescentada depois do boot,
+o `DEFAULT` de `received_at` retirado, um trigger que escreve `NULL` — e, como
+`logic` (classe `23`), descartaria todo pedaço com o sink UP, para sempre. Como
+`fatal` é dump e exit 3, e o boot seguinte já recusa a coluna extra obrigatória
+pelo nome. O custo, aceito: um trigger que anula uma coluna só em certas linhas
+passa a derrubar o processo na primeira delas, em vez de descartar só aqueles
+pedaços.
+
+**A validação do boot tem prazo próprio** (porte do `go-relplog-pg-server`,
+2026-10-13; antes §22.1 item 6): roda com `sink.op_timeout`, não no
+`sink.health_timeout` (1 s) da checagem que a dispara. São ~18 idas e voltas
+(conexão, SCRAM, as consultas de catálogo, cada uma preparada na primeira vez):
+a ~55 ms de RTT nenhuma tentativa cabia em 1 s, e o boot saía com 3 no
+`boot_timeout` culpando a rede. O prazo da checagem é trocado, não o
+cancelamento: um `SIGTERM` durante o boot ainda interrompe a validação, porque
+as checagens de saúde carregam o contexto de quem as chamou como "tempo de
+vida" (`withLifetime`), que a validação vigia (`validationContext`). A checagem
+periódica depois do boot não valida nada e segue no `sink.health_timeout`.
 
 **A classe `42` é fatal e nunca `logic`**: uma tabela dropada classificada como
 `logic` descartaria um lote a cada 5 ms, para sempre, num processo que parece
@@ -1914,8 +1935,9 @@ como perdido **e** guardado: sobra, nunca perda, e nada mais é contado (§13.4)
     reingestão do passo 9 lê o diretório de qualquer forma)
  7. SINK: pool preguiçoso; WaitReady com retentativa até sink.boot_timeout
     (300 s) => exit 3; validação de tabela, tipos, índices, permissão e
-    recuperação (§10.5): recusa => exit 3 IMEDIATO, com o log "the sink
-    refused this server permanently" (e não "within sink.boot_timeout")
+    recuperação (§10.5), com prazo próprio de sink.op_timeout: recusa =>
+    exit 3 IMEDIATO, com o log "the sink refused this server permanently"
+    (e não "within sink.boot_timeout")
  8. RING memory, workers (ainda parados) e o pipeline de recepção montados
  9. antes, o temporário gêmeo de um dump é removido e o de um dump
     interrompido vira um WARN com o caminho, intocado (§12.1);
@@ -2466,7 +2488,7 @@ Removido no go-syslog-pg-server (§1.2).
 | `batch` | `256` | itens por `Dequeue` e linhas por `INSERT`; 1–65 536 |
 | `batch_max_bytes` | `16MiB` | teto de JLH por pedaço; no máximo 256 MiB, abaixo da mensagem de 1 GiB da libpq |
 | `batch_max_delay` | `5ms` | espera máxima para completar um lote; `0` = sem espera |
-| `op_timeout` | `5s` | prazo de uma escrita e da discagem |
+| `op_timeout` | `5s` | prazo de uma escrita, da discagem e da validação do boot (§10.5) |
 | `health_interval` | `2s` | período da checagem; também a latência de UP→DOWN |
 | `health_timeout` | `1s` | prazo de uma checagem |
 | `fail_timeout` | `30s` | DOWN antes de FATAL; `0` = sem fusível por tempo |
@@ -2913,27 +2935,11 @@ sai daqui e a regra vai para a seção que ele cita, spec primeiro.
    `timestamp` omitido, o resto do cabeçalho segue), registrado como desvio D9 e
    levado ao mantenedor da skill; ou dizer em §6.5.1 que a referência aceita
    qualquer offset de dois dígitos.
-5. **`23502` em execução é `logic`** (§10.5). Este servidor nunca manda NULL
-   nas dez colunas, então um `not_null_violation` depois do boot é recusa da
-   **tabela** (uma coluna `NOT NULL` acrescentada, o `DEFAULT` de `received_at`
-   retirado, um trigger): como classe `23`, todo pedaço é descartado em
-   `sink_logic` com o sink UP, para sempre. Direção: `23502` fatal (dump e exit
-   3; o boot seguinte já recusa a coluna extra obrigatória pelo nome), com a
-   tabela de §10.5 e `TestClassifySQLState` mudando juntas; um trigger que anula
-   uma coluna só em certas linhas passa a derrubar o processo, e isso fica
-   escrito. O `go-relplog-pg-server` já tem a correção (2026-10-13), a portar.
-6. **A validação do boot corre no prazo da sonda de saúde** (§10.5, §13.1 passo
-   7). O `Health` roda a validação com o contexto de `sink.health_timeout` (1 s),
-   e ela custa ~18 idas e voltas (conexão, SCRAM e as consultas de catálogo,
-   cada uma preparada na primeira vez): com o banco a mais de ~55 ms de RTT
-   nenhuma tentativa termina, e o boot sai com 3 no `boot_timeout` culpando a
-   rede. Subir `health_timeout` contorna, mas afrouxa a detecção de queda.
-   Direção: a validação com prazo próprio de `sink.op_timeout`, ainda seguindo o
-   cancelamento do boot (`ValidateTimeout`, `validationContext` e
-   `withLifetime` do `go-relplog-pg-server`, a portar).
 
 Os itens 7 a 10 de antes (erros da `LOGHUB_EB_URL` com trechos dela, logs
 falsos depois de um `fsync` de diretório falho, `syslog_emergency_files` zerado
 com dump no disco, `SIGQUIT` tolerado no shutdown por FATAL) foram corrigidos no
-porte de 2026-10-13 e vivem em §10.9, §12.2 e §13.4.
+porte de 2026-10-13 e vivem em §10.9, §12.2 e §13.4. Os itens 5 e 6 (`23502`
+fatal, a validação do boot com prazo próprio de `sink.op_timeout`) foram
+portados do `go-relplog-pg-server` no mesmo dia e vivem em §10.5 e §13.1.
 

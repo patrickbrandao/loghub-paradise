@@ -241,9 +241,14 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 5180   # o logger do ma
   não `len(cru)`. `TestItemOverheadCoversTheStruct` falha se a struct crescer.
 - **Fronteira de histograma como string** pré-formatada na inicialização.
 - **Slices do pool do `unnest`** voltam zerados.
-- **Classes `42` e `3D` são fatais**, nunca `logic` nem `network` (uma tabela
-  ou um banco que não existe não aparece esperando). Erro desconhecido é
-  `network`.
+- **Classes `42` e `3D`, o `23502` e o `0A000` são fatais**, nunca `logic` nem
+  `network` (uma tabela ou um banco que não existe não aparece esperando; o
+  `NULL` de um `23502` nunca vem deste servidor, vem da tabela). Erro
+  desconhecido é `network`.
+- **A validação do boot tem prazo próprio** (`sink.op_timeout`), não o da sonda
+  de saúde (1 s, que a ~55 ms de RTT nunca bastava); toda checagem de saúde
+  carrega o contexto de quem a chamou (`withLifetime`), para que um `SIGTERM`
+  ainda a interrompa.
 - **Nunca DDL.** A fila vem de `docker/postgres/inbox.sql`, DDL literal da skill
   (um teste confere o hash: não edite o bloco), chave só `uuid`, PostgreSQL 18.
 - **`jsonb` recusa `\u0000`** (`22P05`, classe 22, o pedaço inteiro

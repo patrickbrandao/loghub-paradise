@@ -42,6 +42,11 @@ func TestClassifySQLState(t *testing.T) {
 		"28P01", // invalid_password
 		"2F005", // function executed no return statement
 		"3D000", // invalid_catalog_name: the database does not exist
+		// 23502 not_null_violation: the sink never sends NULL, so it is the
+		// table (a required column added, a DEFAULT dropped); as logic it
+		// dropped every chunk with the sink UP (ported from
+		// go-relplog-pg-server, 2026-10-13).
+		"23502",
 		// 0A000 feature_not_supported: ON CONFLICT on a table with an INSERT
 		// or UPDATE rule; as network it was retried forever (ported from
 		// go-relplog-pg-server's review of 2026-10-13).
@@ -64,7 +69,7 @@ func TestClassifySQLState(t *testing.T) {
 			t.Errorf("SQLSTATE %s = %v, want network", c, got)
 		}
 	}
-	logic := []string{"22021", "22003", "22P02", "22P05", "23502", "23505", "23514"}
+	logic := []string{"22021", "22003", "22P02", "22P05", "23505", "23514"}
 	for _, c := range logic {
 		if got := classifySQLState(c); got != ClassLogic {
 			t.Errorf("SQLSTATE %s = %v, want logic", c, got)

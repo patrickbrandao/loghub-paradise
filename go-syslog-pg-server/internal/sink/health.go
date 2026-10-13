@@ -152,7 +152,9 @@ func (h *Health) Run(ctx context.Context) {
 }
 
 func (h *Health) check(ctx context.Context) {
-	cctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+	// The check carries ctx as its lifetime: a boot validation that outlives
+	// sink.health_timeout (validationContext) watches it for cancellation.
+	cctx, cancel := context.WithTimeout(withLifetime(ctx), h.cfg.Timeout)
 	start := time.Now()
 	err := h.sink.Health(cctx)
 	elapsed := time.Since(start)
@@ -261,7 +263,9 @@ func (h *Health) WaitReady(ctx context.Context, timeout, backoffMin, backoffMax 
 	var lastErr error
 
 	for attempt := 1; ; attempt++ {
-		cctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+		// The boot's context is the lifetime of this check: a validation
+		// running past the check's deadline still sees a SIGTERM (SPEC §10.5).
+		cctx, cancel := context.WithTimeout(withLifetime(ctx), h.cfg.Timeout)
 		err := h.sink.Health(cctx)
 		cancel()
 
