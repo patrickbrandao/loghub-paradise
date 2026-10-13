@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-server/internal/config"
+	"github.com/patrickbrandao/loghub-paradise/go-relplog-server/internal/emergency"
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-server/internal/item"
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-server/internal/obs"
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-server/internal/ring"
 )
 
-// Regression tests from the independent review of 2026-10-11 (SPEC §13.4).
+// Regression tests from the independent review of go-relplog-server,
+// 2026-10-11 (SPEC §13.4): the "A portar" of its CHANGELOG entry (dumpPhase +
+// Swap, the late SIGQUIT), ported to this server with the same tests.
 
 // abortApp is the part of an App that abortLoss and dumpEmergency read: a
 // memory ring holding five messages, two of them in a batch a worker holds.
@@ -28,8 +31,7 @@ func abortApp(t *testing.T) (*App, []*item.Item) {
 		}
 	}
 	held, _ := r.Dequeue(context.Background(), 2)
-	cfg := &config.Config{}
-	cfg.Ring.Mode = config.RingModeMemory
+	cfg := config.Defaults()
 	a := &App{cfg: cfg, ring: r, metrics: obs.NewMetrics(obs.Info{}), log: obs.NewLogger(io.Discard, "text", "error")}
 	return a, held
 }
@@ -79,6 +81,32 @@ func TestAbortAndDisabledDumpCountOnce(t *testing.T) {
 	}
 }
 
+// After a dump that FAILED the loss is emergency_failed's, counted once, and an
+// abort racing it counts nothing more (Swap: one side only).
+func TestAbortAndFailedDumpCountOnce(t *testing.T) {
+	a, held := abortApp(t)
+	items := append(held, a.ring.Drain()...)
+	dir := t.TempDir()
+	a.emg = emergencyStoreIn(t, dir)
+	// A directory that is not there any more fails the write.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, nil, 0o600); err != nil { // a file where the directory was
+		t.Fatal(err)
+	}
+	a.dumpPhase.Store(true)
+	a.dumping.Store(int64(len(items)))
+	if a.dumpEmergency(items) {
+		t.Fatal("the dump into a file instead of a directory succeeded")
+	}
+	a.abortLoss() // an abort right after the failure
+	failed := a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Load()
+	if failed != uint64(len(items)) || aborted(a) != 0 {
+		t.Fatalf("emergency_failed %d, abort %d; want %d and 0", failed, aborted(a), len(items))
+	}
+}
+
 // A SIGQUIT that reached only run's watcher -- after the shutdown branch was
 // taken, before the abort channel existed -- still aborts at once.
 func TestLateSIGQUITStillAborts(t *testing.T) {
@@ -98,4 +126,10 @@ func TestLateSIGQUITStillAborts(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the graceful shutdown ran although SIGQUIT had arrived")
 	}
+}
+
+// emergencyStoreIn is the store of an App whose emergency.dir is dir.
+func emergencyStoreIn(t *testing.T, dir string) *emergency.Store {
+	t.Helper()
+	return emergency.NewStore(dir, testID.From)
 }

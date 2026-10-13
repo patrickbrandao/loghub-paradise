@@ -34,10 +34,18 @@ type ebValue struct{ name, raw string }
 // naming both sources.
 func applyEBURL(l *Loaded, ix *index) error {
 	c := l.Config
-	if strings.TrimSpace(c.LogHub.EBURL) == "" {
+	if c.LogHub.EBURL == "" {
 		return nil
 	}
 	ebOrigin := l.Origin["loghub.eb_url"]
+	if strings.TrimSpace(c.LogHub.EBURL) == "" {
+		// Set, to nothing visible: an operator who meant to unset it would
+		// not know the [sink.*] keys are what runs, and the dump showed the
+		// blanks as if they were a URL (independent review of
+		// go-relplog-pg-server, 2026-10-13).
+		return fmt.Errorf("loghub.eb_url (%s) holds only blanks: unset it, or give an eventbus URL",
+			ebOrigin)
+	}
 
 	t, err := parseEBURL(c.LogHub.EBURL)
 	if err != nil {
@@ -103,7 +111,11 @@ func parseEBURL(raw string) (ebTarget, error) {
 		// One server only. Splitting on commas is not an option here: a
 		// password may legally contain one.
 		if strings.Count(s, "://") > 1 {
-			return ebTarget{}, fmt.Errorf("a %s:// URL names one server; only nats:// takes a list",
+			// A second "://" is a second URL -- or one inside the password,
+			// which is the case the message must also cover (independent
+			// review of go-relplog-pg-server, 2026-10-13).
+			return ebTarget{}, fmt.Errorf("a %s:// URL names one server (only nats:// takes a list), "+
+				"and holds \"://\" only once: a \"://\" in the password must be percent-encoded (%%3A%%2F%%2F)",
 				strings.ToLower(scheme))
 		}
 		if strings.HasPrefix(strings.ToLower(scheme), "redis") {
@@ -143,11 +155,36 @@ func parseURL(s string) (*url.URL, error) {
 	if err != nil {
 		var ee url.EscapeError
 		if errors.As(err, &ee) {
+			if strings.Contains(authorityHost(s), "%") {
+				// libpq reads "postgres://%2Frun%2Fpg/db" as a socket
+				// directory; Go's parser refuses an escape in a host, and
+				// "invalid percent-escape" sent the operator after the
+				// password (independent review of go-relplog-pg-server,
+				// 2026-10-13).
+				return nil, errors.New("not a valid URL: a percent-encoded host is not supported; " +
+					"give a unix socket directory as ?host=/dir, with no host before the path")
+			}
 			return nil, errors.New("not a valid URL: it holds an invalid percent-escape")
 		}
 		return nil, errors.New("not a valid URL")
 	}
 	return u, nil
+}
+
+// authorityHost is the host part of s's authority, on the text: what follows
+// the last '@' before the first '/', '?' or '#' after "://".
+func authorityHost(s string) string {
+	_, rest, ok := strings.Cut(s, "://")
+	if !ok {
+		return ""
+	}
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		rest = rest[:end]
+	}
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		rest = rest[at+1:]
+	}
+	return rest
 }
 
 // slashedUserinfo reports an '@' past the end of the authority: after the
@@ -221,6 +258,14 @@ func parseRedisURL(s string) (ebTarget, error) {
 	host := u.Hostname()
 	if host == "" {
 		return ebTarget{}, errors.New("a Redis URL needs a host")
+	}
+	if strings.Contains(host, ",") {
+		// sink.redis.addrs is a comma-separated list: "r1,r2" here became
+		// two addresses -- a cluster nobody configured -- out of a URL that
+		// names one server (go-syslog-server review, 2026-10-13). The host is
+		// not shown: it is what a mangled password lands in.
+		return ebTarget{}, errors.New("a Redis URL names one server: its host holds a ',' " +
+			"(several servers go in sink.redis.addrs)")
 	}
 	port := u.Port()
 	if port == "" {
@@ -300,12 +345,29 @@ func parsePostgresURL(s string) (ebTarget, error) {
 		}
 	}
 
+	if vs, ok := q["host"]; ok && vs[0] == "" {
+		// libpq reads an empty host= as "not set" and dials its default
+		// socket directory, where this server dialled the authority's host:
+		// one URL, two servers (go-syslog-server review, 2026-10-13). Refused
+		// like an empty sslmode below.
+		return ebTarget{}, errors.New("the host= of the PostgreSQL URL is empty: drop it, or give " +
+			"a unix socket directory (?host=/run/postgresql)")
+	}
 	var addr string
 	switch socket := q.Get("host"); {
 	case socket != "":
 		if !strings.HasPrefix(socket, "/") || u.Hostname() != "" {
 			return ebTarget{}, errors.New("host= in a PostgreSQL URL must be a unix socket " +
 				"directory starting with /, with no host before the path")
+		}
+		// libpq reads host= literally: "/run/pg,/x" is two servers and
+		// "/run/pg:5433" a directory with a ':' in its name, where this
+		// server would read a directory and a port. Neither is one server
+		// in both readings (independent review of go-relplog-pg-server,
+		// 2026-10-13).
+		if strings.ContainsAny(socket, ",: \t") {
+			return ebTarget{}, errors.New("host= in a PostgreSQL URL names one socket directory, " +
+				"with no ',', ':' or blank; the port goes in the URL (postgres://u@:5433/db?host=/run/pg)")
 		}
 		addr = socket
 		// postgres://u:p@:5433/db?host=/run/pg: libpq dials
@@ -329,6 +391,13 @@ func parsePostgresURL(s string) (ebTarget, error) {
 	// so they all turn TLS on; SPEC §10.9 names require and verify-full, and
 	// verify-ca demands TLS just the same. Verification itself follows
 	// sink.postgres.tls_ca and tls_insecure, which the URL cannot express.
+	if vs, ok := q["sslmode"]; ok && vs[0] == "" {
+		// libpq refuses an empty sslmode; read as "not set" here, the URL
+		// meant two things to two readers (independent review of
+		// go-relplog-pg-server, 2026-10-13).
+		return ebTarget{}, errors.New("the sslmode of the PostgreSQL URL is empty: drop it or give " +
+			"a libpq sslmode")
+	}
 	var tlsOn bool
 	switch mode := q.Get("sslmode"); mode {
 	case "", "disable", "allow", "prefer":
@@ -340,20 +409,28 @@ func parsePostgresURL(s string) (ebTarget, error) {
 			"(disable, allow, prefer, require, verify-ca, verify-full)")
 	}
 
+	// The user and the database are required (SPEC §10.9; decision ported
+	// from go-relplog-pg-server, 2026-10-13). Left out, libpq would take the
+	// operating-system user and a database of the same name, and this server
+	// took the registry's default, "syslog": two readers of one LOGHUB_EB_URL
+	// reaching two databases. The URL owns both keys, so the operator could
+	// not fix it elsewhere either.
+	if u.User == nil || u.User.Username() == "" {
+		return ebTarget{}, errors.New("the PostgreSQL URL names no user: put it before the '@' " +
+			"(postgres://user:password@host/database)")
+	}
+	db := strings.TrimPrefix(u.Path, "/")
+	if db == "" {
+		return ebTarget{}, errors.New("the PostgreSQL URL names no database: put it in the path " +
+			"(postgres://user:password@host/database)")
+	}
+	pass, _ := u.User.Password()
 	values := []ebValue{
 		{"sink.postgres.addr", addr},
 		{"sink.postgres.tls", strconv.FormatBool(tlsOn)},
-	}
-	var pass string
-	if u.User != nil {
-		if user := u.User.Username(); user != "" {
-			values = append(values, ebValue{"sink.postgres.username", user})
-		}
-		pass, _ = u.User.Password()
-	}
-	values = append(values, ebValue{"sink.postgres.password", pass})
-	if db := strings.TrimPrefix(u.Path, "/"); db != "" {
-		values = append(values, ebValue{"sink.postgres.database", db})
+		{"sink.postgres.username", u.User.Username()},
+		{"sink.postgres.password", pass},
+		{"sink.postgres.database", db},
 	}
 	return ebTarget{
 		sinkType: SinkTypePostgres,

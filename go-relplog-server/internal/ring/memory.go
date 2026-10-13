@@ -240,6 +240,31 @@ func (r *Memory) Stats() Stats {
 	}
 }
 
+// FullFor is a cheap, racy pre-check for the receiver: true when an Enqueue of
+// an n-byte line right now would fail on EITHER ceiling. Enqueue stays the
+// authority.
+//
+// n is the length the receiver is about to copy (after truncation), and the
+// byte test is heldBytes of the item that copy would make: the pooled class of
+// n plus ItemOverhead. Without it a transaction held on a full ring took a
+// pooled buffer, copied the line and built an item on every 50 ms retry, only
+// for Enqueue to refuse it (independent reviews of go-syslog-pg-server and
+// go-relplog-pg-server, 2026-10-13; SPEC §5.7). Only the memory ring has one:
+// the sqlite and redis rings would answer it with a query, which costs more
+// than the copy it saves.
+//
+// A closed ring is never "full": Enqueue then reports ErrClosed, which the
+// receiver answers as the shutdown it is, not as backpressure.
+func (r *Memory) FullFor(n int) bool {
+	if r.closed.Load() {
+		return false
+	}
+	if r.items.Load() >= r.capItems {
+		return true
+	}
+	return r.capBytes > 0 && r.bytes.Load()+int64(item.PooledCap(n))+ItemOverhead > r.capBytes
+}
+
 // Touch is a no-op: nothing else can claim an item held in this process.
 func (r *Memory) Touch([]*item.Item) error { return nil }
 

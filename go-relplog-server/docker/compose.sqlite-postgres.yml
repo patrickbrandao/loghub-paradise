@@ -40,7 +40,7 @@ services:
       # (SPEC §10.5). Acima de 16 tambem e' WARN.
       RELPLOG_SINK_WORKERS: "4"
       RELPLOG_SINK_POSTGRES_TABLE: ${RELPLOG_SINK_POSTGRES_TABLE:-loghub.inbox}
-      # 0 deriva sink.workers + 1 = 5.
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, SPEC §10.5).
       RELPLOG_SINK_POSTGRES_POOL_SIZE: ${RELPLOG_SINK_POSTGRES_POOL_SIZE:-0}
       # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
       # URL no lugar delas, apague as quatro linhas abaixo e descomente a

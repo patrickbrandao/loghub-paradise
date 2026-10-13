@@ -208,6 +208,13 @@ e, num rsyslog: `action(type="omrelp" target="127.0.0.1" port="20514")`.
 - **O `close` do cliente espera as transações em voo** antes da resposta dele.
 - **Testes de janela correm**: as transações de uma janela entram no ring em
   qualquer ordem. Libere pelo conteúdo, nunca pela posição.
+- **O fim da sessão é conferido até o `Enqueue`.** O ring de memória nunca olha
+  o contexto: uma transação montada depois do fim da sessão entraria no ring
+  pelas costas da retransmissão do `librelp` (duplicata). Num teste que encerra
+  a sessão, espere o ring antes de esperar o `200`.
+- **O buffer grande do leitor só é solto com nada no `bufio.Reader`.** Solto
+  antes de todo frame, um emissor de linhas de 24 KiB realocava o buffer inteiro
+  por frame (`BenchmarkRELPReaderFrames`).
 
 ### Herdadas do S
 
@@ -222,6 +229,11 @@ e, num rsyslog: `action(type="omrelp" target="127.0.0.1" port="20514")`.
 - **Fronteira de histograma como string** pré-formatada na inicialização.
 - **Slices do pool do `unnest`** voltam zerados.
 - **Classe `42` é fatal, nunca `logic`.** Erro desconhecido é `network`.
+- **A sonda de saúde SQL tem conexão própria, fora do pool.** No pool, escritas
+  lentas a deixavam sem conexão e um banco sadio ia a FATAL; o pool é dos
+  escritores (`pool_size` deriva `sink.workers`). A posse da contagem do aborto
+  passa toda por `lossMu` (`enterDumpPhase`, `oweDump`, `settleDump`): um
+  `Swap` fora dele reabre a janela do motivo errado.
 - **Nunca DDL** em postgres/mysql; nunca criar stream NATS.
 - **`sink=postgres` é a fila `loghub.inbox` da skill** (SPEC §3.7.1): DDL
   literal em `docker/postgres/inbox.sql` (um teste confere o hash), chave só

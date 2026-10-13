@@ -22,9 +22,11 @@ func TestReviewAccepts(t *testing.T) {
 		{"LOGHUB_EB_URL": "postgres://u:p%2Fw@[2001:db8::1]:5433/loghub?sslmode=verify-full"},
 		{"LOGHUB_EB_URL": "postgresql://u:p@/loghub?host=/var/run/postgresql"},
 		{"LOGHUB_EB_URL": "postgresql://u:p@:5433/loghub?host=/var/run/postgresql"},
-		{"LOGHUB_EB_URL": "postgresql:///loghub?host=/var/run/postgresql"},
+		// User and database are required since 2026-10-13 (SPEC §10.9,
+		// TestEBURLMustNameItsParts): these two keep a user and a database.
+		{"LOGHUB_EB_URL": "postgresql://u@/loghub?host=/var/run/postgresql"},
 		{"LOGHUB_EB_URL": "postgres://u:p@db/loghub"},
-		{"LOGHUB_EB_URL": "postgres://u@db"},
+		{"LOGHUB_EB_URL": "postgres://u@db/loghub"},
 		{"RELPLOG_SINK_TYPE": "postgres", "RELPLOG_SINK_POSTGRES_ADDR": "/var/run/postgresql"},
 		{"RELPLOG_SINK_TYPE": "postgres", "RELPLOG_SINK_POSTGRES_ADDR": "/var/run/postgresql:5433"},
 		{"RELPLOG_SINK_TYPE": "postgres", "RELPLOG_SINK_POSTGRES_ADDR": "[::1]:5432"},

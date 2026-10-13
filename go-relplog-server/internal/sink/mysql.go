@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -58,8 +59,14 @@ type MySQLConfig struct {
 type MySQL struct {
 	cfg MySQLConfig
 	db  *sql.DB
-	log *slog.Logger
-	m   *obs.Metrics
+	// probe is the health check's own one-connection pool, outside db (SPEC
+	// §10.6): in db, slow but working writes held every connection and the
+	// check waited past sink.health_timeout, DOWN and then FATAL with the
+	// server healthy (go-syslog-server review, 2026-10-13). database/sql
+	// replaces its connection when it breaks.
+	probe *sql.DB
+	log   *slog.Logger
+	m     *obs.Metrics
 
 	// quoted is the table as every statement names it: `db`.`t`.
 	quoted string
@@ -113,7 +120,7 @@ var mysqlIdent = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}(\.[A-Za-z0-9_]{1,64})?$
 // A backtick closes the quote (`a`b` is a syntax error at best, SQL at worst);
 // a backslash is an escape to ClickHouse inside backticks and changes the name
 // it reads; a control byte has no business in a name and would reach the logs
-// raw. More than 64 bytes is longer than either server accepts, so refusing
+// raw. More than 64 characters is longer than MySQL accepts, so refusing
 // it here only says so at exit 1 instead of as a server error on the first
 // check. On MySQL a refused statement would also be 1064, which the runtime
 // table classifies as network: the boot would wait sink.boot_timeout for a
@@ -124,8 +131,11 @@ func checkQuotedName(what, name string) error {
 	if name == "" {
 		return fmt.Errorf("%s is empty", what)
 	}
-	if len(name) > 64 {
-		return fmt.Errorf("%s %q has %d bytes; the limit is 64", what, name, len(name))
+	// Characters, not bytes: MySQL's limit is 64 characters, and a name in
+	// UTF-8 the server itself created (CREATE DATABASE `日本…`, 25 characters
+	// in 75 bytes) was refused here (go-syslog-server review, 2026-10-13).
+	if n := utf8.RuneCountInString(name); n > 64 {
+		return fmt.Errorf("%s %q has %d characters; the limit is 64", what, name, n)
 	}
 	for i := 0; i < len(name); i++ {
 		switch c := name[i]; {
@@ -265,6 +275,11 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	db.SetMaxIdleConns(cfg.PoolSize)
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(0)
+	probe := sql.OpenDB(connector)
+	probe.SetMaxOpenConns(1)
+	probe.SetMaxIdleConns(1)
+	probe.SetConnMaxLifetime(0)
+	probe.SetConnMaxIdleTime(0)
 
 	schema, name := cfg.Database, cfg.Table
 	if i := strings.IndexByte(cfg.Table, '.'); i >= 0 {
@@ -273,6 +288,7 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	p := &MySQL{
 		cfg:    cfg,
 		db:     db,
+		probe:  probe,
 		log:    log,
 		m:      m,
 		quoted: "`" + schema + "`.`" + name + "`",
@@ -498,7 +514,7 @@ func (p *MySQL) Health(ctx context.Context) error {
 		return ErrClosed
 	}
 	var readOnly int64
-	if err := p.db.QueryRowContext(ctx, "SELECT @@read_only").Scan(&readOnly); err != nil {
+	if err := p.probe.QueryRowContext(ctx, "SELECT @@read_only").Scan(&readOnly); err != nil {
 		return classifyMySQL("health", err)
 	}
 	p.observePool()
@@ -923,6 +939,7 @@ func (p *MySQL) Close() error {
 	if p.closed.Swap(true) {
 		return nil
 	}
+	_ = p.probe.Close()
 	return p.db.Close()
 }
 
@@ -997,12 +1014,19 @@ func mysqlNumberClass(n uint16) (Class, bool) {
 		return ClassFatal, true
 	case 1054, 1146, 1364: // unknown column, no such table, field has no default
 		return ClassFatal, true
+	// 1048 (column cannot be null) is the TABLE's, as PostgreSQL's 23502: the
+	// boot probe wrote NULL in every column this sink may leave NULL and the
+	// server took it, so after the boot a 1048 is a column made NOT NULL, or
+	// a trigger -- every chunk with a NULL there would be dropped, logic, with
+	// the sink UP (go-syslog-server review, 2026-10-13; SPEC §10.6).
+	case 1048:
+		return ClassFatal, true
 	// 1062 cannot come from the INSERT: ON DUPLICATE KEY absorbs a collision
 	// on ANY unique key -- which is why a second unique index is refused at
 	// boot instead of surfacing here as an error that never comes. What is
 	// left is a duplicate raised by something else in the statement (a
 	// trigger writing to another table): that row, so logic.
-	case 1048, 1062, 1153, 1264, 1366, 1406, 1690: // NULL refused, duplicate entry, packet too large, out of range, bad string, data too long
+	case 1062, 1153, 1264, 1366, 1406, 1690: // duplicate entry, packet too large, out of range, bad string, data too long
 		return ClassLogic, true
 	// 3819 is listed because its SQLSTATE is HY000, which the fallback cannot
 	// read: a CHECK the row fails is that row (the boot probe makes a CHECK

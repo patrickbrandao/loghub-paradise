@@ -50,6 +50,10 @@ func TestClassifySQLState(t *testing.T) {
 		// table (a required column added, a DEFAULT dropped); as logic it
 		// dropped every chunk with the sink UP (SPEC §22.1 item 7).
 		"23502",
+		// 0A000 feature_not_supported: ON CONFLICT on a table with an INSERT
+		// or UPDATE rule; as network it was retried forever with the sink UP
+		// (go-relplog-pg-server review, 2026-10-13).
+		"0A000",
 	}
 	for _, c := range fatal {
 		if got := classifySQLState(c); got != ClassFatal {

@@ -321,16 +321,23 @@ func fatalShutdownInDump(t *testing.T, n int) (*instance, string, func()) {
 	return in, dir, releaseFn
 }
 
-// settle lets the shutdown an abort left behind finish its dump, so it does
-// not write into a directory the test is removing. In the binary the abort's
-// os.Exit ends it instead.
+// settle lets the shutdown an abort left behind finish, and checks that the
+// dump it was writing was abandoned: the messages were counted lost by the
+// abort, so no file may reach the disk to be reingested at the next boot
+// (emergency.Store.SetAbandon, ported from go-relplog-nats-server, 2026-10-13).
+// In the binary the abort's os.Exit usually ends it first.
 func settle(t *testing.T, dir string, release func()) {
 	t.Helper()
 	release()
-	waitFor(t, 30*time.Second, "the abandoned dump to finish", func() bool {
-		d, _ := filepath.Glob(filepath.Join(dir, "emergency", "emg-*.bin"))
-		return len(d) == 1
-	})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		// A temporary may exist for an instant before the dump gives up; the
+		// final name never may.
+		if f, _ := filepath.Glob(filepath.Join(dir, "emergency", "emg-*.bin")); len(f) > 0 {
+			t.Fatalf("an aborted dump reached the disk: %v", f)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // SPEC §13.3, §13.4, §22.1 items 28 and 29. A FATAL shutdown starts with no

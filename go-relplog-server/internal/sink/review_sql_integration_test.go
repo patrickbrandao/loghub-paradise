@@ -3,6 +3,7 @@ package sink
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -241,18 +242,64 @@ func TestPostgresUnknownDatabaseIsFatal(t *testing.T) {
 
 // --------------------------------------------------------------- item 10
 
+// autocommitOffUser creates a MySQL user of this test whose sessions start
+// with autocommit=0, the way a my.cnf or an init_connect would leave them,
+// and returns a config that logs in as it. The init_connect is conditional on
+// that user: every other session -- the suite runs in parallel against one
+// server, shared with other suites -- keeps its own autocommit. The tests
+// once ran SET GLOBAL autocommit = 0, which every concurrent test inherited
+// until the cleanup (go-syslog-server review, 2026-10-13). init_connect does
+// not run for a user with CONNECTION_ADMIN, which this one lacks.
+func autocommitOffUser(t *testing.T, f *mysqlFixture) MySQLConfig {
+	t.Helper()
+	ctx := context.Background()
+	user := fmt.Sprintf("ac0_%d", time.Now().UnixNano()%1e12)
+	f.exec("CREATE USER '" + user + "'@'%' IDENTIFIED BY 'ac0'")
+	t.Cleanup(func() { _, _ = f.db.ExecContext(context.Background(), "DROP USER IF EXISTS '"+user+"'@'%'") })
+	f.exec("GRANT SELECT, INSERT, UPDATE ON `" + f.dbName + "`.* TO '" + user + "'@'%'")
+	var prev string
+	if err := f.db.QueryRowContext(ctx, "SELECT @@GLOBAL.init_connect").Scan(&prev); err != nil {
+		t.Fatal(err)
+	}
+	if prev != "" && !strings.Contains(prev, "ac0_") {
+		t.Skipf("the server already has an init_connect of its own: %q", prev)
+	}
+	// One user per test, so the condition names a prefix: two of these tests
+	// in parallel each find their own user in it.
+	const ic = `SET autocommit = IF(SUBSTRING_INDEX(USER(), '@', 1) LIKE 'ac0\\_%', 0, @@autocommit)`
+	if _, err := f.db.ExecContext(ctx, "SET GLOBAL init_connect = ?", ic); err != nil {
+		t.Skipf("cannot set init_connect here: %v", err)
+	}
+	t.Cleanup(func() { _, _ = f.db.ExecContext(context.Background(), "SET GLOBAL init_connect = ''") })
+	// The control: a plain session of that user really starts with
+	// autocommit=0, or the tests below would prove nothing.
+	mc := mysql.NewConfig()
+	mc.User, mc.Passwd, mc.Net, mc.Addr, mc.DBName = user, "ac0", "tcp", f.cfg.Addr, f.cfg.Database
+	db, err := sql.Open("mysql", mc.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var ac int
+	if err := db.QueryRowContext(ctx, "SELECT @@SESSION.autocommit").Scan(&ac); err != nil {
+		t.Fatal(err)
+	}
+	if ac != 0 {
+		t.Fatalf("control: a session of %s has autocommit=%d, want 0 from init_connect", user, ac)
+	}
+	cfg := f.cfg
+	cfg.Username, cfg.Password = user, "ac0"
+	return cfg
+}
+
 // With autocommit=0 as the server's default, every INSERT used to sit in an
 // implicit transaction nobody committed: Write returned nil and the rows
 // vanished with the connection. The session parameter pins it to 1.
 func TestMySQLWritesCommitUnderAGlobalAutocommitOff(t *testing.T) {
 	f := mysqlSetup(t)
 	ctx := context.Background()
-	if _, err := f.db.ExecContext(ctx, "SET GLOBAL autocommit = 0"); err != nil {
-		t.Skipf("cannot change the global autocommit here: %v", err)
-	}
-	t.Cleanup(func() { _, _ = f.db.ExecContext(context.Background(), "SET GLOBAL autocommit = 1") })
-
-	p, err := NewMySQL(f.cfg, discard(), metrics())
+	cfg := autocommitOffUser(t, f)
+	p, err := NewMySQL(cfg, discard(), metrics())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,27 +308,22 @@ func TestMySQLWritesCommitUnderAGlobalAutocommitOff(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	p.Close() // an uncommitted transaction dies here
-	if _, err := f.db.ExecContext(ctx, "SET GLOBAL autocommit = 1"); err != nil {
-		t.Fatal(err)
-	}
 	if n := f.count(f.table); n != 3 {
 		t.Fatalf("%d rows after Write returned nil for 3: the INSERTs were never committed", n)
 	}
 }
 
 // The validation reads autocommit back: a session where the parameter did not
-// take (here, a pool built without it, under a global autocommit=0) is refused.
+// take (here, a pool built without it, for a user whose sessions start with
+// autocommit=0) is refused.
 func TestMySQLValidationRefusesASessionWithoutAutocommit(t *testing.T) {
 	f := mysqlSetup(t)
 	ctx := context.Background()
-	if _, err := f.db.ExecContext(ctx, "SET GLOBAL autocommit = 0"); err != nil {
-		t.Skipf("cannot change the global autocommit here: %v", err)
-	}
-	t.Cleanup(func() { _, _ = f.db.ExecContext(context.Background(), "SET GLOBAL autocommit = 1") })
+	cfg := autocommitOffUser(t, f)
 
-	p := f.sink(f.cfg)
+	p := f.sink(cfg)
 	mc := mysql.NewConfig()
-	mc.User, mc.Passwd, mc.Net, mc.Addr, mc.DBName = f.cfg.Username, f.cfg.Password, "tcp", f.cfg.Addr, f.cfg.Database
+	mc.User, mc.Passwd, mc.Net, mc.Addr, mc.DBName = cfg.Username, cfg.Password, "tcp", cfg.Addr, cfg.Database
 	connector, err := mysql.NewConnector(mc)
 	if err != nil {
 		t.Fatal(err)

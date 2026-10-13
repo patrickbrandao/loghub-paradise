@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-server/internal/rediscli"
 )
@@ -39,6 +40,41 @@ const (
 	// larger batch here is what lets the operator see the ceiling instead of
 	// discovering it (SPEC §10.6).
 	mysqlMaxBatch = 65535 / mysqlColumns
+)
+
+// Ceilings of SPEC §13.2 for the keys that size memory or a count handed to a
+// library (independent reviews of go-relplog-pg-server and
+// go-relplog-nats-server, 2026-10-13, and of go-syslog-server, 2026-10-13;
+// ported). Without them a typo of a few digits panicked the boot
+// (ring.capacity_items and ring.sqlite.commit_batch: makechan), allocated a
+// gigabyte per Dequeue (sink.batch), wrapped around in the pool's int32
+// (sink.postgres.pool_size 4294967300 became 4), built a chunk whose Bind
+// passes libpq's 1 GiB message limit and fails with no SQLSTATE -- a network
+// error retried forever (sink.batch_max_bytes) -- or overflowed the NATS
+// PublishAsyncMaxPending, 2 × (workers × batch + ring.max_inflight), into a
+// negative number NewNATS silently replaced with 4096 (ring.max_inflight).
+// The MySQL and ClickHouse pools take the PostgreSQL ceiling: a pool of
+// thousands of connections per instance is a typo, never a budget.
+//
+// maxRingItems is the MEMORY ring's: only that ring makes a channel of
+// capacity_items slots. ring=sqlite counts rows in an int64 and ring=redis
+// hands the number to a Lua script that compares doubles, so a 50-million-row
+// ring is legitimate there and was refused (go-syslog-server review,
+// 2026-10-13); they take maxPersistentRingItems, a sanity ceiling against a
+// typo. maxSinkBatch is 1 Mi for the same reason: a ClickHouse batch of
+// 100 000 rows is legitimate; a Dequeue slice of 1 Mi pointers is 8 MiB, not
+// the gigabyte of an unbounded typo. MySQL keeps its own, lower, ceiling
+// (mysqlMaxBatch).
+const (
+	maxRingItems           = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxPersistentRingItems = 1 << 40
+	maxInflight            = 1 << 20
+	maxCommitBatch         = 65536
+	maxSinkBatch           = 1 << 20
+	maxBatchMaxBytes       = 256 << 20
+	maxSinkWorkers         = 1024
+	maxPoolSize            = 4096
+	maxListeners           = 256
 )
 
 // pgIdent is what sink.postgres.table must look like: a plain lowercase
@@ -141,6 +177,9 @@ func validate(c *Config, setIn map[string]bool) ([]string, map[string]string, er
 	}
 
 	v.ringSinkCombinations()
+	if err := v.memoryRingItems(); err != nil {
+		return nil, nil, err
+	}
 	v.outsideDataDir()
 	v.exposure()
 	v.natsMode()
@@ -187,8 +226,8 @@ func validateListeners(c *Config) error {
 		{"listen.tcp_listeners", c.Listen.TCPListeners},
 		{"listen.tls_listeners", c.Listen.TLSListeners},
 	} {
-		if n.v < 1 {
-			return fmt.Errorf("%s: %d is below 1", n.name, n.v)
+		if n.v < 1 || n.v > maxListeners {
+			return fmt.Errorf("%s: %d is outside 1..%d", n.name, n.v, maxListeners)
 		}
 	}
 	// An empty admin.bind would make net.Listen bind every interface on a
@@ -314,8 +353,10 @@ func validateFilter(c *Config) error {
 }
 
 func validateRanges(c *Config) error {
-	if c.Ring.CapacityItems < 1 {
-		return fmt.Errorf("ring.capacity_items: %d is below 1", c.Ring.CapacityItems)
+	// The memory ring's own ceiling, maxRingItems, is checked once the
+	// effective ring is known (memoryRingItems): ring=redis may degrade to it.
+	if c.Ring.CapacityItems < 1 || c.Ring.CapacityItems > maxPersistentRingItems {
+		return fmt.Errorf("ring.capacity_items: %d is outside 1..%d", c.Ring.CapacityItems, maxPersistentRingItems)
 	}
 	if c.Ring.MaxBytes < 1 {
 		return fmt.Errorf("ring.max_bytes: must be positive")
@@ -323,23 +364,24 @@ func validateRanges(c *Config) error {
 	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
 		return fmt.Errorf("ring.high_water: %g is outside (0, 1]", c.Ring.HighWater)
 	}
-	if c.Ring.MaxInflight < 1 {
-		return fmt.Errorf("ring.max_inflight: %d is below 1", c.Ring.MaxInflight)
+	if c.Ring.MaxInflight < 1 || c.Ring.MaxInflight > maxInflight {
+		return fmt.Errorf("ring.max_inflight: %d is outside 1..%d", c.Ring.MaxInflight, maxInflight)
 	}
-	if c.Sink.Workers < 1 {
-		return fmt.Errorf("sink.workers: %d is below 1", c.Sink.Workers)
+	if c.Sink.Workers < 1 || c.Sink.Workers > maxSinkWorkers {
+		return fmt.Errorf("sink.workers: %d is outside 1..%d", c.Sink.Workers, maxSinkWorkers)
 	}
-	if c.Sink.Batch < 1 {
-		return fmt.Errorf("sink.batch: %d is below 1", c.Sink.Batch)
+	if c.Sink.Batch < 1 || c.Sink.Batch > maxSinkBatch {
+		return fmt.Errorf("sink.batch: %d is outside 1..%d", c.Sink.Batch, maxSinkBatch)
 	}
-	if c.Sink.BatchMaxBytes < 1 {
-		return fmt.Errorf("sink.batch_max_bytes: must be positive")
+	if c.Sink.BatchMaxBytes < 1 || c.Sink.BatchMaxBytes > maxBatchMaxBytes {
+		return fmt.Errorf("sink.batch_max_bytes: %s is outside 1..256MiB (a chunk is one write, "+
+			"and libpq refuses a message above 1GiB with no SQLSTATE)", FormatBytes(c.Sink.BatchMaxBytes))
 	}
 	if c.Sink.MaxRetries < 1 {
 		return fmt.Errorf("sink.max_retries: %d is below 1", c.Sink.MaxRetries)
 	}
-	if c.RingSQL.CommitBatch < 1 {
-		return fmt.Errorf("ring.sqlite.commit_batch: %d is below 1", c.RingSQL.CommitBatch)
+	if c.RingSQL.CommitBatch < 1 || c.RingSQL.CommitBatch > maxCommitBatch {
+		return fmt.Errorf("ring.sqlite.commit_batch: %d is outside 1..%d", c.RingSQL.CommitBatch, maxCommitBatch)
 	}
 	if c.Sink.RetryBackoffMax < c.Sink.RetryBackoffMin {
 		return fmt.Errorf("sink.retry_backoff_max (%s) is below sink.retry_backoff_min (%s)",
@@ -532,6 +574,16 @@ func validateSQL(c *Config) error {
 		if err := validatePostgresAddr(d.Addr); err != nil {
 			return err
 		}
+		// The rule of sink.mysql below. pgx sets the TLS config of a socket
+		// connection too, and the SSLRequest over the socket failed every
+		// attempt -- retried as network for the whole sink.boot_timeout. libpq
+		// never uses TLS on a socket, so a URL saying sslmode=require there
+		// would be read as TLS by one reader and as none by the other
+		// (go-syslog-server review, 2026-10-13).
+		if d.TLS && strings.HasPrefix(d.Addr, "/") {
+			return fmt.Errorf("sink.postgres.tls=true (or an sslmode that requires TLS) with a unix "+
+				"socket address (%s): TLS is a TCP feature, and libpq never uses it on a socket", d.Addr)
+		}
 		if !pgIdent.MatchString(d.Table) {
 			return fmt.Errorf("sink.postgres.table: %q must be a lowercase identifier, "+
 				"optionally schema-qualified", d.Table)
@@ -558,13 +610,21 @@ func validateSQL(c *Config) error {
 // validatePostgresAddr accepts one server, by host:port or by socket
 // directory (with an optional :port, which names the socket file:
 // /run/pg:5433 is /run/pg/.s.PGSQL.5433, what LOGHUB_EB_URL fills from
-// postgres://:5433/db?host=/run/pg). Anything else -- "h1,h2:5432", an empty
-// host, port 0 -- passed here and then failed in the DNS or the dial, retried
-// as a network error for the whole sink.boot_timeout (SPEC §10.5, §13.2).
+// postgres://u@:5433/db?host=/run/pg). Anything else -- "h1,h2:5432", an
+// empty host, port 0, a tab, "[h:5432]:5433" -- passed here and then failed in
+// the DNS or the dial, retried as a network error for the whole
+// sink.boot_timeout (SPEC §10.5, §13.2; and the independent review of
+// go-relplog-pg-server, 2026-10-13).
 func validatePostgresAddr(addr string) error {
 	host, port, err := net.SplitHostPort(addr)
 	switch {
 	case strings.HasPrefix(addr, "/"):
+		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
+		// which pgx then tries as a list: refused like "h1,h2" below.
+		if strings.ContainsAny(addr, ",\t ") {
+			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
+				"with no comma or blank", addr)
+		}
 		if err != nil {
 			return nil // a bare socket directory: port 5432
 		}
@@ -572,11 +632,23 @@ func validatePostgresAddr(addr string) error {
 			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
 				"must be 1..65535", addr)
 		}
-	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port):
+	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
 		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
 			"1..65535) nor a unix socket directory starting with /", addr)
 	}
 	return nil
+}
+
+// oneHost reports whether host, the part before the port, names one server: a
+// name or an IP literal. A ':' is only an IPv6 literal's: "[h:5432]:5433"
+// (what postgres://u@h:5432:5433/db becomes) passed as host "h:5432", a DNS
+// name no resolver has, retried for the whole sink.boot_timeout.
+func oneHost(host string) bool {
+	if !strings.Contains(host, ":") {
+		return true
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
 }
 
 // validPort is a decimal port 1..65535 written the canonical way: "+80" and
@@ -597,11 +669,13 @@ const maxDBName = 64
 // (and in MySQL the 1064 that follows is classed network, so the probe waits
 // sink.boot_timeout), a backslash is an escape to ClickHouse inside a quoted
 // identifier, and control bytes are no name either server would show back.
-// Longer than 64 bytes MySQL refuses it anyway, after the wait (SPEC §10.6,
-// §10.10, §13.2).
+// Longer than 64 characters MySQL refuses it anyway, after the wait (SPEC
+// §10.6, §10.10, §13.2). Characters, not bytes: the limit is MySQL's, in
+// characters, and a UTF-8 name the server accepts was refused (go-syslog-server
+// review, 2026-10-13).
 func validateDBName(key, v string) error {
-	if len(v) > maxDBName {
-		return fmt.Errorf("%s: %d bytes is above %d", key, len(v), maxDBName)
+	if n := utf8.RuneCountInString(v); n > maxDBName {
+		return fmt.Errorf("%s: %d characters is above %d", key, n, maxDBName)
 	}
 	for i := 0; i < len(v); i++ {
 		switch c := v[i]; {
@@ -650,7 +724,7 @@ func validateClickHouse(c *Config) error {
 			"(name or database.name; letters, digits and _, not starting with a digit; up to 64 characters each)", ch.Table)
 	}
 	if ch.PoolSize < 0 {
-		return fmt.Errorf("sink.clickhouse.pool_size: %d is negative; 0 derives sink.workers + 1", ch.PoolSize)
+		return fmt.Errorf("sink.clickhouse.pool_size: %d is negative; 0 derives sink.workers", ch.PoolSize)
 	}
 	return nil
 }
@@ -787,6 +861,35 @@ func (v *validator) ringSinkCombinations() {
 		c.Ring.Mode = RingModeMemory
 		v.notes["ring.mode"] = "degraded from redis: ring.redis and sink.redis are the same server (SPEC §9.7)"
 	}
+
+	// A Redis ring with no destination: the stream is shared by every
+	// instance on it, and with sink=none what one drains is confirmed and
+	// discarded -- including what a sibling with a real sink put there, or a
+	// previous life left. Said at boot (go-syslog-server review, 2026-10-13;
+	// SPEC §9.5).
+	if c.Ring.Mode == RingModeRedis && c.Sink.Type == SinkTypeNone {
+		v.warn("ring.mode=redis with sink.type=none: every message in the stream %s -- this "+
+			"instance's, a previous life's, and any other instance's on the same stream -- is "+
+			"drained and discarded. Use ring.mode=memory to test without a destination",
+			c.RingRedis.Stream)
+	}
+}
+
+// memoryRingItems is the ceiling of the EFFECTIVE memory ring: the one asked
+// for, or the one ring=redis degraded to (SPEC §9.7, §13.2). Only it makes a
+// channel of capacity_items slots, and makechan panics past what the runtime
+// can allocate.
+func (v *validator) memoryRingItems() error {
+	c := v.c
+	if c.Ring.Mode != RingModeMemory || c.Ring.CapacityItems <= maxRingItems {
+		return nil
+	}
+	if note := v.notes["ring.mode"]; note != "" {
+		return fmt.Errorf("ring.capacity_items: %d is above %d, the ceiling of the memory ring "+
+			"that ring.mode=redis was %s", c.Ring.CapacityItems, maxRingItems, note)
+	}
+	return fmt.Errorf("ring.capacity_items: %d is outside 1..%d with ring.mode=memory",
+		c.Ring.CapacityItems, maxRingItems)
 }
 
 // exposure is the "ratelimit.enabled=false with a listener off loopback" row.
@@ -862,9 +965,21 @@ func (v *validator) dbWorkers(sinkType string, poolSize *int) error {
 		v.warn("sink.type=%s with sink.workers=%d: above %d, a larger pool trades throughput "+
 			"for lock contention inside the database", sinkType, c.Sink.Workers, dbWarnWorkers)
 	}
+	if *poolSize < 0 || *poolSize > maxPoolSize {
+		return fmt.Errorf("sink.%s.pool_size: %d is outside 0..%d; 0 derives sink.workers",
+			sinkType, *poolSize, maxPoolSize)
+	}
+	// The pool is the writers': the health check has a connection of its own,
+	// outside it (SPEC §10.5, §10.6, §10.10.2). go-relplog-pg-server refused
+	// pool_size = workers because its probe shared the pool and starved
+	// behind slow writes; with the probe outside, that configuration is the
+	// exact one, and the derived pool is the workers (the total stays
+	// workers + 1 connections, as it was). And with ring=none the writers are
+	// up to ring.max_inflight, so no "+ 1" could have protected the probe
+	// there (go-syslog-server review, 2026-10-13; docs/DECISOES.md).
 	if *poolSize == 0 {
-		*poolSize = c.Sink.Workers + 1
-		v.notes["sink."+sinkType+".pool_size"] = "derived: sink.workers + 1"
+		*poolSize = c.Sink.Workers
+		v.notes["sink."+sinkType+".pool_size"] = "derived: sink.workers (the health check has its own connection)"
 	}
 	if *poolSize < c.Sink.Workers {
 		return fmt.Errorf("sink.%s.pool_size=%d is below sink.workers=%d: a worker would "+

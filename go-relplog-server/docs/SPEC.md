@@ -1063,7 +1063,12 @@ onde o oráculo para.
   tem 4 KiB (o leitor só usa `ReadByte` e leituras contadas; o maior `Peek` é o
   do PROXY, de 12 bytes) e o escritor de respostas, outros 4 KiB; depois de um
   frame grande, o leitor descarta o buffer acima de 16 KiB em vez de segurá-lo
-  enquanto a conexão viver ociosa. Com `max_conns = 0`, o custo de N conexões
+  enquanto a conexão viver ociosa — **só quando nada do próximo frame está no
+  `bufio.Reader`** (o emissor parou: a leitura seguinte pode estacionar pelo
+  idle timeout inteiro). Descartado antes de **todo** frame, um emissor de
+  linhas de 24 KiB pagava o dobramento inteiro de novo por frame (2+4+8+16+24 KiB
+  e as cópias: 55 KB, 5 alocações e ~17 µs por frame; com a regra, 0 alocações e
+  ~0,6 µs — `BenchmarkRELPReaderFrames`; revisão do S, 2026-10-13, E2). Com `max_conns = 0`, o custo de N conexões
   caladas é cerca de N × 10 KiB mais as goroutines, fora de `ring.max_bytes`.
 
 ### 5.3 Tamanho e truncamento (decisão 13 do S)
@@ -1279,7 +1284,22 @@ ring cheio detectado
   que acordava depois do aborto ainda podia ser enfileirada, e o `librelp`, que
   a retransmite porque não teve resposta, a entregaria duas vezes
   (`TestReviewRetryAfterPeerLeft`). Uma aquisição do teto que volta depois do
-  fim da sessão é devolvida na hora.
+  fim da sessão é devolvida na hora. **E o contexto é conferido de novo logo
+  antes do `Enqueue`**: o ring de memória nunca olha o contexto, e uma
+  transação cuja sessão acabou enquanto o item era montado (o par sumiu, um
+  frame ruim, o shutdown) entrava no ring pelas costas da retransmissão do
+  `librelp` — duplicata (revisão do RN, 2026-10-13). Ela sai sem resposta,
+  como `shutdown`/`conn_lost`. Por isso, num frame ruim que encerra a sessão, só
+  recebe `200` o que já estava no ring.
+- **Ring cheio é recusado antes do `uuid`, da cópia e do item**, pelos **dois**
+  tetos (`ring.Memory.FullFor(n)`: itens, e os bytes que a cópia da linha
+  truncada ocuparia — a classe do pool mais `ItemOverhead`). Sem a pré-checagem,
+  cada retentativa de 50 ms de uma transação segurada tomava um buffer do pool,
+  copiava a linha e montava um item para o `Enqueue` recusar (revisões do SP e do
+  RP, 2026-10-13). A checagem é corrida de propósito: o `Enqueue` continua sendo a
+  autoridade. Um ring fechado nunca está "cheio" (o `Enqueue` diz `ErrClosed`, o
+  shutdown). Só o ring de memória a tem; `sqlite` e `redis` responderiam com uma
+  consulta, que custa mais que a cópia economizada.
 - **Um par que sumiu** (EOF, reset) com transações seguradas: elas são
   abandonadas (`conn_lost`), **nunca** enfileiradas depois pelas costas da
   retransmissão, o que duplicaria o evento.
@@ -1961,6 +1981,15 @@ que a standard aprendeu continua:
 - **Boot:** o backlog é drenado **integralmente** antes de qualquer transporte
   abrir (§13.1), com guarda de não-progresso (5 s sem linhas com contabilidade
   acima de zero → recount; divergência persistente → exit 3).
+- **Com `sink.type=none` o backlog de uma vida anterior fica no `ring.db`**
+  (`SQLiteConfig.KeepBacklog`): o cursor começa depois da última linha dele e
+  nenhuma é contada, então esta vida não as entrega nem enche com elas, e um
+  `WARN` no boot diz quantas são; uma vida com destino as entrega. Drenadas para
+  o `none`, eram descartadas mensagens que uma vida com destino tinha respondido
+  `200` — um teste de carga no mesmo volume depois de um incidente, o caso da
+  regra do dump (§12.2; revisão do S, 2026-10-13, A3, como o
+  `go-webhook-fast-server`). O `AUTOINCREMENT` garante que toda linha desta vida
+  tem `seq` maior.
 
 ### 9.5 `ring.mode = redis`
 
@@ -1975,6 +2004,12 @@ perda do nó: o que uma instância aceitou outra pode entregar.
 | Contador de bytes | `<stream>:bytes` (string com inteiro) |
 | Grupo | `ring.redis.group` (padrão `relplog-ring`), criado no boot com `XGROUP CREATE <stream> <group> 0 MKSTREAM` (`BUSYGROUP` é sucesso) |
 | Consumidor | o AgentUUID da instância |
+
+Com `sink.type=none` o boot avisa (`WARN`): o stream é de todas as instâncias
+nele, e o que esta drena é confirmado e descartado — inclusive o que uma irmã
+com destino ou uma vida anterior pôs lá (revisão do S, 2026-10-13, A3). A
+contagem do aborto de um ring `redis` (§13.4) é a do stream, de toda a frota, e
+o log diz isso.
 
 **Capacidade global** por stream, com os mesmos `ring.capacity_items` e
 `ring.max_bytes`. O `Enqueue` é um script Lua atômico (`EVALSHA`):
@@ -2268,7 +2303,17 @@ classificação precisa do `pgconn.PgError`).
   emissor. As duplicatas (`len − linhas afetadas`) contam em
   `relplog_sink_postgres_duplicates_total`.
 - `sink.workers` no padrão é rebaixado para 4 com `WARN`; `WARN` acima de 16;
-  `pool_size = 0` deriva `workers + 1`.
+  `pool_size = 0` deriva `workers`, e `pool_size` abaixo de `workers` é exit 1.
+  **O pool é dos escritores; a checagem de saúde tem conexão própria, fora
+  dele** (aqui um `pgx.Conn`, no MySQL um `sql.DB` de uma conexão, no
+  ClickHouse um cliente de uma conexão), discada sob demanda e descartada a
+  qualquer erro. Dentro do pool, escritas lentas mas funcionando seguravam
+  todas as conexões, a checagem esperava uma além do `health_timeout`, e um
+  banco sadio ia a DOWN e, pelos fusíveis, a FATAL e exit 3 (revisão do RP,
+  2026-10-13). O RP resolveu com `pool_size ≥ workers + 1`; com `ring=none` os
+  escritores são até `ring.max_inflight`, e nenhum "+ 1" protegia a sonda ali
+  (revisão do S, 2026-10-13, D1): a sonda saiu do pool, e o total continua
+  `workers + 1` conexões (decisão em `docs/DECISOES.md`).
 - **Validação no boot**, na primeira checagem válida, cada recusa FATAL imediato
   (exit 3, sem esperar `boot_timeout`): a tabela existe; as dez colunas com tipos
   compatíveis (`uuid` em `uuid` e `from_uuid`; `smallint`/`integer`/`bigint` em
@@ -2277,8 +2322,11 @@ classificação precisa do `pgconn.PgError`).
   índice **único** exatamente sobre `(uuid)`, sem predicado nem expressão; o
   papel tem `INSERT` e `SELECT (uuid)` (`GRANT INSERT, SELECT (uuid)`: o
   `ON CONFLICT (uuid)` lê a coluna árbitra, e só com `INSERT` o primeiro pedaço
-  falharia com `42501`); o servidor não está em recuperação
-  (`pg_is_in_recovery()`). Em recuperação é FATAL no boot e DOWN depois dele (uma
+  falharia com `42501`); nenhuma `RULE` de `INSERT` ou `UPDATE` na tabela
+  (`pg_rewrite`; o `INSERT ... ON CONFLICT` é recusado numa tabela com uma,
+  `0A000`, e todo pedaço falhava com o sink UP — revisão do RP, 2026-10-13; uma
+  `RULE` de `DELETE` ou `SELECT` não toca o `INSERT` e passa); o servidor não
+  está em recuperação (`pg_is_in_recovery()`). Em recuperação é FATAL no boot e DOWN depois dele (uma
   réplica que um failover pode promover).
   **Revisão independente de 2026-10-06** — também FATAL no boot, porque cada um
   passava na validação e depois recusava todo pedaço com o sink UP (§20.18):
@@ -2323,7 +2371,7 @@ classificação precisa do `pgconn.PgError`).
 |---|---|
 | `08`, `53`, `57`, `40` | `network` |
 | `22`, `23` (fora do `ON CONFLICT`) | `logic` |
-| **`42`** (esquema), `28`, `2F`, **`3D`**, `42501`, `25006`, **`23502`**, `23514` sem constraint nomeada | **`fatal`** |
+| **`42`** (esquema), `28`, `2F`, **`3D`**, `42501`, `25006`, **`23502`**, **`0A000`**, `23514` sem constraint nomeada | **`fatal`** |
 | qualquer outra | `network` |
 
 `23502` (`not_null_violation`) é `fatal` (pendência 7 do S): o servidor nunca
@@ -2331,7 +2379,20 @@ manda `NULL` nas dez colunas, então ele vem da tabela (coluna obrigatória
 acrescentada, `DROP DEFAULT`, trigger) e, como `logic`, descartaria todo pedaço
 com o sink UP. A classe `3D` (`sink.postgres.database` inexistente, `3D000` no
 login) é `fatal`, como o `1049` do MySQL (pendência 8): retentar até o
-`boot_timeout` só adiava o exit 3 com a mensagem de rede.
+`boot_timeout` só adiava o exit 3 com a mensagem de rede. `0A000`
+(`feature_not_supported`) é o que o `ON CONFLICT` recebe de uma tabela com
+`RULE` criada depois do boot: como `network`, era retentado para sempre.
+
+**`sink.postgres.addr` nomeia um servidor em toda leitura** (a deste servidor e
+a da libpq): `host:porta` com porta 1..65535 escrita sem sinal nem zero à
+esquerda, sem `,`, tab ou espaço, e um `:` no host só de literal IPv6
+(`[h:5432]:5433` é recusado); ou um diretório de socket começando com `/`, sem
+`,` nem branco, com `:porta` opcional (o arquivo `.s.PGSQL.<porta>`). **TLS num
+socket é exit 1** (`sink.postgres.tls=true`, ou um `sslmode` que exige TLS na
+`LOGHUB_EB_URL` com `host=/dir`): o pgx mandava o `SSLRequest` pelo socket e
+cada tentativa falhava como rede até o `boot_timeout`, e a libpq nunca usa TLS
+num socket — a mesma URL valia TLS para um leitor e nada para o outro (revisão
+do S, 2026-10-13, B5; a regra do MySQL).
 
 **A validação do boot tem prazo próprio** (pendência 6 do S), aqui, no MySQL e no
 ClickHouse: roda com `sink.op_timeout`, não no `sink.health_timeout` (1 s) da
@@ -2393,21 +2454,32 @@ com o `Number`). Tudo de §10.5 que não é repetido aqui vale igual.
   não provou nada.
 - `@@read_only = 1` na **primeira** validação é FATAL (a réplica de §10.5);
   depois dela é DOWN.
-- `Health()`: `SELECT @@read_only` (`1` é DOWN) e os gauges do pool.
+- `Health()`: `SELECT @@read_only` (`1` é DOWN), na conexão própria da sonda
+  (§10.5, um `sql.DB` de uma conexão, fora do pool dos escritores), e os gauges
+  do pool.
 
 | `Number` | Classe |
 |---|---|
 | sem número (EOF, `ErrBadConn`, prazo), `1040` `1053` `1077` `1927` `1158`–`1161` `1205` `1213` `1317` `3024` `2006` `2013`, e os limites do servidor que passam sozinhos e vêm com SQLSTATE `42000` — `1203` (`max_user_connections`), `1226` (limite por usuário, inclusive os `*_PER_HOUR`), `1461` (`max_prepared_stmt_count`) | `network` (os três últimos listados porque o recurso ao SQLSTATE os faria `fatal`: um deploy que sobrepõe o orçamento de conexões viraria dump e exit 3 na frota inteira; revisão independente de 2026-10-11) |
-| `1290` `1836` (somente leitura), `1021` `1030` `1041` `1114`, `1044` `1045` `1049` `1130` `1142` `1143`, `1054` `1146` `1364` | **`fatal`** |
-| `1048` `1062` `1153` `1264` `1366` `1406` `1690` `3819`, `ErrPktTooLarge` | `logic` |
+| `1290` `1836` (somente leitura), `1021` `1030` `1041` `1114`, `1044` `1045` `1049` `1130` `1142` `1143`, `1054` `1146` `1364`, **`1048`** | **`fatal`** |
+| `1062` `1153` `1264` `1366` `1406` `1690` `3819`, `ErrPktTooLarge` | `logic` |
 | qualquer outro | pelo **SQLSTATE** do erro: `22`/`23` `logic`, `42`/`28` `fatal`, `08` e `HY000` `network` |
 
+O `1048` (`Column cannot be null`) é `fatal`, gêmeo do `23502` do PostgreSQL
+(§10.5): a sonda do boot gravou `NULL` em toda coluna que este servidor deixa
+`NULL` e o servidor aceitou, então depois do boot um `1048` é uma coluna que
+virou `NOT NULL`, ou um trigger — como `logic`, todo pedaço com `NULL` nela era
+descartado com o sink UP (revisão do S, 2026-10-13, D3).
 O `1062` não vem mais do `INSERT` (outro índice único é recusado no boot) e fica
 `logic` só para o que outro comando gerar (um trigger). `3819` (um `CHECK`, com
 SQLSTATE `HY000`) é `logic` por número. `sink.mysql.database` e
 `sink.clickhouse.database` entram entre crases no `INSERT`: são recusados
 (exit 1) com crase, barra invertida (o escape do ClickHouse dentro de crases),
-byte de controle ou mais de 64 bytes, na config e no construtor (pendência 12).
+byte de controle ou mais de **64 caracteres** (não bytes: o limite do MySQL é em
+caracteres, e um nome UTF-8 de 26 caracteres e 66 bytes que o próprio servidor
+criou era recusado — revisão do S, 2026-10-13, D4), na config e no construtor
+(pendência 12). O ClickHouse aceita nomes mais longos; o teto de 64 caracteres
+vale para os dois.
 
 ### 10.7 `sink.type = nats` (padrão)
 
@@ -2434,7 +2506,14 @@ importam:
 - `WithPublishAsyncTimeout(sink.op_timeout)`: sem ele, um futuro sem resposta
   segura a mensagem e o buffer para sempre.
 
-`WithPublishAsyncMaxPending` = `sink.workers × sink.batch + ring.max_inflight`.
+`WithPublishAsyncMaxPending` = **2 ×** (`sink.workers × sink.batch +
+ring.max_inflight`), calculado em `int64` e limitado a `MaxInt32`: os futuros de
+um pedaço contaminado continuam contando até o prazo deles, que começa no
+publish, um pouco depois do prazo do worker, e uma retentativa rápida parava
+numa janela cheia e falhava com `ErrTooManyStalledMsgs` (revisão do RN,
+2026-10-13); sem teto, um `ring.max_inflight` grande dava a volta num número
+negativo que o `NewNATS` trocava em silêncio por 4096 (revisão do S,
+2026-10-13, C3; os termos agora têm teto, §13.2).
 `Data` aponta para o buffer do pedaço, que só volta ao pool depois de todos os
 futuros resolverem; em qualquer caminho de erro fica para o GC.
 
@@ -2525,10 +2604,41 @@ que não parseia nunca é ecoada; no lugar dela vai o `host:porta`.
 `StreamInfo` (um `PING` responderia feliz com o JetStream desligado); em `core`,
 um `FlushTimeout`.
 
+**TLS que nunca vai dar certo é veredito — se não houver outro servidor**
+(revisão do RN, adaptada ao TLS deste servidor, e revisão do S, 2026-10-13, C1).
+Um certificado que não verifica (CA desconhecida, nome que não confere,
+vencido: o `tls.CertificateVerificationError` que o `nats.go` embrulha em
+`ErrTLS`) ou `sink.nats.tls` ligado contra um servidor sem TLS
+(`ErrSecureConnWanted`) precisam do operador. O `nats.go` só chama o
+`ReconnectErrCB` quando a discagem TCP falha; a recusa do TLS acontece depois,
+no handshake, e aparece no `LastError` com a conexão em `RECONNECTING`, que o
+`Health` lê. Mas o `LastError` é o do **último servidor tentado**: com um pool
+— várias `sink.nats.urls`, ou servidores que o cluster anunciou (`nc.Servers()`
+inclui os descobertos) — o cliente alterna entre eles enquanto o confiável está
+fora, e o erro x509 de um nó não confiável virava FATAL, dump e exit 3 embora o
+confiável voltasse logo depois. Por isso só vira veredito quando o pool tem
+**um** servidor; com mais, é `network` com o motivo no erro ("a server of the
+pool refused TLS"), e se o pool nunca se recupera os fusíveis de §13.3 dão o
+FATAL nomeando o TLS. No boot, a mesma regra: o `nats.Connect` tenta todas as
+URLs e devolve o erro da última, e com mais de uma URL a recusa do TLS é
+`network`, esperada até o `boot_timeout`; com uma só, é exit 3 na hora. Uma
+falha passageira do handshake (reset, prazo) é sempre `network`.
+
+**Flush que atravessa uma reconexão não confirma** (revisão do RN, 2026-10-13).
+O `nats.go` falha um flush pendente com `ErrConnectionClosed` quando a conexão
+**cai** (o canal do `PING` fecha), embora o cliente só esteja `RECONNECTING`; a
+tabela classifica `ErrConnectionClosed` como fatal, e um soluço do NATS no meio
+do flush de um pedaço `core` (ou da checagem `core`) era FATAL. É `network`
+enquanto a conexão não está fechada de vez (`flushErr`). E um flush que
+**começa** durante a reconexão é resolvido pelo `PONG` do servidor novo,
+embora os `PUB` tenham ido pelo socket velho: se o contador de reconexões mudou
+durante o pedaço, ele é `network` e não confirmado; a retentativa o publica de
+novo.
+
 | Erro | Classe |
 |---|---|
 | prazo, `ErrTimeout`, `ErrNoResponders`, `ErrNoServers`, `ErrDisconnected`, `ErrConnectionReconnecting`, `ErrReconnectBufExceeded`, `ErrNoStreamResponse`, `ErrAsyncPublishTimeout`, `ErrTooManyStalledMsgs` | `network` |
-| `10077` cuja descrição é de um stream **cheio** com `discard=new` ("maximum messages exceeded", "maximum bytes exceeded", "maximum messages per subject exceeded") ou **fechando** ("store closed", um restart do NATS) | `network`: backpressure, passa quando um consumidor confirma ou o servidor volta (revisão independente, 2026-10-11; como `fatal` eram dump, exit 3 e duplicatas do pedaço já gravado na reingestão) |
+| `10077` cuja descrição é de um stream **cheio** com `discard=new` ("maximum messages exceeded", "maximum bytes exceeded", "maximum messages per subject exceeded") ou **fechando** ("store is closed", o texto do `ErrStoreClosed` do nats-server 2.14.6, `server/store.go`, e "store closed", uma grafia mais antiga: um restart do NATS; só "store closed" casava, e um stream fechando continuava FATAL — revisão do S, 2026-10-13, C2) | `network`: backpressure, passa quando um consumidor confirma ou o servidor volta (revisão independente, 2026-10-11; como `fatal` eram dump, exit 3 e duplicatas do pedaço já gravado na reingestão) |
 | `10158` (409: o mesmo `Nats-Msg-Id` ainda numa proposta Raft, na retentativa depois de um prazo num stream em cluster), `10167` (429: a fila de entrada do stream cheia) e todo outro erro da API com código 429 | `network`: passam sozinhos (pendência 18 do S; antes, "outro 4xx" os fazia FATAL, dump e exit 3, talvez na frota inteira) |
 | `ErrAuthorization`, `ErrAuthExpired`, `ErrAuthRevoked`, `ErrAccountAuthExpired`, as frases do servidor no primeiro `CONNECT` ("authorization violation", "authentication expired", "authentication revoked"; **nunca** "permissions violation", que é de um subject e vai pelo veredito), o veredito de permissão, `ErrConnectionClosed`, `ErrStreamNotFound` (`10059`), JetStream desligado (`10076`, `10039`), stream esperado não confere (`10060`), selado (`10109`), recursos (`10023`), outro armazenamento (`10077`: um registro que o store não aceita) | **`fatal`** |
 | `ErrMaxPayload`, `ErrMaxBytesExceeded`, `10054`, `10097` | `logic` (só daquela mensagem) |
@@ -2537,7 +2647,8 @@ um `FlushTimeout`.
 
 **Autenticação:** uma de `username`/`password`, `token` ou `credentials` (arquivo
 `.creds`), e só uma (exit 1 com mais de uma). TLS verificado por padrão,
-`tls_ca` própria, `tls_insecure` desliga.
+`tls_ca` própria, `tls_insecure` desliga. Recusas do TLS: veja "TLS que nunca vai
+dar certo" acima.
 
 ### 10.8 `sink.type = none`
 
@@ -2585,6 +2696,23 @@ o caminho; a mensagem pede `%2F`. O
 `--dump-config` mostra os valores derivados como comentário, com a senha
 redigida, para que o dump relido não dispare o conflito.
 
+**Uma URL, um destino, em toda leitura** (revisões do RP e do S, 2026-10-13;
+decisão do RP, portada). A URL PostgreSQL precisa nomear **usuário e banco**:
+sem eles a libpq usaria o usuário do sistema operacional e um banco do mesmo
+nome, e este servidor, o padrão do registry — dois leitores da mesma URL
+chegando a dois bancos, e a URL é dona das duas chaves, então o operador não
+podia corrigir em outro lugar. Também é exit 1: `sslmode=` vazio (a libpq o
+recusa) e `host=` vazio (a libpq o lê como "não definido" e disca o diretório de
+socket padrão, onde este servidor discava o host da autoridade); `host=` com
+`,`, `:` ou branco (a libpq lê `/run/pg,/x` como dois servidores e
+`/run/pg:5433` como um diretório com `:` no nome); um host percentual-codificado
+(`postgres://%2Frun%2Fpg/db`: use `?host=/dir`); um `://` a mais numa URL de
+servidor único (um `://` na senha, que precisa de `%3A%2F%2F`); e uma
+`LOGHUB_EB_URL` só de brancos (definida para nada: quem quisesse desligá-la não
+saberia que as chaves `[sink.*]` é que valem). Na URL Redis, um `,` no host é
+exit 1: `sink.redis.addrs` é uma lista separada por vírgula, e `redis://r1,r2`
+virava dois endereços, um cluster que ninguém configurou (revisão do S, B6).
+
 ### 10.10 `sink.type = clickhouse`
 
 Destino final num ClickHouse **compartilhado por todas as instâncias**. Tabela
@@ -2614,8 +2742,9 @@ visível no `system.query_log`.
 #### 10.10.2 Concorrência e conexões
 
 Igual a §10.5: `sink.workers` padrão vira **4** quando o operador não
-configurou, `sink.clickhouse.pool_size` padrão é `sink.workers + 1` (abaixo de
-`sink.workers` é exit 1), e com `ring=none` um `ring.max_inflight` acima do pool
+configurou, `sink.clickhouse.pool_size` padrão é `sink.workers` (abaixo de
+`sink.workers` é exit 1; a checagem de saúde tem um cliente próprio de uma
+conexão, fora do pool, §10.5 e §10.10.8), e com `ring=none` um `ring.max_inflight` acima do pool
 cria fila escondida dentro dele, com `WARN` no boot. Aqui há um motivo a mais para poucos workers: cada
 `INSERT` é uma parte nova no disco do servidor, e o ClickHouse prefere poucas
 partes grandes (com muitas, `252` `TOO_MANY_PARTS`, §10.10.7). Com `ring=none`
@@ -2742,7 +2871,7 @@ Na primeira checagem de saúde bem-sucedida, com a regra de §10.5: cada recusa
 | `received_at`, se existir, `DateTime64` de 6 a 9 dígitos com `DEFAULT` ou `MATERIALIZED` | `system.columns` (`default_kind`) | exit 3 — sem expressão, o ClickHouse a preencheria com o zero do tipo, 1970, e o atraso medido por ela seria mentira |
 | Nenhuma `CONSTRAINT … CHECK`, com o nome nu ou entre crases | `system.tables.create_table_query` | exit 3 — §3.7.2: a sonda vazia não a exercita, e uma violação seria `logic` em todo pedaço |
 | `max_memory_usage` (quando não é `0`) comporta o pior pedaço: 128 MiB + 8 × `max(sink.batch_max_bytes, pior JLH)` | `getSetting(...)` na sessão do servidor de syslog | exit 3, com os números na mensagem — medido no 25.8 (no `go-webhook-server`): o `INSERT` de um bloco de `payload` JSON consome ~6× os bytes dele mais ~130 MiB fixos, e `241` é fatal (§10.10.7); sem a conta, um pedaço legítimo derrubaria a frota |
-| `max_memory_usage_for_user` (quando não é `0`) comporta `pool_size` vezes isso | `getSetting(...)` | exit 3 — o limite do usuário soma todas as consultas dele: quatro pedaços legítimos e simultâneos estouravam um limite que a comparação com um só aceitava, e `241` é fatal. Outras instâncias no mesmo usuário somam por cima, e nenhuma as enxerga: dê a cada uma o seu usuário |
+| `max_memory_usage_for_user` (quando não é `0`) comporta **os escritores** vezes isso: `sink.workers` com ring, `min(pool_size, ring.max_inflight)` com `ring=none` | `getSetting(...)` | exit 3 — o limite do usuário soma todas as consultas dele: quatro pedaços legítimos e simultâneos estouravam um limite que a comparação com um só aceitava, e `241` é fatal. Outras instâncias no mesmo usuário somam por cima, e nenhuma as enxerga: dê a cada uma o seu usuário. Multiplicar pelo `pool_size` contava uma conexão que nunca faz `INSERT` e mandava "baixar o pool", que a config recusa abaixo dos workers (revisão do S, 2026-10-13, B3/D2) |
 | `INSERT` concedido nas dez colunas, sessão gravável, ajustes aceitos | um `INSERT` **vazio**: `PrepareBatch` com o mesmo comando e os mesmos ajustes do dreno, e `Send` sem linhas, sob o mesmo prazo do dreno (`sink.op_timeout`) | exit 3 — `497` é o grant (a mensagem nomeia as colunas), `164` o modo `readonly` (com `readonly=1` o servidor recusa já a mudança de ajuste); zero linhas não criam parte (medido) |
 
 O MySQL prova a escrita com uma linha de sonda numa transação revertida
@@ -2826,7 +2955,8 @@ provoca: na prática ele só vem de dano.
 
 #### 10.10.8 `Health()`
 
-`SELECT getSetting('readonly')`, que também prova a conexão. Um `readonly`
+Na conexão própria da sonda (um cliente de uma conexão, fora do pool dos
+escritores, §10.5): `SELECT getSetting('readonly')`, que também prova a conexão. Um `readonly`
 diferente de zero é
 **fatal**: no ClickHouse ele é do perfil do usuário, não de um failover, e não
 muda esperando — a regra de §13.1 sobre recusa definitiva no boot. Com motor
@@ -2985,7 +3115,11 @@ gauges em vez de fixá-los.
 `fsync`: sem ele, uma queda de energia logo depois devolveria o nome, e o boot
 seguinte entregaria o dump inteiro de novo (com os mesmos `uuid`, deduplicados só
 onde o destino deduplica). Um `fsync` que falha depois do `unlink` é `WARN`: o
-arquivo já saiu.
+arquivo já saiu. Vale também para o diretório que nem abre para o `fsync`
+(`ErrNotDurable`, como a falha do próprio `fsync`): antes era um erro comum, e o
+log dizia "cannot remove" de um arquivo que já não existia (revisão do RN,
+2026-10-13). No `Write` do dump, o mesmo erro continua sendo um dump falho
+(§12.3).
 
 Arquivo truncado ou corrompido: processado até o último registro íntegro, o resto
 logado em `ERROR` com a contagem de bytes, e o arquivo renomeado para
@@ -3094,9 +3228,12 @@ o certo.
 | combinações de §9.7 que degradam | `WARN` |
 | `sink=sqlite` com `workers > 1` | `WARN`, forçado a 1 |
 | `sink=postgres`/`mysql`/`clickhouse` com `workers` no padrão | rebaixado para 4, `WARN`; `WARN` acima de 16 |
-| `pool_size` abaixo de `workers` | exit 1 |
-| `sink.mysql.database` ou `sink.clickhouse.database` com crase, barra invertida, byte de controle (< 0x20 ou 0x7F) ou mais de 64 bytes | exit 1: o nome entra cru entre crases no `INSERT` e na sonda; uma crase quebraria o comando e, no MySQL, o `1064` seria `network` até o `boot_timeout` (pendência 12 do S) |
-| `sink.postgres.addr` que não é um `host:porta` (porta 1–65535, um servidor, sem vírgula) nem um diretório de socket começando com `/`, com `:porta` opcional | exit 1 (`h1,h2:5432` falhava no DNS até o `boot_timeout`) |
+| `pool_size` abaixo de `workers`, ou acima de 4096 | exit 1 (o pool é dos escritores; a checagem de saúde tem conexão própria, §10.5) |
+| **Tetos** (revisões do RP, RN e S, 2026-10-13): `ring.capacity_items` acima de 16 Mi com o ring de **memória** efetivo — o pedido ou o que `ring=redis` virou por degradação (§9.7), dito na mensagem —, ou acima de 2^40 com `sqlite`/`redis`; `ring.max_inflight` acima de 1 Mi; `sink.workers` acima de 1024; `sink.batch` acima de 1 Mi (o MySQL tem o seu, 3640); `sink.batch_max_bytes` acima de 256 MiB; `ring.sqlite.commit_batch` acima de 65536; `listen.tcp_listeners`/`listen.tls_listeners` acima de 256 | exit 1 nomeando a chave. Sem eles, um erro de digitação derrubava o boot em pânico (`makechan`), alocava um gigabyte por `Dequeue`, dava a volta no `int32` do pool (`4294967300` virava 4), montava um pedaço acima do 1 GiB da libpq (falha sem SQLSTATE, retentada como rede para sempre) ou estourava o `MaxPending` do NATS (§10.7). O teto do ring de memória não vale para os persistentes: um `ring.db` de 50 milhões de linhas é legítimo (revisão do S, B1); `sink.batch` de 100 000 no ClickHouse também (B2) |
+| `ring=redis` com `sink=none` | `WARN` (§9.5) |
+| `sink.mysql.database` ou `sink.clickhouse.database` com crase, barra invertida, byte de controle (< 0x20 ou 0x7F) ou mais de 64 **caracteres** (§10.6) | exit 1: o nome entra cru entre crases no `INSERT` e na sonda; uma crase quebraria o comando e, no MySQL, o `1064` seria `network` até o `boot_timeout` (pendência 12 do S) |
+| `sink.postgres.addr` que não é um `host:porta` (porta 1–65535, um servidor, sem vírgula, tab ou espaço, `:` no host só de literal IPv6) nem um diretório de socket começando com `/` (sem vírgula nem branco), com `:porta` opcional | exit 1 (`h1,h2:5432` falhava no DNS até o `boot_timeout`; §10.5) |
+| `sink.postgres.tls=true` com `sink.postgres.addr` de socket | exit 1 (§10.5) |
 | uma entrada de `sink.nats.urls` que não parseia, sem host, de esquema fora de `nats`/`tls`/`ws`/`wss`, ou com caminho, consulta ou fragmento em `nats://`/`tls://` (`host:porta` sem esquema vale como `nats://`) | exit 1, sem citar a entrada (§16.2) |
 | credencial na URL do NATS junto de `username`/`password`/`token`/`credentials` | exit 1: "uma forma só"; o `nats.go` usaria a da URL e ignoraria a chave em silêncio |
 | `loghub.beacon_interval` entre 0 e 1 s (exclusive) | exit 1 (§11) |
@@ -3196,10 +3333,32 @@ fase 5  para o beacon, fecha o sink, o ring e o SQLite, exit 0
   diretório) tomam o contador com uma troca atômica (`Swap(0)`): exatamente um
   deles conta aquelas mensagens. Antes, um aborto entre o `Drain` e o dump não
   contava nada, e um aborto durante um dump que falhava contava duas vezes.
+  **Forma final** (revisões do RN, 2026-10-13, e do S, 2026-10-13, A2): toda
+  passagem do contador acontece sob um mutex (`lossMu`) — a entrada na fase de
+  dump (`enterDumpPhase`), a recarga com o que vai ao dump (`oweDump`), a volta
+  dele depois do resultado (`settleDump`) e o próprio aborto, que roda **uma
+  vez só** e publica `aborted`. Um aborto que cai antes de uma passagem a
+  encontra fechada (o shutdown sai com 130 sem tentar o dump); um que cai
+  depois toma o contador. Um dump ainda sendo escrito lê `aborted`
+  (`emergency.Store.SetAbandon`, a cada 1024 registros e antes de publicar) e
+  desiste, removendo o temporário: um dump contado como perdido não pode voltar
+  no boot seguinte. Um dump publicado entre a última conferência e o aborto é
+  contado perdido **e** guardado — uma contagem a mais, que o boot seguinte
+  corrige entregando-o, nunca uma perda. E o `settleDump` sob o mutex fecha a
+  última janela: fora dele, o dump podia ver o aborto, desistir e tomar o
+  contador antes do aborto — `emergency_failed=n` e `abort=0`, a perda contada
+  uma vez mas atribuída ao disco.
+- **Com `ring=sqlite` ou `redis` um aborto não conta nada**: as linhas e as
+  entradas nunca foram apagadas, e a próxima vida ou outra réplica as entrega;
+  não há dump. Com `redis`, o `WARN` diz que a contagem é a do stream inteiro,
+  da frota, e não o que esta instância deixa (`TestAbortWithAPersistentRingCountsNothing`).
 - **`SIGQUIT` tardio**: um `SIGQUIT` que chega depois de o shutdown começar e
   antes de ele registrar o canal de aborto só alcança o observador do boot, que
   marca a saída imediata; o shutdown confere essa marca antes de qualquer fase e
   sai com 130. Antes, esse `SIGQUIT` era perdido e o shutdown seguia gracioso.
+  E a marca é também um canal fechado (`quitNow`), que o shutdown espera junto
+  com o segundo sinal: um `SIGQUIT` cujo observador grava a marca logo depois
+  da conferência de entrada ainda é "agora" (revisão do RN, 2026-10-13).
 - **Segundo sinal** em qualquer fase: saída imediata, `exit 130`, aceitando a
   perda (contada em `reason="abort"` com `ring=memory` e `none`; com `sqlite` e
   `redis` o que sobrou continua no ring). `SIGQUIT` aborta sempre, inclusive
@@ -3228,7 +3387,7 @@ fase 5  para o beacon, fecha o sink, o ring e o SQLite, exit 0
 | `1` | erro de configuração ou de inicialização não relacionada a destino |
 | `3` | destino indisponível: sink FATAL, `boot_timeout` ou `drain_timeout` estourados, ring Redis indisponível no boot, maior evento que não cabe, guarda de não-progresso do dreno |
 | `100`–`114` | falha de identidade, emitida pelo `go-loghub-ident` (`DATADIR`, `MACHINE_ID`, `MACHINE_ID_FILE`, `AGENT_NAME`, `AGENT_UUID`, `HOSTNAME`, `WORKSPACE`; 112 = `Initialize()` duas vezes); a tabela completa está na skill `go-loghub-ident` e em `docker/README.md` |
-| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 7–10 do boot |
+| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 7–12 do boot. Um sinal que cancela o bind de um nome de host (`admin.bind`, `listen.*`: a resolução falha com "operation was canceled") é 130, não o exit 1 de um endereço ruim (revisão do RN, 2026-10-13); e um sinal que chega enquanto os transportes abrem sem fazer nenhum bind falhar (um literal IP não resolve nada) também: conferido depois de todos os binds e antes de aceitar a primeira conexão — antes, o servidor abria, o `/readyz` dizia 200 e o shutdown seguinte saía 0 (revisão do S, 2026-10-13, A1) |
 
 ---
 
@@ -3435,6 +3594,32 @@ tem (`--sink.nats.subjet`, um erro de digitação); fora disso o erro cita só a
 flag anterior e pede aspas (revisão independente, 2026-10-11: antes, a cauda
 `-hunter2` saía no stderr). Os erros vão para o stderr e, num `SIGHUP`, para o
 log.
+
+**E da revisão dos cortes RP e RN (2026-10-13), portada:**
+- **Valor colado ao nome** (`--sink.postgres.passwordHunter2`, `-Hunter2`,
+  `_Hunter2`, `.Hunter2`; o `=` esquecido): um nome desconhecido que **começa**
+  com o nome de um parâmetro nunca é citado.
+- **Continuação de segredo no INI**: um valor de segredo que quebra na linha de
+  baixo (`token = eyJhbGciOiJI` e depois `UzI1NiJ9abcDEF==`) faz da cauda uma
+  chave; uma chave desconhecida logo depois de uma linha de segredo nunca é
+  citada, nem uma de forma que não é de chave (`[a-z0-9_]{1,64}`) ou fora de uma
+  seção deste servidor.
+- **Switches não levam valor**: `--dump-config=false` despejava e saía 0; agora
+  `--help`, `-h`, `--version`, `-v` e `--dump-config` com `=` são exit 1, sem
+  citar o valor.
+- **`--config=` vazio** é exit 1: caía no `RELPLOG_CONFIG`, o contrário do que
+  diz.
+- **BOM UTF-8** no começo do INI (editores do Windows) é ignorado: mantido,
+  tornava a linha 1 "expected key = value" sem nada visível que explicasse.
+- Depois de uma flag que espera valor, só um argumento de **dois** traços é
+  nomeado como "a flag seguinte" (`-h` também é um valor de dois caracteres
+  começando com traço), e a mensagem diz que as opções são `--nome=valor` ou
+  `--nome valor`.
+- **Derivados comentados no `--dump-config`**: um valor derivado (o `pool_size`
+  dos workers, os caminhos do `data_dir`) sai como comentário, e o dump relido
+  deriva de novo em vez de fixá-lo.
+- **Sinônimos de charset no `SIGHUP`**: `windows-1252` onde o boot disse
+  `cp1252` (e `iso-8859-1` por `latin1`) não é mudança "que exige restart".
 
 **Um `@` depois do primeiro `/`, `?` ou `#` da autoridade de uma URL é
 recusado**, sem citar a URL: nenhuma URL destes esquemas tem `@` literal no
@@ -3709,7 +3894,7 @@ a validação recusa `0` com exit 1. Zero é legítimo onde diz o que faz:
 | `addr` | `127.0.0.1:5432` / `127.0.0.1:3306` (ou socket unix começando com `/`) |
 | `username`, `password`, `database` | `syslog`, `""`, `syslog` |
 | `table` | `loghub.inbox` no PostgreSQL (§3.7.1), `syslog_events` no MySQL (`nome` ou `esquema.nome`; nunca criada) |
-| `pool_size` | `0` (deriva `workers + 1`) |
+| `pool_size` | `0` (deriva `workers`; a sonda de saúde tem conexão própria, §10.5) |
 | `tls`, `tls_ca`, `tls_insecure` | `false`, `""`, `false` |
 
 #### `[sink.clickhouse]`
@@ -3719,7 +3904,7 @@ a validação recusa `0` com exit 1. Zero é legítimo onde diz o que faz:
 | `addrs` | `127.0.0.1:9000` (lista, protocolo nativo; 9440 com TLS) |
 | `username`, `password`, `database` | `syslog`, `""`, `syslog` |
 | `table` | `inbox_syslog` (§3.7.2; `nome` ou `banco.nome`, caixa preservada; nunca criada) |
-| `pool_size` | `0` (deriva `workers + 1`) |
+| `pool_size` | `0` (deriva `workers`; a sonda de saúde tem conexão própria, §10.5) |
 | `tls`, `tls_ca`, `tls_insecure` | `false`, `""`, `false` |
 
 #### `[loghub]`
@@ -4205,3 +4390,14 @@ Nenhuma conhecida em 2026-10-12. A última encontrada na criação (uma senha co
 dica de `%2F`, `%3F` e `%23` (§10.9, §16.2). Os achados da revisão independente
 de 2026-10-11 estão corrigidos, e a regra de cada um entrou na seção onde vale
 (§5.4, §5.6, §5.7, §5.8, §10.6, §10.7, §13.4, §16.2).
+
+**2026-10-13 — porte das correções dos cortes (RP, RN) e do S.** As correções
+que o `go-relplog-pg-server`, o `go-relplog-nats-server` e o `go-syslog-server`
+receberam depois deste módulo, e os achados da revisão independente do porte
+do S que valem aqui, estão corrigidos; a regra de cada uma está em §5.2 e §5.7
+(recepção), §9.4 e §9.5 (rings), §10.5–§10.10 (sinks), §12.2, §13.2, §13.4,
+§13.5 e §16.2. **Não portados de propósito:** o E1 daquela revisão (linhas em
+buffer descartadas no `Close` com `proxy.protocol=optional`): no RELP o que não
+recebeu `200` o `librelp` retransmite, e o fechamento do leitor é a regra de
+§5.8; e nada que contradiga §5.4 (segurar, nunca `500`). Nenhuma pendência nova
+no código; o que os testes ainda não provam está em `docs/TESTING.md` §10.

@@ -270,8 +270,10 @@ func TestConfigErrorsDoNotEchoSecrets(t *testing.T) {
 		l.Config.SinkNATS.Stream != "LOGHUB_X" {
 		t.Errorf("separated values: workers=%d stream=%q", l.Config.Sink.Workers, l.Config.SinkNATS.Stream)
 	}
-	mustFail(t, []string{"--sink.workers", "-1"}, nil, "-1 is below 1")
-	mustFail(t, []string{"--sink.nats.stream", "-h"}, nil, "the next argument is the flag --h")
+	mustFail(t, []string{"--sink.workers", "-1"}, nil, "-1 is outside")
+	// "-h" after a flag that wants a value may be that value (a two-character
+	// one starting with a dash): only the two-dash spelling is named.
+	mustFail(t, []string{"--sink.nats.stream", "--help"}, nil, "the next argument is the flag --help")
 	mustFail(t, []string{"--sink.nats.password=", "--admin.enabled", "extra"}, nil, `"extra"`)
 	mustFail(t, []string{"--sink.nats.password=", "hunter2"}, nil, "right after the '='")
 	mustFail(t, []string{"--sink.nats.password", "=", "hunter2"}, nil, "right after the '='")

@@ -247,6 +247,17 @@ func (a *App) drainBacklog(ctx context.Context) int {
 	if !ok {
 		return ExitOK
 	}
+	if k := sr.Kept(); k > 0 {
+		// sink=none discards what it is given (SPEC §10.8). Draining a
+		// previous life's rows into it destroyed events a life with a
+		// destination had answered 200 -- a load test on the same volume
+		// after an incident, the case of the dump's rule (SPEC §12.2;
+		// go-syslog-server review, 2026-10-13, as go-webhook-fast-server
+		// does).
+		a.log.Warn("ring.db holds messages a previous life left, but sink.type=none discards what "+
+			"it is given; they are NOT delivered and stay in ring.db for a boot with a destination",
+			"messages", k, "path", a.cfg.RingSQL.Path)
+	}
 	total := sr.Backlog()
 	if total == 0 {
 		return ExitOK
@@ -314,17 +325,23 @@ func (a *App) drainBacklog(ctx context.Context) int {
 // It zeroes App.dumping as soon as the outcome is known and BEFORE anything is
 // counted: saved, an abort loses nothing more; failed, the loss is counted
 // here as emergency_failed, and an abort racing that count must not add the
-// same messages again as abort.
+// same messages again as abort (settleDump: one owner of the count, under
+// lossMu, SPEC §13.4).
+//
+// A dump the abort already counted gives up (emergency.Store.SetAbandon), and
+// one that completed after the abort counts nothing more: the abort counted
+// every message (independent reviews of go-relplog-nats-server and
+// go-relplog-pg-server, 2026-10-13).
 func (a *App) dumpEmergency(items []*item.Item) bool {
 	if len(items) == 0 {
-		a.dumping.Store(0)
+		a.settleDump()
 		return false
 	}
 	if a.emg == nil {
 		// No emergency store (emergency.enabled=false): SPEC §12.3 counts this
 		// exactly like a dump that failed -- unless an abort already took the
-		// counter and counted the same messages (Swap: one side only).
-		if a.dumping.Swap(0) > 0 {
+		// counter and counted the same messages.
+		if a.settleDump() > 0 {
 			a.log.Error("emergency dumps are disabled; these messages are lost", "count", len(items))
 			a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Add(uint64(len(items)))
 		}
@@ -334,7 +351,7 @@ func (a *App) dumpEmergency(items []*item.Item) bool {
 		a.beforeDump()
 	}
 	path, err := a.emg.Write(items)
-	owed := a.dumping.Swap(0)
+	owed := a.settleDump()
 	if err != nil {
 		if owed == 0 {
 			return false // an abort counted them already
@@ -344,8 +361,17 @@ func (a *App) dumpEmergency(items []*item.Item) bool {
 		a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Add(uint64(len(items)))
 		return false
 	}
-	a.log.Warn("pending messages written to an emergency dump; they will be reingested at the next boot",
-		"count", len(items), "path", path)
+	if owed == 0 {
+		// Published between the last abandon check and the abort: counted
+		// lost AND kept, an overcount the next boot corrects by delivering
+		// it, never a loss. Nothing more is counted; the file is on disk, so
+		// the gauges below still say so.
+		a.log.Warn("the emergency dump completed after an abort counted its messages lost; "+
+			"the next boot reingests it", "path", path, "count", len(items))
+	} else {
+		a.log.Warn("pending messages written to an emergency dump; they will be reingested at the next boot",
+			"count", len(items), "path", path)
+	}
 	// Added, not set: a dump the boot could not reingest may still be on disk
 	// (unreadable, kept by sink=none), and the gauges say what is pending
 	// there, not what this one dump holds (SPEC §12.2).

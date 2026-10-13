@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -396,7 +397,7 @@ func Registry(c *Config) []*Param {
 		{Sec: "sink.clickhouse", Key: "table", Kind: KString, Def: "inbox_syslog", Ptr: &c.SinkCH.Table,
 			Desc: "the inbox_syslog table (docker/clickhouse/inbox_syslog.sql), name or database.name with its case kept; never created by the server, only validated"},
 		{Sec: "sink.clickhouse", Key: "pool_size", Kind: KInt, Def: "0", Ptr: &c.SinkCH.PoolSize,
-			Desc: "connection pool ceiling; 0 derives sink.workers + 1"},
+			Desc: "connection pool of the writers (the health check has its own connection); 0 derives sink.workers"},
 		{Sec: "sink.clickhouse", Key: "tls", Kind: KBool, Def: "false", Ptr: &c.SinkCH.TLS,
 			Desc: "TLS to ClickHouse, verified against the system pool or tls_ca"},
 		{Sec: "sink.clickhouse", Key: "tls_ca", Kind: KString, Def: "", Ptr: &c.SinkCH.TLSCA,
@@ -480,7 +481,7 @@ func sqlParams(sec string, d *SQLDB, addr, addrDesc, userDesc, table, tableDesc 
 			Desc: "database name"},
 		{Sec: sec, Key: "table", Kind: KString, Def: table, Ptr: &d.Table, Desc: tableDesc},
 		{Sec: sec, Key: "pool_size", Kind: KInt, Def: "0", Ptr: &d.PoolSize,
-			Desc: "connection pool ceiling; 0 derives sink.workers + 1"},
+			Desc: "connection pool of the writers (the health check has its own connection); 0 derives sink.workers"},
 		{Sec: sec, Key: "tls", Kind: KBool, Def: "false", Ptr: &d.TLS,
 			Desc: "TLS to the database, verified against the system pool or tls_ca"},
 		{Sec: sec, Key: "tls_ca", Kind: KString, Def: "", Ptr: &d.TLSCA,
@@ -522,9 +523,29 @@ func (ix *index) lookup(name string) (*Param, error) {
 			return nil, fmt.Errorf("unknown parameter (the name holds characters no parameter " +
 				"name has, so it is not shown; a value goes after an '=')")
 		}
+		if ix.extendsAName(name) {
+			// "--sink.nats.passwordhunter2": the '=' was forgotten and the
+			// value glued to the name, with or without a separator
+			// ("-hunter2", "_hunter2", ".hunter2"). Quoted, the error would
+			// print the secret (independent review of go-relplog-pg-server,
+			// 2026-10-13).
+			return nil, fmt.Errorf("unknown parameter (it starts with the name of a parameter " +
+				"and goes on, so it is not shown: the '=' between the name and the value may be missing)")
+		}
 		return nil, fmt.Errorf("unknown parameter %q", name)
 	}
 	return p, nil
+}
+
+// extendsAName reports whether name is a parameter name of the registry with
+// something glued after it.
+func (ix *index) extendsAName(name string) bool {
+	for n := range ix.byName {
+		if len(name) > len(n) && strings.HasPrefix(name, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // knownSectionOf reports whether name, read as "<section>.<key>", names a
@@ -534,13 +555,44 @@ func (ix *index) knownSectionOf(name string) bool {
 	if i <= 0 {
 		return false
 	}
-	sec := name[:i]
+	return ix.knownSection(name[:i])
+}
+
+func (ix *index) knownSection(sec string) bool {
 	for _, p := range ix.byName {
 		if p.Sec == sec {
 			return true
 		}
 	}
 	return false
+}
+
+// iniKeyRE is what an INI key of this server looks like. It is narrower than
+// paramNameRE on purpose: an unknown INI key is named only when it has this
+// shape, because the INI is where a secret wraps onto a second line ("token =
+// eyJhbGciOiJI" then "UzI1NiJ9abcDEF==") and the continuation reads as a key.
+var iniKeyRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// lookupINI is lookup for an INI entry. An unknown key is named only when its
+// section is one this server has, its key has the shape of a key, and the
+// line before it was not a secret: a key right after a password or a token is
+// most likely the rest of that value on the next line ("password = abc" then
+// "ffd3a9c1b2=") -- the error goes to stderr and, on a SIGHUP, to the server
+// log (SPEC §13.2, §16.2; independent review of go-relplog-nats-server,
+// 2026-10-13).
+func (ix *index) lookupINI(e iniEntry, afterSecret bool) (*Param, error) {
+	if p, ok := ix.byName[e.Name]; ok {
+		return p, nil
+	}
+	switch {
+	case afterSecret:
+		return nil, errors.New("unknown parameter right after a secret value; it is not shown, " +
+			"in case it is the rest of that value: a value must fit on one line")
+	case !iniKeyRE.MatchString(e.Key) || !ix.knownSection(e.Sec):
+		return nil, errors.New("unknown parameter (not shown: its section or its key is not one " +
+			"a parameter has; a value goes after an '=' on the same line)")
+	}
+	return ix.lookup(e.Name)
 }
 
 // paramNameRE is what a parameter name, known or not, can look like: the

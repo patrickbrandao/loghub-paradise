@@ -572,8 +572,8 @@ Para alertar, use `/metrics`, não o estado do healthcheck:
 | `compose.sqlite-sqlite.yml` | `ring.mode=sqlite with sink.type=sqlite: every message pays TWO fsyncs` | é a combinação (SPEC §9.7); o cabeçalho do arquivo diz quando ela compensa |
 
 Os compose de postgres, mysql e clickhouse fixam `RELPLOG_SINK_WORKERS=4`, e os
-`compose.none-{postgres,mysql,clickhouse}.yml` fixam `RELPLOG_RING_MAX_INFLIGHT=5`, igual ao
-pool derivado (`workers + 1`), para não subirem com os `WARN` de §10.5 e §9.6.
+`compose.none-{postgres,mysql,clickhouse}.yml` fixam `RELPLOG_RING_MAX_INFLIGHT=4`, igual ao
+pool derivado (`workers`; a sonda de saúde tem conexão própria), para não subirem com os `WARN` de §10.5 e §9.6.
 
 ## Memória
 

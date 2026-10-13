@@ -466,6 +466,10 @@ func TestRELPMalformedFrameClosesAfterTheAnswers(t *testing.T) {
 	tr := startTCP(t, h, TCPConfig{})
 	rc := dialRELP(t, tr.Addr())
 	ids := rc.syslog("<13>fine")
+	// Decided first: a transaction still being built when the bad frame ends
+	// the session is abandoned, never enqueued (SPEC §5.7, "o fim da sessão
+	// vence"), and librelp retransmits it.
+	waitFor(t, "the message in the ring", func() bool { return h.ring.Stats().Items == 1 })
 	rc.write("2 syslog x garbage\n")
 	rc.expect(ids[0], "200 OK")
 	rc.expectServerClose()

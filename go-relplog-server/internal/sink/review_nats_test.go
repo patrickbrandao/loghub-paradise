@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -23,10 +24,12 @@ import (
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-server/internal/convert"
 )
 
-// The fixes of SPEC §22.1 items 13 to 20 in the NATS sink (ported, with
-// adaptation, from go-syslog-nats-server and go-webhook-nats-server). Nothing
-// here needs a server except the tests that say so; those against a server
-// with limited permissions skip without RELPLOG_TEST_NATS_PERM_URL (see
+// The fixes of SPEC §22 pendências 13 to 20 in the NATS sink, ported from
+// go-relplog-server (which took them, with adaptation, from
+// go-syslog-nats-server and go-webhook-nats-server), and the findings of
+// go-relplog-nats-server's review of 2026-10-13. Nothing here needs a server
+// except the tests that say so; those against a server with limited
+// permissions skip without RELPLOG_TEST_NATS_PERM_URL (see
 // natsPermSetup).
 
 // ------------------------------------------------------------- fake server
@@ -45,6 +48,25 @@ type natsFake struct {
 	info     string
 	pubReply string
 	acks     bool
+	// silent leaves every PING unanswered: a flush then waits for a PONG
+	// that never comes, until the connection drops.
+	silent bool
+	// replyFor, when set, answers a publish to subject with that -ERR line
+	// (or nothing, for ""), in place of pubReply.
+	replyFor func(subject string) string
+	// ackErr, when set, turns the ack of the n-th acknowledged publish
+	// (from 1) into that JetStream API error JSON (or a normal ack, for "").
+	ackErr func(n int) string
+	// noResponders answers every publish that has a reply subject with the
+	// 503 status a real server sends when no stream listens.
+	noResponders bool
+	// tlsConf, when set, makes the fake a TLS server: right after the INFO
+	// (which should then say tls_required) it runs the server side of the
+	// handshake, as nats-server does, and speaks the protocol inside it.
+	tlsConf *tls.Config
+	// refuse hangs up every new connection before the INFO: a server that
+	// is down, for a client that keeps dialing it.
+	refuse   bool
 	conns    []net.Conn
 	subjects []string
 }
@@ -99,11 +121,22 @@ func (f *natsFake) published() []string {
 func (f *natsFake) serve(c net.Conn) {
 	defer c.Close()
 	f.mu.Lock()
+	if f.refuse {
+		f.mu.Unlock()
+		return
+	}
 	f.conns = append(f.conns, c)
-	info := f.info
+	info, tlsConf := f.info, f.tlsConf
 	f.mu.Unlock()
 	if _, err := c.Write([]byte("INFO " + info + "\r\n")); err != nil {
 		return
+	}
+	if tlsConf != nil {
+		tc := tls.Server(c, tlsConf)
+		if err := tc.Handshake(); err != nil {
+			return
+		}
+		c = tc
 	}
 	rd := bufio.NewReader(c)
 	subs := map[string]string{} // subject of each SUB -> its sid
@@ -131,6 +164,12 @@ func (f *natsFake) serve(c net.Conn) {
 				subs[fields[1]] = fields[len(fields)-1]
 			}
 		case "PING":
+			f.mu.Lock()
+			silent := f.silent
+			f.mu.Unlock()
+			if silent {
+				continue
+			}
 			if _, err := c.Write([]byte("PONG\r\n")); err != nil {
 				return
 			}
@@ -149,13 +188,30 @@ func (f *natsFake) serve(c net.Conn) {
 			}
 			f.mu.Lock()
 			f.subjects = append(f.subjects, fields[1])
-			pubReply, acks := f.pubReply, f.acks
+			pubReply, acks, ackErr, noResp := f.pubReply, f.acks, f.ackErr, f.noResponders
+			if f.replyFor != nil {
+				pubReply = f.replyFor(fields[1])
+			}
 			f.mu.Unlock()
 			if pubReply != "" {
 				// A real server's -ERR for a denied publish, and nothing else:
 				// the message is never routed, so no ack follows.
 				if _, err := c.Write([]byte(pubReply)); err != nil {
 					return
+				}
+				continue
+			}
+			if noResp && reply != "" {
+				sid := subs[reply]
+				if i := strings.LastIndexByte(reply, '.'); sid == "" && i > 0 {
+					sid = subs[reply[:i]+".*"]
+				}
+				if sid != "" {
+					const status = "NATS/1.0 503\r\n\r\n"
+					if _, err := fmt.Fprintf(c, "HMSG %s %s %d %d\r\n%s\r\n", reply, sid,
+						len(status), len(status), status); err != nil {
+						return
+					}
 				}
 				continue
 			}
@@ -168,6 +224,11 @@ func (f *natsFake) serve(c net.Conn) {
 				if sid != "" {
 					seq++
 					ack := fmt.Sprintf(`{"stream":"LOGHUB_SYSLOG","seq":%d}`, seq)
+					if ackErr != nil {
+						if e := ackErr(seq); e != "" {
+							ack = e
+						}
+					}
 					if _, err := fmt.Fprintf(c, "MSG %s %s %d\r\n%s\r\n", reply, sid, len(ack), ack); err != nil {
 						return
 					}
@@ -234,7 +295,7 @@ func holdAsyncErrors(n *NATS) {
 
 // ------------------------------------------------------------- item 13
 
-// §22.1 item 13: a token is the whole user part of a URL (LOGHUB_EB_URL accepts
+// §22 pendência 13: a token is the whole user part of a URL (LOGHUB_EB_URL accepts
 // nats://<token>@host, SPEC §10.9), and nats.go's ConnectedUrlRedacted hides
 // only a password: the token was printed in the "nats connected" INFO of every
 // boot and the WARN of every reconnect. The password URL is the control that
@@ -271,7 +332,7 @@ func TestNATSConnectLogsNoCredentials(t *testing.T) {
 
 func permViolation(s string) error { return fmt.Errorf("%w: %s", nats.ErrPermissionViolation, s) }
 
-// §22.1 item 14: which denials are a verdict on the data path. The text is
+// §22 pendência 14: which denials are a verdict on the data path. The text is
 // what nats.go hands the ErrorHandler for a server's -ERR.
 func TestNATSDeniesTheDataPath(t *testing.T) {
 	for _, tc := range []struct {
@@ -307,7 +368,7 @@ func TestNATSDeniesTheDataPath(t *testing.T) {
 	}
 }
 
-// §22.1 item 14: a denial on the data path reaches this sink only
+// §22 pendência 14: a denial on the data path reaches this sink only
 // asynchronously, so nothing ever turned FATAL and the ring filled behind a
 // sink that looked UP. The verdict is kept and returned by Health and by every
 // Write, which then publishes nothing; a denial on the beacon's subject is
@@ -341,7 +402,7 @@ func TestNATSVerdictIsReturnedByHealthAndWrite(t *testing.T) {
 	}
 }
 
-// §22.1 item 14, core mode: a denied publish never fails PublishMsg. The -ERR
+// §22 pendência 14, core mode: a denied publish never fails PublishMsg. The -ERR
 // comes before the flush's PONG, so the Write that met it reads it from
 // LastError and is already fatal -- with the ErrorHandler held back, nothing
 // else could make it so. Before, the chunk was confirmed, counted as written
@@ -366,7 +427,7 @@ func TestNATSCoreDeniedPublishIsFatalAtOnce(t *testing.T) {
 	}
 }
 
-// §22.1 item 14, jetstream mode: a denied publish never gets an ack, so the
+// §22 pendência 14, jetstream mode: a denied publish never gets an ack, so the
 // futures time out -- network, retried forever. The -ERR already sits in
 // LastError when they do, and the Write returns the verdict, fatal and still
 // tainting; the ErrorHandler is held back so only that read can do it.
@@ -390,7 +451,7 @@ func TestNATSJetStreamDeniedPublishIsFatalAfterTheTimeout(t *testing.T) {
 
 // ------------------------------------------------------------- item 15
 
-// §22.1 item 15: a message the client refuses before it leaves (ErrMaxPayload:
+// §22 pendência 15: a message the client refuses before it leaves (ErrMaxPayload:
 // a reconnection to a node with a smaller max_payload, a dump line from a life
 // with a larger syslog.max_message_bytes) is refused alone, like a 10054: the
 // rest of the chunk is published and Delivered says which. It ended the chunk:
@@ -430,7 +491,7 @@ func TestNATSMaxPayloadMidChunkIsRefusedAlone(t *testing.T) {
 
 // ------------------------------------------------------------- item 16
 
-// §22.1 item 16, core mode: max_payload is checked on every health check, not
+// §22 pendência 16, core mode: max_payload is checked on every health check, not
 // once. A reconnection may land on a server with a smaller one, and every
 // larger message would then be refused by the client, chunk after chunk, with
 // the sink UP.
@@ -462,7 +523,7 @@ func TestNATSCoreMaxPayloadIsCheckedOnEveryCheck(t *testing.T) {
 
 // ------------------------------------------------------------- item 17
 
-// §22.1 item 17 (decided 2026-10-11): retention=interest acknowledges and keeps
+// §22 pendência 17 (decided 2026-10-11): retention=interest acknowledges and keeps
 // nothing while no consumer is interested, so a confirmed chunk could be lost:
 // refused, fatal. workqueue and limits are the controls. max_msgs_per_subject
 // is only warned about, once per value, though validate runs on every check.
@@ -520,7 +581,7 @@ func TestNATSValidateRetentionAndPerSubjectCap(t *testing.T) {
 
 // ------------------------------------------------------------- item 20
 
-// §22.1 item 20: core mode publishes a dump of another space with no stream to
+// §22 pendência 20: core mode publishes a dump of another space with no stream to
 // ask whether anyone listens: lost unless someone subscribes there, and the
 // dump removed as delivered. It is said once per foreign space, never per
 // message, and never for this instance's own space.
@@ -550,7 +611,7 @@ func TestNATSCoreWarnsOnceAboutAForeignSpace(t *testing.T) {
 	}
 }
 
-// §22.1 item 20: the own space is the hot path, and finding its subject --
+// §22 pendência 20: the own space is the hot path, and finding its subject --
 // with the comparison that tells a foreign space apart -- must not cost an
 // allocation per envelope: the subject strings are built once.
 func TestNATSOwnSubjectDoesNotAllocate(t *testing.T) {
@@ -566,7 +627,7 @@ func TestNATSOwnSubjectDoesNotAllocate(t *testing.T) {
 
 // -------------------------------------------- against a real server (14, 15, 16, 17, 19)
 
-// §22.1 item 16: the stream contract holds on every health check, not only at
+// §22 pendência 16: the stream contract holds on every health check, not only at
 // the boot. A stream edited underneath answered every publish with a timeout
 // or a refusal -- network, retried forever, or logic, dropped -- while Health,
 // which saw the stream still there, kept the sink UP.
@@ -607,7 +668,7 @@ func TestNATSStreamEditedAtRuntimeIsFatal(t *testing.T) {
 	}
 }
 
-// §22.1 item 16, the other half: checking the contract on every health check
+// §22 pendência 16, the other half: checking the contract on every health check
 // must not start to require the subject of another space a reingested dump
 // published on. Once that dump drained, narrowing the stream back to the own
 // space -- what the operator may do -- is not a FATAL.
@@ -641,7 +702,7 @@ func TestNATSForeignSubjectIsNotPartOfTheContract(t *testing.T) {
 	}
 }
 
-// §22.1 item 15 against a real server: a message above its max_payload is
+// §22 pendência 15 against a real server: a message above its max_payload is
 // refused by the client before it leaves, alone, in both modes, and
 // Delivered says exactly which were published.
 func TestNATSOversizedMessageIsRefusedAlone(t *testing.T) {
@@ -694,7 +755,7 @@ func TestNATSOversizedMessageIsRefusedAlone(t *testing.T) {
 	}
 }
 
-// §22.1 item 17 against a real server: a stream with retention=interest and no
+// §22 pendência 17 against a real server: a stream with retention=interest and no
 // consumer acknowledges a publish and keeps nothing -- shown here, so the
 // refusal is about a real loss -- and Health refuses it, fatal.
 func TestNATSInterestStreamIsRefused(t *testing.T) {
@@ -772,7 +833,7 @@ func permSink(t *testing.T, url, user, space, stream, mode string) *NATS {
 	return p
 }
 
-// §22.1 item 14 against a real server: a role denied the data subject, or the
+// §22 pendência 14 against a real server: a role denied the data subject, or the
 // _INBOX the acks and the API's answers come back on, is a permanent verdict
 // -- fatal from Write and Health -- in both modes; a role denied only the
 // beacon's subject keeps the data path healthy.
@@ -835,7 +896,7 @@ func TestNATSPermissionDeniedIsFatal(t *testing.T) {
 	})
 }
 
-// §22.1 item 19 against a real server: credentials refused at the first
+// §22 pendência 19 against a real server: credentials refused at the first
 // CONNECT end the boot at once, fatal, instead of waiting out
 // sink.boot_timeout with the network's message.
 func TestNATSRefusedCredentialsAreFatal(t *testing.T) {
@@ -910,4 +971,61 @@ func TestMaskedDenial(t *testing.T) {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
+}
+
+// The flush of a core chunk -- or of the core health check -- that a dropped
+// connection interrupts returns ErrConnectionClosed from nats.go (the pending
+// PING's channel is closed) although the client is only RECONNECTING. Classed
+// as fatal by the table, a NATS blip in the middle of a flush was FATAL, a dump
+// and exit 3 instead of a retry (go-syslog-nats-server TESTING §8 item 1, the
+// same in go-webhook-nats-server and go-relplog-server; found in
+// go-relplog-nats-server, 2026-10-13). It is network now; a
+// connection that is closed for good stays fatal (the control).
+func TestNATSCoreFlushCutByAReconnectionIsNetwork(t *testing.T) {
+	srv := startNATSFake(t, natsFakeINFO(""))
+	n := fakeSink(t, srv, NATSModeCore, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := n.Health(ctx); err != nil {
+		t.Fatalf("control: Health = %v", err)
+	}
+	for _, op := range []string{"write", "health"} {
+		srv.set(func(f *natsFake) { f.silent = true })
+		done := make(chan error, 1)
+		go func() {
+			if op == "write" {
+				done <- n.Write(ctx, batchOf(t, line5424))
+			} else {
+				done <- n.Health(ctx)
+			}
+		}()
+		time.Sleep(200 * time.Millisecond) // the flush is waiting for its PONG
+		srv.set(func(f *natsFake) { f.silent = false })
+		srv.drop()
+		err := <-done
+		if err == nil || ClassOf(err) != ClassNetwork {
+			t.Fatalf("%s: a flush cut by a reconnection = %v (class %s), want network", op, err, ClassOf(err))
+		}
+		waitConnected(t, n)
+	}
+	// Control: once the connection is closed for good, the same error is fatal.
+	n.Close()
+	if err := n.flushErr(n.nc, "flush", nats.ErrConnectionClosed); !IsFatal(err) {
+		t.Fatalf("a flush on a closed connection = %v, want fatal", err)
+	}
+}
+
+func waitConnected(t *testing.T, n *NATS) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		n.mu.Lock()
+		nc := n.nc
+		n.mu.Unlock()
+		if nc != nil && nc.IsConnected() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the client did not reconnect")
 }

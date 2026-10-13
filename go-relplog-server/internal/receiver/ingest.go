@@ -237,6 +237,10 @@ type Ingest struct {
 	cfg     IngestConfig
 	max     int
 
+	// full is the ring's cheap pre-check (ring.Memory.FullFor), nil when the
+	// ring has none: a full ring is refused before the uuid and the copy.
+	full func(n int) bool
+
 	// failLog rate-limits the "could not accept" line. A refusing destination
 	// produces one per message, and a collector must not be able to fill its
 	// own log with notices about not collecting (SPEC §14.2).
@@ -252,10 +256,14 @@ func NewIngest(r ring.Ring, s SinkState, f *filter.Filter, l *ratelimit.Limiter,
 	if limit <= 0 {
 		limit = defaultMaxMessageBytes
 	}
-	return &Ingest{
+	in := &Ingest{
 		ring: r, sink: s, filter: f, limiter: l, m: m, log: log, cfg: cfg, max: limit,
 		failLog: obs.NewSampler(30 * time.Second),
 	}
+	if f, ok := r.(interface{ FullFor(n int) bool }); ok {
+		in.full = f.FullFor
+	}
+	return in
 }
 
 // MaxMessageBytes is the effective syslog.max_message_bytes.
@@ -382,6 +390,17 @@ func (in *Ingest) try(ctx context.Context, raw []byte, w *Wire) Outcome {
 	if in.sink != nil && !in.sink.Up() {
 		return SinkDown
 	}
+	// A full ring is refused before the uuid, the copy and the item: a held
+	// transaction comes back here every 50 ms (SPEC §5.7), and the refusal
+	// would otherwise cost as much as an acceptance. Full on EITHER ceiling,
+	// for the line about to be copied: ring.max_bytes binds as well as
+	// ring.capacity_items. The check is racy on purpose -- Enqueue below is
+	// still the authority, and a slot freed in between only costs one retry
+	// (independent reviews of go-syslog-pg-server and go-relplog-pg-server,
+	// 2026-10-13).
+	if in.full != nil && in.full(len(raw)) {
+		return RingFull
+	}
 
 	// --- 7. the item -------------------------------------------------------
 	if w.UUID.IsZero() {
@@ -420,6 +439,17 @@ func (in *Ingest) try(ctx context.Context, raw []byte, w *Wire) Outcome {
 	it := item.New(h, buf, class)
 
 	// --- 8. ring -----------------------------------------------------------
+	//
+	// The end of the session wins (SPEC §5.7): a transaction whose session
+	// ended while it was being built -- its peer gone, the shutdown -- is not
+	// enqueued, because librelp retransmits what it never got an answer for,
+	// and the copy in the ring would be a duplicate. The memory ring never
+	// looks at the context, so this is the only place that does
+	// (go-relplog-nats-server review, 2026-10-13).
+	if ctx.Err() != nil {
+		it.Release()
+		return Shutdown
+	}
 	err := in.ring.Enqueue(ctx, it)
 	if err == nil {
 		in.m.MessagesAcceptedTotal[obsTransport(w.Transport)].Inc()
