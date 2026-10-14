@@ -78,6 +78,13 @@ func Compare(boot, running, fresh *Loaded) (applied, ignored []string) {
 		running = boot
 	}
 	bootVals, curVals, newVals := boot.Values(), running.Values(), fresh.Values()
+	for _, vals := range []map[string]string{bootVals, curVals, newVals} {
+		// Synonyms are one value: an INI that says windows-1252 where the
+		// boot said cp1252 changed nothing, and a SIGHUP that reported it as
+		// "requires a restart" sent the operator after a restart that would
+		// change nothing (independent review, 2026-10-13).
+		vals["syslog.legacy_charset"] = canonicalCharset(vals["syslog.legacy_charset"])
+	}
 	for _, p := range fresh.Params {
 		name := p.Name()
 		if p.Reload {
@@ -89,4 +96,17 @@ func Compare(boot, running, fresh *Loaded) (applied, ignored []string) {
 		}
 	}
 	return applied, ignored
+}
+
+// canonicalCharset folds the synonyms syslog.legacy_charset accepts into the
+// one spelling convert.ParseCharset gives the same charset for.
+// TestCharsetSynonymsAreOneValue pins the table to convert.ParseCharset.
+func canonicalCharset(v string) string {
+	switch v {
+	case "windows-1252":
+		return CharsetCP1252
+	case "iso-8859-1":
+		return CharsetLatin1
+	}
+	return v
 }

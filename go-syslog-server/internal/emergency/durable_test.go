@@ -65,3 +65,37 @@ func TestWriteGivesUpWhenAbandoned(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The abandon check also runs every 1024 records, so a large dump the abort
+// counted does not finish its writes and its fsync before giving up
+// (independent review of the port, 2026-10-13: only the start and the
+// publish were proven). Abandoned at the second check -- record 1023 of 3000
+// --, the temporary is removed and the check before the publish never runs.
+func TestWriteGivesUpInTheMiddleOfALargeDump(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, agent)
+	items := make([]*item.Item, 3000)
+	for i := range items {
+		items[i] = mkItem(i, "m")
+	}
+	calls := 0
+	s.SetAbandon(func() bool { calls++; return calls >= 2 })
+	if p, err := s.Write(items); !errors.Is(err, ErrAbandoned) || p != "" {
+		t.Fatalf("Write = %q, %v; want ErrAbandoned", p, err)
+	}
+	if calls != 2 {
+		t.Fatalf("the abandon check ran %d times, want 2: the start and record 1023", calls)
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+		t.Fatalf("an abandoned dump left %d entries: %s", len(ents), ents[0].Name())
+	}
+	// Control: never abandoned, the start, two in the middle and the publish.
+	calls = 0
+	s.SetAbandon(func() bool { calls++; return false })
+	if _, err := s.Write(items); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 4 {
+		t.Fatalf("a full write of 3000 records ran %d checks, want 4", calls)
+	}
+}

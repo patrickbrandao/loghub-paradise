@@ -256,15 +256,17 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 			}
 			log.Warn("nats disconnected", "error", err)
 		}),
-		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
+		nats.ReconnectErrHandler(func(nc *nats.Conn, err error) {
 			// nats.go calls this only for a reconnection whose TCP dial
-			// failed; a TLS refusal comes later, in the handshake, and is
-			// caught by noteLastError from Health. Kept for a client version
-			// that reports it here. Only a verdict is logged: every failed
-			// dial of a long outage as an ERROR would repeat what /readyz and
-			// syslog_sink_up already say (go-relplog-nats-server SPEC §22
-			// item 3, not ported).
-			if isTLSRefusal(err) {
+			// failed -- and for a wss:// server, whose TLS is part of the
+			// dial; a nats:// TLS refusal comes later, in the handshake, and
+			// is caught by noteLastError from Health. Only a verdict is
+			// logged: every failed dial of a long outage as an ERROR would
+			// repeat what /readyz and syslog_sink_up already say
+			// (go-relplog-nats-server SPEC §22 item 3, not ported). A TLS
+			// refusal is a verdict only with no other server to go to
+			// (tlsVerdict).
+			if n.tlsVerdict(nc, err) {
 				n.setVerdict(err)
 				n.asyncError(err)
 			}
@@ -365,9 +367,26 @@ func (n *NATS) noteLastError(nc *nats.Conn) {
 	// FATAL came from the fuses, ~20 s later, reading "connection is
 	// RECONNECTING" -- or never, with both fuses off (go-relplog-nats-server,
 	// independent review, 2026-10-13; SPEC §10.7).
-	if deniesTheDataPath(last) || isTLSRefusal(last) {
+	if deniesTheDataPath(last) || n.tlsVerdict(nc, last) {
 		n.setVerdict(last)
 	}
+}
+
+// tlsVerdict reports a TLS refusal that is permanent for this client: one
+// with no other server to go to. With a pool -- several sink.nats.urls, or
+// the servers a cluster gossips (nc.Servers counts both) -- LastError holds
+// the refusal of the LAST server tried while the client cycles through them:
+// one node with a certificate of another CA, or a discovered node whose name
+// is not in its certificate, turned a restart of the trusted node into a
+// permanent FATAL, a dump and exit 3, although the trusted node came back
+// within seconds (independent review of the port, 2026-10-13). There the
+// refusal is network, named in the health check's error, and the fuses of
+// SPEC §13.3 give the FATAL if no server of the pool comes back.
+func (n *NATS) tlsVerdict(nc *nats.Conn, err error) bool {
+	if !isTLSRefusal(err) {
+		return false
+	}
+	return nc == nil || len(nc.Servers()) <= 1
 }
 
 // escalate turns a network failure into the verdict once one is set. A publish
@@ -502,6 +521,15 @@ func (n *NATS) connect() (*nats.Conn, jetstream.JetStream, error) {
 	nc, err := nats.Connect(strings.Join(n.cfg.URLs, ","), n.opts...)
 	if err != nil {
 		n.mu.Unlock()
+		if isTLSRefusal(err) && len(n.cfg.URLs) > 1 {
+			// The first connect tries every URL once and returns the last
+			// error: a TLS refusal of one URL while a trusted one is down for
+			// a moment is not the pool refusing this server. Network: the
+			// boot waits sink.boot_timeout for a server that serves, and its
+			// exit-3 line names the TLS (tlsVerdict).
+			return nil, nil, networkErr("connect", fmt.Errorf(
+				"no server of sink.nats.urls accepted the connection; the last one tried refused TLS: %w", err))
+		}
 		return nil, nil, classifyNATS("connect", err)
 	}
 	var js jetstream.JetStream
@@ -925,8 +953,15 @@ func (n *NATS) Health(ctx context.Context) error {
 		return fatalErr("health", fmt.Errorf("connection closed for good: %w", last))
 	default:
 		// escalate reads LastError: what keeps the client RECONNECTING may be
-		// permanent (a TLS that can never succeed, see noteLastError).
-		return n.escalate(nc, "health", networkErr("health", fmt.Errorf("connection is %s", st)))
+		// permanent (a TLS that can never succeed, see noteLastError). With a
+		// pool it is not, and the error says which TLS refusal the client
+		// keeps meeting: the fuses' FATAL, if it comes, then names it.
+		cause := fmt.Errorf("connection is %s", st)
+		if last := nc.LastError(); isTLSRefusal(last) {
+			cause = fmt.Errorf("connection is %s; the last server tried refused TLS, and another "+
+				"server of the pool may still serve: %w", st, last)
+		}
+		return n.escalate(nc, "health", networkErr("health", cause))
 	}
 
 	if n.cfg.Mode == NATSModeCore {
@@ -1348,8 +1383,11 @@ func classifyNATSError(err error) Class {
 // description is the store's own error: "maximum messages exceeded", "maximum
 // bytes exceeded" and "maximum messages per subject exceeded" are a stream
 // with discard=new that is full -- backpressure, which clears as soon as a
-// consumer acknowledges -- and "store closed" a stream or server shutting
-// down (a rolling restart of NATS). As fatal they were a dump and exit 3, and
+// consumer acknowledges -- and "store is closed" (ErrStoreClosed,
+// nats-server/v2 server/store.go:43) a stream or server shutting down (a
+// rolling restart of NATS). The match was "store closed" until the
+// independent review of the port (2026-10-13): no nats-server text says
+// that, so a closing store was fatal after all. As fatal they were a dump and exit 3, and
 // the stored part of the chunk duplicated at reingestion (independent review,
 // 2026-10-11). A record too large for the store stays fatal: retrying cannot
 // make it fit, and validateSize refuses the configurations that produce it.
@@ -1358,6 +1396,7 @@ func storeFailedIsTransient(desc string) bool {
 	return strings.Contains(d, "maximum messages exceeded") ||
 		strings.Contains(d, "maximum bytes exceeded") ||
 		strings.Contains(d, "maximum messages per subject exceeded") ||
+		strings.Contains(d, "store is closed") ||
 		strings.Contains(d, "store closed")
 }
 

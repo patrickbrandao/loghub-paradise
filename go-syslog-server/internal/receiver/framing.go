@@ -159,7 +159,15 @@ func (f *Framer) Next() (msg []byte, size int, framing item.Framing, err error) 
 	// read below may park for the whole idle timeout: a buffer a large frame
 	// grew is let go here, before the wait, not kept for the connection's
 	// life (SPEC §15.1).
-	if cap(f.buf) > frameKeepCap {
+	//
+	// Only before a wait: with bytes already in the reader the next frame is
+	// here and the buffer is about to be needed again. Released after every
+	// frame above 16 KiB, a stream of 8-64 KiB frames reallocated the 64 KiB
+	// class for each of them -- 12 KiB frames went from 62 µs to 583 µs per
+	// 64 frames and from 78 KB to 4.7 MB allocated (independent review of
+	// the port, 2026-10-13; TESTING §4). An idle connection still keeps no
+	// more than frameKeepCap.
+	if cap(f.buf) > frameKeepCap && f.r.Buffered() == 0 {
 		f.buf = nil
 	}
 	if !f.decided {

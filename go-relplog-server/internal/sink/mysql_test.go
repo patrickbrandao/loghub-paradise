@@ -39,7 +39,7 @@ func TestClassifyMySQLNumber(t *testing.T) {
 		{1054, ClassFatal}, {1146, ClassFatal}, {1364, ClassFatal},
 
 		// The destination is alive and refused THIS data.
-		{1048, ClassLogic}, {1062, ClassLogic}, {1153, ClassLogic}, {1264, ClassLogic},
+		{1048, ClassFatal}, {1062, ClassLogic}, {1153, ClassLogic}, {1264, ClassLogic},
 		{1366, ClassLogic}, {1406, ClassLogic}, {1690, ClassLogic},
 		{3819, ClassLogic}, // a CHECK: its SQLSTATE is HY000, so the fallback cannot see it
 

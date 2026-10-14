@@ -281,9 +281,11 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 5180   # o logger do ma
 - **A perda do abort tem um dono só** (SPEC §13.4). Da fase do dump em diante
   o abort conta o contador `dumping`, nunca o ring; as passagens
   (`enterDumpPhase`, `oweDump`) e o abort vão sob `lossMu`, o dump o toma com
-  `Swap`, e um dump já contado como perdido desiste (`SetAbandon`). Conte cada
+  `Swap` também sob ele (`settleDump`: fora dele, um dump que via `aborted`
+  antes de o abort tomar o contador contava `emergency_failed` no lugar de
+  `abort`), e um dump já contado como perdido desiste (`SetAbandon`). Conte cada
   mensagem num lado só, e teste o abort caindo em **cada** janela (os ganchos
-  `beforeCollect`, `beforeDump`): a corrida esperada não aparece. `SIGQUIT`
+  `beforeCollect`, `beforeDump`, `inAbort`): a corrida esperada não aparece. `SIGQUIT`
   nunca é tolerado, e um `SIGQUIT` tardio chega por `quitNow`.
 - **SIGHUP** compara chave recarregável com o que está em execução e chave de
   restart com o boot. Só `[log]` recarrega.

@@ -258,8 +258,9 @@ func TestClickHouseMetrics(t *testing.T) {
 	if got := in.metric(`syslog_config_info{ring_mode="memory",sink_type="clickhouse",transports="udp,tcp"}`); got != "1" {
 		t.Errorf("syslog_config_info = %s", got)
 	}
-	if got := in.metric(`syslog_sink_clickhouse_pool_conns{state="max"}`); got != "5" {
-		t.Errorf("pool max = %s, want sink.workers + 1 = 5", got)
+	// The pool is the writers': the health check has its own connection.
+	if got := in.metric(`syslog_sink_clickhouse_pool_conns{state="max"}`); got != "4" {
+		t.Errorf("pool max = %s, want sink.workers = 4", got)
 	}
 	if got := in.metric("syslog_sink_clickhouse_dedup_blocks_total"); got != "0" {
 		t.Errorf("dedup blocks = %s", got)

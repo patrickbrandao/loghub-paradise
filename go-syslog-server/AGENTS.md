@@ -265,8 +265,10 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514   # o logger do ma
   escrita e confirmados. Use `Instrumented.Deliver`.
 - **Um "a portar" de um irmão é candidato, não patch.** O R é RELP: o `ctx`
   conferido antes do `Enqueue` evita duplicata lá e **perderia** mensagens TCP
-  já lidas aqui; a sonda MySQL do R não tem `unix`, a deste servidor tem.
-  Confira no S antes de copiar (CHANGELOG, 2026-10-13).
+  já lidas aqui; a sonda MySQL do R não tem `unix`, a deste servidor tem; e o
+  "sem cabeçalho PROXY e fechando, fecha sem contar" do R descartava aqui as
+  linhas que um par `optional` já tinha mandado (só a **espera** pelo cabeçalho
+  é do shutdown, §4.6). Confira no S antes de copiar (CHANGELOG, 2026-10-13).
 - **Valores aceitos pela config precisam significar algo para quem os usa.** Um
   enum aceito pelo registry e desconhecido no pacote consumidor desliga o recurso
   em silêncio (aliases de facility; `windows-1252`).

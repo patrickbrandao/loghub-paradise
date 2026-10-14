@@ -102,7 +102,16 @@ func NewRELPReader(r *bufio.Reader, maxFrame int64, maxMsg int) *RELPReader {
 // is kept.
 func (rd *RELPReader) ReadFrame() (RELPFrame, error) {
 	var f RELPFrame
-	if cap(rd.buf) > relpKeepBlock {
+	// A buffer a large frame grew is let go only when nothing of the next
+	// frame is buffered: the read below may then park for the whole idle
+	// timeout, and an idle connection must not hold 64 KiB for as long as it
+	// lives (SPEC §15.1). Let go before EVERY frame, a sender of 24 KiB lines
+	// paid the whole doubling again per frame -- 2+4+8+16+24 KiB and their
+	// copies, 55 KB and 5 allocations a frame -- for a buffer it was about to
+	// grow back (independent review of go-syslog-server, 2026-10-13, E2;
+	// BenchmarkRELPReaderFrames in TESTING). A sender still sending has the
+	// next frame in the bufio.Reader; one that stopped has not.
+	if cap(rd.buf) > relpKeepBlock && rd.r.Buffered() == 0 {
 		rd.buf = nil
 	}
 

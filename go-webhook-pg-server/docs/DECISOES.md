@@ -91,11 +91,84 @@ entre os dois; o teste da barreira roda 3000 rodadas; e o parser de flags só
 nomeia uma flag que este servidor conhece e não cita nada depois de um valor.
 Fica, decidida como no N, a brecha da cauda com traço depois de um valor não
 vazio (`--x=a -b`): escondê-la esconderia os erros de digitação (TESTING §8
-item 18).
+item 18). Fechada em 2026-10-13 (seção abaixo).
 
 **Não portado**: a porta estreita do dump do N (`shape.go`). Aqui a fila
 recusa o que o N precisa recusar sozinho (CHECKs, `jsonb`), e a reingestão já
 refaz item a item um lote recusado como `logic`.
+
+## Porte das correções da família syslog/RELP (2026-10-13)
+
+Uma subseção por área da rodada; o que veio igual dos irmãos está na SPEC.
+
+### Ciclo de vida e dump
+
+Padrões assumidos nesta rodada (contestáveis); o que veio igual do S, do SP e
+do RN está na SPEC (§9, §9.2, §10.3, §10.5), na mesma forma do fast:
+
+- **O `fsync` do diretório decide a remoção e a quarentena, não o dump.** O SP
+  recusa o dump cujo diretório não sincroniza; aqui ele continua melhor esforço
+  (§9.1, decisão do porte de 2026-10-11). Na remoção e na quarentena a falha
+  vem depois do `unlink`/`rename` e vira `WARN` (`emergency.ErrNotDurable`).
+- **Com `emergency.enabled = false` a perda continua sendo `abort`** (§9.3),
+  não `emergency_failed` como no SP; o envelope deixado fora do dump pela
+  defesa do enquadramento passa a ser contado pelo próprio dump.
+- **A leitura dos dumps em todo boot** (a regra do fast, pendência registrada
+  na SPEC) entrou nesta rodada por ser do mesmo caminho: com a chave
+  desligada, um `emergency.dir` que não se lista é `ERROR` e o boot segue.
+- **Não se aplica o `quitNow` do SP:** `SIGQUIT` fora do shutdown é a ação
+  padrão do Go (§10.3); o canal do aborto, que inclui `SIGQUIT`, passa a ser
+  registrado antes de o contexto soltar `SIGTERM`/`SIGINT`.
+- **Não se aplica o prazo da reingestão "sem progresso"** do SP: a reingestão
+  daqui não espera nem retenta — cada lote tem o seu `sink.op_timeout` e uma
+  recusa de rede ou fatal sai com 3 (§9.2). A leitura é do arquivo inteiro, não
+  em fluxo, então não há "pedaço" para o *gauge* mostrar: ele é do arquivo, e
+  recontado do disco no fim.
+- **Fechamento em paralelo:** já era (`Server.Shutdown`).
+
+### Configuração
+
+As regras de configuração do `go-relplog-server` e dos cortes dele, já no
+`go-syslog-pg-server` (SPEC §13.2, tabela de §10.1). Padrões assumidos,
+contestáveis:
+
+- **Tetos da família:** `ring.capacity_items` 16 Mi (só há ring de memória);
+  `sink.batch` 1 Mi, o do fast (que leva lotes de 100 000 linhas ao
+  ClickHouse), e não os 65 536 do SP: o código é comum aos quatro webhooks, e
+  um `Dequeue` de 1 Mi ponteiros são 8 MiB; `sink.workers` 1024; `pool_size`
+  4096; `server.listeners` 256.
+- **As seções do fast que este servidor não tem contam como conhecidas**
+  (`retiredSections`) para a regra da cauda: `--sink.redis.addrs=x` depois de
+  uma flag com valor é nomeada, como sozinha, em vez de culpar a flag anterior
+  (a mesma escolha do SP com as seções do `go-syslog-server`).
+- **Não se aplica:** `sink.batch_max_bytes`, `ring.max_inflight` e
+  `ring.sqlite.commit_batch` (não existem aqui; o teto de 1 GiB de um parâmetro
+  já é `WARN` de §8.5.4), as regras de URL PostgreSQL da `LOGHUB_EB_URL` (não
+  há `LOGHUB_EB_URL` nem outro leitor de URL ou DSN: `[sink.postgres]` são
+  chaves separadas) e o socket com `tls=true`, que já era recusado.
+
+### O destino PostgreSQL
+
+Portado do `go-syslog-pg-server` e do `go-relplog-pg-server`, com o código do
+`go-webhook-fast-server` (o `sink/postgres.go` segue igual ao dele, salvo os
+comentários que já diferiam). Contestáveis:
+
+- **O check de saúde tem conexão própria (`pgx.Conn`), fora do pool**, em vez
+  da recusa de `pool_size < sink.workers + 1` que o RP adotou para o mesmo
+  defeito (escritas lentas seguram todas as conexões, o check espera uma, DOWN
+  e FATAL com o banco sadio). Aqui só há `ring=memory` e a recusa bastaria, mas
+  o código é o do fast, onde com `ring=none` nenhum `pool_size` bastaria, e
+  manter os dois iguais vale mais. Custo: `pool_size + 1` conexões por
+  instância.
+- **A derivação continua `sink.workers + 1`** (a folga só é aberta se usada), e
+  um `pool_size` explícito **abaixo** de `sink.workers` é `WARN`; igual a
+  `sink.workers` não avisa mais (avisava abaixo de `workers + 1`).
+- **Uma conexão de check reaproveitada que falha é refeita uma vez** dentro do
+  mesmo prazo: o *ping* do pool escondia uma conexão parada que morreu.
+- **Não se aplica:** o `Deliver` com `logic` antes do `ctx` do RP (os workers
+  daqui já tratavam a classe antes do contexto; ficou um teste de guarda); o
+  prazo próprio da validação (já existia; veio a prova contra o servidor real,
+  `validation_deadline_test.go`, do fast).
 
 ## Riscos
 

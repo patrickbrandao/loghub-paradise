@@ -80,6 +80,10 @@ func TestClassifyNATS(t *testing.T) {
 		{"10077 max bytes", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum bytes exceeded"}, ClassNetwork},
 		{"10077 max per subject", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages per subject exceeded"}, ClassNetwork},
 		{"10077 store closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store closed"}, ClassNetwork},
+		// The text nats-server 2.14.6 sends (server/store.go:43, ErrStoreClosed);
+		// the one above is no server's (independent review of go-syslog-server,
+		// 2026-10-13, C2).
+		{"10077 store is closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store is closed"}, ClassNetwork},
 		{"10077 record too large", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "message too large"}, ClassFatal},
 		{"api unknown 4xx", api(400, 10999), ClassFatal},
 		// go-syslog-server SPEC §22.1 item 18: transient though 4xx. 10158 (409) is a

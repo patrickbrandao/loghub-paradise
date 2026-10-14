@@ -267,7 +267,8 @@ func (a *App) deliverDirect(ctx context.Context, envs []sink.Envelope, deadline 
 // It zeroes App.dumping as soon as the outcome is known and BEFORE anything is
 // counted: saved, an abort loses nothing more; failed, the loss is counted
 // here as emergency_failed, and an abort racing that count must not add the
-// same messages again as abort (Swap: one owner of the count, SPEC §13.4).
+// same messages again as abort (settleDump: one owner of the count, under
+// lossMu, SPEC §13.4).
 //
 // A dump the abort already counted gives up (emergency.Store.SetAbandon), and
 // one that completed after the abort counts nothing more: the abort counted
@@ -281,7 +282,7 @@ func (a *App) dumpEmergency(items []*item.Item) bool {
 		// No emergency store (emergency.enabled=false): SPEC §12.3 counts this
 		// exactly like a dump that failed -- unless an abort already took the
 		// counter and counted the same messages.
-		if a.dumping.Swap(0) > 0 {
+		if a.settleDump() > 0 {
 			a.log.Error("emergency dumps are disabled; these messages are lost", "count", len(items))
 			a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Add(uint64(len(items)))
 		}
@@ -291,7 +292,7 @@ func (a *App) dumpEmergency(items []*item.Item) bool {
 		a.beforeDump()
 	}
 	res, err := a.emg.Write(items, convert.New(a.convertConfig()), a.cfg.Syslog.AcceptMalformed)
-	owed := a.dumping.Swap(0)
+	owed := a.settleDump()
 	if err != nil {
 		if owed == 0 {
 			return false // an abort counted them already

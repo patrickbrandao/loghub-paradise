@@ -69,6 +69,27 @@ estão escritas para o usuário poder trocá-las sabendo o custo.
 - Uma transação devolvida **não** é descarte: o emissor a retransmite. Por isso
   não entra em `relplog_messages_dropped_total`.
 
+### 2.1 Porte das correções dos cortes e do S (2026-10-13)
+
+Pedido: trazer para cá as correções que o RP, o RN e o S receberam depois deste
+módulo (lista "A portar" da entrada RP, RN do `CHANGELOG.md` da raiz) e os
+achados da revisão independente do porte do S que valem aqui. As escolhas que o
+plano daquela revisão deixou como "recomendadas" foram autorizadas pelo
+usuário; as novas, minhas, estão abaixo como **padrões assumidos**, contestáveis.
+
+| # | Tema | Decisão | Por quê |
+|---|---|---|---|
+| P1 | **Sonda de saúde SQL** | A checagem de saúde de PostgreSQL, MySQL e ClickHouse tem **conexão própria, fora do pool** (`pgx.Conn`; `sql.DB` com uma conexão; um cliente ClickHouse de uma conexão). O pool é dos escritores: `pool_size = 0` deriva **`sink.workers`** (era `workers + 1`), e abaixo dos workers continua exit 1. **Não** porto o `pool_size ≥ workers + 1` do RP | O "+ 1" do RP existia só para a sonda; com `ring=none` os escritores são até `ring.max_inflight` e nenhum "+ 1" a protegia (revisão do S, D1). Com a sonda fora, `pool = workers` é a configuração exata, e recusá-la seria recusar o certo. O total de conexões continua `workers + 1`, como antes. Custo: uma conexão a mais quando o operador fixou o pool |
+| P2 | Memória do ClickHouse | A conta de `max_memory_usage_for_user` multiplica o pior pedaço pelos **escritores** (`Config.SinkWriters`: `sink.workers` com ring; `min(pool_size, ring.max_inflight)` com `ring=none`), passados pela app | A sonda não faz `INSERT`; e a mensagem antiga mandava "baixar o pool", que a config recusa abaixo dos workers |
+| P3 | TLS de um pool NATS | A recusa do TLS só é veredito com **um** servidor no pool do cliente (`nc.Servers()`, descobertos inclusive); com mais, `network` com o motivo no erro, e os fusíveis dão o FATAL; no boot, mais de uma URL também é `network` | Opção recomendada do plano (C1). O `LastError` é do último servidor tentado |
+| P4 | `ring=sqlite` + `sink=none` | O backlog de uma vida anterior fica no `ring.db`, fora da contabilidade (`KeepBacklog`, como o F), com `WARN`; `ring=redis` + `sink=none` é `WARN` na validação | Opção recomendada (A3); a regra é a do dump com `sink=none` (decisão 16) |
+| P5 | Tetos | `ring.capacity_items` ≤ 16 Mi só no ring de memória efetivo (degradado inclusive), ≤ 2^40 nos persistentes; `sink.batch` ≤ 1 Mi; `ring.max_inflight` ≤ 1 Mi; `sink.workers` ≤ 1024; `pool_size` ≤ 4096; `batch_max_bytes` ≤ 256 MiB; `commit_batch` ≤ 65536; listeners ≤ 256. O `MaxPending` do NATS é calculado em `int64` e limitado a `MaxInt32` | Os valores do S (mesmos rings e sinks); o limite do `MaxPending` garante um `int` em qualquer plataforma, mesmo nos tetos |
+| P6 | URL PostgreSQL | Usuário e banco obrigatórios (decisão do RP); `?host=` vazio, `sslmode=` vazio e TLS num socket (chaves ou URL) são exit 1 | Uma URL, um destino, em toda leitura (libpq e este servidor) |
+| P7 | Pré-checagem do ring cheio | Só o ring de **memória** tem `FullFor` (os dois tetos); `sqlite` e `redis` seguem sem pré-checagem | O R não tinha pré-checagem nenhuma; nos persistentes ela seria uma consulta, que custa mais que a cópia que economiza |
+| P8 | Frame ruim com transações em voo | O contexto da sessão é conferido logo antes do `Enqueue`: num frame ruim, só recebe `200` o que já estava no ring; o resto fica sem resposta e o `librelp` retransmite | É o "fim da sessão vence" de §5.7 levado até o `Enqueue` (RN). `TestRELPMalformedFrameClosesAfterTheAnswers` passou a esperar o ring, como no RN |
+| P9 | Testes de `autocommit` do MySQL | Sem `SET GLOBAL autocommit`: um usuário próprio do teste e um `init_connect` **condicional** a ele (`IF(USER() LIKE 'ac0\_%', 0, @@autocommit)`), com controle de que a sessão desse usuário nasce com `autocommit=0` | Opção recomendada (D5). O `init_connect` ainda é global, mas não muda a sessão de nenhum outro usuário; usuários com `CONNECTION_ADMIN` (o `root` das outras suítes) nem o executam |
+| P10 | Não portado | O **E1** da revisão do S (linhas em buffer no `Close` com `proxy.protocol=optional`): no RELP o que não teve `200` o `librelp` retransmite. Nada que contradiga §5.4 | Pedido explícito; a semântica RELP decide |
+
 ## 3. Riscos
 
 - **Comportamento do cliente.** As decisões 4–6 dependem do `librelp`. Outro

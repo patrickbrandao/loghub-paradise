@@ -111,6 +111,7 @@ go test -run XXX -bench . -benchmem ./internal/convert ./internal/ratelimit ./in
 | `IngestAccept` | 137 ns/op | 280 B, 2 allocs | recepção até o ring (moldura já feita) |
 | `TCPReceive/octet` | 450–560 ns/op (~2 M msg/s) | ~335 B, 2 allocs | uma conexão, linhas de ~200 bytes, socket real + moldura + pipeline até o ring de memória; igual com o leitor de 64 KiB (460–530 ns) e com o de 4 KiB (SPEC §5.4) |
 | `TCPReceive/lf` | 450–570 ns/op (~2 M msg/s) | ~330 B, 2 allocs | idem em LF; com 64 KiB era 860–1 020 ns, porque a busca do NUL varria o buffer inteiro a cada frame (corrigido junto: o NUL só é procurado antes do LF) |
+| `Framer12K` (2026-10-13) | 61–71 µs/op (~12 GB/s) | 78 KB, 5 allocs | 64 frames de 12 KiB pelo leitor de 4 KiB (SPEC §5.4): entre o limiar do buffer guardado (16 KiB) e a classe de 64 KiB. Soltando o buffer depois de todo frame acima de 16 KiB eram 587–929 µs/op, 4,7 MB e 131 allocs (a classe de 64 KiB realocada a cada frame); agora só antes de uma espera (revisão independente do porte) |
 | `AllowSameKey` | 152 ns/op | 0 | rate-limit, um emissor (contenção no shard) |
 | `AllowSpreadKeys` | 39 ns/op | 3 B | rate-limit, emissores espalhados |
 
@@ -298,6 +299,24 @@ SYSLOG_TEST_NATS_PERM_URL=nats://127.0.0.1:14224 go test -race ./internal/sink/ 
 |---|---|
 | `SYSLOG_TEST_NATS_PERM_URL` | sem usuário na URL; usuários `admin`, `nopub`, `noinbox`, `nobeacon` (senha = usuário); a mesma conf está no comentário de `natsPermSetup` em `internal/sink/review_nats_test.go` |
 
+**TLS de verdade, num pool** (revisão independente do porte, 2026-10-13): a
+suíte sobe os próprios `nats-server` com `tls {}`, nas portas 14700–14799, com
+duas CAs geradas em Go no teste (uma que o cliente confia, outra de um nó
+"estranho"), a partir do binário apontado por `SYSLOG_TEST_NATS_SERVER_BIN`
+(2.14.6; pula sem ele):
+
+```bash
+go build -o /tmp/nats-server github.com/nats-io/nats-server/v2@v2.14.6
+SYSLOG_TEST_NATS_SERVER_BIN=/tmp/nats-server go test -race -run 'TLSPool' ./internal/sink/
+```
+
+Prova que um nó de certificado de outra CA num pool de dois não vira veredito
+quando o nó confiável reinicia (era FATAL, 5 de 5), que o primeiro `CONNECT`
+com o confiável fora e o estranho no ar é `network` (dez conexões, contra a
+ordem embaralhada do `nats.go`) e sobe quando o confiável volta, que o estranho
+sozinho continua o veredito imediato, e que um servidor confiável em
+`jetstream` reinicia sem veredito e volta a escrever.
+
 Prova a negação do subject de dados (`jetstream`: fatal depois do
 `sink.op_timeout`; `core`: fatal na hora) e da assinatura `_INBOX` como veredito
 FATAL, a negação do subject do beacon **sem** veredito, e senha errada no
@@ -366,6 +385,19 @@ PostgreSQL 18, MySQL 8.4, ClickHouse 25.8, Redis 7 (dois: um com
 sem JetStream e com permissões, `SYSLOG_TEST_NATS_PERM_URL`) e os emissores reais (`SYSLOG_TEST_EMITTERS=1`) — todas as variáveis de §6:
 681 testes de primeiro nível e 458 subtestes passam, **1 pulado**
 (`TestGoldenVectors/arquivo-sem-pri`: `transport=file`, fora por D5).
+
+### 6.8 Resultado da rodada de 2026-10-13 (revisão independente do porte)
+
+`gofmt -l .` vazio, `go vet ./...` limpo e `go test -race -count=1 -v ./...`
+verde **duas vezes seguidas**, os 16 pacotes, com todas as variáveis de §6
+(PostgreSQL 18, MySQL 8.4, ClickHouse 25.8, os dois Redis 7, nats-server 2.14.6
+com JetStream, sem JetStream e com permissões), os emissores reais
+(`SYSLOG_TEST_EMITTERS=1`) e `SYSLOG_TEST_NATS_SERVER_BIN` (os `nats-server`
+com `tls {}` da suíte): **708 testes de primeiro nível e 471 subtestes passam,
+1 pulado** (`TestGoldenVectors/arquivo-sem-pri`, D5), nas duas rodadas. Fuzz de
+60 s nos alvos cujo código mudou, sem falha: `FuzzFrame` 638 mil execuções,
+`FuzzFrameOracle` 882 mil, `FuzzProxy` 49 mil (máquina carregada por outras
+suítes em paralelo; soma-se à lacuna 1).
 
 ---
 
@@ -448,21 +480,43 @@ Registradas por honestidade, não por esquecimento.
     - Sonda MySQL: linhas `unix` de um ring persistente drenadas numa vida sem
       listener `unix` não têm teste; `parseWithoutLibpqEnv` mexe no ambiente do
       processo sob mutex, sem teste de concorrência com outra leitura dele.
-    - `pool_size ≥ workers + 1` no MySQL e no ClickHouse foi estendido pela
-      leitura do código (a sonda usa o mesmo pool), sem teste de integração; o
-      teto de 4096 desses pools é escolha, não limite de biblioteca.
+    - ~~`pool_size ≥ workers + 1` sem teste de integração~~: fechado pela
+      revisão independente do porte (2026-10-13). A sonda de saúde tem conexão
+      própria nos três sinks, e `Test{Postgres,MySQL,ClickHouse}ProbeIsNotStarvedByTheWriters`
+      seguram tantas escritas lentas quanto conexões no pool (2 e 3) e provam
+      a checagem dentro de 1 s. O teto de 4096 desses pools é escolha, não
+      limite de biblioteca.
     - O `knownSectionOf` ainda cita uma cauda de senha com cara de
       `sink.nats.xyz`: risco reduzido, não fechado (como no R e no RN).
     - NATS: a folga 2× do `MaxPending` não tem teste (tirá-la não mata nenhum);
-      o TLS que nunca verifica e o `ErrSecureConnWanted` só contra o `natsFake`,
-      sem `nats-server` com `tls {}`; num cluster com **um** nó de certificado
-      ruim, a reconexão que cair nele vira FATAL (semântica do RN, não testada).
-    - Dump: o abandono a cada 1024 registros só é provado no início e antes da
-      publicação; o fechamento paralelo dos quatro transportes reais com
-      conexões presas não tem teste de tempo (`TestTransportsCloseTogether` usa
-      transportes falsos); bind cancelado provado em `tcp`, `udp` e admin, não
-      em `unix` e `tls`; o fluxo "operador renomeia o temporário interrompido e
-      o boot seguinte o reingere" não tem teste.
+      o `ErrSecureConnWanted` só contra o `natsFake`. O certificado que não
+      verifica roda contra `nats-server` com `tls {}` (§6.4,
+      `SYSLOG_TEST_NATS_SERVER_BIN`). Até a revisão independente do porte
+      (2026-10-13) esta linha dizia que, num cluster com um nó de certificado
+      ruim, a reconexão que caísse nele virar FATAL era "semântica do RN": não
+      era (o RN não tem TLS), e o FATAL permanente de um restart do nó confiável
+      era bug; a regra agora é a de SPEC §10.7 ("só é veredito quando nenhum
+      outro servidor pode servir"). Não provado: um nó **descoberto** por
+      *gossip* de cluster (o teste usa duas URLs configuradas; a regra lê
+      `nc.Servers()`, que conta os dois); o `wss://` pelo
+      `ReconnectErrHandler`.
+    - Dump: o abandono a cada 1024 registros é provado
+      (`TestWriteGivesUpInTheMiddleOfALargeDump`, 2026-10-13); o fechamento
+      paralelo dos quatro transportes reais com conexões presas não tem teste de
+      tempo (`TestTransportsCloseTogether` usa transportes falsos); bind
+      cancelado provado em `tcp`, `udp`, `tls` e admin por nome de host e em
+      `tcp`, `udp`, `tls` e `unix` por literal/caminho
+      (`TestSignalBeforeALiteralBindExits130`); o fluxo "operador renomeia o
+      temporário interrompido e o boot seguinte o reingere" não tem teste.
+    - Revisão independente do porte (2026-10-13), o que ficou sem prova: o
+      `?host=` vazio e o TLS sobre socket do PostgreSQL são recusados na config,
+      sem servidor por socket nos testes; o `1048` fatal do MySQL vem de uma
+      coluna alterada depois do boot, não de um trigger; a regra
+      `ring=redis` + `sink=none` é só um `WARN`; o teto de `ring.capacity_items`
+      com `sqlite`/`redis` (2⁴⁰) é de sanidade, sem teste de um ring com 50
+      milhões de linhas de verdade; o `store is closed` do `10077` só pela
+      tabela de classes, com o texto do servidor (fechar o store no meio de uma
+      publicação exige um restart cronometrado).
 
 ---
 
@@ -547,3 +601,25 @@ mutantes, todos mortos).
 | pendências 27–29, revisões do R/RN | recusa fatal logada como `boot_timeout`; primeiro `SIGTERM` abortava o shutdown por FATAL; aborto durante o dump subcontado, depois contado duas vezes, e dump já contado como perdido publicado | um dono só da contagem (`lossMu`, `enterDumpPhase`/`oweDump`, `SetAbandon`) |
 | revisão do RN | `SIGQUIT` depois da leitura da flag ignorado; sinal antes do bind de um nome de host saía 1 | sinal tardio chega por canal; bind cancelado é 130 |
 | revisão do R | `Remove` do dump sem `fsync` do diretório; health checks sem o contexto de vida; transportes fechados em sequência (um `closeGrace` cada) | `ErrNotDurable` também ao abrir o diretório; `withLifetime`; fechar todos em paralelo |
+
+### Revisão independente do porte (2026-10-13)
+
+Cinco revisores só de leitura sobre o porte (ciclo de vida e dump; config;
+NATS; sinks SQL e Redis; recepção, conversão, ring e docs). Cada correção tem
+teste que falhava antes, conferido por mutação (a correção desfeita mata o
+teste).
+
+| Achado por | Bug | Lição |
+|---|---|---|
+| revisão A (X1) | sinal nos passos 9–12 com bind de literal IP ou caminho `unix`: nenhum bind falha, o servidor abria, `/readyz` 200 e saía com 0 | o contexto dos sinais é conferido depois de **todos** os binds, não só quando um falha |
+| revisão A (X2) | o aborto publica a marca antes de tomar o contador; o dump que via a marca no intervalo contava tudo como `emergency_failed` | quem toma o contador toma sob o mesmo mutex (`settleDump`) |
+| revisão A | `ring=sqlite` + `sink=none` drenava o `ring.db` de uma vida com destino para o descarte | a regra dos dumps (decisão 26) vale para o backlog: fica, fora da conta |
+| revisão B | teto de 16 Mi itens (do `makechan`) aplicado a `sqlite`/`redis`; `sink.batch` ≤ 65 536 recusava ClickHouse legítimo; `max_inflight` sem teto dava a volta no `MaxPending` | teto vale para quem aloca por ele; o ring **efetivo**, depois da degradação |
+| revisão B | `?host=` vazio, TLS sobre socket do PostgreSQL e `,` no host Redis: a URL dizia uma coisa a cada leitor | toda forma que dois leitores leem diferente é recusada |
+| revisão C | um nó de certificado ruim num pool virava veredito permanente quando o confiável reiniciava (o `LastError` é do último servidor tentado) | recusa de um servidor só é veredito quando não há outro |
+| revisão C (X3) | `10077` "store is closed" (texto do nats-server) era fatal; o teste usava o texto inventado "store closed" | caso de teste com o texto do servidor, citado pelo arquivo e linha |
+| revisão D | a sonda de saúde tirava a conexão do pool dos escritores; com `ring=none` o `+1` não protegia nada | a sonda tem conexão própria; o pool é dos escritores |
+| revisão D | conta de memória por usuário do ClickHouse multiplicava pelo pool (contando a sonda); `1048` do MySQL era `logic`; nome de banco contado em bytes | multiplicar pelo que escreve; erro que o servidor nunca causa é da tabela; limites do servidor nas unidades dele |
+| revisão D | testes de `autocommit` com `SET GLOBAL autocommit` no MySQL compartilhado | um teste não muda estado global do servidor compartilhado: `init_connect` num usuário próprio, ou a sessão pedida pelo próprio conector |
+| revisão E | `proxy.protocol=optional`: linhas já lidas de um par sem cabeçalho descartadas sem contagem no `Close` (regra copiada do R) | só a **espera** pelo cabeçalho é do shutdown |
+| revisão E | o buffer de frame acima de 16 KiB era solto depois de todo frame: 12 KiB de 62 µs para 583 µs | soltar antes de uma espera, não depois de um frame |

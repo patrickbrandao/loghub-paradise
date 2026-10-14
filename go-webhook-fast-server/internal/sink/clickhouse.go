@@ -43,6 +43,15 @@ type ClickHouseConfig struct {
 	// batch can never be the MEMORY_LIMIT_EXCEEDED that is fatal at run time.
 	// Zero skips the check.
 	MaxBatchBytes int64
+
+	// Writers is how many writes this process can have in flight at once
+	// (SPEC §8.8.5): sink.workers with a ring, ring.max_inflight with
+	// ring=none. Like MaxBatchBytes it comes from the app, which knows the
+	// ring; the sink must never consult it. The memory check multiplies the
+	// worst batch by min(PoolSize, Writers): the health check's connection is
+	// a SELECT outside the pool, and a pool slot no writer can use costs the
+	// server nothing. Zero takes PoolSize.
+	Writers int
 }
 
 // ClickHouse is the analytical destination (SPEC §8.8). Schema in §3.9. It is
@@ -55,6 +64,13 @@ type ClickHouse struct {
 	conn driver.Conn
 	log  *slog.Logger
 	m    *obs.Metrics
+
+	// probe is the health check's own pool of ONE connection, outside conn
+	// (SPEC §8.8.8), for the reason of Postgres.probe: writers holding every
+	// pooled connection starved a check that waited for one (the driver's
+	// acquire timeout, then DOWN and FATAL with a healthy server), and with
+	// ring=none no pool_size keeps one free.
+	probe driver.Conn
 
 	// insert is the one statement this sink ever writes with, the column list
 	// in chColumns order.
@@ -119,8 +135,12 @@ func NewClickHouse(cfg ClickHouseConfig, log *slog.Logger, m *obs.Metrics) (*Cli
 	if !chIdent.MatchString(cfg.Table) {
 		return nil, fmt.Errorf("sink clickhouse: table %q is not a plain identifier", cfg.Table)
 	}
-	if cfg.Database == "" {
-		return nil, errors.New("sink clickhouse: database is empty")
+	// The database goes between backticks in the INSERT; the rule and the
+	// reason are checkQuotedName's (SPEC §8.8.3). Inside backticks ClickHouse
+	// reads a backslash as an escape, so a name with one would address
+	// another database than the one validated.
+	if err := checkQuotedName("sink clickhouse: database", cfg.Database); err != nil {
+		return nil, err
 	}
 
 	opts := &clickhouse.Options{
@@ -169,6 +189,13 @@ func NewClickHouse(cfg ClickHouseConfig, log *slog.Logger, m *obs.Metrics) (*Cli
 	if err != nil {
 		return nil, fmt.Errorf("sink clickhouse: %w", err)
 	}
+	popts := *opts
+	popts.MaxOpenConns, popts.MaxIdleConns = 1, 1
+	probe, err := clickhouse.Open(&popts)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sink clickhouse: %w", err)
+	}
 
 	database, name := cfg.Database, cfg.Table
 	if i := strings.IndexByte(cfg.Table, '.'); i >= 0 {
@@ -177,6 +204,7 @@ func NewClickHouse(cfg ClickHouseConfig, log *slog.Logger, m *obs.Metrics) (*Cli
 	c := &ClickHouse{
 		cfg:      cfg,
 		conn:     conn,
+		probe:    probe,
 		log:      log,
 		m:        m,
 		insert:   "INSERT INTO `" + database + "`.`" + name + "` (" + strings.Join(chColumnList, ", ") + ")",
@@ -366,7 +394,7 @@ func (c *ClickHouse) Health(ctx context.Context) error {
 		return ErrClosed
 	}
 	var readonly uint64
-	if err := c.conn.QueryRow(ctx, "SELECT toUInt64(getSetting('readonly'))").Scan(&readonly); err != nil {
+	if err := c.probe.QueryRow(ctx, "SELECT toUInt64(getSetting('readonly'))").Scan(&readonly); err != nil {
 		return classifyClickHouse("health", err)
 	}
 	c.observePool()
@@ -410,7 +438,7 @@ func (c *ClickHouse) Health(ctx context.Context) error {
 // the process -- a 242 on a write still says the same thing, fatally.
 func (c *ClickHouse) replicaHealth(ctx context.Context) error {
 	var ro uint8
-	err := c.conn.QueryRow(ctx,
+	err := c.probe.QueryRow(ctx,
 		"SELECT is_readonly FROM system.replicas WHERE database = ? AND table = ?",
 		c.database, c.name).Scan(&ro)
 	var ex *clickhouse.Exception
@@ -504,7 +532,7 @@ func (c *ClickHouse) validate(ctx context.Context) error {
 		Scan(&maxMem, &maxMemUser); err != nil {
 		return classifyClickHouse("validate", err)
 	}
-	if problem := chMemoryProblem(c.cfg.MaxBatchBytes, c.cfg.PoolSize, maxMem, maxMemUser); problem != "" {
+	if problem := chMemoryProblem(c.cfg.MaxBatchBytes, c.concurrentInserts(), maxMem, maxMemUser); problem != "" {
 		return fatalErr("validate", errors.New(problem))
 	}
 
@@ -804,15 +832,30 @@ func chMemoryNeed(n int64) uint64 {
 	return chMemoryBase + chMemoryFactor*uint64(n)
 }
 
+// concurrentInserts is how many INSERTs this instance can have in flight at
+// once: one per pooled connection, but never more than there are writers to
+// send them (ClickHouseConfig.Writers). The health check's connection is not
+// counted: it is outside the pool and only ever runs a SELECT. Multiplying by
+// the pool alone counted the slot sink.workers + 1 keeps spare, and refused a
+// per-user limit of exactly workers worst batches that no write could ever
+// break (independent review of the port to go-syslog-server, 2026-10-13).
+func (c *ClickHouse) concurrentInserts() int {
+	n := c.cfg.PoolSize
+	if c.cfg.Writers > 0 && c.cfg.Writers < n {
+		n = c.cfg.Writers
+	}
+	return n
+}
+
 // chMemoryProblem compares the session's memory limits with the worst batch
 // (SPEC §8.8.5). max_memory_usage holds for one query; max_memory_usage_for_user
 // for every query of the user at once, and this instance alone can have
-// poolSize INSERTs in flight -- four concurrent legitimate batches broke a
-// per-user limit the single-batch comparison had accepted. Instances sharing
-// the user add up on top, which no one instance can see. Zero is ClickHouse's
-// "unlimited": the server-wide ceiling then applies, which this session cannot
-// read.
-func chMemoryProblem(maxBatch int64, poolSize int, maxMem, maxMemUser uint64) string {
+// inserts INSERTs in flight (concurrentInserts) -- four concurrent legitimate
+// batches broke a per-user limit the single-batch comparison had accepted.
+// Instances sharing the user add up on top, which no one instance can see.
+// Zero is ClickHouse's "unlimited": the server-wide ceiling then applies,
+// which this session cannot read.
+func chMemoryProblem(maxBatch int64, inserts int, maxMem, maxMemUser uint64) string {
 	if maxBatch <= 0 {
 		return ""
 	}
@@ -822,14 +865,20 @@ func chMemoryProblem(maxBatch int64, poolSize int, maxMem, maxMemUser uint64) st
 			"server can write (%d bytes of envelopes) costs the server; MEMORY_LIMIT_EXCEEDED is fatal, so "+
 			"raise the limit or lower the batch", maxMem, need, maxBatch)
 	}
-	if poolSize < 1 {
-		poolSize = 1
+	if inserts < 1 {
+		inserts = 1
 	}
-	if all := need * uint64(poolSize); maxMemUser != 0 && maxMemUser < all {
+	// The remedies are what lowers the need without making a worker queue:
+	// the message once said "lower the pool", and a pool below the workers
+	// only makes them wait for a connection (SPEC §8.5.3) -- fewer writers,
+	// not fewer connections, is what sends fewer INSERTs at once.
+	if all := need * uint64(inserts); maxMemUser != 0 && maxMemUser < all {
 		return fmt.Sprintf("max_memory_usage_for_user=%d is below the %d bytes of %d concurrent INSERTs of "+
-			"the largest batch (%d bytes of envelopes each, one per pooled connection); every instance on "+
-			"the same user adds as much again. MEMORY_LIMIT_EXCEEDED is fatal: raise the limit, give each "+
-			"instance its own user, or lower the pool and the batch", maxMemUser, all, poolSize, maxBatch)
+			"the largest batch (%d bytes of envelopes each; one per writer, at most one per pooled "+
+			"connection); every instance on the same user adds as much again. MEMORY_LIMIT_EXCEEDED is "+
+			"fatal: raise the limit, give each instance its own user, or lower the batch or the "+
+			"writers (sink.workers; ring.max_inflight with ring.mode=none)",
+			maxMemUser, all, inserts, maxBatch)
 	}
 	return ""
 }
@@ -846,12 +895,13 @@ func (c *ClickHouse) observePool() {
 	c.m.SinkClickHousePoolConns[obs.PoolMax].Set(int64(st.MaxOpenConns))
 }
 
-// Close releases the pool. The workers are stopped before the sink is closed.
+// Close releases the pool and the health check's connection. The workers are
+// stopped before the sink is closed.
 func (c *ClickHouse) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-	return c.conn.Close()
+	return errors.Join(c.conn.Close(), c.probe.Close())
 }
 
 // uuidText is the canonical lowercase form of a uuid, which the driver's UUID

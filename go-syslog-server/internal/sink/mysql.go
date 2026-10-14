@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -58,8 +59,11 @@ type MySQLConfig struct {
 type MySQL struct {
 	cfg MySQLConfig
 	db  *sql.DB
-	log *slog.Logger
-	m   *obs.Metrics
+	// probe is the health check's own connection, outside the writers' pool
+	// (SPEC §10.6; see Postgres.probe).
+	probe *sql.DB
+	log   *slog.Logger
+	m     *obs.Metrics
 
 	// quoted is the table as every statement names it: `db`.`t`.
 	quoted string
@@ -124,8 +128,9 @@ func checkQuotedName(what, name string) error {
 	if name == "" {
 		return fmt.Errorf("%s is empty", what)
 	}
-	if len(name) > 64 {
-		return fmt.Errorf("%s %q has %d bytes; the limit is 64", what, name, len(name))
+	// 64 characters, not bytes: MySQL's limit (config.maxDBName).
+	if n := utf8.RuneCountInString(name); n > 64 {
+		return fmt.Errorf("%s %q has %d characters; the limit is 64", what, name, n)
 	}
 	for i := 0; i < len(name); i++ {
 		switch c := name[i]; {
@@ -265,6 +270,14 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	db.SetMaxIdleConns(cfg.PoolSize)
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(0)
+	// The health check's own connection, from the same connector: the same
+	// session parameters (autocommit, sql_mode, time_zone) as every writer's
+	// (see Postgres.probe for why it is not taken from the writers' pool).
+	probe := sql.OpenDB(connector)
+	probe.SetMaxOpenConns(1)
+	probe.SetMaxIdleConns(1)
+	probe.SetConnMaxLifetime(0)
+	probe.SetConnMaxIdleTime(0)
 
 	schema, name := cfg.Database, cfg.Table
 	if i := strings.IndexByte(cfg.Table, '.'); i >= 0 {
@@ -273,6 +286,7 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	p := &MySQL{
 		cfg:    cfg,
 		db:     db,
+		probe:  probe,
 		log:    log,
 		m:      m,
 		quoted: "`" + schema + "`.`" + name + "`",
@@ -498,7 +512,7 @@ func (p *MySQL) Health(ctx context.Context) error {
 		return ErrClosed
 	}
 	var readOnly int64
-	if err := p.db.QueryRowContext(ctx, "SELECT @@read_only").Scan(&readOnly); err != nil {
+	if err := p.probe.QueryRowContext(ctx, "SELECT @@read_only").Scan(&readOnly); err != nil {
 		return classifyMySQL("health", err)
 	}
 	p.observePool()
@@ -537,7 +551,7 @@ func (p *MySQL) Health(ctx context.Context) error {
 // ClassFatal: none of it changes by waiting.
 func (p *MySQL) validate(ctx context.Context) error {
 	var engine sql.NullString
-	err := p.db.QueryRowContext(ctx,
+	err := p.probe.QueryRowContext(ctx,
 		"SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
 		p.schema, p.name).Scan(&engine)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -621,11 +635,11 @@ func (p *MySQL) validate(ctx context.Context) error {
 		}
 	}
 
-	// autocommit, read back from a pooled connection: the session parameter
-	// set it, and a server or proxy that ignored the SET would turn every
+	// autocommit, read back from a connection of the writers' connector: the
+	// session parameter set it, and a server or proxy that ignored the SET would turn every
 	// Write into a transaction nobody commits (see NewMySQL).
 	var autocommit int64
-	if err := p.db.QueryRowContext(ctx, "SELECT @@session.autocommit").Scan(&autocommit); err != nil {
+	if err := p.probe.QueryRowContext(ctx, "SELECT @@session.autocommit").Scan(&autocommit); err != nil {
 		return classifyMySQL("validate", err)
 	}
 	if autocommit != 1 {
@@ -635,7 +649,7 @@ func (p *MySQL) validate(ctx context.Context) error {
 	}
 
 	var maxPacket int64
-	if err := p.db.QueryRowContext(ctx, "SELECT @@max_allowed_packet").Scan(&maxPacket); err != nil {
+	if err := p.probe.QueryRowContext(ctx, "SELECT @@max_allowed_packet").Scan(&maxPacket); err != nil {
 		return classifyMySQL("validate", err)
 	}
 	p.maxPacket.Store(maxPacket)
@@ -657,7 +671,7 @@ func (p *MySQL) validate(ctx context.Context) error {
 	// UUIDs, which the generator can never mint, and the transaction is
 	// rolled back, so the table never gains a row -- which is why InnoDB is
 	// required above.
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := p.probe.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyMySQL("validate", err)
 	}
@@ -788,7 +802,7 @@ type mysqlColumnInfo struct {
 // columns reads the table's columns from information_schema.COLUMNS, keyed by
 // lowercase name.
 func (p *MySQL) columns(ctx context.Context) (map[string]mysqlColumnInfo, error) {
-	rows, err := p.db.QueryContext(ctx, `
+	rows, err := p.probe.QueryContext(ctx, `
 		SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH, EXTRA
 		  FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
 		p.schema, p.name)
@@ -885,7 +899,7 @@ func (k mysqlUniqueKey) describe() string {
 // uniqueKeys reads every unique index of the table from
 // information_schema.STATISTICS, in index and key-part order.
 func (p *MySQL) uniqueKeys(ctx context.Context) ([]mysqlUniqueKey, error) {
-	rows, err := p.db.QueryContext(ctx, `
+	rows, err := p.probe.QueryContext(ctx, `
 		SELECT INDEX_NAME, COLUMN_NAME, SUB_PART
 		  FROM information_schema.STATISTICS
 		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0
@@ -931,7 +945,7 @@ func (p *MySQL) Close() error {
 	if p.closed.Swap(true) {
 		return nil
 	}
-	return p.db.Close()
+	return errors.Join(p.db.Close(), p.probe.Close())
 }
 
 // classifyMySQL maps a driver error onto the class the state machine acts on.
@@ -1005,12 +1019,20 @@ func mysqlNumberClass(n uint16) (Class, bool) {
 		return ClassFatal, true
 	case 1054, 1146, 1364: // unknown column, no such table, field has no default
 		return ClassFatal, true
+	// 1048 (column cannot be null) is the table's, not the row's: the boot
+	// probe proved every nullable column takes a NULL, and every NOT NULL
+	// column of the contract always gets a value. One after the boot is a
+	// column made NOT NULL since, or a trigger -- every row with a NULL there
+	// refused as logic, dropped with the sink UP. The twin of PostgreSQL's
+	// 23502 (independent review of the port, 2026-10-13; SPEC §10.6).
+	case 1048:
+		return ClassFatal, true
 	// 1062 cannot come from the INSERT: ON DUPLICATE KEY absorbs a collision
 	// on ANY unique key -- which is why a second unique index is refused at
 	// boot instead of surfacing here as an error that never comes. What is
 	// left is a duplicate raised by something else in the statement (a
 	// trigger writing to another table): that row, so logic.
-	case 1048, 1062, 1153, 1264, 1366, 1406, 1690: // NULL refused, duplicate entry, packet too large, out of range, bad string, data too long
+	case 1062, 1153, 1264, 1366, 1406, 1690: // duplicate entry, packet too large, out of range, bad string, data too long
 		return ClassLogic, true
 	// 3819 is listed because its SQLSTATE is HY000, which the fallback cannot
 	// read: a CHECK the row fails is that row (the boot probe makes a CHECK

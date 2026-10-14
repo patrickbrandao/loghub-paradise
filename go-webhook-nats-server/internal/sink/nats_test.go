@@ -71,7 +71,25 @@ func TestClassifyNATS(t *testing.T) {
 		{"api sealed 10109", api(400, jsErrStreamSealed), ClassFatal},
 		{"api insufficient resources 10023", api(503, jsErrInsufficientResources), ClassFatal},
 		{"api store failed 10077", api(503, jsErrStreamStoreFailed), ClassFatal},
+		// A full discard=new stream, or one closing, is 10077 too, with the
+		// store's own words: transient (porte da família syslog/RELP,
+		// 2026-10-13). "store is closed" is nats-server 2.14.6's text
+		// (server/store.go, ErrStoreClosed); "store closed" an older one.
+		{"10077 max msgs", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages exceeded"}, ClassNetwork},
+		{"10077 max bytes", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum bytes exceeded"}, ClassNetwork},
+		{"10077 max per subject", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages per subject exceeded"}, ClassNetwork},
+		{"10077 store is closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store is closed"}, ClassNetwork},
+		{"10077 store closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store closed"}, ClassNetwork},
+		{"10077 record too large", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "message too large"}, ClassFatal},
 		{"api unknown 4xx", api(400, 10999), ClassFatal},
+		// SPEC §18.1 item 8 (closed): transient though 4xx. 10158 (409) is a
+		// Nats-Msg-Id still in a Raft proposal, 10167 (429) a full ingest
+		// queue, and any 429 is backpressure; another 409 stays fatal.
+		{"api duplicate in process 10158", api(409, jsErrDuplicateInProcess), ClassNetwork},
+		{"api too many requests 10167", api(429, jsErrStreamTooManyRequests), ClassNetwork},
+		{"api unknown 429", api(429, 10210), ClassNetwork},
+		{"api unknown 409", api(409, 10999), ClassFatal},
+		{"wrapped api 10158", fmt.Errorf("ack: %w", api(409, jsErrDuplicateInProcess)), ClassNetwork},
 
 		{"max payload", nats.ErrMaxPayload, ClassLogic},
 		{"max bytes", jetstream.ErrMaxBytesExceeded, ClassLogic},
@@ -930,9 +948,17 @@ func TestNATSPermissionViolationOnTheDataPathIsFatal(t *testing.T) {
 		{viol(`Permissions Violation for Publish to "loghub.acme.webhook"`), true},
 		{viol(`Permissions Violation for Publish to "loghub.a.b.webhook"`), true},
 		{viol(`Permissions Violation for Publish to "$JS.API.STREAM.INFO.LOGHUB_WEBHOOK"`), true},
-		{viol(`Permissions Violation for Subscription to "_INBOX.x"`), false},
+		// The acks and the API's answers arrive on _INBOX: denied there, every
+		// batch times out (SPEC §18.1 item 9, closed in the porte da família
+		// syslog/RELP, 2026-10-13).
+		{viol(`Permissions Violation for Subscription to "_INBOX.x"`), true},
+		{viol(`Permissions Violation for Subscription to "_INBOX.x" using queue "q"`), true},
 		{viol(`Permissions Violation for Publish to "loghub._ctl.beacon"`), false},
+		{viol(`Permissions Violation for Publish to "loghub.ops.webhook.beacon"`), false},
+		{viol(`Permissions Violation for Publish to "loghub.webhook"`), false},
+		{viol(`Permissions Violation for Subscription to "loghub.acme.webhook"`), false},
 		{viol(`Permissions Violation for Publish to "loghub.acme.syslog"`), false},
+		{nil, false},
 		{errors.New(`Permissions Violation for Publish to "loghub.acme.webhook"`), false}, // not the sentinel
 		{nats.ErrTimeout, false},
 	} {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"runtime"
 	"strings"
@@ -130,8 +131,14 @@ func TestFramerReleasesALargeBuffer(t *testing.T) {
 			if msg, _, _, err := f.Next(); err != nil || string(msg) != "b" {
 				t.Fatalf("second frame: %q, %v", msg, err)
 			}
+			// The reader is empty now: the next Next would park, and lets the
+			// buffer go before it does. While bytes are buffered the buffer is
+			// kept for the frame they are (BenchmarkFramer12K).
+			if _, _, _, err := f.Next(); err != io.EOF {
+				t.Fatalf("third Next: %v, want EOF", err)
+			}
 			if cap(f.buf) > frameKeepCap {
-				t.Fatalf("buffer of %d kept after a small frame", cap(f.buf))
+				t.Fatalf("buffer of %d kept before a wait", cap(f.buf))
 			}
 		})
 	}
@@ -249,5 +256,46 @@ func BenchmarkTCPReceive(b *testing.B) {
 			close(stop)
 			<-drained
 		})
+	}
+}
+
+// The buffer a large frame grew is kept while the next frame is already in
+// the reader: released after every frame above frameKeepCap, a stream of
+// 12 KiB frames reallocated the 64 KiB class for each one (independent review
+// of the port, 2026-10-13). Back-to-back frames reuse it.
+func TestFramerKeepsTheBufferBetweenBufferedFrames(t *testing.T) {
+	line := strings.Repeat("a", 12<<10) + "\n"
+	f := NewFramer(bufio.NewReaderSize(strings.NewReader(strings.Repeat(line, 8)), 4<<10), FramingLF, 64<<10)
+	if _, _, _, err := f.Next(); err != nil {
+		t.Fatal(err)
+	}
+	first := func() *byte { return &f.buf[:cap(f.buf)][0] }
+	grown := first()
+	for i := 1; i < 8; i++ {
+		buffered := f.r.Buffered() > 0
+		if _, _, _, err := f.Next(); err != nil {
+			t.Fatal(err)
+		}
+		if buffered && first() != grown {
+			t.Fatalf("frame %d: buffer reallocated with the frame already buffered", i)
+		}
+		grown = first()
+	}
+}
+
+// BenchmarkFramer12K is 64 frames of 12 KiB through the 4 KiB reader of SPEC
+// §5.4: between the kept-buffer threshold (16 KiB) and the 64 KiB class.
+func BenchmarkFramer12K(b *testing.B) {
+	line := strings.Repeat("a", 12<<10) + "\n"
+	in := strings.Repeat(line, 64)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(in)))
+	for i := 0; i < b.N; i++ {
+		f := NewFramer(bufio.NewReaderSize(strings.NewReader(in), 4<<10), FramingLF, 64<<10)
+		for {
+			if _, _, _, err := f.Next(); err != nil {
+				break
+			}
+		}
 	}
 }

@@ -642,14 +642,26 @@ func TestPostgresDroppedTableIsFatalNotLogic(t *testing.T) {
 
 // A wrong password is fatal at the first check (class 28), not retried until
 // boot_timeout.
+//
+// With the server's connection slots exhausted -- other suites sharing it --
+// PostgreSQL answers 53300 before it looks at the password, a network error
+// that says nothing about this one: the check is repeated while that is the
+// answer (the flake go-relplog-pg-server found, 2026-10-13).
 func TestPostgresWrongPasswordIsFatal(t *testing.T) {
 	f := pgSetup(t)
 	cfg := f.cfg
 	cfg.Password = "definitely-wrong"
 	p := f.sink(cfg)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err := p.Health(ctx)
+	var err error
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = p.Health(ctx)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), "sqlstate=53300") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if !IsFatal(err) {
 		t.Fatalf("Health with a wrong password = %v (class %s), want fatal", err, ClassOf(err))
 	}

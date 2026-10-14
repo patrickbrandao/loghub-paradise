@@ -37,9 +37,11 @@ func TestClassifyMySQLNumber(t *testing.T) {
 		{1044, ClassFatal}, {1045, ClassFatal}, {1049, ClassFatal}, {1130, ClassFatal},
 		{1142, ClassFatal}, {1143, ClassFatal},
 		{1054, ClassFatal}, {1146, ClassFatal}, {1364, ClassFatal},
+		// NOT NULL after the boot probe is the table's (the twin of 23502).
+		{1048, ClassFatal},
 
 		// The destination is alive and refused THIS data.
-		{1048, ClassLogic}, {1062, ClassLogic}, {1153, ClassLogic}, {1264, ClassLogic},
+		{1062, ClassLogic}, {1153, ClassLogic}, {1264, ClassLogic},
 		{1366, ClassLogic}, {1406, ClassLogic}, {1690, ClassLogic},
 		{3819, ClassLogic}, // a CHECK: its SQLSTATE is HY000, so the fallback cannot see it
 

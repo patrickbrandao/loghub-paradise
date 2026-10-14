@@ -344,16 +344,48 @@ func (c cancelAfterWrite) Write(ctx context.Context, b *sink.Batch) error {
 // exit 1 of a bad address (independent review of go-relplog-nats-server,
 // 2026-10-13). Every transport of this server binds with that context.
 func TestSignalBeforeTheBindExits130(t *testing.T) {
-	for _, tc := range []struct{ name, flag string }{
-		{"tcp", "--listen.tcp=localhost:0"},
-		{"udp", "--listen.udp=localhost:0"},
-	} {
+	p := newPKI(t)
+	signalBeforeTheBind(t, []bindCase{
+		{"tcp", func(*testing.T) []string { return []string{"--listen.tcp=localhost:0"} }},
+		{"udp", func(*testing.T) []string { return []string{"--listen.udp=localhost:0"} }},
+		{"tls", func(*testing.T) []string { return p.tlsListen("localhost:0") }},
+	})
+}
+
+// A literal IP and a unix path never look at the context: the bind succeeds
+// after the signal, and the boot used to open, answer /readyz 200 and leave
+// with 0 through the graceful path (independent review of the port,
+// 2026-10-13, X1). The check after the last bind gives them the same 130.
+func TestSignalBeforeALiteralBindExits130(t *testing.T) {
+	p := newPKI(t)
+	signalBeforeTheBind(t, []bindCase{
+		{"tcp", func(*testing.T) []string { return []string{"--listen.tcp=127.0.0.1:0"} }},
+		{"udp", func(*testing.T) []string { return []string{"--listen.udp=127.0.0.1:0"} }},
+		{"tls", func(*testing.T) []string { return p.tlsListen("127.0.0.1:0") }},
+		{"unix", func(t *testing.T) []string { return []string{"--listen.unix=" + shortSocketPath(t)} }},
+	})
+}
+
+type bindCase struct {
+	name  string
+	flags func(t *testing.T) []string
+}
+
+func (p *pki) tlsListen(addr string) []string {
+	return []string{"--listen.tls=" + addr, "--tls.cert_file=" + p.serverCert, "--tls.key_file=" + p.serverKey}
+}
+
+// signalBeforeTheBind lands a signal between the reingestion and the bind,
+// with only the case's transport configured, and wants 130.
+func signalBeforeTheBind(t *testing.T, cases []bindCase) {
+	t.Helper()
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if _, err := emergency.NewStore(filepath.Join(dir, "emergency"), testID.From).Write(crashItems(3, "pre-bind")); err != nil {
 				t.Fatal(err)
 			}
-			args := append(baseArgs(dir), "--listen.tcp=", "--listen.udp=", tc.flag)
+			args := append(append(baseArgs(dir), "--listen.tcp=", "--listen.udp="), tc.flags(t)...)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			code := runContext(ctx, args, testID, func(a *App) {

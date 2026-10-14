@@ -15,6 +15,24 @@ import (
 // whitespace, no wildcards, no dots inside a token, no slashes.
 var natsToken = regexp.MustCompile(`^[^\s.*>/\\]+$`)
 
+// Ceilings of SPEC §10.1 for the keys that size memory or a count handed to a
+// library (go-relplog-pg-server's and go-relplog-nats-server's review, ported
+// from the syslog/RELP family on 2026-10-13). Without them a typo of a few
+// digits panicked the boot (ring.capacity_items: makechan) or allocated a
+// gigabyte per Dequeue (sink.batch). sink.workers is go-syslog-nats-server's
+// (its DECISOES §2.2): every worker publishes on the ONE NATS connection,
+// whose writes go through one mutex and one socket, so past a few dozen only
+// contention grows; and workers x batch is the client's
+// PublishAsyncMaxPending, which with these ceilings stays an int on every
+// platform. maxSinkBatch is 1 Mi, the family's: a Dequeue slice of 1 Mi
+// pointers is 8 MiB.
+const (
+	maxRingItems   = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxSinkBatch   = 1 << 20
+	maxSinkWorkers = 256
+	maxListeners   = 256
+)
+
 // Validate checks every constraint the server depends on and returns the boot
 // warnings from SPEC §10.1. An error here is exit code 1: the process must not
 // start.
@@ -64,6 +82,9 @@ func Validate(c *Config) (warnings []string, err error) {
 	if c.Server.Listeners < 1 {
 		return nil, fmt.Errorf("server.listeners: must be at least 1, got %d", c.Server.Listeners)
 	}
+	if c.Server.Listeners > maxListeners {
+		return nil, fmt.Errorf("server.listeners: %d is above %d", c.Server.Listeners, maxListeners)
+	}
 	if c.Server.MaxBodyBytes <= 0 {
 		return nil, fmt.Errorf("server.max_body_bytes: must be positive")
 	}
@@ -85,6 +106,10 @@ func Validate(c *Config) (warnings []string, err error) {
 	if c.Ring.CapacityItems < 1 {
 		return nil, fmt.Errorf("ring.capacity_items: must be at least 1")
 	}
+	if c.Ring.CapacityItems > maxRingItems {
+		return nil, fmt.Errorf("ring.capacity_items: %d is above %d, the ceiling of the memory ring "+
+			"(a channel of that many slots)", c.Ring.CapacityItems, maxRingItems)
+	}
 	if c.Ring.MaxBytes < 1 {
 		return nil, fmt.Errorf("ring.max_bytes: must be positive")
 	}
@@ -97,8 +122,14 @@ func Validate(c *Config) (warnings []string, err error) {
 	if c.Sink.Workers < 1 {
 		return nil, fmt.Errorf("sink.workers: must be at least 1")
 	}
+	if c.Sink.Workers > maxSinkWorkers {
+		return nil, fmt.Errorf("sink.workers: %d is above %d", c.Sink.Workers, maxSinkWorkers)
+	}
 	if c.Sink.Batch < 1 {
 		return nil, fmt.Errorf("sink.batch: must be at least 1")
+	}
+	if c.Sink.Batch > maxSinkBatch {
+		return nil, fmt.Errorf("sink.batch: %d is above %d", c.Sink.Batch, maxSinkBatch)
 	}
 	if c.Sink.MaxRetries < 1 {
 		return nil, fmt.Errorf("sink.max_retries: must be at least 1")
@@ -192,8 +223,16 @@ func validateNATS(c *Config) error {
 	// a NATS one: anything but nats:// is refused here rather than dialled
 	// with a handshake this server does not do.
 	urlUserinfo := false
-	for _, raw := range n.URLs {
+	for i, raw := range n.URLs {
 		scheme, _, ok := strings.Cut(strings.TrimSpace(raw), "://")
+		if !ok && i > 0 {
+			// The list is split at commas, so an unescaped ',' in a password
+			// ("nats://u:12,cret@h") leaves a piece with no scheme. Saying
+			// only "no scheme" would send the operator looking for a bare
+			// host:port that is not there.
+			return fmt.Errorf("sink.nats.urls: an entry has no scheme; every URL must be nats://, "+
+				"and a ',' in a user, password or token splits the list (%s)", percentEncodeHint)
+		}
 		if !ok || !strings.EqualFold(scheme, "nats") {
 			return fmt.Errorf("sink.nats.urls: every URL must be nats:// (tls://, ws:// and wss:// "+
 				"are refused: there is no TLS to NATS, SPEC §8.7.1); an entry is %s", schemeOf(raw))

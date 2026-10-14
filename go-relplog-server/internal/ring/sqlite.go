@@ -33,6 +33,15 @@ type SQLiteConfig struct {
 	CapacityItems int
 	CapacityBytes int64
 
+	// KeepBacklog leaves the rows a previous run left alone: the cursor
+	// starts after the last of them and none is counted, so this run neither
+	// delivers them nor fills up on them, and a later ring opened without it
+	// reads them all (SPEC §9.4). The app asks for it with sink.type=none,
+	// which would discard them (go-syslog-server review, 2026-10-13, ported
+	// from go-webhook-fast-server); the ring never learns why (invariant
+	// §20.15).
+	KeepBacklog bool
+
 	// Metrics, when set, receives relplog_ring_quarantined_total (SPEC §9.4,
 	// §14.1). Nil is allowed, for tests and tools.
 	Metrics *obs.Metrics
@@ -119,6 +128,12 @@ type SQLiteRing struct {
 	// paths that end the process, and the next boot starts the cursor at zero.
 	cursorMu sync.Mutex
 	cursor   int64
+
+	// keptAfter is the last seq of the rows KeepBacklog set aside, and kept
+	// their count; 0 without it. Written once, before the writer goroutine
+	// starts. AUTOINCREMENT gives every later row a larger seq than any the
+	// table ever held, so the rows of this run are exactly seq > keptAfter.
+	keptAfter, kept int64
 
 	closed atomic.Bool
 	wg     sync.WaitGroup
@@ -253,7 +268,18 @@ func NewSQLite(cfg SQLiteConfig, log *slog.Logger) (*SQLiteRing, error) {
 	r.readDB.SetMaxIdleConns(1)
 
 	// A crash leaves rows behind; they are the backlog the boot drain consumes
-	// before any transport opens (SPEC §13.1 step 10).
+	// before any transport opens (SPEC §13.1 step 10) -- or, with KeepBacklog,
+	// rows this run sets aside.
+	if cfg.KeepBacklog {
+		var n, last sql.NullInt64
+		if err := r.readDB.QueryRow(`SELECT COUNT(*), COALESCE(MAX(seq),0) FROM ring`).Scan(&n, &last); err != nil {
+			r.insert.Close()
+			r.writeDB.Close()
+			r.readDB.Close()
+			return nil, fmt.Errorf("ring sqlite: counting the backlog: %w", err)
+		}
+		r.keptAfter, r.kept, r.cursor = last.Int64, n.Int64, last.Int64
+	}
 	if err := r.Recount(); err != nil {
 		r.insert.Close()
 		r.writeDB.Close()
@@ -278,7 +304,8 @@ func (r *SQLiteRing) Mode() string { return "sqlite" }
 // keeping every transport closed forever with no exit code for a supervisor.
 func (r *SQLiteRing) Recount() error {
 	var n, b sql.NullInt64
-	err := r.readDB.QueryRow(`SELECT COUNT(*), COALESCE(SUM(nbytes),0) FROM ring`).Scan(&n, &b)
+	err := r.readDB.QueryRow(`SELECT COUNT(*), COALESCE(SUM(nbytes),0) FROM ring WHERE seq > ?`,
+		r.keptAfter).Scan(&n, &b)
 	if err != nil {
 		return fmt.Errorf("ring sqlite: counting the backlog: %w", err)
 	}
@@ -294,6 +321,10 @@ func (r *SQLiteRing) Recount() error {
 // Backlog reports the committed rows the accounting holds, for the boot drain:
 // right after NewSQLite it is what a previous run left behind.
 func (r *SQLiteRing) Backlog() int64 { return r.items.Load() }
+
+// Kept reports the rows of a previous run that KeepBacklog set aside. They are
+// not in Stats: this run never delivers them.
+func (r *SQLiteRing) Kept() int64 { return r.kept }
 
 // Enqueue reserves room, hands the item to the writer and waits for its group
 // COMMIT.

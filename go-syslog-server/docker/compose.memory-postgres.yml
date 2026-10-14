@@ -41,7 +41,7 @@ services:
       # (SPEC §10.5). Acima de 16 tambem e' WARN.
       SYSLOG_SINK_WORKERS: "4"
       SYSLOG_SINK_POSTGRES_TABLE: ${SYSLOG_SINK_POSTGRES_TABLE:-loghub.inbox}
-      # 0 deriva sink.workers + 1 = 5.
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, fora do pool).
       SYSLOG_SINK_POSTGRES_POOL_SIZE: ${SYSLOG_SINK_POSTGRES_POOL_SIZE:-0}
       # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
       # URL no lugar delas, apague as quatro linhas abaixo e descomente a

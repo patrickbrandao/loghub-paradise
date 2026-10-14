@@ -171,11 +171,13 @@ func TestRELPUnknownAndUppercaseCommandsAreUnknown(t *testing.T) {
 	}
 }
 
-// After a large frame the reader does not keep the large buffer: an idle
-// connection must not hold 64 KiB for the rest of its life (SPEC §15.1).
+// After a large frame the reader does not keep the large buffer once the
+// sender went quiet: an idle connection must not hold 64 KiB for the rest of
+// its life (SPEC §15.1). "Quiet" is nothing of the next frame buffered: each
+// frame here arrives in a read of its own.
 func TestRELPReaderReleasesALargeBuffer(t *testing.T) {
-	big := strings.Repeat("a", 60000)
-	rd := reader("1 syslog 60000 "+big+"\n2 syslog 1 b\n", 1<<20, 64<<10)
+	big := "1 syslog 60000 " + strings.Repeat("a", 60000) + "\n"
+	rd := NewRELPReader(bufio.NewReaderSize(&chunkReader{chunks: []string{big, "2 syslog 1 b\n"}}, 16), 1<<20, 64<<10)
 	if _, err := rd.ReadFrame(); err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +187,40 @@ func TestRELPReaderReleasesALargeBuffer(t *testing.T) {
 	if cap(rd.buf) > relpKeepBlock {
 		t.Fatalf("buffer of %d kept after a small frame", cap(rd.buf))
 	}
+}
+
+// A sender still sending large frames keeps the buffer: let go before every
+// frame, each 24 KiB line paid the whole doubling again (independent review
+// of go-syslog-server, 2026-10-13, E2).
+func TestRELPReaderKeepsTheBufferWhileFramesFollow(t *testing.T) {
+	frame := func(n int) string { return strconv.Itoa(n) + " syslog 24576 " + strings.Repeat("a", 24576) + "\n" }
+	rd := NewRELPReader(bufio.NewReaderSize(strings.NewReader(frame(1)+frame(2)+frame(3)), relpReadBuffer), 1<<20, 64<<10)
+	if _, err := rd.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	grown := &rd.buf[:1][0]
+	for i := 0; i < 2; i++ {
+		if _, err := rd.ReadFrame(); err != nil {
+			t.Fatal(err)
+		}
+		if &rd.buf[:1][0] != grown {
+			t.Fatalf("frame %d: the buffer was let go with the next frame already buffered", i+2)
+		}
+	}
+}
+
+// chunkReader returns one chunk per Read: a sender that pauses between them.
+type chunkReader struct{ chunks []string }
+
+func (c *chunkReader) Read(p []byte) (int, error) {
+	if len(c.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.chunks[0])
+	if c.chunks[0] = c.chunks[0][n:]; c.chunks[0] == "" {
+		c.chunks = c.chunks[1:]
+	}
+	return n, nil
 }
 
 func TestAppendRSPAndServerClose(t *testing.T) {

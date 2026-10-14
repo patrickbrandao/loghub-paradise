@@ -672,8 +672,8 @@ func TestRelationalWorkerDefaults(t *testing.T) {
 			if l.Config.Sink.Workers != dbDefaultWorkers {
 				t.Fatalf("workers = %d, want %d", l.Config.Sink.Workers, dbDefaultWorkers)
 			}
-			if got := tc.pool(l.Config); got != dbDefaultWorkers+1 {
-				t.Fatalf("pool = %d, want %d", got, dbDefaultWorkers+1)
+			if got := tc.pool(l.Config); got != dbDefaultWorkers {
+				t.Fatalf("pool = %d, want %d", got, dbDefaultWorkers)
 			}
 			if !hasWarning(l, "lowered") || l.Notes["sink.workers"] == "" ||
 				l.Notes["sink."+tc.sink+".pool_size"] == "" {
@@ -1040,7 +1040,7 @@ func TestDumpRoundTrips(t *testing.T) {
 	}
 	// Adjusted and derived values say so, so the dump never presents them as
 	// compiled-in defaults.
-	for _, sub := range []string{"# lowered to 4", "# derived: sink.workers + 1",
+	for _, sub := range []string{"# lowered to 4", "# derived: sink.workers\n",
 		"# derived from server.data_dir", "# resolved to an absolute path", "# from flag --ring.mode"} {
 		if !strings.Contains(buf.String(), sub) {
 			t.Errorf("dump lacks %q", sub)

@@ -62,7 +62,7 @@ services:
       WHS_SINK_CLICKHOUSE_PASSWORD: ${WHS_SINK_CLICKHOUSE_PASSWORD:-webhook}
       WHS_SINK_CLICKHOUSE_DATABASE: ${WHS_SINK_CLICKHOUSE_DATABASE:-webhook}
       WHS_SINK_CLICKHOUSE_TABLE: ${WHS_SINK_CLICKHOUSE_TABLE:-inbox}
-      # 0 deriva sink.workers + 1: uma conexao por worker e uma para o health.
+      # 0 deriva sink.workers + 1: uma conexao por worker e uma de folga (o health tem a sua, fora do pool).
       WHS_SINK_CLICKHOUSE_POOL_SIZE: ${WHS_SINK_CLICKHOUSE_POOL_SIZE:-0}
       # Rede interna do compose: sem TLS. Contra um servidor gerenciado, ligue
       # WHS_SINK_CLICKHOUSE_TLS (porta 9440) e monte a CA em /etc/webhook.

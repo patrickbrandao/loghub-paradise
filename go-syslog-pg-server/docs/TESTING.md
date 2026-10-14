@@ -416,3 +416,35 @@ padrão (`ConnectTimeout`, também `op_timeout`).
 |---|---|---|
 | `23502` em execução era `logic` | coluna `NOT NULL` acrescentada depois do boot: todo pedaço descartado com o sink UP, para sempre | `TestClassifySQLState`, `TestPostgresNotNullViolationIsFatal` |
 | Validação do boot no `sink.health_timeout` (1 s) | a ~55 ms de RTT nenhuma tentativa terminava; exit 3 no `boot_timeout` culpando a rede | `TestPostgresValidationHasItsOwnDeadline`, `TestValidationContext*`, `TestHealthChecksCarryTheirLifetime` |
+
+### Correções transversais da revisão independente do `go-syslog-server` (2026-10-13)
+
+Os itens transversais (X1–X4) do plano da revisão independente do porte do
+`go-syslog-server` (S), e a conferência de C3, D1, E1, E2 e A2-minor; a mesma
+implementação no irmão (regra de sincronia, `diff` conferido). **Conferência
+por mutação**, cada correção revertida sozinha: o teste da linha falha
+(`exited 0, want 130` nos dois subtestes; `abort 0, emergency_failed 5 for
+5`; `err = <nil>` no `?host=`).
+
+| Item | Achado | Consequência sem a correção | Teste |
+|---|---|---|---|
+| X1 (A1 do S) | Sinal depois da reingestão e antes do *accept* com IP literal ou socket unix: nenhum *bind* falha | o servidor abria, o `/readyz` dava 200 e o shutdown saía **0**, não 130 (SPEC §13.1, §13.5) | `TestSignalBeforeALiteralBindExits130` (IPs literais e socket unix) |
+| X2 (A2 do S) | O aborto publica `aborted` antes de tomar o contador; o dump que via a marca nesse meio (abandonado, ou desligado) o tomava primeiro | `emergency_failed = n`, `abort = 0`: a perda contada uma vez, atribuída ao disco (SPEC §13.4) | `TestAbortInsideTheDumpKeepsItsReason` (dump abandonado e dump desligado; o gancho `inAbort` força a intercalação) |
+| X4 (B4 do S) | `?host=` vazio na `LOGHUB_EB_URL` aceito: a libpq e o pgx discam o padrão deles (`pgx.ParseConfig` dá `/private/tmp`), este servidor o host da autoridade | uma URL, dois servidores (SPEC §10.9) | `TestEBURLMustNameItsParts` (dois casos novos) |
+| D1 do S | A sonda de saúde sem conexão no pool | **não se aplica**, conferido: ring só memória, os escritores são os `sink.workers`, o `+ 1` basta (SPEC §10.5) | `TestPoolLeavesTheProbeAConnection`: três escritas presas num `LOCK TABLE` (contadas em `pg_stat_activity`), a sonda responde com `pool_size = 4`; o controle `pool_size = 3` a deixa sem conexão |
+| E2 do S | `frameKeepCap` contra as classes 2/8/64 KiB | **não se aplica**: aqui a moldura cresce pelas classes e nunca solta o buffer (não há `frameKeepCap`), sem realocação por frame | — |
+| E1 do S | `closing` com PROXY `optional` perdendo as linhas em buffer | **não se aplica**: a leitura do cabeçalho não confere `closing` (a pendência do shutdown contado como falha do PROXY segue, com a forma certa escrita nela) | — |
+| A2-minor do S | Comentário de ordem reversa com fechamento paralelo; log do aborto com o ring Redis | **não se aplica**: o fechamento é em ordem reversa, como o comentário diz; não há Redis | — |
+
+Rodada final, PostgreSQL 18 (`rlpg-test-pg18`), Apple M2, Go 1.27.1:
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `SYSLOG_TEST_PG_DSN=... SYSLOG_TEST_EMITTERS=1 go test -race -count=1 ./...` | **verde duas vezes seguidas** (62 s e 75 s), sem *flake* |
+| Testes | **404** de primeiro nível e **287** subtestes passaram, **1** pulado (`TestGoldenVectors/arquivo-sem-pri`, D5), 0 falhas |
+| Por pacote (primeiro nível / subtestes) | `app` 66/57, `config` 63/0, `convert` 15/70, `emergency` 28/45, `ident` 2/0, `item` 5/0, `jlh` 4/0, `jlhcheck` 4/0, `obs` 9/0, `receiver` 110/50, `ring` 13/0, `sink` 85/65 |
+| Emissores reais | `TestEmittersRsyslog` (13,7 s), `TestEmittersSyslogNG` (30,2 s), verdes nas duas rodadas |
+| Fuzz | nenhum: nenhum alvo de fuzz cobre o código que mudou (`app`, `config/eburl.go`) |
+| Mutação | cada correção revertida sozinha: o teste da linha falha (ver acima) |
+| Não rodou | fuzz de 10 min; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |

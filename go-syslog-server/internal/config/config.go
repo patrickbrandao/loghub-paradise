@@ -318,7 +318,7 @@ type SQLDB struct {
 	Password    string // secret
 	Database    string
 	Table       string // name or schema.name (postgres: lowercase; mysql: case kept)
-	PoolSize    int    // after Load: never 0 when this sink is selected (workers + 1)
+	PoolSize    int    // after Load: never 0 when this sink is selected (sink.workers)
 	TLS         bool
 	TLSCA       string
 	TLSInsecure bool
@@ -333,7 +333,7 @@ type SinkClickHouse struct {
 	Password    string // secret
 	Database    string
 	Table       string // name or database.name, case kept
-	PoolSize    int    // after Load: never 0 when this sink is selected (workers + 1)
+	PoolSize    int    // after Load: never 0 when this sink is selected (sink.workers)
 	TLS         bool
 	TLSCA       string
 	TLSInsecure bool

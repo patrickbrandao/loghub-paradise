@@ -33,10 +33,10 @@ services:
     environment:
       # --- ring: none --------------------------------------------------------
       RELPLOG_RING_MODE: none
-      # Igual ao pool (sink.workers 4 + 1): sem ring a escrita e' sincrona, e um
+      # Igual ao pool (sink.workers 4): sem ring a escrita e' sincrona, e um
       # max_inflight acima do pool so' cria fila escondida dentro dele (SPEC
       # §9.6; o boot avisa). Quem subir o pool sobe este junto.
-      RELPLOG_RING_MAX_INFLIGHT: ${RELPLOG_RING_MAX_INFLIGHT:-5}
+      RELPLOG_RING_MAX_INFLIGHT: ${RELPLOG_RING_MAX_INFLIGHT:-4}
       RELPLOG_EMERGENCY_ENABLED: "false"
 
       # --- sink: clickhouse --------------------------------------------------
@@ -51,7 +51,7 @@ services:
       RELPLOG_SINK_CLICKHOUSE_PASSWORD: ${RELPLOG_SINK_CLICKHOUSE_PASSWORD:-syslog}
       RELPLOG_SINK_CLICKHOUSE_DATABASE: ${RELPLOG_SINK_CLICKHOUSE_DATABASE:-syslog}
       RELPLOG_SINK_CLICKHOUSE_TABLE: ${RELPLOG_SINK_CLICKHOUSE_TABLE:-inbox_syslog}
-      # 0 deriva sink.workers + 1 = 5.
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, SPEC §10.5).
       RELPLOG_SINK_CLICKHOUSE_POOL_SIZE: ${RELPLOG_SINK_CLICKHOUSE_POOL_SIZE:-0}
       RELPLOG_SINK_CLICKHOUSE_TLS: ${RELPLOG_SINK_CLICKHOUSE_TLS:-false}
 

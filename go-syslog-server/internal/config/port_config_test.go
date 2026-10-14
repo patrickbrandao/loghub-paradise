@@ -347,14 +347,16 @@ func TestConfigCeilings(t *testing.T) {
 	}
 }
 
-// The health probe takes its connection out of the same pool as the workers:
-// with pool_size = workers, slow but working writes held every connection,
-// the probe timed out, the sink went DOWN and then FATAL.
-func TestPoolLeavesAConnectionForTheProbe(t *testing.T) {
+// Every worker holds a pool connection while it writes, so the pool covers
+// the workers. The health probe used to take its connection out of the same
+// pool, and the rule was workers + 1; it has a connection of its own now
+// (SPEC §10.5; independent review of the port, 2026-10-13), and pool_size =
+// workers is legitimate.
+func TestPoolCoversTheWorkers(t *testing.T) {
 	for _, s := range []string{"postgres", "mysql", "clickhouse"} {
-		mustFail(t, []string{"--sink.type=" + s, "--sink.workers=4", "--sink." + s + ".pool_size=4"}, nil,
-			"sink.workers + 1")
-		mustLoad(t, []string{"--sink.type=" + s, "--sink.workers=4", "--sink." + s + ".pool_size=5"}, nil)
+		mustFail(t, []string{"--sink.type=" + s, "--sink.workers=4", "--sink." + s + ".pool_size=3"}, nil,
+			"below sink.workers=4")
+		mustLoad(t, []string{"--sink.type=" + s, "--sink.workers=4", "--sink." + s + ".pool_size=4"}, nil)
 	}
 }
 
@@ -419,13 +421,13 @@ func TestDumpCommentsDerivedValues(t *testing.T) {
 	out := buf.String()
 	_, pg, _ := strings.Cut(out, "[sink.postgres]\n")
 	pg, _, _ = strings.Cut(pg, "\n[")
-	if !strings.Contains(pg, "# pool_size                    = 4") || strings.Contains(pg, "\npool_size ") {
+	if !strings.Contains(pg, "# pool_size                    = 3") || strings.Contains(pg, "\npool_size ") {
 		t.Fatalf("derived pool_size not commented:\n%s", pg)
 	}
 	f := filepath.Join(t.TempDir(), "dump.ini")
 	writeFile(t, f, out)
 	back := mustLoad(t, []string{"--config=" + f, "--sink.workers=7", "--server.data_dir=/elsewhere"}, nil)
-	if back.Config.SinkPG.PoolSize != 8 {
+	if back.Config.SinkPG.PoolSize != 7 {
 		t.Fatalf("read back with 7 workers, pool_size = %d: the dump fixed the derived value", back.Config.SinkPG.PoolSize)
 	}
 	if back.Config.Emergency.Dir != "/elsewhere/emergency" {

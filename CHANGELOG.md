@@ -16,6 +16,78 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-10-13 — Todos: revisão do porte do S e porte final para R, cortes e webhooks
+
+Pedido: terminar tudo com as opções recomendadas (autorizado), testar e publicar.
+Cinco revisores só-leitura (ciclo de vida, config, NATS, SQL, recepção/docs)
+revisaram o porte do S (`4fac9da`); os achados viraram um plano único, aplicado
+ao S e, onde o código é o mesmo, a R, RP, RN, SP, SN, W, F, P e N, cada item com
+teste conferido por mutação.
+
+**Achados no S** (vários herdados por todos):
+- **Nó TLS ruim num pool NATS dava FATAL permanente** (regressão do próprio
+  porte): durante a reconexão o `LastError` guardava o erro de verificação do
+  nó B enquanto A voltava. A recusa de TLS só é veredito quando nenhum outro
+  servidor (configurado ou descoberto) pode servir; senão `network`, e os
+  fusíveis dão o FATAL nomeando o TLS (S, R, W, F). RN, SN e N mantêm a decisão
+  própria: sem TLS no cliente, um nó que exige TLS é veredito.
+- **`"store closed"` nunca casou**: o nats-server 2.14.6 diz `store is closed`
+  (`server/store.go:43`). O `10077` de store fechando era fatal em R, RN, SN e S.
+- **Sinal entre os binds e o Start com IP literal ou `unix` saía 0** (o
+  servidor abria e o `/readyz` dava 200): `ctx.Err()` depois de todos os binds
+  → 130, em toda a família.
+- **Motivo do aborto trocado** numa janela: um dump que via `aborted` antes de o
+  abort tomar o contador contava `emergency_failed`. `settleDump()` faz o
+  `Swap` sob `lossMu`, em toda a família.
+- **Sonda de saúde SQL sem conexão** atrás dos escritores — com `ring=none`
+  nenhum `pool_size` resolvia. A sonda tem conexão própria fora do pool (S, R,
+  W, F, P); no S e no R o `pool_size` deriva `workers`. RP e SP (só ring em
+  memória) mantêm `≥ workers + 1`, conferido por teste.
+- Tetos copiados dos cortes recusavam rings sqlite/redis e lotes ClickHouse
+  legítimos: o de itens vale só para o ring em memória efetivo; `sink.batch`
+  até 1 Mi. Conta de memória do ClickHouse pelos escritores, não pelo pool.
+- MySQL `1048` fatal (gêmeo do `23502`); nome de banco por caracteres.
+- `?host=` vazio, TLS do PostgreSQL sobre socket e vírgula em host Redis: exit 1.
+- `ring=sqlite` + `sink=none` descartava o `ring.db` de uma vida anterior.
+- PROXY `optional` perdia linhas já lidas no `Close` (suposição do RELP, onde o
+  `librelp` retransmite, copiada para o syslog).
+- A moldura realocava 64 KiB a cada frame de 8–64 KiB (9× mais lento); no
+  leitor RELP (R, RP, RN) o mesmo com 16–64 KiB.
+
+**R** recebeu de uma vez as correções de RP, RN e S que lhe faltavam (posse do
+aborto, `quitNow`, `FullFor` e `ctx` antes do `Enqueue`, config, NATS, SQL).
+
+**Família webhook** (W, F, P, N; quatro áreas em paralelo e um integrador):
+- Um **2º sinal entre `stopSignals()` e o registro do canal do aborto** caía na
+  ação padrão do Go e saía 143 sem contar nada: o canal é registrado antes.
+- O par antigo `atRisk`/`collected` contava a menos um aborto entre o `Drain` e
+  o recolhimento; um dump já contado como perdido ainda podia ser reingerido.
+- Sink FATAL durante o dreno esperava o `drain_timeout` inteiro e saía 0.
+- P/N: `emergency.enabled=false` desligava também a reingestão dos dumps.
+- `retention: interest` aceito confirmava sem gravar; `10158`/`10167`/`429`
+  eram fatais; com `autocommit=0` no servidor MySQL o `200` saía e as linhas
+  sumiam; `sink.redis.addrs` sem porta era retentado até o `boot_timeout`; o
+  rueidis com `ring_scale_each_conn` alto entrava em pânico.
+- O `TestWorkersTaintABatchAfterATimedOutAttempt` intermitente era do teste
+  (o worker começava antes de os itens estarem no ring), não de posse.
+
+**Resultado** (`go test -race`, duas rodadas, serviços e emissores reais):
+S 708 + 471; R 699 + 441; RP 407 + 286; RN 438 + 336; SP 404 + 287;
+SN 431 + 344; W e F 1181; P 582; N 641 testes e subtestes. Os pulados são o
+vetor D5 dos syslog/RELP e o `TestSIGHUPIsIgnored` do P/N quando o processo já
+nasce ignorando SIGHUP (passa num processo normal). Fuzz de 60 s nos alvos
+tocados sem falha.
+
+**Lições.** Um teto vale para quem aloca por ele, não para todos os modos. A
+recusa de um servidor só é veredito quando não há outro. Texto de erro de
+servidor se confere no código do servidor, não na memória — o `"store closed"`
+atravessou quatro módulos. Teste não muda estado global de servidor
+compartilhado. Um porte transversal lê a SPEC do destino antes de aplicar (a
+regra do pool contradizia uma decisão registrada do N). A correção de um corte
+nem sempre serve ao pai: o `workers + 1` tratava o sintoma; a sonda própria
+remove a causa. A ordem entre soltar um sinal e registrar o próximo também é
+uma janela de perda.
+
 ## 2026-10-13 — SP: `23502` fatal e prazo próprio da validação do boot (porte do RP)
 
 Os dois itens que o porte anterior deixou (SP §22.1 itens 5 e 6), do RP, com os

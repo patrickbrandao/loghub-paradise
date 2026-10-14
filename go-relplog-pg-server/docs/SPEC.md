@@ -765,7 +765,15 @@ onde o oráculo para.
   maior `Peek` é o do PROXY, de 12 bytes) e o escritor de respostas, outros
   4 KiB; depois de um
   frame grande, o leitor descarta o buffer acima de 16 KiB em vez de segurá-lo
-  enquanto a conexão viver ociosa. Com `max_conns = 0`, o custo de N conexões
+  enquanto a conexão viver ociosa — mas só quando nada do frame seguinte está
+  no `bufio.Reader` (o emissor parou e a leitura seguinte pode esperar o
+  `idle_timeout`). Descartado antes de **todo** frame, um emissor de linhas de
+  24 KiB refazia o crescimento inteiro por frame (2+4+8+16+24 KiB e as cópias:
+  55 KB e 5 alocações por frame, 12 µs contra 0,5 µs) para um buffer que voltaria a
+  crescer (revisão independente do `go-syslog-server`, 2026-10-13, E2;
+  `BenchmarkRELPReaderFrames`, TESTING §5). O buffer cresce dobrando a partir
+  de 2 KiB até o tamanho do frame, não pelas classes do pool: um frame de até
+  16 KiB nunca passa do teto. Com `max_conns = 0`, o custo de N conexões
   caladas é cerca de N × 10 KiB mais as goroutines, fora de `ring.max_bytes`.
 
 ### 5.3 Tamanho e truncamento (decisão 13 do S)
@@ -1699,7 +1707,14 @@ classificação precisa do `pgconn.PgError`).
   mesmo pool, e com `pool_size = workers` escritas lentas mas funcionando
   seguravam todas, a sonda estourava `sink.health_timeout` esperando uma, o sink
   ia a DOWN e, passado `fail_timeout`, a FATAL: exit 3 sem nada errado no banco
-  (`TestPostgresHealthHasAConnectionWhileTheWorkersWrite`). Tetos de §13.2:
+  (`TestPostgresHealthHasAConnectionWhileTheWorkersWrite`). O `+ 1` basta aqui, e só aqui (conferido na revisão independente do
+  `go-syslog-server`, 2026-10-13, D1, onde o `ring=none` faz dos receptores,
+  até `ring.max_inflight`, os escritores e o `+ 1` não protege nada): o ring é
+  só memória, quem escreve são os `sink.workers`, um `Write` (uma conexão) por
+  vez cada, a reingestão roda antes deles e da sonda, e a sonda é uma só
+  (`TestPoolLeavesTheProbeAConnection`, contra o PostgreSQL real: três
+  escritas presas num `LOCK TABLE`, conferidas em `pg_stat_activity`, e a
+  sonda responde com `pool_size = 4`; com `pool_size = 3`, não). Tetos de §13.2:
   `workers` 1..1024, `pool_size` 0..4096.
 - **Validação no boot**, na primeira checagem válida, cada recusa FATAL imediato
   (exit 3, sem esperar `boot_timeout`): a tabela existe; as dez colunas com tipos
@@ -1832,6 +1847,11 @@ uma palavra-chave da libpq (uma senha colada depois de um `?` também é "chave"
 o `url.Values.Get` lê o primeiro e a libpq vale o último, e a URL passaria pela
 recusa do TLS dizendo o contrário. Com socket, a porta da URL é mantida:
 `postgres://u:p@:5433/db?host=/run/pg` dá `addr = /run/pg:5433`.
+**`?host=` vazio é exit 1** (revisão independente do `go-syslog-server`,
+2026-10-13, B4): a libpq e o pgx o leem como "ausente" e discam o padrão deles
+(o socket do diretório compilado, ou `localhost`), e este servidor discava o host
+da autoridade: duas leituras da mesma URL, dois servidores. Recusado como o
+`sslmode` vazio (`TestEBURLMustNameItsParts`).
 
 **As recusas da revisão independente de 2026-10-13** (exit 1, sem citar a URL):
 
@@ -2166,7 +2186,7 @@ lado dele, que é o certo.
 | `sink.workers > 16` | `WARN` (§10.5) |
 | `sink.postgres.pool_size` negativo, ou abaixo de `sink.workers + 1` | exit 1 (`0` deriva `workers + 1`; a sonda de saúde precisa de uma conexão a mais, §10.5) |
 | `sink.postgres.addr`, `username` ou `database` vazios; `addr` que não é um servidor só (§10.9); `table` que não é identificador em minúsculas (com esquema opcional) | exit 1 |
-| `LOGHUB_EB_URL` em conflito, com esquema que não é `postgres://`/`postgresql://`, com `sslmode` que pede TLS ou vazio, com parâmetro desconhecido ou repetido, com fragmento, com `@` depois de `/`, `?` ou `#`, sem usuário ou sem banco, com `host=` que não é um diretório só, ou só com espaços (§10.9) | exit 1, sem citar a URL |
+| `LOGHUB_EB_URL` em conflito, com esquema que não é `postgres://`/`postgresql://`, com `sslmode` que pede TLS ou vazio, com parâmetro desconhecido ou repetido, com fragmento, com `@` depois de `/`, `?` ou `#`, sem usuário ou sem banco, com `host=` vazio ou que não é um diretório só, ou só com espaços (§10.9) | exit 1, sem citar a URL |
 | durações zero onde zero não é "sem limite" (§16.5) | exit 1 |
 | `GOMEMLIMIT` ausente, ou `< ring.max_bytes × 2` | `WARN` (§15.4) |
 | parâmetro desconhecido na linha de comando ou no INI | exit 1. Isto inclui toda chave do R que saiu (`ring.mode`, `sink.type`, `listen.tls`, `[tls]`, `[filter]`, `[ratelimit]`, `[sink.nats]`, `sink.postgres.tls`...) e as do SP que não existem aqui (`listen.udp`, `listen.unix`, `tcp.framing`, `tcp.backpressure_timeout`): um INI do pai não sobe aqui em silêncio. Uma chave do R que saiu é nomeada com "go-relplog-server has it, go-relplog-pg-server does not (SPEC §1.2)" (`removedParams`, porte do RN, 2026-10-13), inclusive logo depois de uma flag com valor |
@@ -2260,6 +2280,14 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
   duas vezes (10 para 5): um aborto entre os dois `Store`, e um aborto durante
   o recolhimento seguido do shutdown rearmando o contador. Um aborto que
   contou conta uma vez só (um segundo aborto não soma).
+- **O dump toma o contador de volta sob o mesmo mutex** (`settleDump`,
+  revisão independente do `go-syslog-server`, 2026-10-13, A2): o aborto
+  publica `aborted` antes de tomar o contador, e um dump que via a marca
+  nesse meio — desistia (`ErrAbandoned`) ou, desligado, nada tinha a
+  escrever — tomava o contador primeiro: `emergency_failed = n` e
+  `abort = 0`, a perda contada uma vez mas atribuída ao disco. Sob o
+  `lossMu`, ou o aborto terminou (o dump acha 0) ou nem começou (o dump
+  conta, o aborto acha 0) (`TestAbortInsideTheDumpKeepsItsReason`).
 - **Dump abandonado depois do aborto** (`emergency.Store.SetAbandon`): o dump
   confere `aborted` antes de começar, a cada 1024 linhas e antes de publicar o
   nome final, e desiste removendo o temporário (`ErrAbandoned`). Publicado
@@ -2302,7 +2330,7 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
 | `1` | erro de configuração ou de inicialização não relacionada ao banco (inclui a `LOGHUB_EB_URL` com `sslmode` que pede TLS) |
 | `3` | banco indisponível ou inutilizável: sink FATAL, `boot_timeout` ou `drain_timeout` estourados, validação de §10.5 recusada, dump que falhou |
 | `100`–`114` | falha de identidade, emitida pelo `go-loghub-ident` (`DATADIR`, `MACHINE_ID`, `MACHINE_ID_FILE`, `AGENT_NAME`, `AGENT_UUID`, `HOSTNAME`, `WORKSPACE`; 112 = `Initialize()` duas vezes); a tabela completa está na skill `go-loghub-ident` e em `docker/README.md` |
-| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 5–12 do boot. Um sinal que cancela o *bind* da porta admin (passo 5) ou do transporte (passo 12) é 130, não 1: com um nome em `admin.bind` ou `listen.tcp` a resolução falha com "operation was canceled", que não é endereço ruim (revisão independente de 2026-10-13, o código do RN) |
+| `130` | abortado: segundo sinal no shutdown, `SIGQUIT` a qualquer momento, ou `SIGTERM`/`SIGINT` durante os passos 5–12 do boot. Um sinal que cancela o *bind* da porta admin (passo 5) ou do transporte (passo 12) é 130, não 1: com um nome em `admin.bind` ou `listen.tcp` a resolução falha com "operation was canceled", que não é endereço ruim (revisão independente de 2026-10-13, o código do RN). Com IP literal em `listen.tcp` nenhuma resolução falha e o *bind* passa: o sinal é conferido depois do *bind* e antes do primeiro *accept*, e também é 130 (antes o servidor abria, o `/readyz` dava 200 e o shutdown saía 0; revisão independente do `go-syslog-server`, 2026-10-13, A1; `TestSignalBeforeALiteralBindExits130`) |
 
 ---
 

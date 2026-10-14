@@ -10,6 +10,7 @@ import (
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/config"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/emergency"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/envelope"
+	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/obs"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/ring"
 )
 
@@ -84,10 +85,15 @@ func (a *App) reingest(ctx context.Context) int {
 			// reingested -- no destination understands that envelope -- and
 			// never deleted.
 			dst, rerr := a.emg.SetAsideLegacy(path)
-			if rerr != nil {
+			if dst == "" {
 				a.log.Error("cannot set aside a pre-LogHub dump; leaving it in place",
 					"path", path, "error", rerr)
 				continue
+			}
+			if rerr != nil {
+				// Renamed; only the directory fsync failed (ErrNotDurable).
+				a.log.Warn("the pre-LogHub dump was set aside but the directory fsync failed; "+
+					"the new name may not survive a power loss", "path", dst, "error", rerr)
 			}
 			a.log.Error("emergency dump in the pre-LogHub format; it is NOT reingested -- "+
 				"reingest it with the previous version (SPEC §9.2)", "path", dst)
@@ -117,19 +123,53 @@ func (a *App) reingest(ctx context.Context) int {
 
 		if res.Truncated {
 			dst, qerr := a.emg.Quarantine(path)
-			if qerr != nil {
-				a.log.Error("cannot quarantine a truncated dump", "path", path, "error", qerr)
-			} else {
-				a.log.Warn("the dump was truncated; its unreadable tail was quarantined",
-					"path", dst, "discarded_bytes", res.TruncatedBytes)
-			}
-		} else if rerr := a.emg.Remove(path); rerr != nil {
-			a.log.Error("cannot remove a reingested dump", "path", path, "error", rerr)
+			a.reportQuarantine(path, dst, qerr, res)
+		} else {
+			a.reportRemoval(path, a.emg.Remove(path))
 		}
 	}
 
 	a.refreshEmergencyGauges()
 	return ExitOK
+}
+
+// reportQuarantine logs the outcome of Store.Quarantine for a truncated dump.
+//
+// A non-empty dst means the file WAS renamed, whatever qerr says: the error is
+// then only the directory fsync that followed (emergency.ErrNotDurable), so
+// the new name may not survive a power loss. Read as "not quarantined", that
+// case logged "cannot quarantine" with a path that no longer existed and
+// dropped the line with the discarded bytes (SPEC §9.2; port of the
+// syslog/RELP family, 2026-10-13).
+func (a *App) reportQuarantine(path, dst string, qerr error, res *emergency.ReadResult) {
+	if dst == "" {
+		a.log.Error("cannot quarantine a truncated dump", "path", path, "error", qerr)
+		return
+	}
+	if qerr != nil {
+		a.log.Warn("the truncated dump was quarantined but the directory fsync failed; the new "+
+			"name may not survive a power loss", "path", dst, "error", qerr)
+	}
+	a.log.Warn("the dump was truncated; its unreadable tail was quarantined",
+		"path", dst, "discarded_bytes", res.TruncatedBytes)
+}
+
+// reportRemoval logs the outcome of Store.Remove for a reingested dump. An
+// ErrNotDurable means the unlink happened and only the directory fsync after
+// it failed: the file is gone now, and "cannot remove" would be false. What
+// the operator must know is the other consequence -- after a power loss the
+// name may come back, and the next boot would deliver the dump again, which
+// only a destination that deduplicates by uuid absorbs (SPEC §9.2).
+func (a *App) reportRemoval(path string, rerr error) {
+	switch {
+	case rerr == nil:
+	case errors.Is(rerr, emergency.ErrNotDurable):
+		a.log.Warn("the reingested dump was removed but the directory fsync failed; after a "+
+			"power loss it may reappear and be delivered again", "path", path, "error", rerr)
+	default:
+		a.log.Error("cannot remove a reingested dump; it will be delivered again at the next boot",
+			"path", path, "error", rerr)
+	}
 }
 
 // refreshEmergencyGauges sets whs_emergency_* from what is on disk, the only
@@ -347,18 +387,55 @@ func (a *App) drainRing(ctx context.Context, r *ring.SQLiteRing) int {
 	}
 }
 
-// dumpEmergency writes pending items to disk and returns how many of them are
-// lost: all of them when the write failed. It logs; the caller counts, so an
-// abort racing the dump cannot count the same events again (see App.atRisk).
-func (a *App) dumpEmergency(items []*envelope.Item) (lost int) {
+// dumpEmergency writes pending items to disk, or counts them lost (SPEC §9,
+// §9.3).
+//
+// It takes App.dumping back as soon as the outcome is known and BEFORE
+// anything is counted (settleDump): saved, an abort loses nothing more;
+// failed, the loss is counted here as emergency_failed; disabled
+// (emergency.enabled=false), as abort, the reason of SPEC §9.3. An abort
+// racing that count must not add the same events again (one owner of the
+// count, SPEC §10.3).
+//
+// A dump the abort already counted gives up (emergency.Store.SetAbandon), and
+// one that completed after the abort counts nothing more: the abort counted
+// every event.
+func (a *App) dumpEmergency(items []*envelope.Item) {
 	if len(items) == 0 {
-		return 0
+		a.settleDump()
+		return
+	}
+	if !a.dumps {
+		// No dump in this life (ring=memory with emergency.enabled=false): the
+		// loss is the abort's (SPEC §9.3) -- unless an abort already took the
+		// counter and counted the same events.
+		if n := a.settleDump(); n > 0 {
+			a.log.Error("emergency.enabled=false; these events are lost", "count", n)
+			a.metrics.EventsDroppedTotal[obs.DropAbort].Add(uint64(n))
+		}
+		return
+	}
+	if a.beforeDump != nil {
+		a.beforeDump()
 	}
 	path, err := a.emg.Write(items)
+	owed := a.settleDump()
 	if err != nil {
+		if owed == 0 {
+			return // an abort counted them already
+		}
 		a.log.Error("EMERGENCY DUMP FAILED; these events are lost",
 			"count", len(items), "dir", a.emg.Dir(), "error", err)
-		return len(items)
+		a.metrics.EventsDroppedTotal[obs.DropEmergencyFailed].Add(uint64(len(items)))
+		return
+	}
+	if owed == 0 {
+		// Published between the last abandon check and the abort: counted
+		// lost AND kept, an overcount the next boot corrects by delivering
+		// it, never a loss. Nothing more is counted.
+		a.log.Warn("the emergency dump completed after an abort counted its events lost; "+
+			"the next boot reingests it", "path", path, "count", len(items))
+		return
 	}
 	a.log.Warn("pending events written to an emergency dump; "+
 		"they will be reingested at the next boot",
@@ -369,7 +446,20 @@ func (a *App) dumpEmergency(items []*envelope.Item) (lost int) {
 	// -- would double the memory of a dump the size of the ring (SPEC §11.1).
 	a.metrics.EmergencyFiles.Inc()
 	a.metrics.EmergencyEventsPending.Add(int64(len(items)))
-	return 0
+}
+
+// settleDump takes the dump's loss counter back once its outcome is known,
+// under lossMu (the name and the form of the syslog/RELP family). abortLoss
+// publishes aborted BEFORE it takes the counter, and a dump that read the flag
+// in between (ErrAbandoned) took the whole count as emergency_failed: one
+// count, the wrong reason, and the abort's line said nothing was lost
+// (independent review of go-syslog-server's port, 2026-10-13, X2). Under the
+// lock, a dump that saw the abort waits for abortLoss to finish and finds the
+// counter taken.
+func (a *App) settleDump() int64 {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	return a.dumping.Swap(0)
 }
 
 func itoa(n int64) string {

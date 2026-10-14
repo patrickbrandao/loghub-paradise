@@ -307,6 +307,32 @@ func TestClickHouseMemoryRule(t *testing.T) {
 	}
 }
 
+// The per-user check counts the writers, not the pool (go-syslog-server
+// review, 2026-10-13): with pool_size = workers + 1 the check multiplied by a
+// connection that never INSERTs, refusing a limit of exactly workers × cost,
+// and its message said to lower the pool -- which config refuses below the
+// workers. The sink takes the writers from the app; zero falls back to the pool.
+func TestClickHouseMemoryCountsTheWriters(t *testing.T) {
+	const batch = 16 << 20
+	need := chMemoryNeed(batch)
+	if p := chMemoryProblem(batch, 4, 0, 4*need); p != "" {
+		t.Errorf("a limit of exactly 4 writers × the cost refused: %s", p)
+	}
+	p := chMemoryProblem(batch, 4, 0, 4*need-1)
+	if !strings.Contains(p, "4 concurrent") || strings.Contains(p, "lower the pool") ||
+		!strings.Contains(p, "sink.workers") {
+		t.Errorf("one byte short of 4 writers = %q, want it to name the writers and not the pool", p)
+	}
+	c := &ClickHouse{cfg: ClickHouseConfig{PoolSize: 5, Writers: 4}}
+	if got := c.memoryWriters(); got != 4 {
+		t.Errorf("memoryWriters = %d with Writers 4 and a pool of 5, want 4", got)
+	}
+	c.cfg.Writers = 0
+	if got := c.memoryWriters(); got != 5 {
+		t.Errorf("memoryWriters = %d with no Writers, want the pool's 5", got)
+	}
+}
+
 // SPEC §10.10.4: the token is a function of the batch's uuids, in order. The
 // same batch repeats it, and any other batch -- one item more, one less, the
 // same items in another order -- gets another; a constant or a counter would

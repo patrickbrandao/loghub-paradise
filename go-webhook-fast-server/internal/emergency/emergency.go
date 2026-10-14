@@ -48,11 +48,26 @@ var ErrLegacy = errors.New("emergency: dump in the pre-LogHub format (two length
 
 // Store reads and writes dumps in one directory.
 type Store struct {
-	dir   string
-	agent string // the AgentUUID: whose dump a file is (SPEC §9.1)
+	dir     string
+	agent   string // the AgentUUID: whose dump a file is (SPEC §9.1)
+	abandon func() bool
 }
 
 func NewStore(dir, agentUUID string) *Store { return &Store{dir: dir, agent: agentUUID} }
+
+// SetAbandon installs the check a Write in progress consults: true means the
+// process was aborted and counted the dump's events lost, so the dump gives up
+// and removes its temporary file instead of publishing a file the next boot
+// would reingest -- counted lost AND delivered (SPEC §10.3). Checked before
+// the first record, every 1024 records and before the publish; a dump that
+// publishes between the last check and the abort is both counted and kept, an
+// overcount, never a loss (port of the syslog/RELP family, 2026-10-13).
+func (s *Store) SetAbandon(f func() bool) { s.abandon = f }
+
+func (s *Store) abandoned() bool { return s.abandon != nil && s.abandon() }
+
+// ErrAbandoned is Write giving up because the process was aborted.
+var ErrAbandoned = errors.New("emergency: dump abandoned: the process was aborted")
 
 // Dir reports the configured directory.
 func (s *Store) Dir() string { return s.dir }
@@ -73,6 +88,9 @@ func (s *Store) Write(items []*envelope.Item) (string, error) {
 	if len(items) == 0 {
 		return "", nil
 	}
+	if s.abandoned() {
+		return "", ErrAbandoned
+	}
 	if err := os.MkdirAll(s.dir, 0o750); err != nil {
 		return "", fmt.Errorf("emergency: cannot create %s: %w", s.dir, err)
 	}
@@ -90,7 +108,11 @@ func (s *Store) Write(items []*envelope.Item) (string, error) {
 
 	w := bufio.NewWriterSize(f, 1<<20)
 	var written int
-	for _, it := range items {
+	for i, it := range items {
+		if i&1023 == 1023 && s.abandoned() {
+			f.Close()
+			return "", s.abort(tmp, ErrAbandoned)
+		}
 		if it == nil {
 			continue
 		}
@@ -116,10 +138,16 @@ func (s *Store) Write(items []*envelope.Item) (string, error) {
 	if err := f.Close(); err != nil {
 		return "", s.abort(tmp, err)
 	}
+	if s.abandoned() {
+		return "", s.abort(tmp, ErrAbandoned)
+	}
 	if err := publish(tmp, path); err != nil {
 		return "", s.abort(tmp, err)
 	}
-	syncDir(s.dir)
+	// Best effort here, unlike Remove and Quarantine: the dump is complete,
+	// synced and under its final name, and discarding it for the directory
+	// fsync would lose it (SPEC §9.1).
+	_ = syncDir(s.dir)
 	return path, nil
 }
 
@@ -352,29 +380,52 @@ func parseHeader(line string) (n int, legacy bool, err error) {
 }
 
 // Remove deletes a fully reingested dump.
-func (s *Store) Remove(path string) error { return os.Remove(path) }
+//
+// The directory is fsynced after the unlink. Without it a power loss right
+// after the reingestion can bring the name back, and the next boot delivers
+// the whole dump a second time under the same uuids -- deduplicated where the
+// destination can, a duplicate everywhere else (a Redis stream, NATS past its
+// duplicate_window, the SQLite and ClickHouse inbox). An error wrapping
+// ErrNotDurable means the file WAS removed and only that durability is in
+// doubt; the caller logs it at WARN (SPEC §9.2; port of the syslog/RELP
+// family, 2026-10-13).
+func (s *Store) Remove(path string) error {
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
 
 // Quarantine renames a truncated file aside instead of deleting it. The intact
 // prefix has already been reingested; what remains is unrecoverable by this
 // program but may still be worth a human's attention, and deleting evidence of
 // a crash is not this program's call.
+//
+// A non-empty name means the file WAS quarantined, whatever the error says:
+// the rename happened, and the error, if any, is the directory fsync that
+// followed (errors.Is(err, ErrNotDurable)), which only means the new name may
+// not survive a power loss -- and the next boot would then deliver the intact
+// prefix again. The caller logs that at WARN and still reports the quarantine
+// under the new name. An empty name means the file is still where it was.
 func (s *Store) Quarantine(path string) (string, error) {
-	dst := path + corruptExt
-	if err := os.Rename(path, dst); err != nil {
-		return "", err
-	}
-	return dst, nil
+	return renameAside(path, path+corruptExt)
 }
 
 // SetAsideLegacy renames a dump of the pre-LogHub format to .legacy (SPEC
 // §9.2): it is not reingested -- no destination understands that envelope any
 // more -- and it is not deleted, so the previous version can still reingest it.
+// The name and the error mean what they mean for Quarantine.
 func (s *Store) SetAsideLegacy(path string) (string, error) {
-	dst := path + legacyExt
+	return renameAside(path, path+legacyExt)
+}
+
+// renameAside is the rename of Quarantine and SetAsideLegacy, with the
+// directory fsync after it.
+func renameAside(path, dst string) (string, error) {
 	if err := os.Rename(path, dst); err != nil {
 		return "", err
 	}
-	return dst, nil
+	return dst, syncDir(filepath.Dir(dst))
 }
 
 // Count reports how many files are pending and how many events they hold.
@@ -403,19 +454,34 @@ func (s *Store) Count() (files int, events int64, err error) {
 	return files, events, nil
 }
 
-// syncDir fsyncs a directory so a newly created filename is durable. Best
-// effort: some file systems refuse fsync on a directory, and a directory
-// writable but not readable (mode 0300) cannot even be opened for it. Neither
-// is a reason to discard a dump that is complete, synced and under its final
-// name -- which Write did on a failed open.
-func syncDir(dir string) {
+// syncDir fsyncs a directory so a change to its entries is durable. Some file
+// systems refuse fsync on a directory, and a directory writable but not
+// readable (mode 0300) cannot even be opened for it: both are ErrNotDurable,
+// the open included. Write ignores it -- no reason to discard a dump that is
+// complete, synced and under its final name, which Write did on a failed open
+// -- and Remove and Quarantine report it, AFTER the unlink or the rename
+// succeeded: "cannot remove" for a file that is gone would be false (port of
+// the syslog/RELP family, 2026-10-13).
+func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return
+		return fmt.Errorf("%w: cannot open directory %s to fsync it: %w", ErrNotDurable, dir, err)
 	}
 	defer d.Close()
-	_ = d.Sync()
+	if err := dirSync(d); err != nil {
+		return fmt.Errorf("%w: fsync of directory %s: %w", ErrNotDurable, dir, err)
+	}
+	return nil
 }
+
+// ErrNotDurable marks the failure of a directory fsync after the operation on
+// the directory entry itself succeeded: the unlink of Remove or the rename of
+// Quarantine and SetAsideLegacy happened, and only its durability is in doubt.
+var ErrNotDurable = errors.New("emergency: the directory entry may not be durable")
+
+// dirSync is (*os.File).Sync, behind a variable only so the tests can make a
+// directory fsync fail: no portable file system does that on demand.
+var dirSync = func(d *os.File) error { return d.Sync() }
 
 // sanitize keeps an agent uuid usable inside a filename.
 func sanitize(s string) string {

@@ -44,7 +44,7 @@ services:
       RELPLOG_SINK_MYSQL_PASSWORD: ${RELPLOG_SINK_MYSQL_PASSWORD:-syslog}
       RELPLOG_SINK_MYSQL_DATABASE: ${RELPLOG_SINK_MYSQL_DATABASE:-syslog}
       RELPLOG_SINK_MYSQL_TABLE: ${RELPLOG_SINK_MYSQL_TABLE:-syslog_events}
-      # 0 deriva sink.workers + 1 = 5.
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, SPEC §10.5).
       RELPLOG_SINK_MYSQL_POOL_SIZE: ${RELPLOG_SINK_MYSQL_POOL_SIZE:-0}
       RELPLOG_SINK_MYSQL_TLS: ${RELPLOG_SINK_MYSQL_TLS:-false}
 

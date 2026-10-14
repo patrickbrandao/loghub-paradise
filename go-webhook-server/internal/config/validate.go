@@ -7,8 +7,10 @@ import (
 	"net/netip"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Defaults that only apply to the relational destinations (SPEC §8.5.3 and
@@ -34,6 +36,43 @@ const (
 	// A batch is a single parameter per column, so a batch of large bodies can
 	// reach it (SPEC §8.5.4).
 	pgParamCeiling = int64(1) << 30
+)
+
+// Ceilings of SPEC §10.1 for the keys that size memory or a count handed to a
+// library (go-relplog-pg-server's and go-relplog-nats-server's review, ported
+// from the syslog/RELP family on 2026-10-13). Without them a typo of a few
+// digits panicked the boot (ring.capacity_items and ring.sqlite.commit_batch:
+// makechan; sink.redis.ring_scale_each_conn and the rueidis buffers:
+// makeslice), allocated a gigabyte per Dequeue (sink.batch), wrapped around in
+// the pool's int32 (sink.postgres.pool_size 4294967300 became 4), or turned
+// the NATS MaxPending -- workers x batch + ring.max_inflight -- negative,
+// which the sink silently replaced with 4096.
+//
+// maxRingItems is the memory ring's: only that ring makes a channel of
+// capacity_items slots. ring=sqlite counts rows in an int64, so a 50-million-
+// row ring.db is legitimate there; it takes maxPersistentRingItems, a sanity
+// ceiling against a typo, and so does ring=none, which never reads the key.
+// maxSinkBatch is 1 Mi: a ClickHouse batch of 100 000 rows is legitimate, and
+// a Dequeue slice of 1 Mi pointers is 8 MiB; MySQL keeps its own, lower,
+// ceiling (mysqlMaxBatch). The MySQL and ClickHouse pools take the PostgreSQL
+// one: thousands of connections per instance are a typo, never a budget.
+const (
+	maxRingItems           = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxPersistentRingItems = 1 << 40
+	maxInflight            = 1 << 20
+	maxCommitBatch         = 65536
+	maxSinkBatch           = 1 << 20
+	maxSinkWorkers         = 1024
+	maxPoolSize            = 4096
+	maxListeners           = 256
+
+	// rueidis: a ring of 2^n slots per connection, each with a channel and
+	// two condition variables (about 20 MiB at 16, 300 MiB at 20); 2^(n-1)
+	// overflows past 63. PipelineMultiplex above 8 is refused by rueidis
+	// itself, at connect time, where it was retried until sink.boot_timeout.
+	maxRedisRingScale   = 20
+	maxRedisMultiplex   = 8
+	maxRedisBufferBytes = 256 << 20
 )
 
 // pgIdent is what sink.postgres.table must look like: a plain lowercase
@@ -107,6 +146,9 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	if c.Server.Listeners < 1 {
 		return nil, fmt.Errorf("server.listeners: must be at least 1, got %d", c.Server.Listeners)
 	}
+	if c.Server.Listeners > maxListeners {
+		return nil, fmt.Errorf("server.listeners: %d is above %d", c.Server.Listeners, maxListeners)
+	}
 	if c.Server.MaxBodyBytes <= 0 {
 		return nil, fmt.Errorf("server.max_body_bytes: must be positive")
 	}
@@ -128,23 +170,45 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	if c.Ring.CapacityItems < 1 {
 		return nil, fmt.Errorf("ring.capacity_items: must be at least 1")
 	}
+	if c.Ring.CapacityItems > maxPersistentRingItems {
+		return nil, fmt.Errorf("ring.capacity_items: %d is above %d", c.Ring.CapacityItems, maxPersistentRingItems)
+	}
+	if c.Ring.Mode == RingMemory && c.Ring.CapacityItems > maxRingItems {
+		return nil, fmt.Errorf("ring.capacity_items: %d is above %d, the ceiling of ring.mode=memory "+
+			"(a channel of that many slots)", c.Ring.CapacityItems, maxRingItems)
+	}
 	if c.Ring.MaxBytes < 1 {
 		return nil, fmt.Errorf("ring.max_bytes: must be positive")
 	}
 	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
 		return nil, fmt.Errorf("ring.high_water: must be in (0, 1], got %g", c.Ring.HighWater)
 	}
-	if c.Ring.MaxInflight < 1 {
-		return nil, fmt.Errorf("ring.max_inflight: must be at least 1")
+	// ring.max_inflight is a semaphore and one term of the NATS
+	// PublishAsyncMaxPending, 2 × (workers × batch + max_inflight) (SPEC
+	// §8.7.2), which an unbounded value overflowed into a negative number that
+	// the sink silently replaced with 4096 (go-syslog-server review,
+	// 2026-10-13, C3). 1 Mi writers in flight (maxInflight, with the other
+	// ceilings of SPEC §10.1) is far above any budget.
+	if c.Ring.MaxInflight < 1 || c.Ring.MaxInflight > maxInflight {
+		return nil, fmt.Errorf("ring.max_inflight: %d is outside 1..%d", c.Ring.MaxInflight, maxInflight)
 	}
 	if c.RingSQL.CommitBatch < 1 {
 		return nil, fmt.Errorf("ring.sqlite.commit_batch: must be at least 1")
 	}
+	if c.RingSQL.CommitBatch > maxCommitBatch {
+		return nil, fmt.Errorf("ring.sqlite.commit_batch: %d is above %d", c.RingSQL.CommitBatch, maxCommitBatch)
+	}
 	if c.Sink.Workers < 1 {
 		return nil, fmt.Errorf("sink.workers: must be at least 1")
 	}
+	if c.Sink.Workers > maxSinkWorkers {
+		return nil, fmt.Errorf("sink.workers: %d is above %d", c.Sink.Workers, maxSinkWorkers)
+	}
 	if c.Sink.Batch < 1 {
 		return nil, fmt.Errorf("sink.batch: must be at least 1")
+	}
+	if c.Sink.Batch > maxSinkBatch {
+		return nil, fmt.Errorf("sink.batch: %d is above %d", c.Sink.Batch, maxSinkBatch)
 	}
 	if c.Sink.MaxRetries < 1 {
 		return nil, fmt.Errorf("sink.max_retries: must be at least 1")
@@ -199,6 +263,36 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	if c.SinkCH.PoolSize < 0 {
 		return nil, fmt.Errorf("sink.clickhouse.pool_size cannot be negative")
 	}
+	for _, n := range []struct {
+		name string
+		v    int
+	}{
+		{"sink.postgres.pool_size", c.SinkPG.PoolSize},
+		{"sink.mysql.pool_size", c.SinkMySQL.PoolSize},
+		{"sink.clickhouse.pool_size", c.SinkCH.PoolSize},
+	} {
+		if n.v > maxPoolSize {
+			return nil, fmt.Errorf("%s: %d is above %d; 0 derives sink.workers + 1", n.name, n.v, maxPoolSize)
+		}
+	}
+	if r := c.SinkRedis.RingScaleEachConn; r < 0 || r > maxRedisRingScale {
+		return nil, fmt.Errorf("sink.redis.ring_scale_each_conn: %d is outside 0..%d (a ring of 2^n "+
+			"slots per connection; 0 is the rueidis default)", r, maxRedisRingScale)
+	}
+	if m := c.SinkRedis.PipelineMultiplex; m < -1 || m > maxRedisMultiplex {
+		return nil, fmt.Errorf("sink.redis.pipeline_multiplex: %d is outside -1..%d", m, maxRedisMultiplex)
+	}
+	for _, b := range []struct {
+		name string
+		v    int64
+	}{
+		{"sink.redis.read_buffer_each_conn", c.SinkRedis.ReadBufferEachConn},
+		{"sink.redis.write_buffer_each_conn", c.SinkRedis.WriteBufferEachConn},
+	} {
+		if b.v > maxRedisBufferBytes {
+			return nil, fmt.Errorf("%s: %s is above 256MiB", b.name, FormatBytes(b.v))
+		}
+	}
 	if c.Log.AccessSample < 0 || c.Log.AccessSample > 1 {
 		return nil, fmt.Errorf("log.access_sample: must be in [0, 1], got %g", c.Log.AccessSample)
 	}
@@ -237,6 +331,17 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	if c.Sink.Type == SinkRedisType {
 		if len(c.SinkRedis.Addrs) == 0 {
 			return nil, fmt.Errorf("sink.redis.addrs: at least one address is required when sink.type=redis")
+		}
+		// rueidis dials every entry as TCP host:port. One without a port, or
+		// with a blank, failed in the dial, a network error retried for the
+		// whole sink.boot_timeout (ported from the syslog/RELP family,
+		// 2026-10-13). The comma is the list's separator: there is no Redis
+		// URL here whose host could hold one.
+		for _, a := range c.SinkRedis.Addrs {
+			host, port, err := net.SplitHostPort(a)
+			if err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host) {
+				return nil, fmt.Errorf("sink.redis.addrs: %q is not host:port (one server, port 1..65535)", a)
+			}
 		}
 		if c.SinkRedis.Stream == "" {
 			return nil, fmt.Errorf("sink.redis.stream: cannot be empty")
@@ -326,6 +431,9 @@ func validatePostgres(c *Config, setIn map[string]bool, warn func(string, ...any
 	if pg.Addr == "" {
 		return fmt.Errorf("sink.postgres.addr: cannot be empty when sink.type=postgres")
 	}
+	if err := validatePostgresAddr(pg.Addr); err != nil {
+		return err
+	}
 	if pg.Username == "" {
 		return fmt.Errorf("sink.postgres.username: cannot be empty when sink.type=postgres")
 	}
@@ -359,14 +467,18 @@ func validatePostgres(c *Config, setIn map[string]bool, warn func(string, ...any
 			"instances need N x %d of the server's max_connections", c.Sink.Workers, c.Sink.Workers)
 	}
 
-	// One connection per worker plus one for the health check, which runs
-	// beside the workers and cannot queue for a connection without blowing
-	// sink.health_timeout.
+	// One connection per worker, plus one spare. The spare used to be the
+	// health check's; the check now has a connection of its own outside the
+	// pool (SPEC §8.5.3, §8.5.8), and the derivation stays because a pool
+	// opens connections lazily: the spare costs nothing until something uses
+	// it. Below the workers they queue for a connection -- throughput, not
+	// correctness, so a warning (the check no longer starves: a pool equal to
+	// the workers is a legitimate configuration).
 	if pg.PoolSize == 0 {
 		pg.PoolSize = c.Sink.Workers + 1
-	} else if c.Ring.Mode != RingNone && pg.PoolSize < c.Sink.Workers+1 {
-		warn("sink.postgres.pool_size=%d is below sink.workers+1=%d: workers will queue for a "+
-			"connection, and the health check competes with them", pg.PoolSize, c.Sink.Workers+1)
+	} else if c.Ring.Mode != RingNone && pg.PoolSize < c.Sink.Workers {
+		warn("sink.postgres.pool_size=%d is below sink.workers=%d: workers will queue for a "+
+			"connection", pg.PoolSize, c.Sink.Workers)
 	}
 
 	// With ring=none the writers are the handlers, bounded by max_inflight.
@@ -421,6 +533,9 @@ func validateMySQL(c *Config, setIn map[string]bool, warn func(string, ...any)) 
 	if my.Database == "" {
 		return fmt.Errorf("sink.mysql.database: cannot be empty when sink.type=mysql")
 	}
+	if err := validateDBName("sink.mysql.database", my.Database); err != nil {
+		return err
+	}
 	if !mysqlIdent.MatchString(my.Table) {
 		return fmt.Errorf("sink.mysql.table: %q is not a plain identifier "+
 			"(name or database.name; letters, digits and _; up to 64 chars each)", my.Table)
@@ -450,11 +565,13 @@ func validateMySQL(c *Config, setIn map[string]bool, warn func(string, ...any)) 
 			"instances need N x %d of the server's max_connections", c.Sink.Workers, c.Sink.Workers)
 	}
 
+	// The postgres rule (validatePostgres): the health check has its own
+	// connection (SPEC §8.6.2).
 	if my.PoolSize == 0 {
 		my.PoolSize = c.Sink.Workers + 1
-	} else if c.Ring.Mode != RingNone && my.PoolSize < c.Sink.Workers+1 {
-		warn("sink.mysql.pool_size=%d is below sink.workers+1=%d: workers will queue for a "+
-			"connection, and the health check competes with them", my.PoolSize, c.Sink.Workers+1)
+	} else if c.Ring.Mode != RingNone && my.PoolSize < c.Sink.Workers {
+		warn("sink.mysql.pool_size=%d is below sink.workers=%d: workers will queue for a "+
+			"connection", my.PoolSize, c.Sink.Workers)
 	}
 	if c.Ring.Mode == RingNone && c.Ring.MaxInflight > my.PoolSize {
 		warn("ring.mode=none with ring.max_inflight=%d above sink.mysql.pool_size=%d: writers "+
@@ -483,6 +600,9 @@ func validateClickHouse(c *Config, setIn map[string]bool, warn func(string, ...a
 	if ch.Database == "" {
 		return fmt.Errorf("sink.clickhouse.database: cannot be empty when sink.type=clickhouse")
 	}
+	if err := validateDBName("sink.clickhouse.database", ch.Database); err != nil {
+		return err
+	}
 	if !chIdent.MatchString(ch.Table) {
 		return fmt.Errorf("sink.clickhouse.table: %q is not a plain identifier "+
 			"(name or database.name; letters, digits and _, not starting with a digit; up to 64 chars each)", ch.Table)
@@ -501,16 +621,50 @@ func validateClickHouse(c *Config, setIn map[string]bool, warn func(string, ...a
 			"its own parts; fewer, larger INSERTs are what ClickHouse merges best", c.Sink.Workers)
 	}
 
+	// The postgres rule (validatePostgres): the health check has its own
+	// connection (SPEC §8.8.2).
 	if ch.PoolSize == 0 {
 		ch.PoolSize = c.Sink.Workers + 1
-	} else if c.Ring.Mode != RingNone && ch.PoolSize < c.Sink.Workers+1 {
-		warn("sink.clickhouse.pool_size=%d is below sink.workers+1=%d: workers will queue for a "+
-			"connection, and the health check competes with them", ch.PoolSize, c.Sink.Workers+1)
+	} else if c.Ring.Mode != RingNone && ch.PoolSize < c.Sink.Workers {
+		warn("sink.clickhouse.pool_size=%d is below sink.workers=%d: workers will queue for a "+
+			"connection", ch.PoolSize, c.Sink.Workers)
 	}
 	if c.Ring.Mode == RingNone && c.Ring.MaxInflight > ch.PoolSize {
 		warn("ring.mode=none with ring.max_inflight=%d above sink.clickhouse.pool_size=%d: writers "+
 			"beyond the pool wait for a connection inside it, invisible to the ring's accounting. "+
 			"Raise sink.clickhouse.pool_size or lower ring.max_inflight", c.Ring.MaxInflight, ch.PoolSize)
+	}
+	return nil
+}
+
+// maxDBName is the longest database name MySQL accepts, in CHARACTERS (64),
+// and the ceiling used for ClickHouse too.
+const maxDBName = 64
+
+// validateDBName holds sink.mysql.database and sink.clickhouse.database to
+// what can go between backticks (SPEC §8.6.3; ported from the syslog/RELP
+// family, 2026-10-13). Both sinks put the name raw inside `...` in the INSERT,
+// and the table name is checked precisely so nothing typed in the
+// configuration can change a statement: a backtick ends the quoting, a
+// backslash is an escape to ClickHouse inside a quoted identifier, and control
+// bytes are no name either server would show back. Longer than 64 characters
+// either server refuses it anyway, after the first check. Characters, not
+// bytes: a legitimate name of 64 accented letters is 128 bytes, and the byte
+// count refused it (go-syslog-server review, 2026-10-13). The sinks'
+// constructors check the same rule (checkQuotedName) for a caller that
+// bypasses this.
+func validateDBName(key, v string) error {
+	if n := utf8.RuneCountInString(v); n > maxDBName {
+		return fmt.Errorf("%s: %d characters is above %d", key, n, maxDBName)
+	}
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; {
+		case c == '`' || c == '\\':
+			return fmt.Errorf("%s: %q holds a backtick or a backslash, which would break the "+
+				"quoting of the name in every statement", key, v)
+		case c < 0x20 || c == 0x7f:
+			return fmt.Errorf("%s: %q holds a control byte", key, v)
+		}
 	}
 	return nil
 }
@@ -521,42 +675,9 @@ func validateNATS(c *Config) error {
 	if len(n.URLs) == 0 {
 		return fmt.Errorf("sink.nats.urls: at least one URL is required when sink.type=nats")
 	}
-	// Each URL is parsed here, and never quoted in the message: a password
-	// with an unescaped %, / or # failed inside nats.Connect as a network
-	// error, with the password in every log line, until sink.boot_timeout
-	// (SPEC §8.7.9; found in go-webhook-nats-server).
-	urlUserinfo := false
-	for _, raw := range n.URLs {
-		raw = strings.TrimSpace(raw)
-		if !strings.Contains(raw, "://") {
-			// nats.go dials a bare host:port as nats://.
-			raw = "nats://" + raw
-		}
-		u, err := parseURL(raw)
-		if err != nil {
-			return fmt.Errorf("sink.nats.urls: an entry is %v (%s)", err, percentEncodeHint)
-		}
-		if u.Hostname() == "" {
-			return fmt.Errorf("sink.nats.urls: an entry has no host (%s)", percentEncodeHint)
-		}
-		// It is also what catches the password that parses:
-		// nats://user:1234/5678@host is host "user", port 1234 and a path,
-		// with no credentials at all, and the client would dial it until
-		// sink.boot_timeout.
-		if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("sink.nats.urls: an entry carries a path, a query or a fragment, "+
-				"which a NATS URL has none of (%s)", percentEncodeHint)
-		}
-		if u.User != nil {
-			urlUserinfo = true
-		}
-	}
-	// nats.go prefers the URL's userinfo over every explicit credential: the
-	// two together would leave the explicit one unused, silently.
-	if urlUserinfo && (n.Username != "" || n.Password != "" || n.Token != "" || n.Credentials != "") {
-		return fmt.Errorf("sink.nats.urls carries credentials (user:password@ or token@) and " +
-			"sink.nats.username/password/token/credentials is set too: the client would use the " +
-			"URL's and ignore the other; keep one")
+	// Each URL is parsed, and never quoted in the message (natsurl.go).
+	if err := validateNATSURLs(n); err != nil {
+		return err
 	}
 	if !natsToken.MatchString(n.Stream) {
 		return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
@@ -590,6 +711,56 @@ func validateNATS(c *Config) error {
 		return fmt.Errorf("sink.nats.tls_ca is set but sink.nats.tls=false: enable tls or drop the CA")
 	}
 	return nil
+}
+
+// validatePostgresAddr accepts one server, by host:port or by socket
+// directory (with an optional :port, which names the socket file:
+// /run/pg:5433 is /run/pg/.s.PGSQL.5433). Anything else -- "h1,h2:5432", an
+// empty host, port 0, a tab, "[h:5432]:5433" -- passed here and then failed in
+// the DNS or the dial, retried as a network error for the whole
+// sink.boot_timeout (SPEC §8.5.2; go-syslog-pg-server and
+// go-relplog-pg-server, ported 2026-10-13).
+func validatePostgresAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	switch {
+	case strings.HasPrefix(addr, "/"):
+		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
+		// which pgx then tries as a list: refused like "h1,h2" below.
+		if strings.ContainsAny(addr, ",\t ") {
+			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
+				"with no comma or blank", addr)
+		}
+		if err != nil {
+			return nil // a bare socket directory: port 5432
+		}
+		if !validPort(port) {
+			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
+				"must be 1..65535", addr)
+		}
+	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
+		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
+			"1..65535) nor a unix socket directory starting with /", addr)
+	}
+	return nil
+}
+
+// oneHost reports whether host, the part before the port, names one server: a
+// name or an IP literal. A ':' is only an IPv6 literal's: "[h:5432]:5433"
+// passed as host "h:5432", a DNS name no resolver has, retried for the whole
+// sink.boot_timeout.
+func oneHost(host string) bool {
+	if !strings.Contains(host, ":") {
+		return true
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
+}
+
+// validPort is a decimal port 1..65535 written the canonical way: "+80" and
+// "080" parse with Atoi and would be dialled as something other than written.
+func validPort(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == s
 }
 
 func checkSynchronous(name, v string) error {

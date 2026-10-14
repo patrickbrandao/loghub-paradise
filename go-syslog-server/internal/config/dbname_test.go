@@ -16,7 +16,10 @@ func TestDatabaseNamesFitBetweenBackticks(t *testing.T) {
 		key := "--sink." + sec + ".database="
 		// Controls: the default, a name at the ceiling, and names that are
 		// odd but quote fine.
-		for _, ok := range []string{"syslog", long, "logs-2026", "Dados.Brutos", "a b"} {
+		// 64 CHARACTERS, not bytes: 64 'ç' are 128 bytes, a name MySQL
+		// accepts (independent review of the port, 2026-10-13).
+		for _, ok := range []string{"syslog", long, "logs-2026", "Dados.Brutos", "a b",
+			strings.Repeat("ç", 64), strings.Repeat("日", 25)} {
 			mustLoad(t, append(base, key+ok), nil)
 		}
 		for _, tc := range []struct{ name, want string }{
@@ -28,6 +31,7 @@ func TestDatabaseNamesFitBetweenBackticks(t *testing.T) {
 			{"sys\x00log", "control byte"},
 			{"sys\x7flog", "control byte"},
 			{long + "d", "above 64"},
+			{strings.Repeat("ç", 65), "65 characters is above 64"},
 		} {
 			mustFail(t, append(base, key+tc.name), nil, "sink."+sec+".database")
 			mustFail(t, append(base, key+tc.name), nil, tc.want)

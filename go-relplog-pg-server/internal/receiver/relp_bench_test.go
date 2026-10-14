@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"net"
 	"strconv"
@@ -75,4 +76,48 @@ func BenchmarkRELPSession(b *testing.B) {
 	}
 	<-done
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msg/s")
+}
+
+// cycleReader replays one stream forever, as a sender that never pauses.
+type cycleReader struct {
+	b   []byte
+	off int
+}
+
+func (c *cycleReader) Read(p []byte) (int, error) {
+	n := 0
+	for n < len(p) { // no short read at the wrap: that would be a pause
+		k := copy(p[n:], c.b[c.off:])
+		c.off = (c.off + k) % len(c.b)
+		n += k
+	}
+	return n, nil
+}
+
+// BenchmarkRELPReaderFrames reads back-to-back syslog frames of one size
+// through the session's 4 KiB bufio.Reader. Above relpKeepBlock (16 KiB) the
+// reader used to let the buffer go before EVERY frame and grow it again by
+// doubling: a sender of 24 KiB lines paid the whole growth per frame
+// (independent review of go-syslog-server, 2026-10-13, E2; TESTING).
+func BenchmarkRELPReaderFrames(b *testing.B) {
+	for _, size := range []int{200, 12 << 10, 24 << 10, 60 << 10} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			msg := bytes.Repeat([]byte("a"), size)
+			var stream []byte
+			for i := 1; i <= 64; i++ {
+				stream = append(stream, strconv.Itoa(i)+" syslog "+strconv.Itoa(size)+" "...)
+				stream = append(stream, msg...)
+				stream = append(stream, '\n')
+			}
+			rd := NewRELPReader(bufio.NewReaderSize(&cycleReader{b: stream}, relpReadBuffer), 1<<20, 64<<10)
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := rd.ReadFrame(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

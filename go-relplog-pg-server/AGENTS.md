@@ -280,7 +280,9 @@ DATADIR=/tmp/rlpg-data AGENT_NAME=go-relplog-pg-server HOSTNAME=dev-mac \
   `ErrNotDurable`: é `WARN`, não "será entregue de novo".
 - **A contagem do aborto tem um dono só**: `dumpPhase` + `dumping.Swap`, sob
   o `lossMu` (`enterDumpPhase`, `oweDump`: nada rearma o contador depois de um
-  aborto). Sem isso o aborto durante o dump contava duas vezes ou nenhuma. E um
+  aborto; `settleDump`: o dump toma o contador de volta sob ele, ou um dump
+  que via `aborted` antes de o aborto tomar o contador contava
+  `emergency_failed` no lugar de `abort`). Sem isso o aborto durante o dump contava duas vezes ou nenhuma. E um
   dump que o aborto já contou é **abandonado** (`Store.SetAbandon`): publicado,
   voltaria no boot seguinte embora contado como perdido.
 - **O `sink.boot_timeout` da reingestão é sem progresso**: o prazo anda a cada

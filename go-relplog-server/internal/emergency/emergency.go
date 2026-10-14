@@ -70,13 +70,28 @@ const (
 
 // Store reads and writes dumps in one directory.
 type Store struct {
-	dir   string
-	agent string
+	dir     string
+	agent   string
+	abandon func() bool
 }
 
 // NewStore builds a store for emergency.dir. agentUUID is the instance's
 // AgentUUID, which names the files it writes (SPEC §12.1).
 func NewStore(dir, agentUUID string) *Store { return &Store{dir: dir, agent: agentUUID} }
+
+// SetAbandon installs the check a Write in progress consults: true means the
+// process was aborted and counted the dump's messages lost, so the dump gives
+// up and removes its temporary file instead of publishing a file the next boot
+// would reingest (SPEC §13.4). Checked every 1024 records and before the
+// publish; a dump that publishes between the last check and the abort is both
+// counted and kept, an overcount, never a loss (ported from
+// go-relplog-nats-server, independent review of 2026-10-13).
+func (s *Store) SetAbandon(f func() bool) { s.abandon = f }
+
+func (s *Store) abandoned() bool { return s.abandon != nil && s.abandon() }
+
+// ErrAbandoned is Write giving up because the process was aborted.
+var ErrAbandoned = errors.New("emergency: dump abandoned: the process was aborted")
 
 // Dir reports the configured directory.
 func (s *Store) Dir() string { return s.dir }
@@ -118,6 +133,9 @@ func (s *Store) Write(items []*item.Item) (string, error) {
 	if len(items) == 0 {
 		return "", nil
 	}
+	if s.abandoned() {
+		return "", ErrAbandoned
+	}
 	if err := os.MkdirAll(s.dir, 0o750); err != nil {
 		return "", fmt.Errorf("emergency: cannot create %s: %w", s.dir, err)
 	}
@@ -136,7 +154,11 @@ func (s *Store) Write(items []*item.Item) (string, error) {
 	w := bufio.NewWriterSize(f, 1<<20)
 	head := make([]byte, 0, 512)
 	hdr := make([]byte, 0, maxHeaderLine)
-	for _, it := range items {
+	for i, it := range items {
+		if i&1023 == 1023 && s.abandoned() {
+			f.Close()
+			return "", s.abort(tmp, ErrAbandoned)
+		}
 		if it == nil {
 			continue
 		}
@@ -169,6 +191,9 @@ func (s *Store) Write(items []*item.Item) (string, error) {
 	}
 	if err := f.Close(); err != nil {
 		return "", s.abort(tmp, err)
+	}
+	if s.abandoned() {
+		return "", s.abort(tmp, ErrAbandoned)
 	}
 	if err := publish(tmp, path); err != nil {
 		return "", s.abort(tmp, err)
@@ -594,7 +619,11 @@ func countFile(path string) (int64, error) {
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return err
+		// Also not durable, not undone: Remove and Quarantine call this AFTER
+		// the unlink or the rename succeeded, and reporting "cannot remove"
+		// for a file that is gone would be false (go-relplog-nats-server,
+		// independent review, 2026-10-13). In Write it is still a failed dump.
+		return fmt.Errorf("%w: cannot open directory %s to fsync it: %w", ErrNotDurable, dir, err)
 	}
 	defer d.Close()
 	if err := dirSync(d); err != nil {
@@ -604,8 +633,8 @@ func syncDir(dir string) error {
 }
 
 // ErrNotDurable marks the failure of a directory fsync after the operation on
-// the directory entry itself succeeded: the rename of Quarantine happened,
-// and only its durability is in doubt. Write's error may wrap it too, but
+// the directory entry itself succeeded: the unlink of Remove or the rename of
+// Quarantine happened, and only its durability is in doubt. Write's error may wrap it too, but
 // there the fsync decides the dump: the file is removed and the dump has
 // failed (SPEC §12.3).
 var ErrNotDurable = errors.New("emergency: the directory entry may not be durable")

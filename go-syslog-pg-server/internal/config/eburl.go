@@ -230,6 +230,15 @@ func parsePostgresURL(s string) (ebTarget, error) {
 		}
 	}
 
+	if vs, ok := q["host"]; ok && vs[0] == "" {
+		// libpq and pgx read an empty host= as "not set" and dial their own
+		// default (a unix socket in a compiled-in directory, or localhost),
+		// while this server dialed the host of the authority: two readers
+		// of one LOGHUB_EB_URL reaching two servers (independent review of
+		// go-syslog-server, 2026-10-13, B4). Refused like an empty sslmode.
+		return ebTarget{}, errors.New("the host= of the PostgreSQL URL is empty: drop it, or " +
+			"name a unix socket directory starting with / (postgres://u@:5433/db?host=/run/pg)")
+	}
 	var addr string
 	switch socket := q.Get("host"); {
 	case socket != "":

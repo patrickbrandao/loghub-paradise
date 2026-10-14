@@ -323,10 +323,150 @@ barreira roda 3000 rodadas; e o parser de flags só nomeia uma flag que este
 servidor conhece e não cita nada depois de um valor. Fica, decidida como no N,
 a brecha da cauda com traço depois de um valor não vazio (`--x=a -b`):
 escondê-la esconderia os erros de digitação (`TESTING.md` §8 item 41).
+Fechada em 2026-10-13 (seção 4b): a cauda só é nomeada dentro de uma seção
+conhecida, o que mantém visíveis os erros de digitação que importam.
 
 Fica de fora, com o porquê: o TLS do `sink=nats` continua (este módulo tem TLS;
 o `TLSCertCB` que recusa é do N e do SN, que não têm), e a reingestão que refaz
 item a item uma recusa `logic` (`TESTING.md` §8 item 38) não estava na lista.
+
+## 4b. Porte das correções da família syslog/RELP (2026-10-13)
+
+Uma subseção por área da rodada; o que veio igual dos irmãos está na SPEC.
+
+### Ciclo de vida e dump
+
+Padrões assumidos nesta rodada (contestáveis), com o que veio igual do S, do
+SP e do RN registrado na SPEC (§9.2, §10.3, §10.5):
+
+- **O `fsync` do diretório decide a remoção e a quarentena, não o dump.** O S
+  e o SP recusam o dump cujo diretório não sincroniza; aqui ele continua
+  melhor esforço (§9.1, decisão do porte de 2026-10-11: o arquivo já está
+  completo e no nome final, e jogá-lo fora perderia o ring). Na remoção, na
+  quarentena e também no `.legacy` (o S não o tem) a falha vem depois do
+  `unlink`/`rename` e vira `WARN` (`emergency.ErrNotDurable`), nunca o "cannot
+  remove" falso.
+- **Com `emergency.enabled = false` a perda continua sendo `abort`** (§9.3),
+  não `emergency_failed` como no S: a decisão é deste módulo, de 2026-10-11, e
+  a posse única do contador vale igual nos dois ramos.
+- **Não se aplica o `quitNow` do S.** Aqui `SIGQUIT` fora do shutdown é a ação
+  padrão do Go (§10.3, decisão anterior), e não há observador próprio dele que
+  possa marcar o sinal entre a entrada do shutdown e o registro do canal do
+  aborto: o canal do aborto, que inclui `SIGQUIT`, passa a ser registrado
+  antes de o contexto soltar `SIGTERM`/`SIGINT`, e é isso que cobre a janela.
+- **Não se aplica o prazo da reingestão "sem progresso"** do SP e do RN: a
+  reingestão daqui não espera nem retenta — cada lote tem o seu
+  `sink.op_timeout` e qualquer recusa sai com 3 (§9.2), o crashloop
+  intencional. Não há um `boot_timeout` único gasto pelas entregas bem
+  sucedidas. Os *gauges* já eram do arquivo inteiro e recontados do disco
+  (2026-10-11).
+- **Fechamento em paralelo:** já era. O `Server.Shutdown` fecha os
+  `server.listeners` ao mesmo tempo, sob um prazo só; a porta admin é uma.
+
+### Configuração
+
+As regras de configuração do `go-relplog-server` e dos cortes dele, já no
+`go-syslog-server` (SPEC §13.2, tabela de §10.1), com as opções recomendadas do
+plano da rodada. Padrões assumidos, contestáveis:
+
+- **Os tetos são os do `go-syslog-server`**, que tem os mesmos rings e sinks:
+  16 Mi itens só para o ring de memória (o único que faz um canal de
+  `capacity_items` posições); 2⁴⁰ como teto de sanidade com `sqlite` e `none`
+  (50 milhões de linhas no `ring.db` são legítimas); `ring.max_inflight` 1 Mi
+  (teto genérico; a relação com o `MaxPending` do NATS é da área do NATS);
+  `ring.sqlite.commit_batch` 65 536; `sink.batch` 1 Mi (um lote de 100 000
+  linhas no ClickHouse é legítimo; o MySQL mantém os seus 5000);
+  `sink.workers` 1024; pools 4096; `server.listeners` 256 (o
+  `listen.*_listeners` da família).
+- **Tetos próprios do webhook, nos botões do rueidis**, que nenhum irmão tem:
+  `sink.redis.ring_scale_each_conn` 0–20 (um anel de 2^n posições por conexão,
+  cada uma com um canal e duas variáveis de condição: ~20 MiB em 16, ~300 MiB
+  em 20; acima de 63 o `2 << (n-1)` dá a volta e o `makeslice` entra em
+  pânico), `sink.redis.pipeline_multiplex` −1–8 (o teto do próprio rueidis,
+  que recusava só no `connect`, retentado até o `boot_timeout`) e os buffers
+  por conexão até 256 MiB (o número da família para memória por unidade).
+  Escolhidos como sanidade, não como orçamento: um valor legítimo acima deles
+  é motivo para subir o teto.
+- **`sink.redis.addrs`: cada entrada é `host:porta`.** O item B6 do plano (a
+  `,` no host de uma URL Redis) não se aplica: aqui não há URL, e a vírgula é o
+  separador da lista. Mas uma entrada sem porta ou com branco falhava no *dial*
+  como `network` até o `boot_timeout`; agora é exit 1, como o
+  `sink.postgres.addr`.
+- **`sink.postgres.addr` nomeia um servidor só** (regra do SP/RP): o socket
+  com `tls=true` já era recusado aqui (item B5 do plano: nada a fazer).
+- **Fica de fora, por não se aplicar:** `sink.batch_max_bytes` (a família
+  webhook não tem a chave; o teto de 1 GiB de um parâmetro do PostgreSQL já é
+  `WARN` de §8.5.4, limitado na prática por `ring.max_bytes`) e as regras de
+  URL PostgreSQL da `LOGHUB_EB_URL` (`sslmode=`/`host=` vazios, usuário e banco
+  obrigatórios, fragmento): este servidor não tem `LOGHUB_EB_URL` nem outro
+  leitor de URL ou DSN PostgreSQL/MySQL na configuração — `sink.postgres` e
+  `sink.mysql` são chaves separadas.
+
+### Sink NATS
+
+Padrões assumidos no porte (contestáveis), com a regra em SPEC
+§8.7:
+
+- **`retention: interest` é recusado** (fatal na validação de toda checagem),
+  não só avisado: a decisão do `go-syslog-server` de 2026-10-11, que a SPEC
+  §19.1 item 6 deixava em aberto aqui. O `PubAck` é o que dá ao `200` de
+  `ring=none` e à liberação do ring o seu sentido, e um stream que descarta no
+  aceite o esvazia. `max_msgs_per_subject > 0` só dá `WARN`, uma vez por valor.
+- **Recusa de TLS só é veredito sem outro servidor no *pool*** (a opção
+  recomendada do C1 da revisão do `go-syslog-server`): com mais de um servidor
+  — nas URLs ou anunciado pelo cluster — é `network`, nomeando o TLS, e os
+  fusíveis dão o FATAL se o *pool* nunca voltar; no boot, mais de uma URL
+  também é `network`. A alternativa (veredito sempre) derrubava o processo por
+  um nó mal configurado enquanto o confiável voltava.
+- **`sink.nats.urls` aceita `nats://`, `tls://`, `ws://` e `wss://`**, os que o
+  `nats.go` disca, como no `go-syslog-server`; o caminho só num websocket. O N
+  e o SN aceitam só `nats://`, por não terem TLS.
+
+### Destinos SQL
+
+Portado do `go-syslog-server`, do `go-syslog-pg-server` e do
+`go-relplog-pg-server` (e da revisão independente do porte ao S), sem decisão
+nova do usuário. Contestáveis, como tudo neste arquivo:
+
+- **O check de saúde tem conexão própria, fora do pool**, nos três destinos SQL
+  (PostgreSQL: uma `pgx.Conn`; MySQL: um `sql.DB` de uma conexão, do mesmo
+  *connector*; ClickHouse: um segundo `clickhouse.Open` de uma conexão), em
+  qualquer ring. O RP resolveu o mesmo defeito (escritores lentos seguram todas
+  as conexões, o check espera uma, DOWN e FATAL com o banco sadio) **recusando**
+  `pool_size < sink.workers + 1`; aqui isso não bastaria, porque com
+  `ring=none` os escritores são os handlers, até `ring.max_inflight`, e o
+  destino não pode consultar o ring para mudar de regra (SPEC §2.1). Custo: a
+  conta por instância passa a `pool_size + 1` conexões (um usuário com
+  `MAX_USER_CONNECTIONS` tem de contá-la).
+- **A derivação continua `sink.workers + 1`**: o pool abre conexões sob demanda,
+  a folga não custa nada até ser usada, e mudá-la mudaria o que toda
+  configuração implantada deriva.
+- **`pool_size` explícito abaixo de `sink.workers` é `WARN`, não recusa**; igual
+  a `sink.workers` não avisa mais (avisava abaixo de `workers + 1`). Com a sonda
+  fora do pool, um pool menor só limita a vazão (os workers esperam conexão
+  sob `sink.op_timeout` e retentam); recusar seria recusar uma configuração que
+  funciona.
+- **Uma conexão de check reaproveitada que falha é refeita uma vez** dentro do
+  mesmo prazo (PostgreSQL); o `database/sql` e o `clickhouse-go` já refazem a
+  conexão quebrada sozinhos. Sem isso, uma conexão morta parada (um *proxy*,
+  um reinício do servidor) dava um check falho que o pool escondia com o *ping*.
+- **`autocommit = 1` fixado na sessão do MySQL e lido de volta no boot** (era a
+  pendência 8 da SPEC §19.1; o S já o fazia). A prova da leitura de volta
+  desliga o `autocommit` da única conexão do pool à mão, com `SET SESSION`:
+  nada de `SET GLOBAL` num servidor compartilhado.
+- **Nome do banco do MySQL e do ClickHouse:** até 64 **caracteres** (não bytes),
+  sem crase, contrabarra ou byte de controle, na configuração (`exit 1`) e no
+  construtor do destino. O módulo não tinha regra nenhuma; a forma é a do S,
+  com a contagem por caracteres da revisão do porte ao S.
+- **ClickHouse: a conta de memória por usuário multiplica o pior lote por
+  `min(pool_size, escritores)`**, com os escritores (`sink.workers`, ou
+  `ring.max_inflight` com `ring=none`) passados pela montagem, que conhece o
+  ring; a mensagem deixou de mandar "baixar o pool".
+- **Não se aplica:** a sonda MySQL com `unix`/`src_ip NULL` do R (o webhook não
+  tem coluna que possa vir `NULL`: as dez são sempre preenchidas, e é por isso
+  que `1048` e `23502` passam a fatais); o `Deliver` com `logic` antes do `ctx`
+  do RP (os workers daqui já tratavam a classe antes do contexto; ficou um teste
+  de guarda); o prazo próprio da validação (já existia, `validationContext`).
 
 ## 5. Ordem de entrega
 

@@ -206,7 +206,10 @@ Registradas por honestidade, não por esquecimento:
     `obs.Logger.SetLevel` (da recarga).
 15. **`envelope.appendKey` não é usado** (`golangci-lint unused`); veio do fast,
     onde também não é, e fica até a correção ser portada nos dois.
-16. **Segundo sinal no meio do dump** (revisão de 2026-10-11): o aborto conta
+16. ~~**Segundo sinal no meio do dump**~~ — **fechada em 2026-10-13** (§9,
+    "Porte das correções da família syslog/RELP": o dump que o aborto contou
+    desiste, e o contador passa de mão sob uma trava antes do recolhimento).
+    O registro de então: (revisão de 2026-10-11): o aborto conta
     os itens como perda, mas a escrita continua e, se o `link` acontecer antes
     do `os.Exit`, o dump é reingerido no boot seguinte — perda contada a mais,
     nenhum evento perdido. E entre o `Drain` (que já desconta o ring) e o
@@ -214,15 +217,20 @@ Registradas por honestidade, não por esquecimento:
     menos. Janela de milissegundos; correção proposta: o `link` como ponto de
     compromisso (o caminho gracioso reivindica o `atRisk` antes dele) e
     `atRisk`/`collected` num só atômico.
-17. **`Count` pula um dump ilegível** (revisão de 2026-10-11, anterior ao
+17. ~~**`Count` pula um dump ilegível**~~ — **fechada em 2026-10-13** (§9,
+    "Porte das correções da família syslog/RELP"). O registro de então:
+    (revisão de 2026-10-11, anterior ao
     porte): um arquivo sem permissão de leitura fica no disco e não entra em
     `whs_emergency_files`, ao contrário do que diz a linha de 2026-10-07 abaixo.
     É defeito, com a direção da correção em SPEC §19.1.
-18. **Uma brecha deixada no parser de flags** (SPEC §13.2, como no N): a cauda
+18. ~~**Uma brecha deixada no parser de flags** (SPEC §13.2, como no N): a cauda
     de um valor que o shell partiu num espaço, quando começa com traço e vem
     depois de um valor não vazio (`--sink.postgres.password=a -b`), sai como
     parâmetro desconhecido, com o nome. Escondê-la esconderia todo erro de
-    digitação de uma flag depois de outra.
+    digitação de uma flag depois de outra.~~ — **fechada em
+    2026-10-13** (porte da família syslog/RELP, `knownSectionOf`): depois de um
+    valor, só se nomeia uma flag desconhecida dentro de uma seção deste
+    servidor; `TestFamilyPortTailAfterAValueIsNotNamed`.
 
 ## 9. Histórico: bugs que os testes encontraram
 
@@ -308,3 +316,94 @@ interrompido "foram contados como perda".
 A mutação deste porte achou um caminho do `flags.go` sem teste, também no N:
 tirar o `assigned(v)` do `--config` não derrubava nada. Caso novo,
 `--config= x` (o argumento depois do `=` vazio não é citado).
+
+### Porte das correções da família syslog/RELP (2026-10-13)
+
+**A (ciclo de vida, dump, shutdown, boot).** Cada item com SPEC primeiro, o
+teste abaixo e a correção revertida numa cópia do módulo (mutação): 34 de 34
+mutantes mortos. Os testes são os do `go-webhook-fast-server`
+(`port_lifecycle_test.go`, `durable_test.go`), adaptados ao dump JSON Lines e
+ao destino falso (`memSink`); o código comum é igual entre o P e o N.
+
+| Item | Teste |
+|---|---|
+| `fsync` do diretório no `Remove` e na quarentena; `ErrNotDurable` (inclusive na abertura do diretório) vira `WARN`, não o "cannot remove" falso; a escrita do dump continua melhor esforço (SPEC §9.1, §9.2) | `TestRemoveSyncsTheDirectory`, `TestRemoveWithAnUnopenableDirectoryIsNotDurable`, `TestQuarantineWithAFailedDirectoryFsyncIsQuarantined`, `TestWriteKeepsTheDumpWhenTheDirectoryFsyncFails`, `TestReingestedDumpRemovedWithoutDurabilityIsAWarning`, `TestQuarantineWithoutDurabilityIsStillReported` |
+| Posse única da perda do aborto (`lossMu`, `enterDumpPhase`, `oweDump`, `settleDump`), no lugar do par `atRisk`/`collected`: o aborto entre o `Drain` e o registro do recolhimento contava a menos (2 de 5) (SPEC §10.3; fecha §8 item 16, a segunda metade) | `TestAbortBetweenTheDrainAndTheDumpCountsEverything`, `TestAbortAfterASavedDumpCountsNothing`, `TestAbortAndDisabledDumpCountOnce`, `TestAbortAndFailedDumpCountOnce`, `TestAbortDuringTheDrainIsCountedOnce`, `TestAbortBeforeTheDumpPhaseKeepsItClosed`, `TestNewlineEnvelopeLeftOutOfTheDumpIsCountedOnce` (o envelope com `0x0A`, agora contado pelo dump) |
+| O dump que o aborto contou desiste (`Store.SetAbandon`), e o que publica depois da última conferência não é contado de novo (fecha §8 item 16, a primeira metade) | `TestWriteGivesUpWhenAbandoned` (antes da primeira linha, a cada 1024, antes do `link`), `TestDumpAfterTheAbortIsAbandoned`, `TestAbortAfterTheLastAbandonCheckCountsNothingMore`, `TestAbortDuringTheDumpCountsItOnceAndLeavesNoDump` (ponta a ponta: `beforeDump` segura o dump até o aborto contar) |
+| X2: o dump toma o contador sob `lossMu`, nos dois ramos (com dump e `emergency.enabled=false`) | `TestDumpThatSawTheAbortLeavesTheCountToIt` (`inAbort`: o dump roda com a trava do aborto na mão) |
+| `SIGQUIT` nunca tolerado, e o primeiro `SIGTERM`/`SIGINT` do shutdown por FATAL tolerado (já valia; agora com teste de unidade em `shutdownWith`) | `TestFatalShutdownToleratesTheFirstSignal` |
+| O canal do aborto registrado antes de o contexto soltar `SIGTERM`/`SIGINT` (um segundo sinal no meio saía 143 sem contar) | sem teste: a janela é de instruções, entre o `signal.Stop` do contexto e o `signal.Notify`; provado por leitura |
+| X1: `bind` cancelado por sinal = 130, na porta admin e na pública, com nome de host e com IP literal; o `Server.Close` fecha também os listeners que o `Serve` nunca recebeu | `TestSignalBeforeTheBindExits130` (`127.0.0.1:0` e `localhost:0`, a porta solta depois), `TestCancelledAdminBindIsAnAbortNotAConfigError` |
+| Um sink FATAL durante o dreno do `SIGTERM` encerra a espera, e a saída é 3 sempre que a saúde termina FATAL (SPEC §10.3; fecha SPEC §19.1 item 10, já registrado) | `TestFatalDuringTheDrainEndsTheWaitAndExits3` (prazo de 10 min; o dump sai na hora), `TestFatalDuringThePreStopDelayExits3` (ring vazio: saía 0) |
+| Leitura dos dumps em todo boot, com `emergency.enabled` desligado também, e o diretório que não se lista só para uma vida que escreve dumps (fecha SPEC §19.1 item 8) | `TestDumpsAreReingestedWithEmergencyDisabled`, `TestUnlistableEmergencyDirStopsOnlyALifeThatDumps` |
+| *Gauges* de emergência do arquivo inteiro e do disco: `whs_emergency_files` posto no início da reingestão, o `Count` contando o arquivo ilegível, falha da recontagem com `WARN` (fecha SPEC §19.1 item 12 e TESTING §8 item 17) | `TestEmergencyFilesGaugeDuringReingestion`, `TestCountKeepsAnUnreadableFile`, `TestEmergencyGaugesCountAnUnreadableDump` (o `WARN` sem teste: só log) |
+| `withLifetime` e `validationContext` com `sink.op_timeout` (SP2/RP): já estavam aqui; o guarda do fast veio junto | `TestHealthChecksCarryTheirLifetime` (`internal/sink`) |
+
+Não se aplicam (DECISOES, "Porte das correções da família syslog/RELP"): o
+`quitNow` (sem observador de `SIGQUIT` fora do shutdown), o prazo da
+reingestão sem progresso (sem retentativa nem prazo único; a leitura é do
+arquivo inteiro, sem "pedaço"), o fechamento em paralelo (o `Server.Shutdown`
+já fecha os listeners juntos) e o A4 do plano (não há `ring=sqlite`).
+
+**B (configuração, `internal/config/`).** Testes em
+`internal/config/family_port_test.go`; cada um falhou contra o código de antes
+(conferido no módulo intocado; `TestFamilyPortRetiredKeyAfterAValueIsNamed` é
+guarda da regra nova) e cada correção revertida sozinha derruba ao menos um
+(31 mutantes, 31 mortos).
+
+| Item | Teste |
+|---|---|
+| Cauda depois de um valor nomeada só dentro de uma seção conhecida (`knownSectionOf`; fecha §8 item 18), contando as seções do fast que este servidor não tem (`retiredSections`) | `TestFamilyPortTailAfterAValueIsNotNamed`, `TestFamilyPortRetiredKeyAfterAValueIsNamed`; controles de `TestParserErrorsDoNotEchoValues` ajustados |
+| `-h`/`-v` depois de uma flag que espera valor não é nomeado como *switch* | `TestFamilyPortShortDashValueIsNotNamedAsAFlag` |
+| Valor colado ao nome, `:` no lugar do `=`, na flag e no INI; chave antes de seção | `TestFamilyPortGluedValueIsNotPrinted` |
+| Continuação de segredo numa linha do INI | `TestFamilyPortINISecretContinuationIsNotPrinted` |
+| *Switches* com valor; `--config=` vazio; BOM na linha 1 | `TestFamilyPortSwitchesTakeNoValue`, `TestFamilyPortEmptyConfigFlagIsRefused`, `TestFamilyPortINIByteOrderMarkIsIgnored` |
+| Derivados (`emergency.dir`, `sink.postgres.pool_size`) comentados no `--dump-config` | `TestFamilyPortDumpCommentsDerivedValues` |
+| Tetos (`capacity_items`, `batch`, `workers`, `pool_size`, `listeners`) | `TestFamilyPortConfigCeilings` |
+| `sink.postgres.addr` um servidor só | `TestFamilyPortPostgresAddrNamesOneServer` |
+
+Não se aplica (`DECISOES.md`): `sink.batch_max_bytes` (a chave não existe),
+`ring.max_inflight` e `ring.sqlite.commit_batch` (não existem), as regras de
+URL PostgreSQL da `LOGHUB_EB_URL` (não há `LOGHUB_EB_URL` nem outro leitor de
+URL/DSN), e o socket com `tls=true`, que já era recusado.
+
+**C (sink NATS).** Não se aplica: este servidor não tem NATS (SPEC §8.7,
+retirado; nenhuma dependência do `nats.go` no `go.mod`). Os achados da área —
+`10077` de stream cheio ou fechando, `discard=new` abaixo de um registro,
+negação mascarada em `core`, veredito do TLS na reconexão, *flush* `core`
+através de uma reconexão, folga do `MaxPending` e teto de
+`ring.max_inflight`, `retention: interest`, `10158`/`10167`/429, `_INBOX`
+negado, `space` estrangeiro e as URLs NATS — ficam para o F, o W e o N.
+
+**D (o destino PostgreSQL e o dreno).** Cada correção tem o teste abaixo,
+contra o PostgreSQL 18 real, e foi revertida numa cópia (mutação): 13 de 13
+mutantes morreram. `23502` e `0A000` fatais, `RULE` de `INSERT`/`UPDATE`
+recusada no boot: `TestClassifySQLState`, `TestPostgresNotNullViolationIsFatal`,
+`TestPostgresRulesAreRefusedAtBoot`. O check de saúde com conexão própria:
+`TestPostgresHealthHasItsOwnConnection` (`pool = escritas` em 1 e 3, presas
+num lock) e `TestPostgresHealthRedialsADeadConnection`. A regra do pool:
+`TestPostgresWorkersAndPool` (abaixo de `sink.workers` avisa, igual não). O
+prazo próprio da validação já estava no código e nos testes de unidade; veio
+do `go-webhook-fast-server` a prova contra o servidor real,
+`TestPostgresValidationHasItsOwnDeadline` (por um *proxy* que atrasa cada
+pedaço; o aquecimento abre também a conexão do check, ou o *handshake* dela
+consumia o prazo da checagem), com `TestHealthChecksCarryTheirLifetime`. O
+dreno já tratava a recusa `logic` antes do contexto;
+`TestWorkersLogicRefusalDuringShutdownIsLoggedAndCounted` a guarda. E o *flake*
+de `TestPostgresWrongPasswordIsFatal` (`53300` antes de conferir a senha, com as
+vagas do servidor esgotadas por outras suítes): o teste repete enquanto essa é
+a resposta, como no RP.
+
+**Integração (as quatro áreas fundidas).** O `TestWorkersTaintABatchAfterATimedOutAttempt`
+falhou duas vezes durante a rodada (`DATA RACE` entre o `Release` de
+`sink/workers.go` e a leitura de `it.Env` no teste; 1× no W, 1× no N), com o
+`workers.go` e o teste iguais ao `base`. Não era defeito de posse: o teste
+iniciava o worker **antes** de enfileirar os quatro itens, e o worker podia
+pegar só os primeiros, estourar o prazo neles (marcados, nunca voltam ao pool)
+e entregar os demais numa tentativa que não estourou — esses voltam ao pool,
+como manda a SPEC §12.3, e o teste lia o `Env` que o `Release` zerava (com
+`-race -count=200`, 3 falhas; com a guarda nova, 6 de 300 diziam "the stalled
+write carried 1|2|3 of the 4 items"). Correção no teste: enfileirar antes do
+`Start` (como o `TestWorkersMarkFatal`) e conferir que a escrita parada levou
+os quatro (`stallOnceSink.stalled`); `-race -count=500` verde. O
+`go-syslog-standard-server` tem o mesmo teste com a mesma ordem.

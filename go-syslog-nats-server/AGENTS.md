@@ -313,9 +313,11 @@ nats --server nats://127.0.0.1:14222 sub 'loghub._ctl.beacon'     # o heartbeat
 - **A perda do abort tem um dono só** (SPEC §13.4). Da fase do dump em diante
   o abort conta o contador `dumping`, nunca o ring; as passagens
   (`enterDumpPhase`, `oweDump`) e o abort vão sob `lossMu`, o dump o toma com
-  `Swap`, e um dump já contado como perdido desiste (`SetAbandon`). Conte cada
+  `Swap` também sob ele (`settleDump`: fora dele, um dump que via `aborted`
+  antes de o abort tomar o contador contava `emergency_failed` no lugar de
+  `abort`), e um dump já contado como perdido desiste (`SetAbandon`). Conte cada
   mensagem num lado só, e teste o abort caindo em **cada** janela (os ganchos
-  `beforeCollect`, `beforeDump`): a corrida esperada não aparece. `SIGQUIT`
+  `beforeCollect`, `beforeDump`, `inAbort`): a corrida esperada não aparece. `SIGQUIT`
   nunca é tolerado, e um `SIGQUIT` tardio chega por `quitNow`.
 - **Ring cheio é conferido antes do `uuid` e da cópia** (pré-checagem sem trava,
   zero alocação); o `Enqueue` continua sendo a autoridade. O buffer cru volta ao

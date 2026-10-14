@@ -648,8 +648,16 @@ func TestPostgresWorkersAndPool(t *testing.T) {
 	if l.Config.SinkPG.PoolSize != 2 {
 		t.Errorf("explicit pool_size = %d, want 2 kept", l.Config.SinkPG.PoolSize)
 	}
-	if !hasWarning(l.Warnings, "below sink.workers+1") {
+	if !hasWarning(l.Warnings, "pool_size=2 is below sink.workers=4") {
 		t.Errorf("warnings = %v, want the small-pool warning", l.Warnings)
+	}
+
+	// SPEC §8.5.3: the health check has its own connection, outside the
+	// pool, so a pool of exactly sink.workers is legitimate (port of the
+	// syslog/RELP family, 2026-10-13).
+	l = load(t, Options{Args: []string{"--sink.postgres.pool_size=4"}})
+	if hasWarning(l.Warnings, "pool_size=4 is below") {
+		t.Errorf("pool_size = sink.workers must not warn: %v", l.Warnings)
 	}
 }
 
@@ -898,12 +906,15 @@ func TestParserErrorsDoNotEchoValues(t *testing.T) {
 		want string
 	}{
 		{[]string{"--sink.workers", "-1"}, "must be at least 1"},
-		{[]string{"--sink.postgres.table", "-h"}, "the next argument is the flag --h"},
+		{[]string{"--sink.postgres.table", "--help"}, "the next argument is the flag --help"},
 		{[]string{"--sink.postgres.password=", "--server.http2", "extra"}, `"extra"`},
 		{[]string{"--sink.postgres.password=", "hunter2"}, "right after the '='"},
 		{[]string{"--sink.postgres.password", "=", "hunter2"}, "right after the '='"},
 		{[]string{"--sink.postgres.password=foo", "hunter2"}, "goes in quotes"},
-		{[]string{"--sink.workers=4", "--typo.key=1"}, `"typo.key"`},
+		// After a value, a flag outside every section may be the tail of that
+		// value (knownSectionOf); a typo inside one is still named.
+		{[]string{"--sink.workers=4", "--typo.key=1"}, "unexpected argument after --sink.workers"},
+		{[]string{"--sink.workers=4", "--sink.wrkers=1"}, `"sink.wrkers"`},
 		{[]string{"--sink.postgres.password", "--sink.workers=4"}, "the flag --sink.workers"},
 	} {
 		if _, err := Load(Options{Args: c.args, LookupEnv: envMap(nil)}); err == nil ||

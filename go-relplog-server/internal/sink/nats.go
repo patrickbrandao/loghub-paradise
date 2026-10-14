@@ -2,6 +2,7 @@ package sink
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -65,7 +66,7 @@ type NATSConfig struct {
 	// the worker's own deadline.
 	OpTimeout time.Duration
 	// MaxPending is the ceiling of async publishes in flight per process:
-	// sink.workers × sink.batch + ring.max_inflight (SPEC §10.7).
+	// 2 × (sink.workers × sink.batch + ring.max_inflight) (SPEC §10.7).
 	MaxPending int
 	// MaxEventBytes is the worst JLH (MaxEventBytes(L), SPEC §3.9), computed by
 	// the app. The boot compares it plus the header block with max_payload, the
@@ -161,7 +162,8 @@ type NATS struct {
 	perSubjectWarned atomic.Int64
 
 	// verdict is a permanent refusal the client reported asynchronously -- a
-	// permissions violation on the data path -- which no synchronous call
+	// permissions violation on the data path, a reconnection whose TLS can
+	// never succeed (isTLSRefusal) -- which no synchronous call
 	// returns: a denied publish only times out (jetstream) or vanishes (core),
 	// and a denied stream info or ack subscription only times out. Health and
 	// every Write turn it into FATAL (SPEC §10.7).
@@ -254,6 +256,20 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 			}
 			log.Warn("nats disconnected", "error", err)
 		}),
+		nats.ReconnectErrHandler(func(nc *nats.Conn, err error) {
+			// nats.go calls this only for a reconnection whose TCP dial
+			// failed; a TLS refusal comes later, in the handshake, and is
+			// caught by noteLastError from Health. Kept for a client version
+			// that reports it here. Only a verdict is logged: every failed
+			// dial of a long outage as an ERROR would repeat what /readyz and
+			// relplog_sink_up already say (go-relplog-nats-server SPEC §22
+			// item 3, not ported). The verdict only with no other server to
+			// go to (soleServer).
+			if isTLSRefusal(err) && soleServer(nc) {
+				n.setVerdict(err)
+				n.asyncError(err)
+			}
+		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			m.SinkNATSReconnectsTotal.Inc()
 			log.Warn("nats reconnected", "url", connectedURL(nc))
@@ -340,10 +356,35 @@ func (n *NATS) verdictErr(op string) error {
 // caller that has just seen its own round trip complete reads it here instead
 // of racing the handler.
 func (n *NATS) noteLastError(nc *nats.Conn) {
-	if last := nc.LastError(); deniesTheDataPath(last) {
+	last := nc.LastError()
+	// A TLS that can never succeed -- a server whose certificate this client
+	// does not trust, or one that stopped offering the TLS sink.nats.tls
+	// demands -- refuses this client for good. Seen only here after the boot:
+	// nats.go calls ReconnectErrCB only when the TCP dial of a reconnection
+	// fails, while the TLS refusal happens later, in the connect handshake,
+	// and lands in LastError with the status RECONNECTING. Without this the
+	// FATAL came from the fuses, ~20 s later, reading "connection is
+	// RECONNECTING" -- or never, with both fuses off (go-relplog-nats-server,
+	// independent review, 2026-10-13; SPEC §10.7).
+	//
+	// Only when no other server can serve (soleServer). LastError is the last
+	// server TRIED: with a pool -- several sink.nats.urls, or servers the
+	// cluster announced -- the client cycles through them while the one it
+	// trusts is down, and the TLS error of one untrusted node read here made a
+	// permanent FATAL, a dump and exit 3, though the trusted one came back a
+	// moment later (go-syslog-server review, 2026-10-13). With a pool it stays
+	// network, and Health names the TLS refusal as the reason, so the FATAL of
+	// the fuses, if the pool never recovers, says why.
+	if deniesTheDataPath(last) || (isTLSRefusal(last) && soleServer(nc)) {
 		n.setVerdict(last)
 	}
 }
+
+// soleServer reports that the client has no server to go to but the one it
+// is using: its pool -- the configured URLs plus every server the cluster
+// announced since (nats.go adds them on its own) -- has one entry. Only then
+// is a TLS refusal a verdict on this client (SPEC §10.7).
+func soleServer(nc *nats.Conn) bool { return nc == nil || len(nc.Servers()) <= 1 }
 
 // escalate turns a network failure into the verdict once one is set. A publish
 // the server denied never gets an ack, so the future ends in a timeout --
@@ -477,6 +518,14 @@ func (n *NATS) connect() (*nats.Conn, jetstream.JetStream, error) {
 	nc, err := nats.Connect(strings.Join(n.cfg.URLs, ","), n.opts...)
 	if err != nil {
 		n.mu.Unlock()
+		if isTLSRefusal(err) && len(n.cfg.URLs) > 1 {
+			// nats.Connect tries every URL and returns the error of the last
+			// one: the TLS refusal of one server does not say the others
+			// cannot serve -- one may be down for a moment. Network, waited
+			// out to sink.boot_timeout, with the refusal named (SPEC §10.7).
+			return nil, nil, networkErr("connect", fmt.Errorf(
+				"a server of sink.nats.urls refused TLS, and no other answered: %w", err))
+		}
 		return nil, nil, classifyNATS("connect", err)
 	}
 	var js jetstream.JetStream
@@ -759,6 +808,7 @@ func (n *NATS) writeCore(ctx context.Context, nc *nats.Conn, b *Batch) error {
 	var refused *Error
 	var rejected []bool
 	before := nc.LastError()
+	reconnects := nc.Stats().Reconnects
 	for i := range b.Envelopes {
 		e := &b.Envelopes[i]
 		if space := e.Item.Head.Space; space != n.cfg.Workspace {
@@ -776,8 +826,21 @@ func (n *NATS) writeCore(ctx context.Context, nc *nats.Conn, b *Batch) error {
 			return n.escalate(nc, "publish", classifyNATS("publish", err))
 		}
 	}
+	if beforeCoreFlush != nil {
+		beforeCoreFlush()
+	}
 	if err := n.flush(ctx, nc); err != nil {
-		return n.escalate(nc, "flush", classifyNATS("flush", err))
+		return n.escalate(nc, "flush", n.flushErr(nc, "flush", err))
+	}
+	if nc.Stats().Reconnects != reconnects {
+		// The connection was re-established during the chunk. A flush that
+		// STARTED while the client was reconnecting queues its PING for the
+		// new server, whose PONG resolves it -- but the PUBs went down the
+		// old socket. A success would claim the server received them.
+		// Uncertain, so not confirmed: the retry publishes them again
+		// (go-relplog-nats-server, independent review, 2026-10-13; SPEC §10.7).
+		return &Error{Class: ClassNetwork, Op: "flush",
+			Err: errors.New("the connection was re-established during the chunk; its messages may not have reached the server")}
 	}
 	// A denied publish never fails PublishMsg: the server answers with an
 	// -ERR, and it comes before the PONG of the flush, so LastError holds it
@@ -828,6 +891,25 @@ func (n *NATS) warnForeign(space string) {
 		"subject", subject, "space", space, "workspace", n.cfg.Workspace)
 }
 
+// beforeCoreFlush runs between the publications of a core chunk and its
+// flush. Tests only: nil in the binary.
+var beforeCoreFlush func()
+
+// flushErr classifies the error of a flush. nats.go fails a pending flush with
+// ErrConnectionClosed when the connection DROPS -- the channel of its PING is
+// closed -- although the client is only RECONNECTING and will be back. The
+// table classes ErrConnectionClosed as fatal (a client that closed for good),
+// so a NATS blip in the middle of the flush of a core chunk, or of the core
+// health check, was FATAL, a dump and exit 3 instead of a retry
+// (go-syslog-nats-server TESTING §8 item 1). It is network while the
+// connection is not closed; closed for good, it stays fatal (SPEC §10.7).
+func (n *NATS) flushErr(nc *nats.Conn, op string, err error) error {
+	if errors.Is(err, nats.ErrConnectionClosed) && nc != nil && !nc.IsClosed() {
+		return networkErr(op, fmt.Errorf("the connection dropped during the flush and is reconnecting: %w", err))
+	}
+	return classifyNATS(op, err)
+}
+
 // flush bounds the round trip by the caller's deadline, or by sink.op_timeout
 // when the context has none.
 func (n *NATS) flush(ctx context.Context, nc *nats.Conn) error {
@@ -866,12 +948,20 @@ func (n *NATS) Health(ctx context.Context) error {
 		}
 		return fatalErr("health", fmt.Errorf("connection closed for good: %w", last))
 	default:
-		return networkErr("health", fmt.Errorf("connection is %s", st))
+		// escalate reads LastError: what keeps the client RECONNECTING may be
+		// permanent (a TLS that can never succeed, see noteLastError). With a
+		// pool it is not a verdict, but it is the reason, and it goes in the
+		// error: the FATAL of the fuses keeps the error of the last check.
+		down := networkErr("health", fmt.Errorf("connection is %s", st))
+		if last := nc.LastError(); isTLSRefusal(last) {
+			down = networkErr("health", fmt.Errorf("connection is %s; a server of the pool refused TLS: %w", st, last))
+		}
+		return n.escalate(nc, "health", down)
 	}
 
 	if n.cfg.Mode == NATSModeCore {
 		if err := n.flush(ctx, nc); err != nil {
-			return n.escalate(nc, "health", classifyNATS("flush", err))
+			return n.escalate(nc, "health", n.flushErr(nc, "health", err))
 		}
 		// The flush's PONG follows any -ERR the server sent before it.
 		n.noteLastError(nc)
@@ -1172,6 +1262,30 @@ func isAuthRefusal(err error) bool {
 		strings.Contains(msg, "authentication revoked")
 }
 
+// isTLSRefusal recognises a TLS failure that no retry can change: the server's
+// certificate fails verification (an unknown authority, a name that does not
+// match, an expired certificate -- nats.go wraps the handshake's
+// tls.CertificateVerificationError in ErrTLS), or sink.nats.tls is on and the
+// server offers no TLS (ErrSecureConnWanted). Both need the operator: a CA, a
+// certificate, the configuration. A server that starts to DEMAND TLS is
+// upgraded to by nats.go on its own, with the system roots when sink.nats.tls
+// is off, and lands here only if that certificate does not verify. Other
+// failures of the handshake -- a reset, a timeout -- stay network. As network,
+// the boot waited out sink.boot_timeout to exit with the network's message, and
+// after the boot the client stayed RECONNECTING with the sink DOWN until the
+// fuses (go-relplog-nats-server, independent review, 2026-10-13, adapted: that
+// server has no TLS and refuses every TLS server; SPEC §10.7).
+func isTLSRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, nats.ErrSecureConnWanted) {
+		return true
+	}
+	var cv *tls.CertificateVerificationError
+	return errors.As(err, &cv)
+}
+
 // classifyNATS maps a client or API error onto the class the state machine acts
 // on. The table is SPEC §10.7; keep the two in step.
 func classifyNATS(op string, err error) error {
@@ -1186,11 +1300,11 @@ func classifyNATSError(err error) Class {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return ClassNetwork
 
-	// Credentials refused, or a connection closed for good: nothing a retry
-	// can change.
+	// Credentials refused, a connection closed for good, or a TLS that can
+	// never succeed: nothing a retry can change.
 	case errors.Is(err, nats.ErrAuthorization), errors.Is(err, nats.ErrAuthExpired),
 		errors.Is(err, nats.ErrAuthRevoked), errors.Is(err, nats.ErrAccountAuthExpired),
-		errors.Is(err, nats.ErrConnectionClosed), isAuthRefusal(err):
+		errors.Is(err, nats.ErrConnectionClosed), isAuthRefusal(err), isTLSRefusal(err):
 		return ClassFatal
 
 	// The stream is gone or JetStream is off: every chunk would be refused.
@@ -1264,16 +1378,22 @@ func classifyNATSError(err error) Class {
 // description is the store's own error: "maximum messages exceeded", "maximum
 // bytes exceeded" and "maximum messages per subject exceeded" are a stream
 // with discard=new that is full -- backpressure, which clears as soon as a
-// consumer acknowledges -- and "store closed" a stream or server shutting
+// consumer acknowledges -- and "store is closed" a stream or server shutting
 // down (a rolling restart of NATS). As fatal they were a dump and exit 3, and
 // the stored part of the chunk duplicated at reingestion (independent review,
 // 2026-10-11). A record too large for the store stays fatal: retrying cannot
 // make it fit, and validateSize refuses the configurations that produce it.
+//
+// The text is nats-server's own (server/store.go, ErrStoreClosed, 2.14.6:
+// "store is closed"). This matched "store closed" alone, a text the server
+// never sends, so a stream closing was still FATAL (go-syslog-server review,
+// 2026-10-13); "store closed" stays for an older wording.
 func storeFailedIsTransient(desc string) bool {
 	d := strings.ToLower(desc)
 	return strings.Contains(d, "maximum messages exceeded") ||
 		strings.Contains(d, "maximum bytes exceeded") ||
 		strings.Contains(d, "maximum messages per subject exceeded") ||
+		strings.Contains(d, "store is closed") ||
 		strings.Contains(d, "store closed")
 }
 

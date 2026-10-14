@@ -225,3 +225,40 @@ por que não se aplica.
    itens, cada correção conferida por mutação (`docs/TESTING.md` §9.1); os
    tetos de `sink.workers` e `sink.batch_max_bytes` escolhidos para o NATS
    (§2.2).
+
+---
+
+## 5. Correções transversais da revisão independente do `go-syslog-server` (2026-10-13)
+
+Itens X1–X4 do plano da revisão do porte do S, mais a conferência de C3, D1,
+E1, E2 e A2-minor. A mesma implementação no irmão (regra de sincronia).
+
+- **X1, o sinal entre os *bind* e o primeiro *accept*** (SPEC §13.1, §13.5):
+  conferido uma vez, depois de todos os *bind* e antes do primeiro `Start`
+  (`bindCtx.Err()` → 130). Com IP literal ou socket unix nenhum *bind* falha,
+  e o servidor abria e saía 0 no shutdown que seguia.
+- **X2, o motivo do aborto** (SPEC §13.4): das duas opções do plano, o
+  `Swap` do dump **sob o `lossMu`** (`settleDump`, nos dois ramos: dump
+  desligado e dump escrito), não reordenar o `abortLoss`. É a regra que já
+  valia para `enterDumpPhase` e `oweDump` — toda passagem do contador sob o
+  mutex — e não depende da ordem das duas escritas dentro do aborto. O
+  gancho `inAbort` (nulo no binário, como `beforeDump`) existe só para o teste
+  forçar a intercalação.
+- **X3, `"store is closed"`**: o texto do `ErrStoreClosed` do nats-server
+  2.14.6 (`server/store.go:43`) entra em `storeFailedIsTransient`; o
+  `"store closed"`, que nenhum servidor manda, fica (inofensivo).
+- **C3, teto do `MaxPending`**: não se aplica. Não há `ring.max_inflight`
+  (sem `ring=none`), e `2 × workers × batch` já é limitado pelos tetos de
+  `sink.workers` (256) e `sink.batch` (65 536): no máximo 33 554 432.
+- **E2, o buffer da moldura RELP**: o crescimento aqui não é o do S (dobra de
+  2 KiB até o tamanho do frame, não pelas classes 2/8/64 KiB), então um frame
+  de 12 KiB nunca passou do teto de 16 KiB; mas um de 16–64 KiB perdia o
+  buffer antes de **todo** frame (55 KB e 5 alocações por frame de 24 KiB).
+  Padrão assumido, o do plano para o S: soltar só com
+  `bufio.Reader.Buffered() == 0` (o emissor parou). Sob carga a janela do
+  `librelp` (128) mantém o frame seguinte no buffer; ocioso, solta.
+  `BenchmarkRELPReaderFrames` (TESTING §4). A portar para o R.
+- **E1 não aplicado** (por instrução): no RELP as linhas no buffer de uma
+  sessão que fecha nunca tiveram `200`, e o `librelp` as retransmite.
+- **A2-minor**: não se aplica. O comentário de `closeTransports` já diz
+  "AT ONCE", e não há ring Redis.

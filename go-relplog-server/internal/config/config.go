@@ -320,7 +320,7 @@ type SQLDB struct {
 	Password    string // secret
 	Database    string
 	Table       string // name or schema.name (postgres: lowercase; mysql: case kept)
-	PoolSize    int    // after Load: never 0 when this sink is selected (workers + 1)
+	PoolSize    int    // after Load: never 0 when this sink is selected (sink.workers)
 	TLS         bool
 	TLSCA       string
 	TLSInsecure bool
@@ -335,7 +335,7 @@ type SinkClickHouse struct {
 	Password    string // secret
 	Database    string
 	Table       string // name or database.name, case kept
-	PoolSize    int    // after Load: never 0 when this sink is selected (workers + 1)
+	PoolSize    int    // after Load: never 0 when this sink is selected (sink.workers)
 	TLS         bool
 	TLSCA       string
 	TLSInsecure bool
@@ -487,6 +487,31 @@ func WorstChunkBytes(c *Config) int64 {
 
 // AnyListener reports whether at least one transport is configured. None is a
 // boot error rather than a silent idle process.
+// SinkWriters is how many writes the destination can see from this instance
+// at once: the drain workers with a ring; with ring=none every transaction
+// writes for itself, up to ring.max_inflight at a time and, for the SQL sinks,
+// never more than the pool hands out. The ClickHouse memory check multiplies
+// the worst chunk by it (SPEC §10.10.5; go-syslog-server review, 2026-10-13).
+func (c *Config) SinkWriters() int {
+	if c.Ring.Mode != RingModeNone {
+		return c.Sink.Workers
+	}
+	n := c.Ring.MaxInflight
+	var pool int
+	switch c.Sink.Type {
+	case SinkTypePostgres:
+		pool = c.SinkPG.PoolSize
+	case SinkTypeMySQL:
+		pool = c.SinkMySQL.PoolSize
+	case SinkTypeClickHouse:
+		pool = c.SinkCH.PoolSize
+	}
+	if pool > 0 && pool < n {
+		n = pool
+	}
+	return n
+}
+
 func (c *Config) AnyListener() bool {
 	return c.Listen.TCP != "" || c.Listen.TLS != ""
 }

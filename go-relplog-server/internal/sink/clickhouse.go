@@ -45,6 +45,15 @@ type ClickHouseConfig struct {
 	// batch can never be the MEMORY_LIMIT_EXCEEDED that is fatal at run time.
 	// Zero skips the check.
 	MaxBatchBytes int64
+
+	// Writers is how many INSERTs this instance can have in flight at once:
+	// sink.workers with a ring, min(pool_size, ring.max_inflight) with
+	// ring=none (config.Config.SinkWriters). The per-user memory check
+	// multiplies the worst chunk by it, not by the pool: the pool may be
+	// larger than the writers, and the health check runs on a connection of
+	// its own that only SELECTs (go-syslog-server review, 2026-10-13).
+	// Zero means PoolSize.
+	Writers int
 }
 
 // ClickHouse is the analytical destination (SPEC §10.10). Table in §3.7.2. It
@@ -55,8 +64,13 @@ type ClickHouseConfig struct {
 type ClickHouse struct {
 	cfg  ClickHouseConfig
 	conn driver.Conn
-	log  *slog.Logger
-	m    *obs.Metrics
+	// probe is the health check's own one-connection client, outside conn's
+	// pool (SPEC §10.10.8): in the pool, slow but working INSERTs held every
+	// connection and the check waited past sink.health_timeout, DOWN and then
+	// FATAL with the server healthy (go-syslog-server review, 2026-10-13).
+	probe driver.Conn
+	log   *slog.Logger
+	m     *obs.Metrics
 
 	// insert is the one statement this sink ever writes with, the column list
 	// in chColumns order.
@@ -175,6 +189,13 @@ func NewClickHouse(cfg ClickHouseConfig, log *slog.Logger, m *obs.Metrics) (*Cli
 	if err != nil {
 		return nil, fmt.Errorf("sink clickhouse: %w", err)
 	}
+	po := *opts
+	po.MaxOpenConns, po.MaxIdleConns = 1, 1
+	probe, err := clickhouse.Open(&po)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("sink clickhouse: %w", err)
+	}
 
 	database, name := cfg.Database, cfg.Table
 	if i := strings.IndexByte(cfg.Table, '.'); i >= 0 {
@@ -183,6 +204,7 @@ func NewClickHouse(cfg ClickHouseConfig, log *slog.Logger, m *obs.Metrics) (*Cli
 	c := &ClickHouse{
 		cfg:      cfg,
 		conn:     conn,
+		probe:    probe,
 		log:      log,
 		m:        m,
 		insert:   "INSERT INTO `" + database + "`.`" + name + "` (" + strings.Join(chColumnList, ", ") + ")",
@@ -386,7 +408,7 @@ func (c *ClickHouse) Health(ctx context.Context) error {
 		return ErrClosed
 	}
 	var readonly uint64
-	if err := c.conn.QueryRow(ctx, "SELECT toUInt64(getSetting('readonly'))").Scan(&readonly); err != nil {
+	if err := c.probe.QueryRow(ctx, "SELECT toUInt64(getSetting('readonly'))").Scan(&readonly); err != nil {
 		return classifyClickHouse("health", err)
 	}
 	c.observePool()
@@ -430,7 +452,7 @@ func (c *ClickHouse) Health(ctx context.Context) error {
 // the process -- a 242 on a write still says the same thing, fatally.
 func (c *ClickHouse) replicaHealth(ctx context.Context) error {
 	var ro uint8
-	err := c.conn.QueryRow(ctx,
+	err := c.probe.QueryRow(ctx,
 		"SELECT is_readonly FROM system.replicas WHERE database = ? AND table = ?",
 		c.database, c.name).Scan(&ro)
 	var ex *clickhouse.Exception
@@ -524,7 +546,7 @@ func (c *ClickHouse) validate(ctx context.Context) error {
 		Scan(&maxMem, &maxMemUser); err != nil {
 		return classifyClickHouse("validate", err)
 	}
-	if problem := chMemoryProblem(c.cfg.MaxBatchBytes, c.cfg.PoolSize, maxMem, maxMemUser); problem != "" {
+	if problem := chMemoryProblem(c.cfg.MaxBatchBytes, c.memoryWriters(), maxMem, maxMemUser); problem != "" {
 		return fatalErr("validate", errors.New(problem))
 	}
 
@@ -823,6 +845,15 @@ func chVersionAtLeast(version string, want [2]int) bool {
 	return major > want[0] || major == want[0] && minor >= want[1]
 }
 
+// memoryWriters is the number of concurrent INSERTs the memory check counts:
+// Writers, or the pool when the app did not say.
+func (c *ClickHouse) memoryWriters() int {
+	if c.cfg.Writers > 0 {
+		return c.cfg.Writers
+	}
+	return c.cfg.PoolSize
+}
+
 // chMemoryNeed is what the server needs to INSERT a batch of n bytes.
 func chMemoryNeed(n int64) uint64 {
 	return chMemoryBase + chMemoryFactor*uint64(n)
@@ -831,12 +862,12 @@ func chMemoryNeed(n int64) uint64 {
 // chMemoryProblem compares the session's memory limits with the worst batch
 // (SPEC §10.10.5). max_memory_usage holds for one query; max_memory_usage_for_user
 // for every query of the user at once, and this instance alone can have
-// poolSize INSERTs in flight -- four concurrent legitimate batches broke a
+// writers INSERTs in flight -- four concurrent legitimate batches broke a
 // per-user limit the single-batch comparison had accepted. Instances sharing
 // the user add up on top, which no one instance can see. Zero is ClickHouse's
 // "unlimited": the server-wide ceiling then applies, which this session cannot
 // read.
-func chMemoryProblem(maxBatch int64, poolSize int, maxMem, maxMemUser uint64) string {
+func chMemoryProblem(maxBatch int64, writers int, maxMem, maxMemUser uint64) string {
 	if maxBatch <= 0 {
 		return ""
 	}
@@ -846,14 +877,17 @@ func chMemoryProblem(maxBatch int64, poolSize int, maxMem, maxMemUser uint64) st
 			"server can write (%d bytes of JLH) costs the server; MEMORY_LIMIT_EXCEEDED is fatal, so "+
 			"raise the limit or lower sink.batch_max_bytes or syslog.max_message_bytes", maxMem, need, maxBatch)
 	}
-	if poolSize < 1 {
-		poolSize = 1
+	if writers < 1 {
+		writers = 1
 	}
-	if all := need * uint64(poolSize); maxMemUser != 0 && maxMemUser < all {
+	if all := need * uint64(writers); maxMemUser != 0 && maxMemUser < all {
+		// The pool is not the lever: the writers are (go-syslog-server review,
+		// 2026-10-13). A pool lowered below them is refused by config.
 		return fmt.Sprintf("max_memory_usage_for_user=%d is below the %d bytes of %d concurrent INSERTs of "+
-			"the largest chunk (%d bytes of JLH each, one per pooled connection); every instance on "+
-			"the same user adds as much again. MEMORY_LIMIT_EXCEEDED is fatal: raise the limit, give each "+
-			"instance its own user, or lower the pool and sink.batch_max_bytes", maxMemUser, all, poolSize, maxBatch)
+			"the largest chunk (%d bytes of JLH each, one per writer: sink.workers, or ring.max_inflight "+
+			"with ring.mode=none); every instance on the same user adds as much again. "+
+			"MEMORY_LIMIT_EXCEEDED is fatal: raise the limit, give each instance its own user, or lower "+
+			"the writers and sink.batch_max_bytes", maxMemUser, all, writers, maxBatch)
 	}
 	return ""
 }
@@ -875,6 +909,7 @@ func (c *ClickHouse) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+	_ = c.probe.Close()
 	return c.conn.Close()
 }
 

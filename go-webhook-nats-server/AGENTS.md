@@ -211,6 +211,9 @@ WHS_TEST_NATS_URL=nats://127.0.0.1:14222 WHS_TEST_NATS_NOJS_URL=nats://127.0.0.1
   go test -race -timeout 900s ./internal/sink/ ./internal/control/ ./internal/app/
 ```
 
+Os casos de permissões, TLS e *pool* pedem ainda `WHS_TEST_NATS_PERM_URL`,
+`WHS_TEST_NATS_TLS_URL` e `WHS_TEST_NATS_SERVER` (`TESTING.md` §5).
+
 Se você mexeu em `internal/sink/`, `internal/control/`, na validação de `config`
 ou em `docker/nats/`, **rode esta suíte**.
 
@@ -311,7 +314,10 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   `tls_required` no `INFO`, o cliente se promove a TLS com as raízes do sistema.
   O `TLSCertCB` que recusa (e `errNATSServerRequiresTLS` fatal) é o que impede:
   não o remova, e não ligue nada de TLS no cliente. A recusa de `tls://`,
-  `ws://` e `wss://` existe na config **e** no sink.
+  `ws://` e `wss://` existe na config **e** no sink. Depois do boot o `nats.go`
+  **não** relata essa recusa pelo `ReconnectErrCB` (só a falha da discagem
+  TCP): ela fica no `LastError`, com a conexão em `RECONNECTING`, e é o
+  `Health` que a lê (`noteLastError`).
 - **O JLH vai em `Data`, nunca num header NATS** (teto de 64 KiB, `10097`). O
   bloco de headers é fixo: exatamente 257 B no pior caso.
 - **`Nats-Msg-Id` é `<uuid>.<step>`, nunca o `uuid` puro**: um processador que
@@ -325,10 +331,18 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   contamina o lote (`Taint`): um futuro pendente aponta para o `Env`. Um erro
   devolvido não quer dizer "ninguém mais lê".
 - **Permissão negada só chega assíncrona.** O `ErrorHandler` guarda um veredito
-  (`loghub.<space>.webhook` ou `$JS.API`) que o `Health` e todo `Write`
-  devolvem como `fatal`; no subject do beacon, não. Em `core` o `Write` lê o
-  `LastError()` depois do *flush* (o `-ERR` vem antes do `PONG`): sem isso o
-  lote negado era confirmado e perdido.
+  (`loghub.<space>.webhook`, `$JS.API` ou a assinatura em `_INBOX.`) que o
+  `Health` e todo `Write` devolvem como `fatal`; no subject do beacon, não. Em
+  `core` o `Write` lê o `LastError()` depois do *flush* (o `-ERR` vem antes do
+  `PONG`): sem isso o lote negado era confirmado e perdido. Uma ida e volta que
+  falha como `network` também o lê (`escalate`). E o *flush* `core` não
+  confirma um lote que atravessou uma reconexão, nem um em que chegou uma
+  negação nova de outro subject (`maskedDenial`): o `nats.go` guarda só o
+  último `-ERR`.
+- **O `10077` tem dois sentidos pela descrição do *store***
+  (`storeFailedIsTransient`): cheio ou fechando é `network`, o resto fatal.
+  Confira o texto no `server/store.go` do `nats-server` ("store is closed"),
+  não na memória: a família casou "store closed" por meses.
 - **O contrato do stream vale em toda checagem, não só no boot.** Um stream
   editado por baixo respondia toda publicação com timeout, `network`, para
   sempre, com o sink UP. Não volte a guardar o `validate` atrás do

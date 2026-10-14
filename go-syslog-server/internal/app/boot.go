@@ -255,6 +255,15 @@ func (a *App) drainBacklog(ctx context.Context) int {
 	if !ok {
 		return ExitOK
 	}
+	if k := sr.Kept(); k > 0 {
+		// Draining them into the discard destroyed messages a life with a
+		// destination had confirmed -- a load test on the same volume after
+		// an incident, the case of the dump's rule (SPEC §9.4, §12.2;
+		// independent review of the port, 2026-10-13, decision of the F).
+		a.log.Warn("ring.db holds messages of a previous life, but sink.type=none discards what "+
+			"it is given; they are NOT drained and stay in ring.db, outside this run's ring "+
+			"accounting, for a boot with a destination", "count", k, "path", a.cfg.RingSQL.Path)
+	}
 	total := sr.Backlog()
 	if total == 0 {
 		return ExitOK
@@ -330,14 +339,14 @@ func (a *App) drainBacklog(ctx context.Context) int {
 // go-relplog-pg-server, 2026-10-13).
 func (a *App) dumpEmergency(items []*item.Item) bool {
 	if len(items) == 0 {
-		a.dumping.Store(0)
+		a.settleDump()
 		return false
 	}
 	if a.emg == nil {
 		// No emergency store (emergency.enabled=false): SPEC §12.3 counts this
 		// exactly like a dump that failed -- unless an abort already took the
 		// counter and counted the same messages.
-		if a.dumping.Swap(0) > 0 {
+		if a.settleDump() > 0 {
 			a.log.Error("emergency dumps are disabled; these messages are lost", "count", len(items))
 			a.metrics.EventsDroppedTotal[obs.EventDropEmergencyFailed].Add(uint64(len(items)))
 		}
@@ -347,7 +356,7 @@ func (a *App) dumpEmergency(items []*item.Item) bool {
 		a.beforeDump()
 	}
 	path, err := a.emg.Write(items)
-	owed := a.dumping.Swap(0)
+	owed := a.settleDump()
 	if err != nil {
 		if owed == 0 {
 			return false // an abort counted them already
@@ -374,4 +383,17 @@ func (a *App) dumpEmergency(items []*item.Item) bool {
 	a.metrics.EmergencyFiles.Inc()
 	a.metrics.EmergencyEventsPending.Add(int64(len(items)))
 	return true
+}
+
+// settleDump takes the dump's loss counter back once its outcome is known,
+// under lossMu. abortLoss
+// publishes aborted BEFORE it takes the counter, and a dump that read the flag
+// in between (ErrAbandoned) took the whole count as emergency_failed: one
+// count, the wrong reason, and the abort's line said nothing was lost
+// (independent review of the port, 2026-10-13). Under the lock, a dump that
+// saw the abort waits for abortLoss to finish and finds the counter taken.
+func (a *App) settleDump() int64 {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	return a.dumping.Swap(0)
 }

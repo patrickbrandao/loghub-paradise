@@ -230,7 +230,11 @@ por teste: `unnest` dos arrays, `ON CONFLICT (uuid)`, as CHECKs da skill
 aceitando tudo o que o servidor produz, o envelope reconstruído da linha igual
 ao JLH, a classificação por SQLSTATE e a validação do boot (tipos, índice único
 exatamente sobre `(uuid)`, nenhum outro único, particionada e `LATIN1`
-recusadas). **Não provado:** o FATAL de um servidor em recuperação exige uma
+recusadas, `RULE` de `INSERT`/`UPDATE` recusada no boot e `0A000` fatal depois —
+`TestPostgresRulesAreRefusedAtBoot`). A checagem de saúde na conexão própria
+(`TestPostgresHealthProbeOutsideThePool`, com `pool = workers` e todas as
+conexões presas atrás de um `LOCK TABLE`) e o redial depois de um
+`pg_terminate_backend` (`TestPostgresHealthProbeRedials`). **Não provado:** o FATAL de um servidor em recuperação exige uma
 réplica.
 
 ### 7.3 MySQL
@@ -241,7 +245,14 @@ fatal no boot e DOWN depois, entrega parcial, e as formas de tabela que
 perderiam em silêncio (`TestMySQLValidationRefusesSilentLossShapes`). Desde a
 revisão de 2026-10-11 a sonda usa `tcp` e um `src_ip` presente: `src_ip NOT
 NULL`, `transport CHAR(3)` e `CHECK (transport IN ('tcp','tls'))` são aceitos;
-`CHAR(2)` é recusado. `1203`/`1226`/`1461` são `network`.
+`CHAR(2)` é recusado. `1203`/`1226`/`1461` são `network`. Desde 2026-10-13:
+`1048` depois do boot é fatal (`TestMySQLNotNullAfterBootIsFatal`); um banco de
+nome UTF-8 de 26 caracteres e 66 bytes é aceito e um de 65 caracteres recusado
+(`TestMySQLMultibyteDatabaseName`); a sonda na conexão própria
+(`TestMySQLHealthProbeOutsideThePool`, atrás de um `LOCK TABLES ... WRITE`); e os
+testes de `autocommit` **sem `SET GLOBAL autocommit`**: um usuário do teste e um
+`init_connect` condicional a ele, com o controle de que a sessão dele nasce com
+`autocommit=0` (`autocommitOffUser`).
 
 ### 7.4 NATS
 
@@ -252,7 +263,15 @@ o mesmo do S), `Nats-Msg-Id = <uuid>.0`, os `X-LogHub-*`, a validação do strea
 entrega parcial, beacon em `loghub._ctl.beacon`, permissões negadas (com
 `RELPLOG_TEST_NATS_PERM_URL`), a negação mascarada do `mode=core`
 (`TestMaskedDenial`, com o `natsFake` do próprio teste), queda e volta por proxy
-sem perda, e FATAL → dump → reingestão.
+sem perda, e FATAL → dump → reingestão. Contra o `natsFake` do teste (que fala TLS com um
+certificado gerado na hora): o veredito do TLS numa reconexão a um servidor não
+confiável, a recusa no boot, e **um nó não confiável num pool não é veredito**
+— por `sink.nats.urls` e por `connect_urls` anunciados —, o `Health` dizendo o
+motivo e o cliente voltando ao confiável (`TestNATSOneUntrustedServerOfAPoolIsNoVerdict`,
+`TestNATSBootTLSRefusalOfAPoolIsNetwork`); o flush `core` cortado por uma
+reconexão é `network` e o que atravessa uma reconexão não confirma; o `10077`
+com o texto real do nats-server 2.14.6, "store is closed"
+(`TestNATSStoreIsClosedIsNetwork`).
 
 ### 7.5 ClickHouse (`inbox_syslog`)
 
@@ -260,7 +279,15 @@ ClickHouse 25.8, protocolo nativo: ida e volta pelo oráculo, token de
 idempotência com prefixo `rls-` (`rls-probe` na sonda), as 32 tabelas de
 validação, inferência de datas desligada, privilégios e memória (com
 `CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1`), os quatro rings ponta a ponta e o
-destino caindo e voltando sem perda.
+destino caindo e voltando sem perda. A sonda em cliente próprio
+(`TestClickHouseHealthProbeOutsideThePool`, com uma view materializada que dorme
+segurando os `INSERT`), a conta de memória pelos escritores
+(`TestClickHouseMemoryCountsTheWriters`) e um banco de nome UTF-8 de 26
+caracteres (`TestClickHouseMultibyteDatabaseName`). **Achado no caminho:** o
+ClickHouse 25.8 cria um banco de 25 caracteres CJK, mas não consegue dropá-lo —
+o nome vai percentual-codificado (9 bytes por caractere) num nome de arquivo
+de `metadata_dropped` que passa de 255 bytes. Não afeta este servidor, que
+nunca cria nem dropa bancos; o teste usa 20 CJK e seis dígitos.
 
 ### 7.6 Emissores reais: rsyslog com `omrelp` (SPEC §18.7)
 
@@ -307,6 +334,48 @@ conferido por mutação (a correção desfeita faz o teste falhar).
 | `TestEmittersRELP*` (rsyslog real) | os quatro cenários de §7.6 verdes |
 | `gofmt -l .`, `go vet ./...` | limpos |
 
+**Rodada de 2026-10-13** (porte de §9.1), duas vezes seguidas, com PostgreSQL 18
+(`max_connections=300`), MySQL 8.4, ClickHouse 25.8, dois Redis 7 (um
+`allkeys-lru`), nats-server 2.14.6 (JetStream, sem JetStream, com permissões) e
+`RELPLOG_TEST_EMITTERS=1` (rsyslog real): `go test -race -count=1 ./...` com os
+16 pacotes `ok`, **699 testes de primeiro nível + 441 subtestes, 1 pulado** (o
+mesmo vetor `arquivo-sem-pri`, D5); os quatro `TestEmittersRELP*` verdes. Uma
+rodada anterior pegou um teste novo instável
+(`TestNATSBootTLSRefusalOfAPoolIsNetwork`: o `nats.go` embaralha o pool a cada
+`Connect`, e cinco tentativas não bastavam), corrigido antes das duas. Fuzz de
+60 s nos alvos cujo código mudou: `FuzzFrame` 1,64 M execs e `FuzzRead` 7,75 M,
+sem falha. `gofmt -l .` e `go vet ./...` limpos.
+
+### 9.1 Porte das correções dos cortes e do S (2026-10-13)
+
+Cada item com teste que falhava antes (rodado contra o código anterior) e
+conferido por mutação (a correção desfeita derruba o teste). Os testes estão em
+`internal/*/review_port*_test.go`, `internal/emergency/durable_test.go`,
+`internal/app/review_{abort,cut,rn}_test.go` (portados do RN, com um `fixture`
+mínimo em `review_port_helpers_test.go`) e nos arquivos indicados.
+
+| Item | Teste | Mutantes |
+|---|---|---|
+| `ErrNotDurable` na abertura do diretório; `SetAbandon` (antes de publicar e a cada 1024) | `TestRemoveWithAnUnopenableDirectoryIsNotDurable`, `TestWriteGivesUpWhenAbandoned`, `TestWriteChecksTheAbandonWhileWriting` | 3 mortos |
+| Posse do aborto (`lossMu`, `enterDumpPhase`, `oweDump`, `settleDump` — X2 —, uma vez só), `SetAbandon` ligado, `quitNow` | `TestAbort*`, `TestDumpAfterTheAbortIsAbandoned`, `TestSIGQUITAfterTheEntryCheckStillAborts`, `TestAbortInsideTheDumpKeepsItsReason`, `settle` (nenhum dump abortado chega ao disco) | 6 mortos |
+| Bind cancelado = 130 (admin, transportes) e X1 (literal IP) | `TestCancelledBindIsAnAbortNotAConfigError`, `TestSignalBeforeTheBindExits130`, `TestSignalBeforeALiteralBindExits130` | 3 mortos |
+| A3: `ring=sqlite` + `sink=none` guarda o backlog; `ring=redis` + `sink=none` avisa | `TestSinkNoneKeepsAPreviousLifesRingRows`, `TestRedisRingWithSinkNoneWarns` | 2 mortos (+1 contado na config) |
+| A4: aborto com ring persistente não conta nada (sqlite e redis) | `TestAbortWithAPersistentRingCountsNothing` | 1 morto |
+| `MaxPending` 2× e limitado | `TestNATSMaxPendingIsDoubledAndBounded` | 1 morto (o do teto só pela compilação) |
+| `FullFor` (dois tetos, ring fechado) e o contexto antes do `Enqueue` | `TestIngest{FullRing,ByteCeiling}IsRefusedBeforeTheCopy`, `TestIngestClosedFullRingIsTheShutdown`, `TestIngestEndedSessionIsNotEnqueued` | 4 mortos |
+| E2: buffer do leitor solto só com o emissor parado | `TestRELPReaderKeepsTheBufferWhileFramesFollow`, `TestRELPReaderReleasesALargeBuffer` (ajustado), `BenchmarkRELPReaderFrames` | 2 mortos |
+| `Deliver` com `logic` antes do `ctx` | `TestDeliverLogicRefusalWinsOverTheCancellation` | falhava antes |
+| PostgreSQL `RULE`/`0A000` | `TestPostgresRulesAreRefusedAtBoot`, `TestClassifySQLState` | 2 mortos |
+| D1: sonda fora do pool (PG, MySQL, ClickHouse) | `Test{Postgres,MySQL,ClickHouse}HealthProbeOutsideThePool`, `TestPostgresHealthProbeRedials` | 3 mortos; **1 sobrevivente equivalente**: tirar o `dropProbe` depois de um erro do PG — o pgx fecha sozinho a conexão nos erros que importam, e o `IsClosed` a redisca |
+| D2/B3: memória do ClickHouse pelos escritores | `TestClickHouseMemoryCountsTheWriters`, `TestSinkWriters` | 2 mortos (+1 contado na config) |
+| X5: MySQL `1048` fatal; nomes de banco por caracteres | `TestMySQLNotNullAfterBootIsFatal`, `TestMySQL/ClickHouseMultibyteDatabaseName`, `TestClassifyMySQLNumber` | 2 mortos |
+| D5: `autocommit` sem `SET GLOBAL` | `TestMySQLWritesCommitUnderAGlobalAutocommitOff`, `TestMySQLValidationRefusesASessionWithoutAutocommit` | 1 morto |
+| NATS: veredito do TLS, `flushErr`, contagem de reconexões (do S) | `TestNATSReconnectToAnUntrustedTLSServerIsAVerdict`, `TestNATSBootTLSRefusalIsFatal`, `TestNATSCoreFlushCutByAReconnectionIsNetwork`, `TestNATSCoreFlushAcrossAReconnectionIsNotConfirmed` | os quatro falhavam antes |
+| C1: TLS de um pool; X3: "store is closed" | `TestNATSOneUntrustedServerOfAPoolIsNoVerdict` (urls e anunciados), `TestNATSBootTLSRefusalOfAPoolIsNetwork`, `TestNATSStoreIsClosedIsNetwork` | 4 mortos |
+| Config: valor colado, continuação de segredo, switches, `--config=` vazio, BOM, tetos (B1, B2, C3), pool dos escritores, regras do `addr` e da URL PostgreSQL (B4, B5), vírgula na URL Redis (B6), derivados comentados, sinônimos de charset | `internal/config/port_config_test.go` (18 testes, todos falhavam antes) | 31 mortos |
+
+Total: 67 mutantes mortos (mais um morto só pela compilação), 1 sobrevivente equivalente.
+
 ---
 
 ## 10. Lacunas conhecidas
@@ -336,6 +405,17 @@ Registradas por honestidade, não por esquecimento.
     `async_insert` não são exercitados.
 11. **Envio tardio de um comando cancelado** (rueidis, NATS) só é provado pela
     decisão de quem chamou, não contra um servidor que trave no meio do comando.
+12. **A regra do pool no `ReconnectErrHandler`** do NATS (veredito do TLS só com
+    um servidor) não tem teste: o `nats.go` 1.x nunca chama esse handler com uma
+    recusa de TLS (só com a falha da discagem TCP). Ela fica para uma versão do
+    cliente que relate ali; o caminho real, pelo `LastError`, é provado.
+13. **O veredito do TLS contra um nats-server de verdade** com TLS não roda na
+    suíte (os testes usam o `natsFake` com TLS); a revisão do S o reproduziu com
+    o binário 2.14.6, e a regra é a mesma.
+14. **A ligação app → `ClickHouseConfig.Writers`** é provada por partes
+    (`TestSinkWriters` na config, `TestClickHouseMemoryCountsTheWriters` no
+    sink), não por um boot contra um usuário com `max_memory_usage_for_user`
+    exato.
 
 ---
 

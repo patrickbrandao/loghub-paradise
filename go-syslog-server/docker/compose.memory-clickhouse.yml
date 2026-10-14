@@ -46,7 +46,7 @@ services:
       SYSLOG_SINK_CLICKHOUSE_PASSWORD: ${SYSLOG_SINK_CLICKHOUSE_PASSWORD:-syslog}
       SYSLOG_SINK_CLICKHOUSE_DATABASE: ${SYSLOG_SINK_CLICKHOUSE_DATABASE:-syslog}
       SYSLOG_SINK_CLICKHOUSE_TABLE: ${SYSLOG_SINK_CLICKHOUSE_TABLE:-inbox_syslog}
-      # 0 deriva sink.workers + 1 = 5.
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, fora do pool).
       SYSLOG_SINK_CLICKHOUSE_POOL_SIZE: ${SYSLOG_SINK_CLICKHOUSE_POOL_SIZE:-0}
       SYSLOG_SINK_CLICKHOUSE_TLS: ${SYSLOG_SINK_CLICKHOUSE_TLS:-false}
 

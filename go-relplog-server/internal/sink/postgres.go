@@ -63,6 +63,17 @@ type Postgres struct {
 	log  *slog.Logger
 	m    *obs.Metrics
 
+	// probe is the health check's own connection, outside the pool (SPEC
+	// §10.5). In the pool, slow but working writes -- one per worker, or up
+	// to ring.max_inflight with ring=none -- held every connection, the check
+	// waited for one past sink.health_timeout, and a healthy database went
+	// DOWN and then FATAL by the fuses (go-relplog-pg-server and
+	// go-syslog-server reviews, 2026-10-13). Dialled on demand, dropped after
+	// any error; probeMu serializes the checks that share it.
+	probeMu  sync.Mutex
+	probe    *pgx.Conn
+	probeCfg *pgx.ConnConfig
+
 	// insert is the one statement this sink ever runs: ten arrays plus
 	// unnest, ten parameters whatever the chunk size, ON CONFLICT (uuid) DO
 	// NOTHING.
@@ -231,12 +242,13 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	}
 
 	p := &Postgres{
-		cfg:     cfg,
-		pool:    pool,
-		log:     log,
-		m:       m,
-		insert:  fmt.Sprintf(pgInsert, pgx.Identifier(strings.Split(cfg.Table, ".")).Sanitize()),
-		regname: cfg.Table,
+		cfg:      cfg,
+		pool:     pool,
+		probeCfg: cc.Copy(),
+		log:      log,
+		m:        m,
+		insert:   fmt.Sprintf(pgInsert, pgx.Identifier(strings.Split(cfg.Table, ".")).Sanitize()),
+		regname:  cfg.Table,
 	}
 	p.args.New = func() any { return &pgArgs{} }
 	return p, nil
@@ -550,8 +562,8 @@ func (p *Postgres) Health(ctx context.Context) error {
 	if p.closed.Load() {
 		return ErrClosed
 	}
-	var inRecovery bool
-	if err := p.pool.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil {
+	inRecovery, err := p.inRecovery(ctx)
+	if err != nil {
 		return classifyPostgres("health", err)
 	}
 	p.observePool()
@@ -767,6 +779,25 @@ func (p *Postgres) validate(ctx context.Context) error {
 				"(docs/SPEC.md §10.5)", p.regname, extra))
 	}
 
+	// No INSERT or UPDATE rule. PostgreSQL refuses "INSERT ... ON CONFLICT"
+	// on a table with one (0A000, feature_not_supported): every chunk would
+	// fail with the sink UP and /readyz green (go-relplog-pg-server review,
+	// 2026-10-13). A rule ON DELETE or ON SELECT (a view's) does not touch
+	// the INSERT and is left alone.
+	var rules string
+	if err := p.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT string_agg(quote_ident(rulename), ', ' ORDER BY rulename)
+		                   FROM pg_catalog.pg_rewrite
+		                  WHERE ev_class = to_regclass($1) AND ev_type IN ('2', '3')), '')`,
+		p.regname).Scan(&rules); err != nil {
+		return classifyPostgres("validate", err)
+	}
+	if rules != "" {
+		return fatalErr("validate", fmt.Errorf(
+			"table %s has an INSERT or UPDATE rule (%s); INSERT ... ON CONFLICT cannot run on such a "+
+				"table (0A000): drop the rule, or use a trigger (docs/SPEC.md §10.5)", p.regname, rules))
+	}
+
 	// INSERT, and SELECT on uuid: ON CONFLICT (uuid) reads the arbiter
 	// column, and a role with INSERT alone fails the first chunk with 42501.
 	var canInsert, canSelectUUID bool
@@ -793,6 +824,43 @@ func contains(list []string, s string) bool {
 	return false
 }
 
+// inRecovery runs the health query on the probe's own connection, dialling it
+// when there is none. Any error drops the connection: a query cut by its
+// deadline leaves it mid-protocol, and the next check dials a fresh one.
+func (p *Postgres) inRecovery(ctx context.Context) (bool, error) {
+	p.probeMu.Lock()
+	defer p.probeMu.Unlock()
+	if p.closed.Load() {
+		return false, ErrClosed
+	}
+	if p.probe == nil || p.probe.IsClosed() {
+		c, err := pgx.ConnectConfig(ctx, p.probeCfg.Copy())
+		if err != nil {
+			return false, err
+		}
+		p.probe = c
+	}
+	var in bool
+	if err := p.probe.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&in); err != nil {
+		p.dropProbe()
+		return false, err
+	}
+	return in, nil
+}
+
+// dropProbe closes the probe's connection, with probeMu held. The close sends
+// a Terminate under a short deadline of its own: the server may be the thing
+// that is gone.
+func (p *Postgres) dropProbe() {
+	if p.probe == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_ = p.probe.Close(ctx)
+	cancel()
+	p.probe = nil
+}
+
 // observePool exports the pool occupancy (SPEC §14.1). EmptyAcquireCount --
 // acquires that found no idle connection and had to wait for one to be
 // released or created -- is cumulative, so only its growth since the last check
@@ -814,6 +882,9 @@ func (p *Postgres) Close() error {
 	if p.closed.Swap(true) {
 		return nil
 	}
+	p.probeMu.Lock()
+	p.dropProbe()
+	p.probeMu.Unlock()
 	p.pool.Close()
 	return nil
 }
@@ -845,8 +916,12 @@ func classifyPostgres(op string, err error) error {
 //
 //	08, 53, 57, 40                                network
 //	22, 23 (outside the ON CONFLICT)              logic
-//	42 (schema), 28, 2F, 3D, 42501, 25006, 23502  fatal
+//	42 (schema), 28, 2F, 3D, 42501, 25006, 23502,
+//	0A000, 23514 without a constraint name        fatal
 //	anything else                                 network
+//
+// (23514 without a name is decided by classifyPostgres, which sees the
+// constraint name; this table sees only the code.)
 //
 // The line that matters most: everything in class 42 is FATAL, never logic. A
 // dropped table or a missing unique index would otherwise be a logic error --
@@ -857,6 +932,13 @@ func classifyPostgres(op string, err error) error {
 func classifySQLState(code string) Class {
 	switch code {
 	case "25006": // read_only_sql_transaction: a promoted replica, or configured so
+		return ClassFatal
+	case "0A000":
+		// feature_not_supported: what INSERT ... ON CONFLICT gets from a table
+		// with an INSERT or UPDATE rule, refused at boot by validate. A rule
+		// created after the boot fails every chunk the same way; as network
+		// it was retried forever with the sink UP (go-relplog-pg-server
+		// review, 2026-10-13).
 		return ClassFatal
 	case "23502":
 		// not_null_violation is class 23 but never THIS data: the sink fills

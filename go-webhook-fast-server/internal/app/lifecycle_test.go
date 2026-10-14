@@ -472,6 +472,10 @@ func TestSignalDuringTheBacklogDrainExits130(t *testing.T) {
 		return redisArgs(proxy.Addr(), stream,
 			"--ring.mode=sqlite", "--ring.sqlite.synchronous=OFF",
 			"--sink.op_timeout=60s", "--sink.boot_timeout=30s",
+			// The closed proxy must not trip the fuses before the drain
+			// deadline: a sink FATAL at the end of phase 4 exits 3 whatever
+			// the ring (SPEC §10.3), and this test is about ring.db.
+			"--sink.max_retries=1000", "--sink.fail_timeout=60s",
 			"--shutdown.drain_timeout=1s")
 	}
 

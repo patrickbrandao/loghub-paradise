@@ -132,6 +132,7 @@ prazo); fica registrado para quem vir o 0/s.
 
 ```bash
 go test -run=XXX -bench='BenchmarkRELPSession|BenchmarkIngestAccept' -benchtime=3s ./internal/receiver/
+go test -run=XXX -bench=BenchmarkRELPReaderFrames -benchmem ./internal/receiver/
 go test -run=XXX -bench=. -benchmem ./internal/convert/
 ```
 
@@ -139,6 +140,7 @@ go test -run=XXX -bench=. -benchmem ./internal/convert/
 |---|---|---|
 | `RELPSession` | 1 886 ns/op, **~530 mil msg/s** | uma sessão RELP sobre loopback, janela cheia, `200` depois do ring em memória, sem sink (no R: ~486 mil, a mesma peça com filtro e rate-limit desligados) |
 | `IngestAccept` | 102,8 ns/op, 224 B/op, 1 alloc/op | recepção até o ring (moldura já feita); a alocação é o próprio `Item` |
+| `RELPReaderFrames/200`, `/12288`, `/24576`, `/61440` | 76 ns, 377 ns, 528 ns, 1,15 µs; 0 B, 0 allocs em todos | frames `syslog` seguidos pelo `bufio.Reader` de 4 KiB da sessão. Antes da correção E2 (§9.2) o buffer acima de 16 KiB era solto antes de todo frame: `/24576` 12,3 µs, 55 KB, 5 allocs; `/61440` 37,7 µs, 129 KB, 6 allocs |
 
 Não há benchmark do sink NATS: o custo de publicação depende do servidor e da
 rede, e só uma carga contra um servidor real o mede (§8).
@@ -415,6 +417,31 @@ recuperação, o árbitro do `ON CONFLICT`, o *flake* do `53300`.
 held"), a citação de SPEC §13.4 no shutdown (a do RP não existe na SPEC dele) e
 `TestAbortDuringTheDumpCountsTheLeftovers`, ao lado do teste com um worker.
 
+### 9.2 Correções transversais da revisão independente do `go-syslog-server` (2026-10-13)
+
+Os itens transversais (X1–X4) do plano da revisão independente do porte do
+`go-syslog-server` (S), e a conferência de C3, D1, E1, E2 e A2-minor; a mesma
+implementação no irmão (regra de sincronia, `diff` conferido). **Conferência
+por mutação**, cada correção revertida sozinha: o teste da linha falha
+(`exited 0, want 130`; `abort 0, emergency_failed 5 for 5`; o subteste
+`10077_store_is_closed`; o buffer solto com o frame seguinte já no
+`bufio.Reader`). **Não provado** contra um servidor real: o `10077` com
+"store is closed" vem do texto do `nats-server` 2.14.6 (`server/store.go:43`),
+não de um stream fechando durante um publish (difícil de provocar sem
+corrida).
+
+| Item | Achado | Consequência sem a correção | Teste |
+|---|---|---|---|
+| X1 (A1 do S) | Sinal depois da reingestão e antes do *accept* com IP literal: nenhum *bind* falha | o servidor abria, o `/readyz` dava 200 e o shutdown saía **0**, não 130 (SPEC §13.1, §13.5) | `TestSignalBeforeALiteralBindExits130` (IP literal; o nome de host segue em `TestSignalBeforeTheBindExits130`) |
+| X2 (A2 do S) | O aborto publica `aborted` antes de tomar o contador; o dump que via a marca nesse meio (abandonado, ou desligado) o tomava primeiro | `emergency_failed = n`, `abort = 0`: a perda contada uma vez, atribuída ao disco (SPEC §13.4) | `TestAbortInsideTheDumpKeepsItsReason` (dump abandonado e dump desligado; o gancho `inAbort` força a intercalação) |
+| X3 (C2 do S) | `storeFailedIsTransient` conferia "store closed"; o nats-server 2.14.6 manda "store is closed" (`server/store.go:43`) | o `10077` de um store fechando era `fatal`: dump, exit 3 e duplicatas na reingestão a cada restart do NATS (SPEC §10.7) | `TestClassifyNATS/10077_store_is_closed` |
+| C3 do S | Teto do que entra no `MaxPending` | **não se aplica**: sem `ring.max_inflight`; `2 × workers × batch` já limitado por `sink.workers` ≤ 256 e `sink.batch` ≤ 65 536 | `TestConfigCeilings`, `TestMaxPendingHasTwiceTheWorkersBatches` (já existentes) |
+| E2 do S | O leitor RELP soltava o buffer acima de 16 KiB antes de **todo** frame | um emissor de linhas de 16–64 KiB refazia o crescimento por frame: 24 KiB custavam 12,3 µs, 55 KB e 5 alocações, contra 0,52 µs e 0 (SPEC §5.2) | `TestRELPReaderKeepsTheBufferWhileFramesFollow`, `TestRELPReaderReleasesALargeBuffer` (agora com o emissor parado entre os frames), `BenchmarkRELPReaderFrames` (§4) |
+| E1 do S | `closing` com PROXY `optional` | **não aplicado**, por instrução: no RELP as linhas no buffer nunca tiveram `200`, e o `librelp` as retransmite | — |
+| A2-minor do S | Comentário de ordem reversa com fechamento paralelo; log do aborto com o ring Redis | **não se aplica**: o comentário diz "AT ONCE", como o código; não há Redis | — |
+
+---
+
 ## 10. Resultado da rodada final (2026-10-13, depois do porte de §9.1)
 
 Apple M2, macOS, Go 1.27.1, quatro `nats-server` 2.14.6 em processos próprios
@@ -431,3 +458,16 @@ Apple M2, macOS, Go 1.27.1, quatro `nats-server` 2.14.6 em processos próprios
 | Fuzz | `FuzzFrame`, `FuzzProxy`, `FuzzRead`, 60 s cada, sem falha (§3); `FuzzConvert` e `FuzzSD` não rodaram (`convert` não mudou) |
 | Mutação | cada correção de código portada em §9.1 (itens 1, 2, 6, 9, 10, 13 e 14–21), revertida numa cópia do módulo: o teste correspondente falha (22 mutantes, todos mortos) |
 | Não rodou | fuzz de 10 min (§8.2 item 1); `docker compose --profile demo` (o `docker/` só mudou em texto); carga ponta a ponta (§8.2 item 2) |
+
+### Depois das correções transversais de §9.2 (2026-10-13)
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `RELPLOG_TEST_NATS_*` (os quatro: 14622 JetStream, 14623 sem JetStream, 14624 permissões, 14625 `tls {}`) `RELPLOG_TEST_EMITTERS=1 go test -race -count=1 ./...` | **verde duas vezes seguidas** (51 s e 54 s), sem *flake* |
+| Testes | **438** de primeiro nível e **336** subtestes passaram, **1** pulado (`TestGoldenVectors/arquivo-sem-pri`, D5), 0 falhas (435 e 332 antes: os 3 de primeiro nível novos são os de §9.2) |
+| Por pacote (primeiro nível / subtestes) | `app` 73/81, `config` 69/0, `control` 9/0, `convert` 15/70, `emergency` 28/45, `ident` 2/0, `item` 5/0, `jlh` 4/0, `jlhcheck` 4/0, `obs` 10/0, `receiver` 101/33, `ring` 13/0, `sink` 105/107 |
+| Emissores reais | `TestEmittersRELPInClear` (12,8 s), `TestEmittersRELPBackpressureRetransmits` (5,8 s), `TestEmittersRELPSurvivesARestart` (3,7 s), verdes nas duas rodadas |
+| Fuzz | `FuzzFrame` 60 s, sem falha (1,63 milhão de execuções); o único alvo cujo código mudou (`relpframe.go`; `nats.go` não tem alvo) |
+| Mutação | cada correção revertida sozinha: o teste da linha falha (ver acima) |
+| Não rodou | fuzz de 10 min; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |

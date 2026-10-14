@@ -222,7 +222,7 @@ de parse congelada.
   `arquivo-sem-pri` (`transport=file` está fora); o de TLS com os metadados de
   sessão injetados. Contratos com os schemas JLH e syslog, mais uma porta em Go
   das regras do `validate_payload.py`.
-- Fuzz: `FuzzParse` (toda saída é JLH válido pelo schema), `FuzzSD`,
+- Fuzz: `FuzzConvert` (toda saída é JLH válido pelo schema), `FuzzSD`,
   `FuzzFrame`, `FuzzProxy`, `FuzzHead` e `FuzzRead` do dump.
 - Suítes de integração por variável (`SYSLOG_TEST_REDIS_ADDR`,
   `SYSLOG_TEST_PG_DSN`, `SYSLOG_TEST_MYSQL_DSN`, `SYSLOG_TEST_NATS_URL`) e
@@ -248,6 +248,41 @@ decidiu para o S.
   boot com destino; descartá-los destruiria mensagens que uma vida com destino
   real aceitou (SPEC §12.2). A alternativa — reingerir no descarte e remover —
   continua possível se o usuário preferir.
+
+### Revisão independente do porte (2026-10-13)
+
+As opções recomendadas do plano de correção foram autorizadas pelo usuário. As
+escolhas abaixo são minhas, feitas ao aplicá-las; contestáveis.
+
+- **`pool_size` volta a derivar `workers`, com mínimo `workers`.** A sonda de
+  saúde do PostgreSQL, do MySQL e do ClickHouse ganhou conexão própria, fora do
+  pool (SPEC §10.5), e a regra `pool_size ≥ workers + 1` perdeu o motivo: o
+  pool é dos escritores. O padrão continua abrindo `workers + 1` conexões por
+  instância (o orçamento de conexões da frota não muda), e os
+  `compose.none-{postgres,mysql,clickhouse}.yml` passaram a fixar
+  `ring.max_inflight=4`, igual ao pool derivado. Manter `+1` deixaria uma
+  conexão ociosa por instância a mais no orçamento compartilhado.
+- **A conexão da sonda no PostgreSQL é um `pgxpool` de uma conexão**, cópia da
+  configuração do pool dos workers, e não um `pgx.Conn` cru: o mesmo isolamento,
+  com a reconexão e o *lazy connect* que o pool já dá; um `pgx.Conn` exigiria
+  reconectar à mão e um mutex em volta. No MySQL é um segundo `sql.DB` do mesmo
+  conector (`MaxOpenConns(1)`), no ClickHouse uma segunda `clickhouse.Open`
+  com `MaxOpenConns = 1`.
+- **Tetos novos:** `ring.max_inflight` ≤ 1 048 576 (com os tetos de `workers` e
+  `batch`, o `MaxPending` do NATS cabe folgado num `int`); `ring.capacity_items`
+  ≤ 2⁴⁰ com `sqlite`/`redis` (sanidade contra erro de digitação; o teto de
+  16 Mi fica só para o ring efetivo `memory`).
+- **Nome de banco do ClickHouse:** o mesmo teto de 64 **caracteres** do MySQL.
+  O limite real do ClickHouse é o nome codificado em `%XX` como nome de arquivo
+  (255 bytes, medido no 25.8: 25 caracteres CJK criam, 30 não); 64 caracteres
+  nunca recusam um nome que ele aceite, salvo ASCII entre 65 e ~240, recusado
+  como antes.
+- **`ring=redis` + `sink=none`:** só `WARN` na validação. Ao contrário do
+  `ring.db`, nada distingue as entradas desta vida das de outras réplicas, e
+  recusar o boot proibiria o uso legítimo num stream de teste.
+- **TLS do NATS no primeiro `CONNECT`:** "pool" é mais de uma entrada em
+  `sink.nats.urls` (os servidores anunciados por um cluster só existem depois
+  da primeira conexão); depois dela, `nc.Servers()`.
 
 ---
 
