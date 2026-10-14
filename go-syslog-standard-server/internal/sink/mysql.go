@@ -194,7 +194,19 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	// Strict for this session only. Outside strict mode a value too long or a
 	// byte that is not UTF-8 is truncated with a warning instead of refused,
 	// and a truncated raw line would be stored with nothing to count it.
-	mc.Params = map[string]string{"sql_mode": "'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'"}
+	//
+	// autocommit is pinned for the same reason the mode is: it is the server's
+	// to default, and this sink depends on it. With autocommit=0 in my.cnf or
+	// init_connect, every INSERT opens an implicit transaction nobody commits:
+	// Write returns success, the duplicates arithmetic looks right, and the
+	// rows vanish when the connection closes -- a silent loss of everything
+	// confirmed. The driver sends these as SET after the handshake, so they win
+	// over init_connect, which the server runs before. The boot validation
+	// reads it back (SPEC §10.7.1, §10.7.4).
+	mc.Params = map[string]string{
+		"sql_mode":   "'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'",
+		"autocommit": "1",
+	}
 	if cfg.AppName != "" {
 		// The driver splits the attribute list on commas; a node.id holding
 		// one would lose its tail in performance_schema, not break anything.
@@ -511,6 +523,19 @@ func (p *MySQL) validate(ctx context.Context) error {
 	if unique == 0 {
 		return fatalErr("validate", fmt.Errorf(
 			"table %s has no unique index on (id); ON DUPLICATE KEY needs one", p.cfg.Table))
+	}
+
+	// autocommit, read back from a connection of the writers' pool: the
+	// session parameter set it, and a server or proxy that ignored the SET
+	// would turn every Write into a transaction nobody commits (see NewMySQL).
+	var autocommit int64
+	if err := p.db.QueryRowContext(ctx, "SELECT @@session.autocommit").Scan(&autocommit); err != nil {
+		return classifyMySQL("validate", err)
+	}
+	if autocommit != 1 {
+		return fatalErr("validate", errors.New(
+			"the session has autocommit=0 although this sink sets it to 1; every INSERT would stay in "+
+				"a transaction nobody commits, and its rows would vanish with the connection"))
 	}
 
 	var maxPacket int64

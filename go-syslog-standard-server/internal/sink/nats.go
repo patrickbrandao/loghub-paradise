@@ -398,6 +398,19 @@ func (n *NATS) validate(ctx context.Context, nc *nats.Conn, js jetstream.JetStre
 	if info.Config.Sealed {
 		return fatalErr("validate", fmt.Errorf("stream %q is sealed and accepts no publishes", n.cfg.Stream))
 	}
+	if info.Config.Retention == jetstream.InterestPolicy {
+		// With interest retention a message nobody is interested in is
+		// acknowledged with an ordinary PubAck and not kept: with no consumer
+		// bound -- before the first one, or while every one is deleted -- each
+		// batch is confirmed, released from the ring and lost, with no error
+		// and no counter. The PubAck is what gives ring=none its meaning, so a
+		// stream that may discard on acceptance cannot be this sink's (SPEC
+		// §10.8.5; ported from go-syslog-server, §21.1 item 6).
+		return fatalErr("validate", fmt.Errorf(
+			"stream %q has retention=interest: it acknowledges and keeps nothing while no consumer is "+
+				"interested, so a confirmed batch could be lost (docs/SPEC.md §10.8.5); use "+
+				"retention=limits (or workqueue)", n.cfg.Stream))
+	}
 	if n.cfg.MaxRawBytes > 0 {
 		need := n.maxMessageBytes()
 		if mp := nc.MaxPayload(); mp < need {
@@ -457,6 +470,8 @@ const (
 	jsErrStreamStoreFailed     = 10077
 	jsErrHeaderExceedsMaximum  = 10097
 	jsErrStreamSealed          = 10109
+	jsErrDuplicateInProcess    = 10158
+	jsErrStreamTooManyRequests = 10167
 )
 
 // classifyNATS maps a client or API error onto the class the state machine acts
@@ -512,9 +527,23 @@ func classifyNATSError(err error) Class {
 				// rather than the fatal of an unknown 4xx: were it ever
 				// reached, it would be about that message, not the stream.
 				return ClassLogic
+			case jsErrDuplicateInProcess, jsErrStreamTooManyRequests:
+				// Transient, though 4xx. 10158 (409): the same Nats-Msg-Id is
+				// still in a Raft proposal -- the retry, after a deadline, of a
+				// publish a clustered stream has not finished storing; it
+				// passes on its own, and the retry then is a duplicate. 10167
+				// (429): the stream's ingest queue is full. As the fatal of an
+				// unknown 4xx either was a dump and exit 3, maybe on the whole
+				// fleet at once (SPEC §10.8.6).
+				return ClassNetwork
 			}
-			// A 4xx is the server refusing the request's form, which repeats on
-			// every attempt; a 5xx is the server's own trouble.
+			// Any 429 is backpressure, never the request's form: it passes
+			// once the server catches up, like 10167.
+			if api.Code == 429 {
+				return ClassNetwork
+			}
+			// Any other 4xx is the server refusing the request's form, which
+			// repeats on every attempt; a 5xx is the server's own trouble.
 			if api.Code >= 400 && api.Code < 500 {
 				return ClassFatal
 			}

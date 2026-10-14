@@ -762,10 +762,17 @@ falam.
   (padrão `0666`, que é o que `/dev/log` tem em todo sistema — qualquer processo
   precisa poder logar).
 - Um socket órfão de uma execução anterior é **removido** antes do `bind`, mas
-  só depois de o servidor confirmar que ninguém está escutando nele: um `connect`
-  que sucede significa que há outro processo vivo, e aí o boot falha com
-  `exit 1` em vez de roubar o `/dev/log` de quem estava servindo.
-- No shutdown o arquivo é removido.
+  só quando o `connect` datagrama a ele é **recusado** (`ECONNREFUSED`: ninguém
+  escuta ali). Um `connect` que sucede significa que há outro processo vivo, e
+  aí o boot falha com `exit 1` em vez de roubar o `/dev/log` de quem estava
+  servindo. Só um **socket** é candidato, conferido sem seguir link simbólico
+  (`Lstat`): um arquivo comum, um diretório ou um socket de outro tipo no
+  caminho (um `/dev/log` em modo stream responde `EPROTOTYPE`, não recusa) é
+  `exit 1` com a mensagem certa, e fica intocado. A regra "o `connect` falhou,
+  então remove" apagaria o arquivo de um caminho mal configurado ou o socket
+  vivo de outro dono.
+- No shutdown o arquivo é removido — só o que este processo criou: um boot
+  recusado pela regra acima sai sem tocar no que estava no caminho.
 - `peer-addr` fica `""`, `peer-port` `0`, `peer-ip-version` `0`. O rate-limit de
   §8 não se aplica: não há prefixo de rede, e limitar o `/dev/log` local seria
   calar o próprio host.
@@ -1737,6 +1744,7 @@ lá com a ressalva.
 | `40` | falha de transação (deadlock, serialização) | `ClassNetwork` — retry |
 | `22` | dado inválido (UTF-8, overflow numérico) | `ClassLogic` — descarta o lote e conta |
 | `23` | violação de constraint fora do `ON CONFLICT` | `ClassLogic` |
+| **`23502`** | `not_null_violation` | **`ClassFatal`** — o servidor nunca envia `NULL`, então ele só nasce da tabela: uma coluna extra `NOT NULL` sem default, um default removido, um trigger. Como `logic`, cada lote seria descartado com o sink UP; é o mesmo caso do `1364` do MySQL (§10.7.6) |
 | `42` | **esquema** — tabela, coluna ou índice ausente | **`ClassFatal`** |
 | `28` `2F` `42501` | autenticação e privilégio | **`ClassFatal`** |
 | `25006` | transação read-only (réplica) | **`ClassFatal`** |
@@ -1783,6 +1791,14 @@ longo demais ou um byte inválido é **truncado com aviso** em vez de recusado, 
 uma linha crua cortada seria gravada sem erro nenhum para contar — a violação de
 §19.5 que nenhum teste de unidade enxerga. A configuração global do banco não é
 tocada.
+
+O `autocommit` da **sessão** é fixado em `1`, no mesmo `SET` de sessão que o
+driver envia depois do handshake (e que por isso vence o `init_connect`, que o
+servidor roda antes). Com `autocommit=0` global (`my.cnf` ou `init_connect`),
+cada `INSERT` ficaria numa transação implícita que ninguém confirma: a escrita
+retorna sucesso, a conta de duplicatas fecha, e as linhas somem quando a
+conexão fecha — perda silenciosa de mensagens confirmadas, com a sonda do boot
+passando. A validação de §10.7.4 relê o valor.
 
 O pool nasce **preguiçoso**: `sql.OpenDB` não conecta, e o `WaitReady` do boot
 (§12.1) é quem retenta. O log do driver vai para o `slog` em `WARN`: por padrão
@@ -1857,6 +1873,7 @@ Corre uma vez, na primeira checagem de saúde bem-sucedida, com a regra de
 | A tabela existe, o usuário a enxerga, e o motor é InnoDB | `information_schema.TABLES` | exit 3 |
 | As dezessete colunas existem com as famílias de tipo de §3.7; extras toleradas | `information_schema.COLUMNS` | exit 3 |
 | Índice único exatamente sobre `(id)` | `information_schema.STATISTICS` (`NON_UNIQUE = 0`, uma coluna, `id`) | exit 3 — sem ele o `ON DUPLICATE KEY` não tem onde colidir |
+| A sessão está em `autocommit=1` (um servidor ou proxy pode ignorar o `SET` de §10.7.1) | `SELECT @@session.autocommit` | exit 3 — cada `INSERT` ficaria numa transação que ninguém confirma |
 | `max_allowed_packet` comporta a maior linha possível | `SELECT @@max_allowed_packet` contra a conta abaixo | exit 3, com os dois números na mensagem |
 | `INSERT` e `UPDATE` concedidos, sessão gravável | um `INSERT ... ON DUPLICATE KEY UPDATE` de sonda com o id nulo (dezesseis zeros) numa transação **revertida** | exit 3 — `1142` é permissão, `1290` é servidor somente leitura |
 
@@ -2045,6 +2062,7 @@ Na primeira checagem de saúde bem-sucedida, com a regra de §10.5.5 (cada recus
 | O stream existe | `js.Stream(stream)` | exit 3 |
 | O subject pertence a **este** stream | `js.StreamNameBySubject(subject) == stream` | exit 3 — publicar cairia noutro stream, ou em nenhum |
 | O stream aceita publicações | `Sealed = false` | exit 3 |
+| O stream guarda o que confirma | `retention` diferente de `interest` (`limits` ou `workqueue`) | exit 3 — com `interest` o servidor responde um `PubAck` normal a uma publicação sem consumidor interessado e não guarda nada: enquanto não houver consumidor, toda mensagem é confirmada, sai do ring e some, com o sink UP |
 | O maior evento cabe | `nc.MaxPayload()` e o `max_msg_size` do stream contra o pior caso de §3.9 mais os headers | exit 3, com os números na mensagem |
 | O maior registro cabe no file store | com `storage: file`, o mesmo pior caso mais o subject contra os 32 MiB por registro do `nats-server` (`rlBadThresh`), acima dos quais ele responde `10077`, que é fatal | exit 3 — senão um `max_payload` de 64 MB transformaria uma mensagem grande no fim do processo |
 
@@ -2069,7 +2087,8 @@ volta por `TestClassifyNATS`.
 | API `10060` stream esperado não confere, `10109` stream selado | contrato de configuração quebrado | `ClassFatal` |
 | API `10023` recursos insuficientes, `10077` armazenamento falhou | disco ou limite da conta | `ClassFatal` — coerente com o `OOM` do Redis (§10.3) |
 | `nats.ErrMaxPayload`, `jetstream.ErrMaxBytesExceeded`, API `10054` mensagem acima do máximo, API `10097` header acima de 64 KiB | uma mensagem grande demais | `ClassLogic` — inalcançável depois de §10.8.5, salvo mudança no servidor; o `10097` nem isso, porque o bloco de headers deste destino tem tamanho fixo (§3.8), e está na tabela para não cair na regra do 4xx desconhecido |
-| outro erro da API com `Code` 4xx | pedido recusado pela forma: repetiria em toda tentativa | `ClassFatal` |
+| API `10158` (`409`) `Nats-Msg-Id` ainda numa proposta Raft, `10167` (`429`) fila de entrada do stream cheia, e todo outro `Code` `429` | a retentativa, logo depois de um prazo, de uma publicação que o stream em cluster ainda não terminou de gravar; contrapressão do servidor | `ClassNetwork` — esperar resolve; como o 4xx desconhecido da linha abaixo, seriam FATAL, dump e `exit 3` ao mesmo tempo em toda instância que publica no stream |
+| outro erro da API com `Code` 4xx (fora o `429`) | pedido recusado pela forma: repetiria em toda tentativa | `ClassFatal` |
 | outro erro da API com `Code` 5xx | falha do lado do servidor | `ClassNetwork` |
 | qualquer outro | desconhecido | `ClassNetwork` |
 
@@ -3111,6 +3130,12 @@ privilégio, de `CREATE USER`. A suíte de NATS exige JetStream ligado e baixa o
 frames para caber no `max_payload` padrão de 1 MiB, porque o boot recusa, de
 propósito, um teto que não caiba (§3.9).
 
+O `natsio/nats-box` do serviço `nats-init` dos compose de NATS, que cria o
+stream a partir de `docker/nats/stream.json`, tem versão fixa (`0.20.0`, a dos
+módulos irmãos), no compose e no `.env.example`: com `latest` a mesma receita
+instalaria CLIs diferentes em dias diferentes, e o stream criado poderia mudar
+sem mudança no repositório. `TestComposeNATSBoxIsPinned` confere.
+
 ### 17.6 Carga
 
 Gerador próprio, não `logger` em laço. Mede, por combinação `ring` × `sink` e
@@ -3268,8 +3293,9 @@ sido medidos pela primeira vez.
 
 ## 21. Lacunas e riscos
 
-Este módulo é **referência**: o código fica como está, e quem porta um trecho
-dele para outro módulo confere esta seção antes. As lacunas de teste estão em
+Este módulo é **referência**: o código fica como está (salvo os seis itens de
+§21.1 corrigidos em 2026-10-14 por porte do `go-syslog-server`), e quem porta
+um trecho dele para outro módulo confere esta seção antes. As lacunas de teste estão em
 `docs/TESTING.md` §8.
 
 ### 21.1 Pendências conhecidas
@@ -3294,12 +3320,11 @@ trecho portado leva a correção junto, não o defeito.
    teto global ao processo, adquirido antes da cópia e de pelo menos
    `relp.max_frame_bytes`; esgotado, o leitor para de ler e a janela TCP segura
    o emissor.
-3. **`listen.unix` apaga o que estiver no caminho.** O código usa `os.Stat`
-   (que segue link simbólico) e remove qualquer coisa cujo `connect` de
-   datagrama falhe: um arquivo comum, um diretório vazio ou um socket *stream*
-   vivo de outro processo (`/dev/log` em modo stream). §4.3 promete remover só
-   socket órfão. Direção: `Lstat`, exigir `ModeSocket` e remover só quando o
-   `connect` recebe `ECONNREFUSED`; o resto é `exit 1` sem apagar.
+3. *Corrigido em 2026-10-14 (porte do go-syslog-server):* `listen.unix` só
+   remove um socket (`Lstat`, sem seguir link) cujo `connect` datagrama é
+   recusado (`ECONNREFUSED`); arquivo comum, diretório, link ou socket vivo de
+   qualquer tipo é `exit 1` sem apagar, e o boot recusado não remove o caminho
+   na saída; regra em §4.3.
 4. **Credencial dentro de `sink.nats.urls`.** Com `nats://usuario:senha@host`
    ou `nats://token@host`, a credencial aparece nos logs de conexão e de
    reconexão (`ConnectedUrl`), no log de sink configurado e no `--dump-config`,
@@ -3318,31 +3343,19 @@ trecho portado leva a correção junto, não o defeito.
    `password: x` no INI ou um `sink.nats.password=x` sem `--` vai inteiro para
    o stderr e, no `SIGHUP`, para o log, contra a regra de §15.3. Direção:
    mensagens com o número da linha ou a posição do argumento, nunca o texto.
-6. **Stream NATS com `retention: interest`.** O servidor NATS responde com um
-   `PubAck` normal a uma publicação sem consumidor interessado e não guarda
-   nada; a validação de §10.8.5 não lê a retenção. Enquanto não houver
-   consumidor, toda mensagem é confirmada, sai do ring e some, com o sink UP.
-   Direção: recusar `retention=interest` como fatal na validação do boot.
-7. **4xx transitórios do JetStream viram fatais.** A regra do "4xx
-   desconhecido" de §10.8.6 pega o `409`/`10158` (o `Nats-Msg-Id` ainda está
-   numa proposta Raft: a retentativa logo depois de um timeout num stream em
-   cluster) e o `429`/`10167` (fila de entrada do stream cheia). Esperar
-   resolve os dois, e hoje eles dão FATAL, dump e `exit 3`, ao mesmo tempo em
-   toda instância que publica no stream. Direção: os dois, e todo `429`, como
-   `network`.
-8. **`autocommit` da sessão MySQL não é fixado.** Só o `sql_mode` é fixado por
-   sessão (§10.7.1). Com `autocommit=0` global (`my.cnf` ou `init_connect`),
-   cada `INSERT` fica numa transação implícita na conexão do pool, retorna
-   sucesso e é revertido quando a conexão fecha: perda silenciosa de mensagens
-   confirmadas, e a sonda do boot passa. Direção: fixar `autocommit=1` no mesmo
-   `SET` de sessão; opcionalmente conferir `@@session.autocommit` no boot.
-9. **`23502` do PostgreSQL é `logic`.** O servidor nunca envia `NULL`, então o
-   `not_null_violation` só nasce da tabela: uma coluna extra `NOT NULL` sem
-   default (que §3.6 tolera e a validação não confere), uma coluna nova depois
-   do boot, um default removido, um trigger. Como classe `23`, cada lote é
-   descartado com o sink UP. O `1364` do MySQL, o mesmo caso, já é fatal
-   (§10.7.6). Direção: `23502` como `fatal`, e a validação recusar coluna extra
-   obrigatória sem default.
+6. *Corrigido em 2026-10-14 (porte do go-syslog-server):* stream com
+   `retention: interest` é recusado como fatal na validação do boot; regra em
+   §10.8.5.
+7. *Corrigido em 2026-10-14 (porte do go-syslog-server):* `10158` (`409`),
+   `10167` (`429`) e todo `429` do JetStream são `network`, não o fatal do 4xx
+   desconhecido; regra em §10.8.6.
+8. *Corrigido em 2026-10-14 (porte do go-syslog-server):* a sessão MySQL fixa
+   `autocommit=1` no mesmo `SET` do `sql_mode`, e a validação do boot relê
+   `@@session.autocommit` (fatal se não for 1); regra em §10.7.1 e §10.7.4.
+9. *Corrigido em 2026-10-14 (porte do go-syslog-server):* `23502` do PostgreSQL
+   é `fatal`; regra em §10.5.7. A outra metade da direção — a validação recusar
+   no boot coluna extra `NOT NULL` sem default — não foi portada: hoje a tabela
+   assim passa no boot e a primeira escrita é fatal.
 10. **Validação do boot dentro de `sink.health_timeout`.** A validação do
     PostgreSQL e do MySQL (§10.5.5, §10.7.4) roda no contexto da checagem de
     saúde, de 1 s por padrão, e faz cerca de uma dúzia de idas e voltas. Com o
@@ -3392,10 +3405,9 @@ trecho portado leva a correção junto, não o defeito.
     recusadas por `max_conns_per_ip`; o operador não distingue "ninguém
     conecta" de "um IP é recusado o tempo todo". Direção: um contador com o
     rótulo `transport` em §13.1, antes do código.
-19. **Imagem do `nats-box` sem versão fixa.** Os compose de NATS e o
-    `.env.example` usam `natsio/nats-box:latest` no `nats-init`, que cria o
-    stream: a mesma receita pode instalar CLIs diferentes em dias diferentes.
-    Direção: fixar `natsio/nats-box:0.20.0`, como os módulos irmãos.
+19. *Corrigido em 2026-10-14 (porte do go-syslog-server):*
+    `natsio/nats-box:0.20.0` nos três compose de NATS e no `.env.example`,
+    conferido por `TestComposeNATSBoxIsPinned`; regra em §17.5.
 20. **Nomes que colidem com o `go-syslog-server` atual.** A imagem padrão
     (`go-syslog-server:local`), os projetos e contêineres `sls-*`, os volumes
     (`sls-data`, `nats-data`, `redis-data`), o `--version` e o `relp_software`

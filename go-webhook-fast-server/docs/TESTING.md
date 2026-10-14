@@ -1291,3 +1291,14 @@ construir o cliente ("control: the Redis client was never built"). A retomada
 passou para 1,2 s; `-race -count=8` verde em W e F. O teste continua pegando o
 prazo duplo: com o cliente construído aos 1,5 s, um segundo prazo de 2 s
 levaria o boot a ~3,5 s, acima do teto de 3 s.
+
+### Corrida no `tcpProxy` de teste (2026-10-14)
+
+O proxy de `internal/app/lifecycle_test.go` registrava a conexão só depois de
+discar o upstream: um `Pause` nesse intervalo não a cortava, e um teste que
+derruba o destino via um destino que nunca saiu. Achada pela revisão do
+`go-syslog-standard-server`, onde derrubou o `TestMySQLDownThenBackLosesNothing`
+uma vez; aqui não chegou a falhar. O `serve` registra o cliente sob a mesma
+trava da checagem de pausa, e o `pipe`, depois de discar, só segue se o cliente
+ainda está no mapa: um `Pause` (mesmo seguido de `Resume`) durante a discagem
+corta o par.

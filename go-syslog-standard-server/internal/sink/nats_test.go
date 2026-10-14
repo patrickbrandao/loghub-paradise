@@ -61,6 +61,13 @@ func TestClassifyNATS(t *testing.T) {
 		{"api message too big", api(400, jsErrMessageExceedsMaximum), ClassLogic},
 		{"api header too big", api(400, jsErrHeaderExceedsMaximum), ClassLogic},
 
+		// SPEC §10.8.6: 4xx that waiting resolves are network, not the fatal
+		// of an unknown 4xx.
+		{"api duplicate in process (409)", api(409, jsErrDuplicateInProcess), ClassNetwork},
+		{"api stream too many requests (429)", api(429, jsErrStreamTooManyRequests), ClassNetwork},
+		{"api unknown 429", api(429, 10997), ClassNetwork},
+		{"api unknown 409", api(409, 10996), ClassFatal},
+
 		{"api unknown 5xx", api(503, 10998), ClassNetwork},
 		{"plain error", errors.New("boom"), ClassNetwork},
 		{"wrapped fatal", fmt.Errorf("publish: %w", nats.ErrAuthorization), ClassFatal},
@@ -178,5 +185,30 @@ func TestNewNATSRejectsBadConfig(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// SPEC §17.5: the nats-init of the compose files creates the stream with the
+// nats-box CLI, so its version is part of the recipe. With latest the same
+// recipe could install different CLIs on different days (§21.1 item 19).
+func TestComposeNATSBoxIsPinned(t *testing.T) {
+	files, err := filepath.Glob("../../docker/*nats*.yml")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no nats compose files found: %v", err)
+	}
+	files = append(files, "../../docker/.env.example")
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			if !strings.Contains(line, "natsio/nats-box") {
+				continue
+			}
+			if !strings.Contains(line, "natsio/nats-box:0.20.0") {
+				t.Errorf("%s:%d: nats-box is not pinned to 0.20.0: %s", f, i+1, strings.TrimSpace(line))
+			}
+		}
 	}
 }

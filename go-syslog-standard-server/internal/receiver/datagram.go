@@ -121,17 +121,14 @@ func (d *Datagram) listenUnix() (net.PacketConn, error) {
 	}
 
 	// A socket left by a previous run has to go before bind can succeed. But a
-	// socket somebody is SERVING must not: dialing it tells the two apart, and
-	// stealing /dev/log from a running syslogd is not a mistake to make quietly.
-	if _, err := os.Stat(path); err == nil {
-		if c, derr := net.Dial("unixgram", path); derr == nil {
-			c.Close()
-			return nil, fmt.Errorf("receiver unix: %s is already served by another "+
-				"process; stop it or choose another path", path)
-		}
-		if err := os.Remove(path); err != nil {
-			return nil, fmt.Errorf("receiver unix: removing the stale socket %s: %w", path, err)
-		}
+	// socket somebody is SERVING must not, and neither may anything that is
+	// not a stale socket: stealing /dev/log from a running syslogd, or deleting
+	// a file a mistyped path points at, is not a mistake to make quietly.
+	removed, err := removeStaleSocket(path)
+	if err != nil {
+		return nil, err
+	}
+	if removed {
 		d.log.Warn("removed a stale unix socket from a previous run", "path", path)
 	}
 
@@ -153,6 +150,52 @@ func (d *Datagram) listenUnix() (net.PacketConn, error) {
 	}
 	d.setReadBuffer(c)
 	return c, nil
+}
+
+// removeStaleSocket clears listen.unix for bind, and reports whether it
+// removed anything (SPEC §4.3; ported from go-syslog-server, §21.1 item 3).
+//
+// It removes ONLY a stale socket: the file must be a socket (Lstat, so a
+// symlink is not followed) AND a unixgram connect to it must be REFUSED, which
+// is what the kernel answers when nobody is bound there. Anything else is left
+// alone and refused with a message that says what is there:
+//
+//   - the connect succeeds: a live datagram socket, someone else's /dev/log;
+//   - EPROTOTYPE or similar: a live socket of another type (a SOCK_STREAM
+//     /dev/log, as some systemd setups have), which a blanket "dial failed,
+//     remove it" would have deleted from under its owner;
+//   - not a socket at all: a regular file, a directory or a symlink, which is
+//     a configuration mistake and never ours to delete.
+//
+// ENOENT -- the file vanished between Lstat and connect -- needs no removal.
+func removeStaleSocket(path string) (bool, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("receiver unix: %s: %w", path, err)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return false, fmt.Errorf("receiver unix: %s exists and is not a socket (%s); "+
+			"refusing to replace it", path, fi.Mode().Type())
+	}
+	c, derr := net.Dial("unixgram", path)
+	switch {
+	case derr == nil:
+		c.Close()
+		return false, fmt.Errorf("receiver unix: %s is already served by another "+
+			"process; stop it or choose another path", path)
+	case errors.Is(derr, syscall.ENOENT):
+		return false, nil
+	case !errors.Is(derr, syscall.ECONNREFUSED):
+		return false, fmt.Errorf("receiver unix: %s is a socket that is not a stale "+
+			"datagram socket (%v); refusing to remove it", path, derr)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("receiver unix: removing the stale socket %s: %w", path, err)
+	}
+	return true, nil
 }
 
 // setReadBuffer applies SO_RCVBUF.
@@ -260,9 +303,12 @@ func (d *Datagram) closeAll() error {
 	for _, c := range d.conns {
 		errs = append(errs, c.Close())
 	}
-	if d.cfg.Unix && d.cfg.Addr != "" {
+	if d.cfg.Unix && d.cfg.Addr != "" && len(d.conns) > 0 {
 		// The socket file outlives the process otherwise, and the next boot
-		// would have to decide whether it is stale.
+		// would have to decide whether it is stale. Only once this receiver
+		// has bound it: a boot refused by removeStaleSocket must leave what
+		// sits at the path -- someone else's live /dev/log, a file, a
+		// directory -- exactly as it found it (SPEC §4.3).
 		if err := os.Remove(d.cfg.Addr); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 		}

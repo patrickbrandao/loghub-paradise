@@ -209,6 +209,7 @@ func TestClassifySQLState(t *testing.T) {
 		"3D000", // invalid_catalog_name
 		"57P04", // database_dropped
 		"XX001", // data_corrupted
+		"23502", // not_null_violation: this server never sends NULL, so it is the table's
 	}
 	for _, c := range fatal {
 		if got := classifySQLState(c); got != ClassFatal {
@@ -221,7 +222,7 @@ func TestClassifySQLState(t *testing.T) {
 			t.Errorf("SQLSTATE %s = %v, want network", c, got)
 		}
 	}
-	logic := []string{"22021", "22003", "23502", "54000"}
+	logic := []string{"22021", "22003", "23505", "23514", "54000"}
 	for _, c := range logic {
 		if got := classifySQLState(c); got != ClassLogic {
 			t.Errorf("SQLSTATE %s = %v, want logic", c, got)

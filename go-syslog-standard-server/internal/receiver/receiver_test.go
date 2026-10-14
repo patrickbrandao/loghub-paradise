@@ -1074,3 +1074,98 @@ func TestRELPWindowAllowsConcurrentTransactions(t *testing.T) {
 		t.Fatalf("%d distinct acknowledgements of %d", len(seen), n)
 	}
 }
+
+// SPEC §4.3: whatever sits at listen.unix is removed ONLY when it is a socket
+// and a datagram connect to it is refused. A regular file, a directory and a
+// live stream socket are left alone, with a clear error (§21.1 item 3, ported
+// from go-syslog-server). The directory is short on purpose: t.TempDir under
+// macOS can pass the 104 bytes of sun_path.
+func TestUnixRemovesOnlyAStaleDatagramSocket(t *testing.T) {
+	h := newHarness(t, 10, "debug", nil)
+	dir, err := os.MkdirTemp("/tmp", "slstd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	open := func(path string) error {
+		d, err := NewDatagram(context.Background(), DatagramConfig{Addr: path, Unix: true},
+			h.in, h.m, logger())
+		if err == nil {
+			d.Close()
+		}
+		return err
+	}
+
+	file := filepath.Join(dir, "precious")
+	if err := os.WriteFile(file, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := open(file); err == nil || !strings.Contains(err.Error(), "not a socket") {
+		t.Fatalf("regular file: err = %v", err)
+	}
+	if b, err := os.ReadFile(file); err != nil || string(b) != "data" {
+		t.Fatalf("the regular file was touched: %q %v", b, err)
+	}
+
+	sub := filepath.Join(dir, "adir")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := open(sub); err == nil {
+		t.Fatal("a directory at listen.unix was accepted")
+	}
+	if fi, err := os.Stat(sub); err != nil || !fi.IsDir() {
+		t.Fatal("the directory was removed")
+	}
+
+	// A symlink to a stale socket is not followed: neither the link nor its
+	// target is removed.
+	target := filepath.Join(dir, "target")
+	c, err := net.ListenPacket("unixgram", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close() // the file stays, unserved
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := open(link); err == nil || !strings.Contains(err.Error(), "not a socket") {
+		t.Fatalf("symlink: err = %v", err)
+	}
+	if _, err := os.Lstat(target); err != nil {
+		t.Fatalf("the symlink's target was removed: %v", err)
+	}
+
+	// A live datagram socket is refused, and the refused boot does not remove
+	// it on the way out either.
+	live := filepath.Join(dir, "live")
+	lc, err := net.ListenPacket("unixgram", live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	if err := open(live); err == nil || !strings.Contains(err.Error(), "already served") {
+		t.Fatalf("live datagram socket: err = %v", err)
+	}
+	if c, err := net.Dial("unixgram", live); err != nil {
+		t.Fatalf("the live datagram socket was removed: %v", err)
+	} else {
+		c.Close()
+	}
+
+	stream := filepath.Join(dir, "stream")
+	ln, err := net.Listen("unix", stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if err := open(stream); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
+		t.Fatalf("live stream socket: err = %v", err)
+	}
+	if c, err := net.Dial("unix", stream); err != nil {
+		t.Fatalf("the live stream socket was removed: %v", err)
+	} else {
+		c.Close()
+	}
+}

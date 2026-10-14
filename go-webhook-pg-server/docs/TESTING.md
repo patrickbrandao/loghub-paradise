@@ -487,3 +487,14 @@ documentados estão em §8 e na seção do assunto da SPEC.
 | T2 — o resto do lote retido com falha no pedaço do meio, e com fatal (§8.1 passo 3) | `TestWorkersHoldTheRestOfTheBatchWhileAPieceRetries` (6 itens, 3 pedaços) | (lacuna de teste: passa no código) | `hold` por pedaço |
 
 **Rodadas.** `gofmt -l .` vazio e `go vet ./...` limpo. Duas rodadas completas `go test -race -count=1 -timeout 1500s ./...` (`tasks/run2.sh go-webhook-pg-server rev`, PostgreSQL 18 real): as duas verdes, nenhuma refeita.
+
+### Corrida no `tcpProxy` de teste (2026-10-14)
+
+O proxy de `internal/app/lifecycle_test.go` registrava a conexão só depois de
+discar o upstream: um `Pause` nesse intervalo não a cortava, e um teste que
+derruba o destino via um destino que nunca saiu. Achada pela revisão do
+`go-syslog-standard-server`, onde derrubou o `TestMySQLDownThenBackLosesNothing`
+uma vez; aqui não chegou a falhar. O `serve` registra o cliente sob a mesma
+trava da checagem de pausa, e o `pipe`, depois de discar, só segue se o cliente
+ainda está no mapa: um `Pause` (mesmo seguido de `Resume`) durante a discagem
+corta o par.

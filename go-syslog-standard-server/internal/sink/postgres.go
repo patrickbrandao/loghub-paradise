@@ -611,6 +611,13 @@ func classifySQLState(code string) Class {
 		return ClassNetwork
 	case "57P04": // database_dropped
 		return ClassFatal
+	case "23502":
+		// not_null_violation. This server never sends NULL, so it can only
+		// come from the table: an extra NOT NULL column without a default, a
+		// default dropped after boot, a trigger. Every batch would hit it, and
+		// as class 23 (logic) each one would be dropped with the sink UP --
+		// the same case as MySQL's 1364, which is fatal (SPEC §10.5.7).
+		return ClassFatal
 	case "57014": // query_canceled: statement_timeout on the server
 		return ClassNetwork
 	case "40001", "40P01", "55P03": // serialization, deadlock, lock not available

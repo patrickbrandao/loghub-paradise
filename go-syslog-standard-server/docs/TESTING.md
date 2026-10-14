@@ -127,7 +127,8 @@ compose sobem sem o aviso de `GOMEMLIMIT` (§14.4).
 
 ### 6.2 PostgreSQL
 
-Os testes de unidade cobrem a classificação de SQLSTATE, o saneamento de UTF-8,
+Os testes de unidade cobrem a classificação de SQLSTATE (`TestClassifySQLState`,
+com o `23502` fatal desde 2026-10-14), o saneamento de UTF-8,
 o `reset` do pool de argumentos e o parse de UUID. **Nada roda contra um
 PostgreSQL real.** É a §8, item 2.
 
@@ -155,14 +156,16 @@ docker rm -f sls-test-mysql
 | `sink` | `TestMySQLSplitsLargeBatches` | lote acima de 3 855 linhas e acima do pacote dividido, todas as linhas gravadas |
 | `sink` | `TestMySQLHealthValidatesTheSchema` | tabela ausente, tipo errado, coluna ausente, sem índice único, MyISAM, `id` de largura errada: fatal; extras e tipos mais estreitos tolerados |
 | `sink` | `TestMySQLHealthValidatesThePrivilege` | só `INSERT` é recusado no boot; `INSERT` + `UPDATE (id)` basta; a sonda não deixa linha |
+| `sink` | `TestMySQLWritesCommitUnderAGlobalAutocommitOff` | com `init_connect = 'SET autocommit = 0'` para um usuário do teste, as linhas gravadas sobrevivem ao fechamento da conexão (§10.7.1 da spec) |
+| `sink` | `TestMySQLValidationRefusesASessionWithoutAutocommit` | uma sessão em `autocommit=0` (o `SET` ignorado) é fatal no boot, com a palavra `autocommit` (§10.7.4) |
 | `sink` | `TestMySQLDroppedTableIsFatalNotLogic`, `TestMySQLPacketCeilingIsCheckedAtBoot` | `1146` na escrita é fatal; pacote menor que a maior linha é fatal no boot |
 | `app` | `TestMySQLAllRingModes` | os três pares novos da matriz, reconciliando confirmações RELP com linhas |
 | `app` | `TestMySQLTheRowIsFaithful`, `TestMySQLRingNoneIsInstrumented` | a linha de ponta a ponta; as métricas com `ring=none` |
 | `app` | `TestMySQLSchemaMismatchExitsThreeImmediately`, `TestMySQLUnreachableKeepsTransportsShut` | `exit 3` imediato com esquema errado ou pacote pequeno; transportes nunca abrem |
 | `app` | `TestMySQLDownThenBackLosesNothing`, `TestMySQLFatalDumpsAndTheNextBootReingests` | queda e volta por proxy sem perda; FATAL, dump, reingestão com as colunas consultáveis |
 
-**Ainda não executada contra um MySQL real** nesta pasta: é a §8, item 18. Sem
-servidor, `TestMySQLSchemaFileMatchesTheContract` confere o arquivo de esquema
+Executada pela primeira vez contra MySQL 8.4 real em 2026-10-14 (§8, itens 18,
+21 e 22). Sem servidor, `TestMySQLSchemaFileMatchesTheContract` confere o arquivo de esquema
 contra o contrato de colunas do código, e os testes de unidade cobrem a tabela
 de `Number`, o texto do comando, a divisão do lote, o pool de argumentos e a
 conta da maior linha.
@@ -184,13 +187,18 @@ SYSLOG_TEST_NATS_URL=nats://127.0.0.1:14222 \
 | `sink` | `TestNATSEnvelopeSurvivesHostileBytes` | envelope com bytes de controle, `DEL`, UTF-8 inválido e aspas, e um de mais de 100 KiB, voltam byte a byte |
 | `sink` | `TestNATSRedeliveryIsDeduplicatedAndCounted`, `TestNATSConcurrentWriters` | desduplicação por `Nats-Msg-Id` contada; oito escritores numa conexão |
 | `sink` | `TestNATSLargestAcceptedMessageFitsTheServer` | a maior linha que a checagem de boot admite, no formato que mais infla o envelope, é aceita pelo `max_payload` real; um byte a mais é recusado no boot |
-| `sink` | `TestNATSHealthValidatesTheStream` | stream ausente, subject de outro stream, subject sem stream, stream selado, `max_payload` e `max_msg_size`: fatal |
+| `sink` | `TestNATSHealthValidatesTheStream` | stream ausente, subject de outro stream, subject sem stream, stream selado, `retention: interest`, `max_payload` e `max_msg_size`: fatal; `retention: workqueue` aceito |
 | `sink` | `TestNATSExpectedStreamMismatchIsFatalOnWrite`, `TestNATSDroppedStreamIsFatal` | subject de outro stream recusado na escrita; stream apagado é fatal na sonda |
 | `app` | `TestNATSAllRingModes` | os três pares novos, reconciliando confirmações RELP com mensagens no stream |
 | `app` | `TestNATSTheStreamMessageIsFaithful`, `TestNATSRingNoneIsInstrumented` | a mensagem de ponta a ponta, com `NUL` e structured-data; as métricas com `ring=none` |
 | `app` | `TestNATSStreamMismatchExitsThreeImmediately`, `TestNATSUnreachableKeepsTransportsShut` | `exit 3` imediato com stream errado ou frames padrão acima do `max_payload`; transportes nunca abrem |
 | `app` | `TestNATSDownThenBackLosesNothing` | proxy pausado: `/readyz` 503; retomado: recupera, uma reconexão contada, nenhuma confirmação perdida |
 | `app` | `TestNATSFatalDumpsAndTheNextBootReingests` | FATAL com 8 mensagens confirmadas no ring, dump, `exit 3`, reingestão completa no boot seguinte |
+
+Sem servidor, `TestClassifyNATS` cobre a tabela de §10.8.6 (inclusive `10158`,
+`10167` e todo `429` como `network`, e o `409` desconhecido ainda fatal), e
+`TestComposeNATSBoxIsPinned` confere que os compose de NATS e o `.env.example`
+fixam `natsio/nats-box:0.20.0` (§17.5).
 
 Primeira execução em 2026-09-15, `nats-server` v2.14.6 compilado do cache de
 módulos, macOS: os 16 testes de integração (9 em `sink`, 7 em `app`, com seus
@@ -284,7 +292,9 @@ Registradas por honestidade, não por esquecimento.
    medida contra a alternativa**. A métrica `syslog_parse_duration_seconds`
    existe para responder isso em produção.
 10. **O transporte `unix` com `/dev/log` de verdade** não foi testado no Linux; os
-    testes usam um socket em diretório temporário no macOS.
+    testes usam um socket em diretório temporário no macOS. A regra de remoção
+    de §4.3 (só socket órfão, nunca arquivo, diretório, link ou socket vivo de
+    qualquer tipo) é provada ali por `TestUnixRemovesOnlyAStaleDatagramSocket`.
 11. **A rotação do `sink=sqlite` com `keep_files > 0`** tem o caminho de remoção
     escrito e não testado; só o padrão `0`, que nunca apaga, tem teste.
 
@@ -338,18 +348,61 @@ Registradas por honestidade, não por esquecimento.
     catálogo, a sonda de privilégio e a divisão do lote por pacote só se provam
     no servidor. Na primeira sessão o Docker Desktop da máquina de
     desenvolvimento respondia 500 a toda chamada. Os comandos estão em §6.3.
+    *Atualizado em 2026-10-14:* a suíte rodou duas vezes contra MySQL 8.4 real
+    (rodada da §8.1); os itens 21 e 22 abaixo eram defeitos de teste, corrigidos
+    no mesmo dia, e as rodadas 3 e 4 passaram inteiras.
 
 19. **Os compose de MySQL e NATS não subiram.** `docker compose config` valida
     os seis; a imagem, o `nats-init` com `nats-box`, o `max_allowed_packet` de
     256 MiB e o `max_payload` de 8 MB lido de `nats/nats-server.conf` não foram
     exercitados em contêiner. O `max_payload` foi conferido no binário do
-    `nats-server` com o mesmo arquivo (8 388 608 bytes).
+    `nats-server` com o mesmo arquivo (8 388 608 bytes). Desde 2026-10-14 o
+    `nats-box` do `nats-init` tem versão fixa (`0.20.0`), conferida por
+    `TestComposeNATSBoxIsPinned`; continua sem ter subido.
 
 20. **A conta do maior evento (§3.9 da spec) é pessimista e nunca foi medida
     contra tráfego real.** O fator 6 do envelope é provado como teto por
     `TestMaxBytesBoundsTheEnvelope`; quanto ele sobra na prática, e se o
     `max_payload` de 8 MB dos compose é folgado ou justo para quem sobe os
     frames, não tem número.
+
+21. ~~`TestMySQLInvalidUTF8HostnameDoesNotDropTheBatch` espera o que o código
+    não faz~~ — **fechada em 2026-10-14**: a expectativa passou a ser uma
+    `U+FFFD` por sequência inválida (`\xff\xfe` é uma, o `NUL` outra), como a
+    SPEC §3.6 e o `strings.ToValidUTF8`; o código já estava certo.
+
+22. ~~`TestMySQLDownThenBackLosesNothing` é instável sob carga~~ — **fechada
+    em 2026-10-14**: o `tcpProxy` de teste registra o cliente sob a mesma
+    trava da checagem de pausa e reconfere depois de discar o upstream, então
+    um `Pause` durante a discagem corta o par. A família webhook tinha a mesma
+    corrida no seu proxy (`lifecycle_test.go`) e recebeu a forma do S.
+
+### 8.1 Rodada de 2026-10-14: seis pendências de §21.1 da spec
+
+Porte do `go-syslog-server` para os itens 3, 6, 7, 8, 9 e 19. Cada teste
+abaixo falhou no código anterior, passa no corrigido, e volta a falhar com só a
+correção revertida (mutação). Serviços: MySQL 8.4 (`23306`, banco `whs_std`),
+`nats-server` v2.14.6 (`24222` e irmãos); o PostgreSQL de `25433` não é lido
+por esta pasta (não há suíte de PostgreSQL, item 2).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 8 `autocommit` | `TestMySQLWritesCommitUnderAGlobalAutocommitOff`, `TestMySQLValidationRefusesASessionWithoutAutocommit` | 0 linhas depois de `Write` nil para 3; `Health` = nil com sessão em `autocommit=0` | sem `autocommit=1` nos parâmetros: o boot recusa a sessão; sem a releitura: `Health` = nil |
+| 6 `retention: interest` | `TestNATSHealthValidatesTheStream/interest_retention` (e `workqueue` como controle aceito) | `Health` aceitou o stream | idem |
+| 9 `23502` | `TestClassifySQLState` (`23505` e `23514` seguem `logic`) | `23502 = logic, want fatal` | idem |
+| 7 4xx transitórios | `TestClassifyNATS` (`10158`/409, `10167`/429, `429` desconhecido: `network`; `409` desconhecido: `fatal`) | três casos `fatal, want network` | idem |
+| 3 `listen.unix` | `TestUnixRemovesOnlyAStaleDatagramSocket` (arquivo, diretório, link para socket órfão, socket datagrama vivo, socket stream vivo) | o arquivo comum foi apagado (`err = <nil>`) | `Stat`+remove de volta: idem; sem a guarda do `closeAll`: o boot recusado apaga o arquivo na saída |
+| 19 `nats-box` | `TestComposeNATSBoxIsPinned` | quatro linhas com `latest` | um compose de volta a `latest`: falha |
+
+Rodadas completas (`tasks/run2.sh go-syslog-standard-server std`: `gofmt -l`,
+`go vet`, `go test -race -count=1 ./...`), logs em
+`tasks/logs/go-syslog-standard-server-std-r{1,2}.log`:
+
+| Rodada | Resultado |
+|---|---|
+| 1 | `gofmt` e `vet` limpos; todos os pacotes `ok` menos `sink`, por `TestMySQLInvalidUTF8HostnameDoesNotDropTheBatch` (item 21, anterior) |
+| 2 | o mesmo, mais `TestMySQLDownThenBackLosesNothing` em `app` (item 22, instável) |
+| 3 e 4 | depois de corrigir os dois testes (itens 21 e 22): todos os pacotes `ok`, as duas (`tasks/logs/go-syslog-standard-server-std2-r{1,2}.log`) |
 
 ## 9. Histórico: bugs que os testes encontraram
 

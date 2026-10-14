@@ -298,8 +298,10 @@ func TestMySQLInvalidUTF8HostnameDoesNotDropTheBatch(t *testing.T) {
 		mysqlID(t, batch[1].Item.Head.ID)).Scan(&host, &env, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if host != "web���-01" {
-		t.Errorf("hostname column = %q, want the invalid bytes and the NUL replaced", host)
+	// One U+FFFD per invalid sequence, as strings.ToValidUTF8 does: the
+	// run \xff\xfe is one sequence, the NUL another.
+	if host != "web��-01" {
+		t.Errorf("hostname column = %q, want the invalid run and the NUL replaced", host)
 	}
 	if string(env) != string(batch[1].Env) || string(raw) != bad {
 		t.Error("env or raw was altered; the replacement must touch the column copy only")
@@ -594,5 +596,94 @@ func TestMySQLPacketCeilingIsCheckedAtBoot(t *testing.T) {
 	}
 	if !IsFatal(err) || !strings.Contains(err.Error(), "max_allowed_packet") {
 		t.Errorf("got %v, want a fatal error naming max_allowed_packet", err)
+	}
+}
+
+// ------------------------------------------------------------- autocommit
+
+// SPEC §10.7.1: with autocommit=0 as the server's default, every INSERT sat in
+// an implicit transaction nobody committed: Write returned nil and the rows
+// vanished with the connection. The session parameter pins it to 1 (SPEC §21.1
+// item 8, ported from go-syslog-server).
+//
+// The default comes from init_connect on a user of the test's own, never from
+// SET GLOBAL autocommit: that one would reach every session of the shared
+// server -- the fixture's own root connection included -- for as long as the
+// test ran. init_connect does not run for an administrative user, so only
+// this test's user sees it.
+func TestMySQLWritesCommitUnderAGlobalAutocommitOff(t *testing.T) {
+	f := mysqlSetup(t)
+	ctx := context.Background()
+	user := fmt.Sprintf("slstd_ac_%d", time.Now().UnixNano()%1e9)
+	if _, err := f.db.ExecContext(ctx, "CREATE USER '"+user+"'@'%' IDENTIFIED BY 'pw'"); err != nil {
+		t.Skipf("cannot create users on this server: %v", err)
+	}
+	t.Cleanup(func() { _, _ = f.db.ExecContext(context.Background(), "DROP USER IF EXISTS '"+user+"'@'%'") })
+	f.exec("GRANT SELECT, INSERT, UPDATE ON `" + f.dbName + "`.* TO '" + user + "'@'%'")
+	var prev string
+	if err := f.db.QueryRowContext(ctx, "SELECT @@GLOBAL.init_connect").Scan(&prev); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx, "SET GLOBAL init_connect = 'SET autocommit = 0'"); err != nil {
+		t.Skipf("cannot set init_connect here: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.db.ExecContext(context.Background(), "SET GLOBAL init_connect = ?", prev)
+	})
+
+	// The premise: a session of that user, without the parameter, starts
+	// with autocommit=0.
+	mc := mysql.NewConfig()
+	mc.User, mc.Passwd, mc.Net, mc.Addr, mc.DBName = user, "pw", "tcp", f.cfg.Addr, f.cfg.Database
+	raw, err := sql.Open("mysql", mc.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var ac int64
+	if err := raw.QueryRowContext(ctx, "SELECT @@session.autocommit").Scan(&ac); err != nil || ac != 0 {
+		t.Fatalf("a session of %s has autocommit=%d (%v): init_connect did not take", user, ac, err)
+	}
+
+	cfg := f.cfg
+	cfg.Username, cfg.Password = user, "pw"
+	p, err := NewMySQL(cfg, discard(), metrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.ready(p)
+	if err := p.Write(ctx, batchOf(t, 3)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	p.Close() // an uncommitted transaction dies here
+	if n := f.count(f.table); n != 3 {
+		t.Fatalf("%d rows after Write returned nil for 3: the INSERTs were never committed", n)
+	}
+}
+
+// SPEC §10.7.4: the validation reads autocommit back, and a session where the
+// parameter did not take is refused. The pool is replaced by one that asks for
+// autocommit=0 itself -- the session a server or proxy that ignores the SET
+// would give --, with no global change on the shared server.
+func TestMySQLValidationRefusesASessionWithoutAutocommit(t *testing.T) {
+	f := mysqlSetup(t)
+	ctx := context.Background()
+
+	p := f.sink(f.cfg)
+	mc := mysql.NewConfig()
+	mc.User, mc.Passwd, mc.Net, mc.Addr, mc.DBName = f.cfg.Username, f.cfg.Password, "tcp", f.cfg.Addr, f.cfg.Database
+	mc.Params = map[string]string{"autocommit": "0"}
+	connector, err := mysql.NewConnector(mc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.db.Close()
+	p.db = sql.OpenDB(connector)
+
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	err = p.Health(cctx)
+	if !IsFatal(err) || !strings.Contains(err.Error(), "autocommit") {
+		t.Fatalf("Health on a session with autocommit=0 = %v, want fatal naming autocommit", err)
 	}
 }

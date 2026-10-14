@@ -16,6 +16,22 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-10-14 — go-syslog-standard-server: seis pendências baratas (porte do S)
+
+Autorizado pelo usuário depois do fechamento da rodada: só os itens 3, 6, 7,
+8, 9 e 19 da §21.1, cada um com teste que falhava e mutação; os outros 14
+seguem abertos na SPEC. `autocommit=1` na sessão do MySQL, conferido no boot;
+`retention: interest` e `23502` fatais; `10158`/`10167`/`429` do JetStream
+são `network`; `listen.unix` só remove socket abandonado (e o boot recusado
+não apaga mais o socket vivo de outro processo, achado no porte);
+`nats-box:0.20.0`. A suíte de MySQL rodou pela primeira vez contra servidor
+real e mostrou dois defeitos de teste: a expectativa de três `U+FFFD` onde
+`strings.ToValidUTF8` dá um por sequência, e o `tcpProxy` que registrava a
+conexão só depois de discar (um `Pause` nesse intervalo não a cortava). A
+mesma corrida estava no proxy de teste da família webhook (W, F, P, N), que
+recebeu a mesma forma. Lição: uma suíte que nunca rodou contra o serviço real
+não está verde, está sem prova; os primeiros defeitos que ela acha são dela.
+
 ## 2026-10-14 — Todos: fechamento das "Pendências conhecidas"
 
 Pedido: fechar as pendências das SPECs, começando pelo W, sem fuzz. Triagem por

@@ -64,8 +64,13 @@ func (p *tcpProxy) serve() {
 		if err != nil {
 			return
 		}
+		// The client is tracked under the same lock as the check, so a Pause
+		// that comes while the upstream is being dialed cuts it too.
 		p.mu.Lock()
 		paused, closing := p.paused, p.closing
+		if !paused && !closing {
+			p.conns[c] = struct{}{}
+		}
 		p.mu.Unlock()
 		if paused || closing {
 			// Refusing rather than hanging is what a dead Redis looks like to
@@ -80,11 +85,24 @@ func (p *tcpProxy) serve() {
 func (p *tcpProxy) pipe(client net.Conn) {
 	up, err := net.DialTimeout("tcp", p.upstream, 5*time.Second)
 	if err != nil {
+		p.untrack(client)
 		_ = client.Close()
 		return
 	}
-	p.track(client)
-	p.track(up)
+	// A Pause during the dial closed the client and dropped it from conns
+	// (even if a Resume followed): the upstream must not outlive it, or the
+	// test sees a destination that never went away.
+	p.mu.Lock()
+	_, live := p.conns[client]
+	if live {
+		p.conns[up] = struct{}{}
+	}
+	p.mu.Unlock()
+	if !live {
+		_ = client.Close()
+		_ = up.Close()
+		return
+	}
 
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(up, client); done <- struct{}{} }()
@@ -95,12 +113,6 @@ func (p *tcpProxy) pipe(client net.Conn) {
 	p.untrack(up)
 	_ = client.Close()
 	_ = up.Close()
-}
-
-func (p *tcpProxy) track(c net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.conns[c] = struct{}{}
 }
 
 func (p *tcpProxy) untrack(c net.Conn) {

@@ -97,7 +97,7 @@ services:
   # de producao esse papel e' de quem administra o servidor -- o syslog nunca cria
   # nem altera um stream (docs/SPEC.md 10.8.5).
   nats-init:
-    image: ${SYSLOG_NATS_BOX_IMAGE:-natsio/nats-box:latest}
+    image: ${SYSLOG_NATS_BOX_IMAGE:-natsio/nats-box:0.20.0}
     container_name: sls-sqlite-nats-nats-init
     depends_on:
       nats:

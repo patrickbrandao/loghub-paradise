@@ -435,6 +435,9 @@ func TestNATSHealthValidatesTheStream(t *testing.T) {
 	_, otherSubject := f.newStream(nil)
 	small, smallSubject := f.newStream(func(c *jetstream.StreamConfig) { c.MaxMsgSize = 1024 })
 
+	interest, interestSubject := f.newStream(func(c *jetstream.StreamConfig) { c.Retention = jetstream.InterestPolicy })
+	workqueue, workqueueSubject := f.newStream(func(c *jetstream.StreamConfig) { c.Retention = jetstream.WorkQueuePolicy })
+
 	sealed, sealedSubject := f.newStream(nil)
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -460,6 +463,10 @@ func TestNATSHealthValidatesTheStream(t *testing.T) {
 		{"subject of another stream", func(c *NATSConfig) { c.Subject = otherSubject }, "belongs to stream"},
 		{"subject with no stream", func(c *NATSConfig) { c.Subject = "nobody.home" }, "no stream listens"},
 		{"sealed stream", func(c *NATSConfig) { c.Stream, c.Subject = sealed, sealedSubject }, "sealed"},
+		// SPEC §10.8.5: interest retention acknowledges and keeps nothing
+		// while no consumer is interested; workqueue keeps until consumed.
+		{"interest retention", func(c *NATSConfig) { c.Stream, c.Subject = interest, interestSubject }, "retention=interest"},
+		{"workqueue retention", func(c *NATSConfig) { c.Stream, c.Subject = workqueue, workqueueSubject }, ""},
 		{"payload ceiling", func(c *NATSConfig) { c.MaxRawBytes = f.nc.MaxPayload() }, "max_payload"},
 		{"stream max_msg_size", func(c *NATSConfig) {
 			c.Stream, c.Subject, c.MaxRawBytes, c.MaxEnvelopeBytes = small, smallSubject, 512, 512

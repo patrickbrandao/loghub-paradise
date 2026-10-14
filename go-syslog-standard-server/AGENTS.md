@@ -236,8 +236,9 @@ SYSLOG_TEST_PG_DSN='postgres://sls:sls@127.0.0.1:15432/sls_test?sslmode=disable'
 docker rm -f sls-test-pg
 ```
 
-Destino MySQL — a suíte existe e **nunca rodou contra um servidor real nesta
-pasta** (`docs/TESTING.md` §8, item 18). Cria as tabelas dela a partir de
+Destino MySQL — a suíte rodou pela primeira vez contra MySQL 8.4 real em
+2026-10-14; a expectativa de teste errada e o teste instável que ela mostrou
+foram corrigidos no mesmo dia (`docs/TESTING.md` §8, itens 18, 21 e 22). Cria as tabelas dela a partir de
 `docker/mysql/schema.sql`:
 
 ```bash
@@ -429,9 +430,9 @@ O que já foi verificado fora dos testes unitários, numa máquina real:
 - o `sink=nats` contra um `nats-server` v2.14.6 real, pela suíte de §6.4 de
   `docs/TESTING.md`, de ponta a ponta nos três modos de ring.
 
-O `sink=mysql` tem suíte escrita e nunca executada contra um MySQL real, e os
-seis compose de MySQL e NATS nunca subiram (`docs/TESTING.md` §8, itens 18 e
-19).
+O `sink=mysql` rodou a suíte contra MySQL 8.4 real só em 2026-10-14
+(`docs/TESTING.md` §8.1), e os seis compose de MySQL e NATS nunca subiram
+(`docs/TESTING.md` §8, item 19).
 
 Antes de qualquer deploy real faltam, em ordem: versionamento (nível acima),
 integração contínua com Redis, PostgreSQL **e** os emissores vivos, o teste do
