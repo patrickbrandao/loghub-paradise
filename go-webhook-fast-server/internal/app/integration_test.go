@@ -1084,7 +1084,7 @@ func TestSameSQLiteFileRefusesToStart(t *testing.T) {
 	code := runRefused(t, []string{
 		"--ring.mode=sqlite", "--sink.type=sqlite",
 		"--ring.sqlite.path=" + same, "--sink.sqlite.path=" + same,
-		"--server.bind=127.0.0.1:0", "--admin.bind=127.0.0.1:0",
+		"--server.bind=127.0.0.1:0", "--admin.bind=127.0.0.1:9101",
 	}, testID)
 	if code != ExitConfig {
 		t.Errorf("exit code %d, want %d", code, ExitConfig)

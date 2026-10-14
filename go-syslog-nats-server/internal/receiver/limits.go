@@ -44,6 +44,12 @@ func listenStream(ctx context.Context, addr string, reusePort bool) (net.Listene
 // read at accept time, and reading it here would let any client make the
 // accept loop wait on its header_timeout. With a balancer in front, the
 // per-IP cap sees the balancer (SPEC §4.4).
+//
+// The key is the EXACT address, a /128 in IPv6: a peer with a /64 can open each
+// connection from a new address. Counting by prefix was declined (decided on
+// 2026-10-14 as in go-syslog-server and the RELP sibling, DECISOES §9): a /64
+// can be a whole LAN of emitters, and one prefix-wide quota would let one of
+// them lock out the rest.
 type connLimiter struct {
 	max   int
 	perIP int

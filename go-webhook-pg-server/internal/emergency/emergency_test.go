@@ -612,10 +612,21 @@ func TestDamagedLineInTheMiddleIsSkipped(t *testing.T) {
 	if bytes.Equal(rawFF, b) || bytes.Equal(surrogate, b) || !json.Valid(rawFF) || !json.Valid(surrogate) {
 		t.Fatal("fixture: the jsonb-refused lines are not what they claim")
 	}
+	// A raw U+2028 or U+2029 (E2 80 A8/A9): valid UTF-8 and valid JSON, but
+	// the serializer always escapes them (SPEC §9.2, §12.1; port of
+	// go-webhook-server, W 20), so a line that holds one is not ours.
+	rawLS := bytes.Replace(b, []byte(`"path":"/x"`), []byte("\"path\":\"/x\xe2\x80\xa8\""), 1)
+	rawPS := bytes.Replace(b, []byte(`"path":"/x"`), []byte("\"path\":\"/x\xe2\x80\xa9\""), 1)
+	if bytes.Equal(rawLS, b) || bytes.Equal(rawPS, b) || !json.Valid(rawLS) || !json.Valid(rawPS) ||
+		!utf8.Valid(rawLS) || !utf8.Valid(rawPS) || !onlyOurEscapes(rawLS) {
+		t.Fatal("fixture: the raw LS/PS lines are not what they claim")
+	}
 	cases := map[string][]byte{
 		"truncated envelope": noBrace,
 		"invalid utf-8":      rawFF,
 		"lone surrogate":     surrogate,
+		"raw U+2028":         rawLS,
+		"raw U+2029":         rawPS,
 		"invalid json":       badJSON,
 		"foreign object":     notOurs,
 		"binary garbage":     {0x00, 0xff, 0x7f},
@@ -642,19 +653,32 @@ func TestDamagedLineInTheMiddleIsSkipped(t *testing.T) {
 	}
 }
 
-// The escapes the serializer does write pass, and an escaped backslash
-// followed by "u" is text, not an escape.
+// onlyOurEscapes admits exactly the escapes the serializer writes (SPEC
+// §9.2, W 34): \" \\ \n \r \t, \u00XX in lowercase hex for a
+// control byte with no short form, and \u2028/\u2029 -- nothing else. It used
+// to admit any two-character escape and any \u00XX, and this test asserted
+// the opposite of §9.2.
 func TestOnlyOurEscapes(t *testing.T) {
 	for in, want := range map[string]bool{
 		`"a\u0000b"`:     true,
 		`"\u001f"`:       true,
+		`"\u007f"`:       false, // DEL is written raw
 		`"\u2028\u2029"`: true,
 		`"\\ud800"`:      true, // an escaped backslash, then the text ud800
-		`"\n\t\"\/"`:     true,
+		`"\n\t\r\"\\"`:   true,
+		`"\/"`:           false,
+		`"\b"`:           false,
+		`"\f"`:           false,
+		`"\u000a"`:       false, // the serializer writes \n
+		`"\u0009"`:       false, // and \t
+		`"\u000d"`:       false, // and \r
+		`"\u001F"`:       false, // uppercase hex
+		`"\u0041"`:       false, // a printable character
 		`"\ud800"`:       false,
-		`"\u00e9"`:       true,
+		`"\u00e9"`:       false,
 		`"\u0100"`:       false,
 		`"\u20AC"`:       false,
+		`"\u202a"`:       false,
 		`"\`:             false,
 		`"\u00`:          false,
 	} {

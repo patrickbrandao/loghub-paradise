@@ -74,6 +74,10 @@ type Server struct {
 	// conns maps a live net.Conn to its tag, so the protocol gauge can be
 	// decremented from the bucket the connection was actually counted in.
 	conns sync.Map
+
+	// listenFn opens one public socket; listen in the binary. A test swaps it
+	// to put a faulty listener under the accept retry (SPEC §10.3).
+	listenFn func(ctx context.Context, addr string, reusePort bool) (net.Listener, error)
 }
 
 // New builds the server. trusted and headerExclude come from the current
@@ -85,6 +89,7 @@ func New(cfg Config, r ring.Ring, h *sink.Health, l *ratelimit.Limiter,
 	s := &Server{
 		cfg: cfg, ring: r, health: h, limiter: l, metrics: m, log: log,
 		untrustedSampler: obs.NewSampler(30 * time.Second),
+		listenFn:         listen,
 	}
 	s.dyn.Store(&dynamic{
 		resolver:      clientip.New(trusted, maxXFF),
@@ -116,7 +121,7 @@ func (s *Server) Listen(ctx context.Context) error {
 			func() { s.metrics.Reject(obs.ReasonBadRequest) })
 	}
 	for i := 0; i < s.cfg.Listeners; i++ {
-		ln, err := listen(ctx, s.cfg.Bind, s.cfg.Listeners > 1)
+		ln, err := s.listenFn(ctx, s.cfg.Bind, s.cfg.Listeners > 1)
 		if err != nil {
 			for _, l := range s.listeners {
 				_ = l.Close()
@@ -124,6 +129,9 @@ func (s *Server) Listen(ctx context.Context) error {
 			s.listeners = nil
 			return err
 		}
+		// Always, and beneath the limiter: an accept error must never reach
+		// net/http, which gives up on any that is not Temporary (SPEC §10.3).
+		ln = newRetryListener(ln, s.log)
 		if limiter != nil {
 			ln = limiter.wrap(ln)
 		}
@@ -255,25 +263,34 @@ func (s *Server) noteProtocol(r *http.Request) {
 	s.metrics.ConnsActive[obs.ProtoHTTP2].Inc()
 }
 
-// Serve starts accepting. It returns when every listener has stopped.
+// Serve starts accepting. It returns nil when every listener has stopped
+// through Shutdown or Close, and returns the error AT ONCE when any one of
+// them stops with an error (SPEC §10.3): waiting for all of them left a dead
+// listener invisible, with server.listeners > 1, until every other one died
+// too. The caller then shuts the whole server down, which stops the rest.
 func (s *Server) Serve() error {
 	s.mu.Lock()
 	srvs, lns := s.srvs, s.listeners
 	s.mu.Unlock()
 
-	var wg sync.WaitGroup
-	errs := make([]error, len(srvs))
+	// Buffered for every listener, so the ones still running when Serve has
+	// returned can finish later without blocking.
+	results := make(chan error, len(srvs))
 	for i := range srvs {
-		wg.Add(1)
 		go func(i int) {
-			defer wg.Done()
-			if err := srvs[i].Serve(lns[i]); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errs[i] = err
+			err := srvs[i].Serve(lns[i])
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
 			}
+			results <- err
 		}(i)
 	}
-	wg.Wait()
-	return errors.Join(errs...)
+	for range srvs {
+		if err := <-results; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // StartDraining begins shutdown phase 3: stop accepting, tell open connections

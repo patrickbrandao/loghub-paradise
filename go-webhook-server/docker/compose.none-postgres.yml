@@ -51,6 +51,7 @@ services:
       # workers, entao o "workers + 1" derivado nao faria sentido aqui.
       WHS_SINK_POSTGRES_POOL_SIZE: ${WHS_SINK_POSTGRES_POOL_SIZE:-32}
       WHS_SINK_POSTGRES_TLS: ${WHS_SINK_POSTGRES_TLS:-false}
+      WHS_SINK_POSTGRES_TLS_CA: ${WHS_SINK_POSTGRES_TLS_CA:-}
       # Nao ha' dreno em background neste modo: workers/batch ficam sem efeito
       # sobre o caminho da requisicao.
       WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}

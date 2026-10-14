@@ -337,8 +337,15 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   `link` (sem *hard link*, renomeia depois de conferir o nome livre). O `fsync`
   do diretório é melhor esforço — nunca apague um dump pronto porque ele
   falhou. Só arquivos regulares são dumps.
-- **`ring.Commit` antes do `Release`**, também na recusa `logic`: o ring
-  desconta `len(Env)`, que o `Release` zera.
+- **`ring.Commit` antes do `Release`**, também na recusa `logic`. Desde
+  2026-10-14 o ring cobra `cap(Env)` mais `ring.ItemOverhead` e desconta o
+  `Item.Charged` gravado no `Enqueue` (SPEC §7.2), sem reler o buffer; a ordem
+  continua a regra (é a única que serve também ao `ring=sqlite` do fast, que
+  desconta `len(Env)`, que o `Release` zera).
+- **O lote vai em pedaços de `sink.batch_max_bytes`** (SPEC §8.1): o worker
+  segura o pedaço em retentativa **e o resto do lote**, e o `unhold` tira só o
+  pedaço resolvido (`unhold(id, piece)`); apagar o registro inteiro perderia o
+  resto num dump.
 - **O ring é selado antes do último `Drain` do shutdown** (`Seal`, uma
   barreira contra o `Enqueue`): um upload que terminasse depois recebia `200`
   num ring que ninguém mais lia. Não tire o `RWMutex` do `Enqueue`. O teste

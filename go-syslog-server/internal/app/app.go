@@ -611,6 +611,7 @@ func (a *App) buildSink() int {
 			Synchronous:       a.cfg.SinkSQL.Synchronous,
 			BusyTimeout:       a.cfg.SinkSQL.BusyTimeout,
 			WALAutocheckpoint: a.cfg.SinkSQL.WALAutocheckpoint,
+			StuckAfter:        a.cfg.Sink.OpTimeout + a.cfg.Sink.HealthTimeout,
 		}, a.log.Logger, a.metrics)
 		if err != nil {
 			// A database that cannot be opened is a destination failure, not
@@ -1116,6 +1117,16 @@ func (a *App) abortLoss() {
 		a.logLeftInRing()
 		return
 	}
+	// Close BEFORE counting (SPEC §13.4): the transports are still open (a
+	// SIGQUIT in normal operation, or a second signal in pre_stop_delay), and
+	// an Enqueue after the read would be accepted for a message the os.Exit
+	// loses uncounted. Closed, the ring refuses it with ErrClosed, which the
+	// receiver treats as shutdown (messages_dropped{shutdown}). Only memory
+	// and none get here, and their Close is a flag: the persistent rings'
+	// Close waits for the group commit and the client, and an abort is "now".
+	// Nothing is left to honour after an abort, so stopping intake here
+	// changes no pre_stop_delay semantics.
+	_ = a.ring.Close()
 	st := a.ring.Stats()
 	if st.Items == 0 {
 		return

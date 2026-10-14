@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"modernc.org/sqlite"
@@ -29,6 +29,11 @@ type SQLiteConfig struct {
 	Synchronous       string // FULL | NORMAL | OFF
 	BusyTimeout       time.Duration
 	WALAutocheckpoint int
+	// StuckAfter is how long a chunk in progress may hold the writer's lock
+	// and still count as busy, not stuck, for a probe that cannot get it:
+	// sink.op_timeout + sink.health_timeout (SPEC §10.4). Zero means 6s, the
+	// sum of the defaults.
+	StuckAfter time.Duration
 }
 
 // SQLite is the standalone final destination (SPEC §10.4). It needs no server.
@@ -46,13 +51,17 @@ type SQLiteConfig struct {
 //
 // Exactly one goroutine ever writes. SQLite serialises writers by construction,
 // so additional ones would only produce SQLITE_BUSY; sink.workers is forced to 1
-// by configuration validation, and the mutex below makes it true regardless.
+// by configuration validation, and the lock below makes it true regardless.
 type SQLite struct {
 	cfg SQLiteConfig
 	log *slog.Logger
 	m   *obs.Metrics
 
-	mu      sync.Mutex
+	// mu is the writer's lock, a one-slot semaphore rather than a sync.Mutex
+	// so that Health can give up waiting for it at its own deadline (SPEC
+	// §10.4): a chunk holds it up to sink.op_timeout, longer than
+	// sink.health_timeout.
+	mu      chan struct{}
 	db      *sql.DB
 	insert  *sql.Stmt
 	current string // path of the open file
@@ -65,6 +74,54 @@ type SQLite struct {
 	now func() time.Time
 
 	closed bool
+
+	// lastWrite is how the last Write ended: writeNone before any, writeOK,
+	// writeFailed. A probe that cannot get the lock in time reads it to tell
+	// a busy writer from a stuck one (SPEC §10.4).
+	lastWrite atomic.Int32
+
+	// base is NewSQLite's instant, with its monotonic reading: writeStart is
+	// an offset from it, so a step of the wall clock (NTP, a manual change)
+	// does not move the age the probe reads (SPEC §10.4, review A3 of
+	// 2026-10-14).
+	base time.Time
+
+	// writeStart is when the Write in progress took the lock, as
+	// time.Since(base). A
+	// probe that cannot get the lock counts the writer as busy only while
+	// that chunk has held it for at most cfg.StuckAfter (SPEC §10.4, review
+	// A1): COMMIT and the rotation take no context, and a stuck fsync would
+	// otherwise keep the sink UP forever on the good chunk before it.
+	writeStart atomic.Int64
+}
+
+const (
+	writeNone int32 = iota
+	writeOK
+	writeFailed
+)
+
+func (s *SQLite) lock()   { s.mu <- struct{}{} }
+func (s *SQLite) unlock() { <-s.mu }
+
+// wallClock is the wall clock, a variable only so a test can step it as NTP
+// would (TestSQLiteProbeAgeIgnoresWallClockSteps).
+var wallClock = time.Now
+
+// afterProbeLock, nil outside tests, runs in Health right after the probe
+// took the writer's lock (TestSQLiteHeartbeatCutByItsOwnContextIsNotAFailedWrite).
+var afterProbeLock func()
+
+// stampWriteStart records that the chunk in progress took the lock now, on
+// the monotonic clock. time.Now().UnixNano() and time.Unix(0, ...) carry no
+// monotonic reading: an NTP step backwards during a stuck chunk gave a
+// negative age and kept the sink UP, a step forwards gave a spurious DOWN
+// (SPEC §10.4, review A3).
+func (s *SQLite) stampWriteStart() { s.writeStart.Store(int64(time.Since(s.base))) }
+
+// heldFor is how long the chunk in progress has held the lock.
+func (s *SQLite) heldFor() time.Duration {
+	return time.Since(s.base) - time.Duration(s.writeStart.Load())
 }
 
 // The schema of SPEC §3.7, which this server creates itself: the file is local
@@ -122,8 +179,11 @@ func NewSQLite(cfg SQLiteConfig, log *slog.Logger, m *obs.Metrics) (*SQLite, err
 	if cfg.WALAutocheckpoint <= 0 {
 		cfg.WALAutocheckpoint = 1000
 	}
+	if cfg.StuckAfter <= 0 {
+		cfg.StuckAfter = 6 * time.Second
+	}
 
-	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now}
+	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now, mu: make(chan struct{}, 1), base: time.Now()}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o750); err != nil {
 		return nil, fmt.Errorf("sink sqlite: %w", err)
 	}
@@ -242,8 +302,8 @@ func (s *SQLite) maybeRotate(now time.Time) error {
 // setClock replaces the rotation clock. Test-only; the writer holds the same
 // lock, so the swap cannot land in the middle of a chunk.
 func (s *SQLite) setClock(f func() time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	defer s.unlock()
 	s.now = f
 }
 
@@ -258,8 +318,8 @@ func (s *SQLite) SetKeepFiles(n int) {
 	if n < 0 {
 		n = 0
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	defer s.unlock()
 	s.cfg.KeepFiles = n
 }
 
@@ -325,13 +385,23 @@ func nullText(ns convert.NullString) any {
 }
 
 // Write inserts the whole chunk in one transaction (SPEC §10.4).
-func (s *SQLite) Write(ctx context.Context, b *Batch) error {
+func (s *SQLite) Write(ctx context.Context, b *Batch) (err error) {
 	if len(b.Envelopes) == 0 {
 		return nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	defer s.unlock()
+	s.stampWriteStart()
+	defer func() {
+		// Any error, whatever its class: a probe that finds the writer busy
+		// trusts only a writer whose last chunk went in (SPEC §10.4).
+		if err != nil {
+			s.lastWrite.Store(writeFailed)
+		} else {
+			s.lastWrite.Store(writeOK)
+		}
+	}()
 
 	if s.closed {
 		return ErrClosed
@@ -380,16 +450,55 @@ func (s *SQLite) Write(ctx context.Context, b *Batch) error {
 // outlasts sink.health_timeout, the sink is marked DOWN, the fuses escalate to
 // FATAL, and the next boot fails the same way, forever (a real bug of the
 // standard server). The integrity scan still runs once, at boot (SPEC §10.4).
+//
+// The writer's lock is waited for only within the probe's deadline (SPEC
+// §10.4, decisão do usuário 2026-10-14). A chunk holds it up to
+// sink.op_timeout, and a probe that waited past sink.health_timeout failed
+// with the file intact: a DOWN cycle, backpressure on every listener, for
+// slowness. When the lock does not come in time, a writer whose last chunk
+// ended without error is busy, not broken -- the chunk in progress is the
+// proof of life, and what the probe looks for (a full disk, a read-only file)
+// that chunk reports itself as fatal -- so the probe counts UP without
+// touching the file. With the last chunk failed, or none yet, it is DOWN as
+// before. "Busy" has a limit: a chunk holding the lock for longer than
+// sink.op_timeout + sink.health_timeout is stuck (review A1), and a heartbeat
+// that fails counts as a failed Write (review A2), so the probe does not
+// alternate DOWN and UP and reset the fuses.
 func (s *SQLite) Health(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	select {
+	case s.mu <- struct{}{}:
+	case <-ctx.Done():
+		held := s.heldFor()
+		if s.lastWrite.Load() == writeOK && held <= s.cfg.StuckAfter {
+			return nil
+		}
+		return networkErr("heartbeat", fmt.Errorf("the writer held the database past the probe's deadline (chunk in progress for %s): %w",
+			held.Round(time.Millisecond), ctx.Err()))
+	}
+	defer s.unlock()
+	if afterProbeLock != nil {
+		afterProbeLock()
+	}
 
 	if s.closed {
 		return ErrClosed
 	}
-	if _, err := s.db.ExecContext(ctx, sqliteHeartbeat, time.Now().UnixNano()); err != nil {
+	if _, err := s.db.ExecContext(ctx, sqliteHeartbeat, wallClock().UnixNano()); err != nil {
+		// A heartbeat cut by the probe's own context -- the lock came at
+		// deadline - epsilon, or the shutdown cancelled it -- says nothing
+		// about the file: marking it as a failed Write made every following
+		// probe that found the writer busy DOWN until the next chunk ended
+		// (SPEC §10.4, review A1 of the RELP family, 2026-10-14).
+		if ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			s.lastWrite.Store(writeFailed)
+		}
 		return classifySQLite("heartbeat", err)
 	}
+	// The heartbeat took the lock and wrote the file: the same proof as a good
+	// chunk. Without this a failed heartbeat (a full disk, freed later) left
+	// writeFailed until the next good Write, and the first chunk longer than
+	// health_timeout made a sound sink DOWN (SPEC §10.4, review A4).
+	s.lastWrite.Store(writeOK)
 	return nil
 }
 
@@ -407,8 +516,8 @@ func (s *SQLite) integrityCheck() error {
 }
 
 func (s *SQLite) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	defer s.unlock()
 
 	if s.closed {
 		return nil

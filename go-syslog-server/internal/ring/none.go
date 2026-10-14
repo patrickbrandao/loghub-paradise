@@ -58,6 +58,11 @@ type None struct {
 	closed atomic.Bool
 }
 
+// afterNoneReserve, nil outside tests, runs in None.Enqueue right after
+// cur.Add(1): the point where a Close racing the Enqueue must still be seen
+// (TestNoneEnqueueSeesACloseThatRacedTheReservation).
+var afterNoneReserve func()
+
 // NewNone builds the unbuffered ring. maxInflight is ring.max_inflight; zero or
 // less disables the semaphore, which the app does with sink=none (SPEC §9.6) --
 // the decision is taken there, because this package must not know the sink's
@@ -89,6 +94,23 @@ func (r *None) Enqueue(ctx context.Context, it *item.Item) error {
 		}
 	}
 	r.cur.Add(1)
+	if afterNoneReserve != nil {
+		afterNoneReserve()
+	}
+	// The closed check above can be stale by now: an abort closes the ring
+	// and then reads Stats, which is cur (SPEC §13.4). Re-checked after the
+	// reservation, either this Add is visible to that read (counted) or the
+	// Close is visible here and the write never starts -- never a write the
+	// abort's os.Exit loses uncounted. Both can happen in one race: the
+	// Enqueue refuses and the abort still counted it, an overcount, never a
+	// loss (independent review of 2026-10-14, A2).
+	if r.closed.Load() {
+		r.cur.Add(-1)
+		if r.inflight != nil {
+			<-r.inflight
+		}
+		return ErrClosed
+	}
 	defer func() {
 		r.cur.Add(-1)
 		if r.inflight != nil {

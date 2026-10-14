@@ -311,23 +311,45 @@ aqui; os defeitos que o código ainda tem estão em SPEC §18.1.
     afins) são provadas pela tabela de classificação, com o texto que o
     `nats.go` v1.53.1 devolve; um servidor com JWT expirado não foi montado (um
     real responde "Authorization Violation", que já era fatal).
-18. ~~**A janela da contabilidade do aborto**~~ — **fechada em 2026-10-13** (§9,
-    "Porte das correções da família syslog/RELP": o contador passa de mão sob
-    uma trava antes do recolhimento). O registro de então: entre o `ring.Drain()` e o
-    `atRisk.Store` (herdada do P): um segundo sinal exatamente ali conta a
-    menos. A atualização das métricas de emergência deixou de reler o diretório
-    no caminho do dump, o que encurtou a janela; não foi fechada.
+18. ~~A janela da contabilidade do aborto~~ — *fechada em 2026-10-13* (§9, "Porte das correções da família syslog/RELP").
 19. **Mutante equivalente conhecido**: dar à fase 3 do shutdown o seu próprio
     `drain_timeout` não muda nada, porque o prazo único é calculado no mesmo
     instante; o teste do prazo único mata a mutação da fase 4.
-20. ~~**Uma brecha deixada no parser de flags** (SPEC §13.2): a cauda de um valor
-    que o shell partiu num espaço, quando começa com traço e vem depois de um
-    valor não vazio (`--sink.nats.password=a -b`), sai como parâmetro
-    desconhecido, com o nome. Escondê-la esconderia todo erro de digitação de
-    uma flag depois de outra.~~ — **fechada em
-    2026-10-13** (porte da família syslog/RELP, `knownSectionOf`): depois de um
-    valor, só se nomeia uma flag desconhecida dentro de uma seção deste
-    servidor; `TestFamilyPortTailAfterAValueIsNotNamed`.
+20. ~~Brecha no parser de flags (cauda de um valor partido pelo shell)~~ — *fechada em 2026-10-13* (`knownSectionOf`, `TestFamilyPortTailAfterAValueIsNotNamed`).
+21. **A retentativa do `accept`** (SPEC §10.3) é provada com um listener falso
+    que devolve `ENOBUFS` (`TestAcceptRetriesNonTemporaryErrors`), e o
+    `Serve` com erro, por um `Serve` embrulhado (`App.wrapServe`,
+    `TestServeErrorGoesThroughTheShutdown`): nenhum erro real do kernel foi
+    provocado.
+22. **O ring cobrando o buffer retido** (SPEC §7.2) é provado pela
+    contabilidade (`TestMemoryChargesTheRetainedBuffer`,
+    `TestItemOverheadCoversTheStruct`, `unsafe.Sizeof` = 80); o RSS de um ring
+    cheio com o destino fora não foi medido (§7).
+23. **`max_conns_per_ip` por endereço exato** é decisão contestável
+    (`DECISOES.md` §3b); `TestPerIPLimitCountsTheExactAddress` é teste de
+    **trava**: passa por desenho.
+24. **`sink.batch_max_bytes` contra o NATS real**: o corte é provado pelo
+    destino falso (`TestWorkersSplitABatchByBytes`,
+    `TestBootWritesInPiecesUnderBatchMaxBytes`); pedaços perto do teto contra
+    um JetStream real não foram publicados.
+25. **O compose** é conferido como texto (`internal/config/compose_test.go`);
+    o `.creds` montado em `/etc/webhook` (o volume comentado) não subiu de
+    ponta a ponta.
+
+26. **`Expect: 100-continue` com o corpo enviado sem esperar** (SPEC §4.3;
+    revisão independente de 2026-10-14) não tem teste: o `net/http` fecha
+    sem `closeWriteAndWait`, e um RST pode levar o `429`/`503`. Reproduzi-lo
+    pede um cliente que mande o corpo antes do `100` e um *timing* de RST
+    que o loopback não dá de forma estável; aceito e documentado.
+
+27. **A cópia do `held` e a fatia do `Dequeue` fora do `ItemOverhead`** (SPEC
+    §7.2; revisão independente de 2026-10-14): até `workers × batch × 16`
+    bytes fora de `ring.max_bytes`, sem teste, por ser um limite documentado
+    e não uma regra.
+
+28. **O recusado no `.corrupt` fica fora dos *gauges*** (SPEC §9.2; revisão
+    independente de 2026-10-14): só o `ERROR` com o `uuid` o registra;
+    documentado, sem teste de métrica.
 
 ## 9. Histórico: bugs que os testes encontraram
 
@@ -475,7 +497,8 @@ derivado" não muda nada sem um derivado inteiro).
 
 Já estava feito: fragmento e caminho/consulta recusados (`TestEBURLUnsupportedOrMalformed`),
 chave própria vazia que não conflita (`TestConfigReviewFindings`). Não se
-aplica: `sink.batch_max_bytes`, `pool_size`, `ring.max_inflight` (não existem)
+aplica: `sink.batch_max_bytes` (*revisto em 2026-10-14: existe, por decisão do
+usuário, ver a rodada abaixo*), `pool_size`, `ring.max_inflight` (não existem)
 e as regras de URL PostgreSQL (a `LOGHUB_EB_URL` daqui é só `nats://`).
 
 **C (sink NATS).** O sink do `go-syslog-nats-server` depois do porte de
@@ -525,3 +548,61 @@ write carried 1|2|3 of the 4 items"). Correção no teste: enfileirar antes do
 `Start` (como o `TestWorkersMarkFatal`) e conferir que a escrita parada levou
 os quatro (`stallOnceSink.stalled`); `-race -count=500` verde. O
 `go-syslog-standard-server` tem o mesmo teste com a mesma ordem.
+
+### Porte das correções de W e F (2026-10-14)
+
+As correções que fecharam a SPEC §19.1 do `go-webhook-server` (W) e do
+`go-webhook-fast-server` (F), portadas do código de F por `diff`. Cada item:
+SPEC primeiro, o teste abaixo falhando contra o código de antes (com só o
+mínimo para compilar: o campo ou a função vazia), a correção, o teste verde, e
+a correção revertida sozinha (mutação) derrubando o teste. Progresso e saídas
+em `tasks/progress-P-N.md` da raiz.
+
+| Item (W) | Regra | Teste | Falha antes | Mutantes mortos |
+|---|---|---|---|---|
+| W 1 `Content-Length` pré-aloca | §12.2, §4.3 passo 11 | `TestReadBodyAllocatesOnlyWhatArrives` | buffer cap 5242880 | sem o teto de 64 KiB |
+| W 2 checagem rápida por bytes | §4.3 passo 9 | 3 casos em `TestErrorAnswersBeforeTheUUIDArePlainText` + controle | `status = 200, want 429` ×3 | sem a cláusula de bytes |
+| W 3 dreno vs h2/`Expect` | §4.3 | `TestRejectDrainFollowsTheProtocol`, `TestRejectWithExpectSendsNo100Continue` | 65537 bytes lidos; `100 Continue` como primeira linha | sem o h2; sem o `Expect` |
+| W 4 `write_timeout` da resposta | §13.5 | `TestSlowUploadStillGetsItsAnswer`, `...OverH2C`, `TestWriteTimeoutIsArmedForEveryAnswer` | `unexpected EOF`; `INTERNAL_ERROR`; prazo não armado ×3 | sem limpar (h2c); sem rearmar |
+| W 5 `accept` e `Serve` com erro | §10.3, §10.5 | `TestAcceptRetriesNonTemporaryErrors`, `TestServeReturnsWhenOneListenerStops`, `TestServeErrorGoesThroughTheShutdown` (app: `memSink` com `hang` no lugar do `heldSink`/`sink=sqlite` de F) | conexão recusada; `Serve` esperando; `exit 1, want 3` e 5 de 5 sem entrega | sem `retryListener`; `Serve` esperando todos; `return ExitConfig` antes do shutdown |
+| W 6 endereço exato (contestável) | §13.5 | `TestPerIPLimitCountsTheExactAddress` (trava) | passa por desenho | chave por /64 |
+| W 8 ring cobra o buffer | §7.2, §12.2, §12.4 | `TestMemoryChargesTheRetainedBuffer`, `TestMemoryGivesBackWhatItCharged`, `TestItemOverheadCoversTheStruct`, `TestMemoryByteCeiling` ajustado | `bytes = 100, want 16640`; `Bytes:300, want 33280` | `it.Size()` no `Enqueue`; `it.Size()` no `Commit` |
+| W 30 retidos no teto de itens | §7.2 | `TestMemoryHeldItemsCountAgainstTheCeiling` | `err = <nil>, want ErrFull` | `capItems+1000` |
+| W 10 worker sobrevive ao `Dequeue` | §8.1 passo 1 | `TestWorkersSurviveTransientDequeueErrors`, `TestWorkersStopOnTheEndsOfTheRing` (sem `ErrNoBacklog`) | `delivered 0 of 5` | `dequeueEnds` sempre verdadeiro |
+| W 11 `sink.batch_max_bytes` | §8.1, §9.2, §13.5 | `TestSplitByBytes`, `TestWorkersSplitABatchByBytes`, `TestWorkersSendAnEnvelopeAboveTheCeilingAlone`, `TestWorkersHoldTheRestOfTheBatchWhileAPieceRetries`, `TestSinkBatchMaxBytes`, `TestBootWritesInPiecesUnderBatchMaxBytes` (dump e workers; novo, `internal/app/batch_bytes_test.go`) | `writes = [[4 4197748]]`; `[[3 68127]]`; lote dado como resolvido; `default = 0`; `a write of 5 items` | `n := len(rest)`; `unhold` que apaga tudo; sem o teto de 256 MiB; app sem `BatchMaxBytes`; boot sem o corte |
+| W 29 guardas em `t.Fatalf` | §15.1 | `describe_test.go` (3) | com o bug de volta: `SKIP`, `ok` | `lastElem` no JA3; `hostPort` não zerado; `DisableGeneralOptionsHandler: false` |
+| W 20 (§18.1 item 10) U+2028/U+2029 crus | §9.2 | +4 casos em `TestOurShapeEscapes`, +2 *probes* em `TestGateRefusesWhatTheWriterNeverWrites` ("raw U+2028", "same key in two spellings") | `str(...) = true` ×2; `the gate let it through` ×2 | sem a recusa em `shape.go` |
+| W 24 defesa dupla no parser | §13.5 | `TestNonFiniteNumbersAreRefused` (`pending_config_test.go`, o mesmo do P, com `TestEmptyAdminBindIsRefused`, `TestDumpINIRoundTripsQuotedAndPaddedValues` e `TestQuoteINI`, que já passavam aqui) | a recusa vinha da validação, sem "must be finite" nem a linha do INI | sem `IsNaN`/`IsInf` |
+| Compose (W 27/28 por regra; o volume do `.creds`) | §13.6 | `TestComposeForwardsEverySinkVariable`, `TestComposeImagesArePinned` (`compose_test.go`, novo) | passava (o volume não é testável sem Docker) | `nats-box:latest` |
+
+A armadilha de 2026-10-14 (registrada pelo grupo B de W): o texto `\u2028`
+digitado na ferramenta de edição vira o caractere cru. Os testes novos usam
+`\xe2\x80\xa8` no Go, e a contagem de U+2028/U+2029 crus por arquivo foi
+conferida igual à de antes.
+
+**Rodadas.** `gofmt -l .` vazio e `go vet ./...` limpo. `go test -race
+-count=1 -timeout 1500s ./...` com `tasks/infra/env.sh` (JetStream com 8 MiB em
+24222): duas rodadas completas verdes (56 s e 57 s); e mais duas com
+`WHS_TEST_NATS_URL=nats://127.0.0.1:24226` (JetStream com o `max_payload`
+padrão de 1 MiB, para os testes que medem o teto do servidor): verdes (56 s e
+55 s). Nenhuma refeita.
+
+### Revisão independente da família webhook (2026-10-14)
+
+Os achados de `tasks/review-web-{http,ring,sinks}.md` que pediam código (e as
+três notas do coordenador sobre a sonda do `sink=sqlite`, vindas das revisões
+das famílias syslog e RELP). Ordem por item: SPEC, teste falhando contra o
+código de antes, correção, mutação (só a correção revertida). Os só
+documentados estão em §8 e na seção do assunto da SPEC.
+
+| Item (W) | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| W 31 — o shutdown por erro do `Serve` tolera o primeiro sinal (§10.3) | `TestServeErrorGoesThroughTheShutdown/held sink, then one signal: still dumped, exit 3` | `exit 130, want 3` | o ramo `serveErr` com `tolerateFirst=false` |
+| W 32 — prazo de escrita limpo só com `read_timeout > 0` (§13.5) | `TestWriteDeadlineIsKeptWithoutReadTimeout`, `TestSlowH2CUploadIsBoundedWithoutReadTimeout` (h2c real) | `deadline cleared on entry = true`; `status 200 … outlived write_timeout` | a condição antiga |
+| W 35 — piso de `ring.max_bytes` com `ring=memory` (§7.2) | `TestRingMaxBytesCoversTheLargestEvent` | `--ring.max_bytes=65791 … was accepted` | a condição com `&& false` |
+| W 39 — `WaitReady` dorme `min(backoff, restante)` (§10.1) | `TestWaitReadyDoesNotSleepPastItsDeadline` | `took 2.00s with a 300ms budget` | `time.After(backoff)` |
+| W 40 — `admin.bind` com porta 1–65535 (§11) | `TestEmptyAdminBindIsRefused` (+ `127.0.0.1:`, `:`, `[::1]:`, `localhost:abc`, `:0`, `:65536`, `:+80`, `:080`) | `--admin.bind=127.0.0.1: … was accepted` | sem o `validPort` |
+| W 41 — byte de controle num valor de texto é exit 1 (§13.2) | `TestControlBytesInTextValuesAreRefused` | as 4 entradas `was accepted` | a checagem desligada |
+| T2 — o resto do lote retido com falha no pedaço do meio, e com fatal (§8.1 passo 3) | `TestWorkersHoldTheRestOfTheBatchWhileAPieceRetries` (6 itens, 3 pedaços) | (lacuna de teste: passa no código) | `hold` por pedaço |
+
+**Rodadas.** `gofmt -l .` vazio e `go vet ./...` limpo. Duas rodadas completas `go test -race -count=1 -timeout 1500s ./...` (`tasks/run2.sh go-webhook-nats-server rev`, NATS reais do `env.sh`): as duas verdes; e o pacote `internal/sink` com `WHS_TEST_NATS_URL=nats://127.0.0.1:24226`, verde, nenhum teste pulado.

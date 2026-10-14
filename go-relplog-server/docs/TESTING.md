@@ -323,6 +323,7 @@ conferido por mutação (a correção desfeita faz o teste falhar).
 | Config e dump | 45 mutantes mortos | cauda de valor partida pelo shell ecoada no erro; `@` depois de `/`, `?`, `#` numa URL; fragmento em URL PostgreSQL; `Remove` do dump sem `fsync` do diretório |
 | Sinks | 25 mutantes NATS, 255 testes SQL/Redis | `10077` de stream cheio tratado como fatal; `discard=new` abaixo de um registro; negação mascarada no `mode=core`; sonda MySQL com `unix`/`NULL` recusando tabela legítima; `1203`/`1226`/`1461`; prazo dos health checks |
 | Docs e Docker | ~30 | referências de seção, listas de `500`, portas TLS, versões |
+| Porte das pendências do RP/RN (2026-10-14, §9.2) | 8 (6 de código, 2 travas) + 5 regras de texto | sem revisão independente própria: os achados vêm da revisão do RP/RN e da triagem (`tasks/triage-RP-RN.md`); cada correção conferida por mutação. Achado do porte, o mesmo do S: o `Instrumented.Deliver` contava como `network` a escrita cortada pelo cancelamento do boot |
 
 ---
 
@@ -376,6 +377,66 @@ mínimo em `review_port_helpers_test.go`) e nos arquivos indicados.
 
 Total: 67 mutantes mortos (mais um morto só pela compilação), 1 sobrevivente equivalente.
 
+### 9.2 Porte das pendências do RP/RN (2026-10-14)
+
+Entrada: `tasks/port-to-R-S-SP-SN.md` da raiz (tudo o que ela indica para o R,
+inclusive o item 4, só do R) e a ressalva de §6.9. Ordem por item: SPEC, teste
+que falhava no código de então, correção, mutação (só a correção revertida, o
+teste falha, restaurada). Testes novos em `internal/*/known_issues_test.go`.
+Registro passo a passo em `tasks/progress-R-port.md` da raiz.
+
+| Item (SPEC §22.1) | Regra | Testes | Mutação |
+|---|---|---|---|
+| 1, aborto lê o ring aberto | §13.4 | `TestAbortClosesTheRingBeforeCounting` (`app`: o `Enqueue` depois do aborto dava `nil`); `TestEnqueueSeesACloseThatRacedTheReservation` (`ring`, gancho `afterReserve`); controle `TestEnqueueWithoutACloseIsUnaffectedByTheHook` | sem `Close` no `abortLoss` e sem a reconferência: os dois falham |
+| 2, piso de `ring.max_bytes` | §13.2, §15.1 | `TestRingMaxBytesFitsTheLargestMessage` (65 919 aceito; `memory`, `sqlite`, `redis`, `redis` degradado, `none`); `TestRingMinBytesIsWhatTheRingCharges` (o piso é o `FullFor` do ring vazio) | sem a checagem: falha |
+| 3, `admin.bind` × `listen.*` | §13.2, §14 | `TestAdminBindCollidesWithListen` (literal, curinga, `[::]`, nome, IPv4 mapeado, três casos de `listen.tls`; controles: literais distintos, admin desligado, porta 0, TLS válido em outra porta) | sem a checagem: falha; só `listen.tcp`: falha o caso TLS |
+| 4, rótulo do idle | §5.4, §13.2 | `TestIdleCloseWithAHeldTransactionIsBackpressure` (`backpressure = 0, server_closed = 1`); `TestIdleBelowBackpressureWarns` (tcp e tls); controles `TestIdleCloseWithNothingHeldCountsNothing`, `TestSecondOpenLeavesItsHeldTransactionServerClosed` (portado do RN) | rótulo sempre `server_closed`, `held` que nunca sobe, `WARN` desligado, `WARN` sem olhar o listener: cada um falha |
+| 5, derivada no `SIGHUP` | §16.3 | `TestReloadDoesNotReportDerivedKeys` (`ring.sqlite.path`, `sink.sqlite.path`, `emergency.dir`), `TestReloadDoesNotReportTheDerivedPoolSize` (postgres, mysql, clickhouse) | filtro desligado: falham; `\|\|` no lugar de `&&`: falham os controles explícito↔derivado |
+| 6, reconexão NATS (trava) | §10.7 | `TestNATSReconnectDialFailureIsNotLogged`, `TestNATSReconnectErrOfAPoolIsNoVerdict` (passam no código de antes: refatoração pura para `onReconnectErr`) | `asyncError` fora do `if`, `if false`, sem `soleServer`: cada um falha |
+| 7, `network` do cancelamento no `Deliver` (achado) | §14.1 | `TestDeliverCancellationIsNotANetworkError` (o do S: `kind=network counted 1`) | `network` de volta no `writeChunk`: falha |
+| 8, §6.9 × §6.5.1 (travas) | §6.9, §6.5.1, §4.4 | `TestRFC3164ISOOffsetIsNotRangeChecked`, `TestPerIPLimitCountsTheExactAddress` (portados do SP; passam no código de antes) | conferência de faixa do offset na RFC 3164; chave sem `item.Canonical`: cada um falha |
+| 9–13 | §12.2, §10.5, §13.4, §14.1, §10 item 15 | sem código novo (`TestQuarantineAndRemovalReportTheirOutcome` já cobria a remoção) | — |
+| 14, sonda do `sink=sqlite` com a escritora ocupada (decisão do usuário) | §10.4 | `TestSQLiteProbeDoesNotWaitForTheWriterPastItsDeadline` (`internal/sink/sqlite_probe_test.go`, o mesmo do S: segura a trava, sem corrida; antes "the probe waited 3.0s for the writer, past its 200ms deadline") | `Health` com `s.lock()` incondicional: falha |
+| 14 (revisão A1, A2) | §10.4 | subteste `busy past op_timeout + health_timeout` ("writer holding the lock past StuckAfter: <nil>"), `TestSQLiteFailedHeartbeatCountsAsAFailedWrite` ("busy writer after a failed heartbeat: <nil>") | sem o limite de idade; sem `writeFailed` no heartbeat: cada um falha |
+
+**Rodada de 2026-10-14** (infraestrutura comum `tasks/infra/env.sh`: PostgreSQL
+18, MySQL 8.4, ClickHouse 25.8, dois Redis 7 — um `allkeys-lru` —, nats-server
+2.14.6 em 24222 com JetStream e `max_payload` de 8 MiB, 24223 sem JetStream,
+24224 com permissões, 24225 TLS; `RELPLOG_TEST_EMITTERS=1`, rsyslog 8.2410 com
+`librelp` 1.11), compartilhada com outros agentes rodando ao mesmo tempo (load
+average entre 40 e 126):
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `go test -race -count=1 -timeout 1200s ./...`, versão final | **verde duas vezes seguidas** (152 s e 160 s): 16 pacotes `ok`, **715 testes de primeiro nível e 439 subtestes passaram, 2 pulados**, 0 falhas |
+| Por pacote (primeiro nível / subtestes, com os pulados) | `app` 90/73, `config` 91/3, `control` 9/0, `convert` 15/71, `emergency` 26/10, `filter` 13/0, `ident` 2/0, `item` 5/2, `jlh` 4/0, `jlhcheck` 4/0, `obs` 9/0, `ratelimit` 21/0, `receiver` 123/33, `rediscli` 6/3, `ring` 63/2, `sink` 235/243 |
+| Pulados | `TestGoldenVectors/arquivo-sem-pri` (D5) e `TestNATSOversizedMessageIsRefusedAlone`, que pede um `max_payload` abaixo de 4 MiB: com `RELPLOG_TEST_NATS_URL=nats://127.0.0.1:24226` (JetStream, `max_payload` padrão) os pacotes `sink` e `app` rodaram e ele passou (`jetstream` e `core`) |
+| Emissores reais | os quatro `TestEmittersRELP*` verdes em todas as rodadas |
+| Falhas de carga, fora das duas rodadas verdes | rodadas anteriores (antes do ajuste final do `Instrumented`) tiveram, cada uma, uma falha que não é do código: `Test{MySQL,Postgres}ValidationHasItsOwnDeadline/the_validation_outlives_the_check_deadline` (prazo de `4 × rtt + 100 ms` medido sob carga; o código de `HEAD` falha igual, intermitente, conferido com `git archive`) e `TestNATSBootValidationExitsThree/stream_capturing_the_control_plane` (`subjects overlap with an existing stream`: o stream de outro agente no NATS compartilhado). O pacote repetido passou em cada caso |
+| Não rodou | fuzz (por instrução; o único alvo próximo, `FuzzFrame`, não mudou); carga ponta a ponta; `docker compose` (o `docker/` não mudou) |
+
+### 9.3 Revisão independente de 2026-10-14 (S, SP, SN, R, RP, RN)
+
+Entrada: `tasks/review-syslog.md` e `tasks/review-relp.md`; progresso em
+`tasks/progress-review-fixes-syslog-relp.md`. **Ordem:** SPEC, teste que falha
+no código de antes, correção. **Mutação:** cada correção revertida sozinha,
+com o teste da linha falhando e a correção restaurada depois.
+
+| Item | Falha antes / com o mutante | Teste |
+|---|---|---|
+| `ring=none` reconfere o fechamento depois de `cur.Add(1)` (§13.4; A2) | "Enqueue racing a Close = <nil>, want ErrClosed"; mutante `if false && r.closed.Load()`: a mesma | `TestNoneEnqueueSeesACloseThatRacedTheReservation` (gancho `afterNoneReserve`) |
+| Sonda `sink=sqlite`: idade no relógio monotônico (§10.4; A3) | "wall clock stepped back 1h: UP, want DOWN"; "stepped forward 1h: … chunk in progress for 1h0m0.1s … want UP"; mutante (volta ao relógio de parede): as mesmas | `TestSQLiteProbeAgeIgnoresWallClockSteps` (gancho `wallClock`) |
+| Sonda `sink=sqlite`: heartbeat bom grava `writeOK` (§10.4; A4, fecha o D5) | "busy writer after a good heartbeat: … want UP"; mutante sem o `writeOK`: a mesma. O subteste "busy, no Write yet" de `TestSQLiteProbeDoesNotWaitForTheWriterPastItsDeadline` passou a rodar antes do controle "lock free" (o heartbeat bom agora marca) | `TestSQLiteGoodHeartbeatClearsAFailedWrite` |
+| Sonda `sink=sqlite`: heartbeat cortado pelo próprio contexto não marca `writeFailed` (§10.4; A1 do RELP) | "busy writer after a heartbeat cut by its own context: … want UP" (prazo e cancelamento); mutante `if true` no lugar da guarda: a mesma | `TestSQLiteHeartbeatCutByItsOwnContextIsNotAFailedWrite` (gancho `afterProbeLock`) |
+| `sameStreamSocket` por valor (§13.2; D1 do syslog, D4 do RELP) | 7 casos, p.ex. `sameStreamSocket("[::0]:9102", "127.0.0.1:9102") = false, want true`, `("127.0.0.1:0514", "127.0.0.1:514")`, `("127.0.0.1:http", "127.0.0.1:80")`; mutantes (curinga por grafia; porta comparada como texto): mortos | `TestSameStreamSocketReadsValuesNotSpellings` |
+| Transação segurada desde antes do primeiro `Accept` (§5.4; A2 do RELP) | "idle during a slow first Accept: backpressure = 0, server_closed = 1; want 1 and 0"; mutante (o `held` de volta para depois do primeiro `Accept`): a mesma | `TestIdleDuringASlowFirstAcceptIsBackpressure` |
+| O aborto não fecha ring persistente (§13.4; A3 do RELP) | passa antes (trava); mutante `if true` no lugar de `if !a.persistentRing()`: "Enqueue after the abort on ring=sqlite … the abort closed a persistent ring" | `TestAbortLeavesAPersistentRingOpen` |
+
+Registrados sem código: comentário do `Memory.Enqueue` ("pelo menos um dos dois", D1); a frase de §13.4 com `ring=none` (D2: escrita já contada pode terminar e responder `200`, sobrecontagem/duplicata); URL única com vários IPs e *pool* só de servidores que recusam (D3; D2 do syslog; §10.7); `logic` e o instante só do `Write` na sonda (D5, D6; §10.4); soltura do buffer do leitor entre frames (A5/D4 do S; §5.2); sobrecontagem pelo recuo de bytes (D3 do syslog; §13.4). O PROXY do RELP já fechava só sem cabeçalho (`(err != nil \|\| !found) && closing`): o A1 do syslog não se aplica.
+
+Rodadas: `tasks/run2.sh go-relplog-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh` e banco próprio `whs_r`), logs em `tasks/logs/go-relplog-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*; e o pacote `sink` com `RELPLOG_TEST_NATS_URL=nats://127.0.0.1:24226`: **ok**. Fuzz: nenhum, por instrução da rodada.
+
 ---
 
 ## 10. Lacunas conhecidas
@@ -406,9 +467,10 @@ Registradas por honestidade, não por esquecimento.
 11. **Envio tardio de um comando cancelado** (rueidis, NATS) só é provado pela
     decisão de quem chamou, não contra um servidor que trave no meio do comando.
 12. **A regra do pool no `ReconnectErrHandler`** do NATS (veredito do TLS só com
-    um servidor) não tem teste: o `nats.go` 1.x nunca chama esse handler com uma
-    recusa de TLS (só com a falha da discagem TCP). Ela fica para uma versão do
-    cliente que relate ali; o caminho real, pelo `LastError`, é provado.
+    um servidor) é provada chamando o handler (`onReconnectErr`) direto
+    (`TestNATSReconnectErrOfAPoolIsNoVerdict`, 2026-10-14): o `nats.go` 1.x nunca
+    o chama com uma recusa de TLS (só com a falha da discagem TCP). O caminho
+    real, pelo `LastError`, é provado contra o nats-server.
 13. **O veredito do TLS contra um nats-server de verdade** com TLS não roda na
     suíte (os testes usam o `natsFake` com TLS); a revisão do S o reproduziu com
     o binário 2.14.6, e a regra é a mesma.
@@ -416,6 +478,43 @@ Registradas por honestidade, não por esquecimento.
     (`TestSinkWriters` na config, `TestClickHouseMemoryCountsTheWriters` no
     sink), não por um boot contra um usuário com `max_memory_usage_for_user`
     exato.
+
+15. **A disputa de linha de cache dos contadores da recepção** sob
+    `SO_REUSEPORT` (registrada no porte do RP/RN, 2026-10-14) não foi medida. Os
+    contadores (`obs.Counter`, um `atomic.Uint64`) não têm *padding*, mas o
+    mesmo contador é incrementado por **todos** os listeners: a disputa
+    principal é *true sharing* da mesma palavra, que *padding* não remove.
+    Resolver de verdade seria um contador por listener somado no *scrape*,
+    otimização sem evidência. O `BenchmarkRELPSession` com vários listeners é o
+    lugar de medir.
+16. **O fechamento por idle com transação segurada** (SPEC §5.4) é provado no
+    receptor com o ring cheio (`TestIdleCloseWithAHeldTransactionIsBackpressure`);
+    com o sink DOWN, o ring indisponível ou o rate-limit o caminho é o mesmo
+    laço de `decide`, sem teste próprio, e o idle do TLS é o mesmo leitor.
+17. **A soltura do buffer do leitor RELP vale só entre frames** (A5 e D4 do S,
+    2026-10-14; SPEC §5.2): um frame grande seguido de alguns bytes do próximo
+    segura o buffer até o idle. Não corrigido (medido no S) e sem teste que
+    fixe o número.
+18. **`sameStreamSocket` com nome de serviço** (revisão de 2026-10-14) é
+    provado com `http` (a tabela embutida do Go) e com um nome inexistente; um
+    nome que só o `/etc/services` conhece depende do arquivo da máquina ou da
+    imagem.
+19. **A transação segurada desde antes do primeiro `Accept`** (A2 do RELP,
+    2026-10-14) é provada com um ring falso cujo `Enqueue` espera o teste e
+    devolve `ErrFull`, e o idle vence pelo relógio (200 ms contra 700 ms de
+    espera); sem teste com o `sqlite`/`redis`/`none` de verdade.
+20. **A sonda do `sink=sqlite` de 2026-10-14** (A3, A4, A1 do RELP): o passo
+    do relógio de parede é simulado pelo gancho `wallClock` (não há passo real
+    de NTP no teste), e o heartbeat cortado pelo próprio prazo pelo gancho
+    `afterProbeLock`, que cancela o contexto depois de a trava vir; a corrida
+    real (`Write` soltando a trava em `prazo − ε`) não é reproduzida.
+21. **`ring=none` no aborto** (A2 de 2026-10-14) é provado no ring
+    (`TestNoneEnqueueSeesACloseThatRacedTheReservation`); sem teste de app de
+    um `SIGQUIT` com escrita síncrona em voo.
+22. **NATS: *pool* só de servidores que recusam e uma URL com vários IPs** (D2
+    do syslog, D3 do RELP, 2026-10-14; SPEC §10.7): registrados como limite,
+    sem teste; o primeiro precisaria de dois `nats-server` com TLS recusado, o
+    segundo de um nome com vários IPs.
 
 ---
 

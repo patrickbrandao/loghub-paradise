@@ -936,18 +936,28 @@ func TestPostgresPoolSizeWarnings(t *testing.T) {
 	}
 }
 
-// SPEC §8.5.4: the byte ceiling warning uses the SMALLER of the two worst
-// cases, so it does not fire on the defaults and mean nothing.
+// SPEC §8.5.4: the byte ceiling warning uses the worst batch a write can
+// carry -- the smallest of the count, the ring and sink.batch_max_bytes, but
+// at least one envelope -- so it does not fire on the defaults and mean
+// nothing.
 func TestPostgresByteCeilingWarning(t *testing.T) {
 	l := load(t, Options{Args: []string{"--sink.type=postgres"}})
 	if hasWarning(l.Warnings, "ceiling of a single protocol parameter") {
 		t.Errorf("the defaults are bounded by ring.max_bytes and must not warn: %v", l.Warnings)
 	}
 
+	// 2 GiB by count and by the ring, but written in pieces of
+	// sink.batch_max_bytes (SPEC §8.1 step 2): no batch reaches 1 GiB.
 	l = load(t, Options{Args: []string{"--sink.type=postgres",
 		"--server.max_body_bytes=8MiB", "--sink.batch=256", "--ring.max_bytes=4GiB"}})
+	if hasWarning(l.Warnings, "ceiling of a single protocol parameter") {
+		t.Errorf("pieces of at most 256 MiB must not warn: %v", l.Warnings)
+	}
+	// One envelope above 1 GiB goes alone, above any ceiling: that warns.
+	l = load(t, Options{Args: []string{"--sink.type=postgres",
+		"--server.max_body_bytes=1GiB", "--ring.max_bytes=4GiB"}})
 	if !hasWarning(l.Warnings, "ceiling of a single protocol parameter") {
-		t.Errorf("2 GiB per batch must warn: %v", l.Warnings)
+		t.Errorf("an envelope above 1 GiB must warn: %v", l.Warnings)
 	}
 
 	// With ring=none a batch is one item, so only an absurd body warns.
@@ -1117,9 +1127,10 @@ func TestClickHouseLowersDefaultWorkersOnly(t *testing.T) {
 	}
 }
 
-// SPEC §8.8.5: the worst batch the ClickHouse boot compares with the memory
-// limit -- one envelope with ring=none, otherwise sink.batch envelopes capped
-// by ring.max_bytes.
+// SPEC §8.5.4, §8.8.5: the worst batch the ClickHouse boot compares with the
+// memory limit -- one envelope with ring=none, otherwise sink.batch envelopes
+// capped by ring.max_bytes and by sink.batch_max_bytes, but never less than
+// one envelope, which goes alone above the ceiling (SPEC §8.1 step 2).
 func TestWorstBatchBytes(t *testing.T) {
 	l := load(t, Options{Args: []string{"--ring.mode=none"}})
 	event := envelope.MaxEventBytes(l.Config.Server.MaxBodyBytes, l.Config.Server.MaxHeaderBytes,
@@ -1127,9 +1138,17 @@ func TestWorstBatchBytes(t *testing.T) {
 	if got := WorstBatchBytes(l.Config); got != event {
 		t.Errorf("ring=none: %d, want one envelope %d", got, event)
 	}
-	l = load(t, Options{Args: []string{"--ring.mode=memory", "--ring.max_bytes=64MiB"}})
+	l = load(t, Options{Args: []string{"--ring.mode=memory", "--ring.max_bytes=64MiB", "--sink.batch_max_bytes=256MiB"}})
 	if got := WorstBatchBytes(l.Config); got != 64<<20 {
 		t.Errorf("ring capped: %d, want ring.max_bytes", got)
+	}
+	l = load(t, Options{Args: []string{"--ring.mode=memory"}})
+	if got := WorstBatchBytes(l.Config); got != 16<<20 {
+		t.Errorf("defaults: %d, want sink.batch_max_bytes (16 MiB)", got)
+	}
+	l = load(t, Options{Args: []string{"--ring.mode=sqlite", "--sink.batch_max_bytes=1KiB"}})
+	if got := WorstBatchBytes(l.Config); got != event {
+		t.Errorf("a ceiling below one envelope: %d, want the envelope that goes alone %d", got, event)
 	}
 	l = load(t, Options{Args: []string{"--ring.mode=memory", "--sink.batch=2"}})
 	if got := WorstBatchBytes(l.Config); got != 2*event {

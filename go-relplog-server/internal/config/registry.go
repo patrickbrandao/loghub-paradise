@@ -223,7 +223,7 @@ func Registry(c *Config) []*Param {
 		{Sec: "ring", Key: "capacity_items", Kind: KInt, Def: "65536", Ptr: &c.Ring.CapacityItems,
 			Desc: "item ceiling; with 200-byte messages this is the one that binds. Global across instances with mode=redis"},
 		{Sec: "ring", Key: "max_bytes", Kind: KBytes, Def: "512MiB", Ptr: &c.Ring.MaxBytes,
-			Desc: "byte ceiling, counting raw lines only; the JLH is the worker's memory, not the ring's. Global with mode=redis"},
+			Desc: "byte ceiling, counting raw lines only; the JLH is the worker's memory, not the ring's. Global with mode=redis. At least one message of syslog.max_message_bytes (with mode=memory, its pool class + 384 bytes)"},
 		{Sec: "ring", Key: "high_water", Kind: KFloat, Def: "0.80", Ptr: &c.Ring.HighWater,
 			Desc: "occupancy fraction, of either ceiling, above which /readyz fails"},
 		{Sec: "ring", Key: "max_inflight", Kind: KInt, Def: "2048", Ptr: &c.Ring.MaxInflight,

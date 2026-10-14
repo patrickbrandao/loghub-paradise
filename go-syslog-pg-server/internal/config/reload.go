@@ -1,5 +1,7 @@
 package config
 
+import "strings"
+
 // ReloadResult is what one SIGHUP found (SPEC §16.3).
 type ReloadResult struct {
 	// Fresh is the snapshot just loaded. When Applied is not empty, the app
@@ -91,11 +93,25 @@ func Compare(boot, running, fresh *Loaded) (applied, ignored []string) {
 				applied = append(applied, name)
 			}
 		} else if bootVals[name] != newVals[name] {
+			// A key derived in both snapshots (emergency.dir from
+			// server.data_dir, and the like) changed only because its source
+			// did, and the source is reported: listing it too sent the
+			// operator after two restarts for one edit. Explicit on one side
+			// and derived on the other is a real change (SPEC §16.3).
+			if derived(boot, name) && derived(fresh, name) {
+				continue
+			}
 			ignored = append(ignored, name)
 		}
 	}
 	return applied, ignored
 }
+
+// derived reports whether Load or Validate derived name in l rather than took
+// it from a source: the "derived" notes of SPEC §16.2, the ones --dump-config
+// comments. The other notes ("lowered to 4", "resolved to an absolute path")
+// say how a value a source gave was adjusted, and do not count.
+func derived(l *Loaded, name string) bool { return strings.HasPrefix(l.Notes[name], "derived") }
 
 // canonicalCharset folds the synonyms syslog.legacy_charset accepts into the
 // one spelling convert.ParseCharset gives the same charset for.

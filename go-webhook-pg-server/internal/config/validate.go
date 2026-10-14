@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-pg-server/internal/envelope"
+	"github.com/patrickbrandao/loghub-paradise/go-webhook-pg-server/internal/ring"
 )
 
 const (
@@ -33,11 +34,13 @@ const (
 // family's (go-webhook-fast-server takes ClickHouse batches of 100 000 rows):
 // a Dequeue slice of 1 Mi pointers is 8 MiB.
 const (
-	maxRingItems   = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
-	maxSinkBatch   = 1 << 20
-	maxSinkWorkers = 1024
-	maxPoolSize    = 4096
-	maxListeners   = 256
+	maxRingItems = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxSinkBatch = 1 << 20
+	// maxBatchMaxBytes is sink.batch_max_bytes's ceiling (SPEC §8.1 step 2).
+	maxBatchMaxBytes = int64(256) << 20
+	maxSinkWorkers   = 1024
+	maxPoolSize      = 4096
+	maxListeners     = 256
 )
 
 // pgIdent is what sink.postgres.table must look like: a plain lowercase
@@ -117,7 +120,22 @@ func Validate(c *Config) (warnings []string, err error) {
 	if c.Ring.MaxBytes < 1 {
 		return nil, fmt.Errorf("ring.max_bytes: must be positive")
 	}
-	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
+	// The largest event the configuration accepts must fit an empty memory
+	// ring: below what it costs there -- its pool class plus the per-item
+	// overhead, the ring's own charge -- it got 429 always and its sender
+	// retried it for ever (SPEC §7.2, W 35; the floor of the RELP
+	// cuts). The server.max_* above are already positive.
+	{ // ring.mode is always memory here
+		event := envelope.MaxEventBytes(c.Server.MaxBodyBytes, c.Server.MaxHeaderBytes, c.Server.MaxURIBytes)
+		if floor := envelope.PooledCap(event) + ring.ItemOverhead; c.Ring.MaxBytes < floor {
+			return nil, fmt.Errorf("ring.max_bytes (%s) is below what the largest event the server.max_* "+
+				"limits accept costs the ring, %s (an envelope of up to %s in its pool class, plus %d "+
+				"bytes): that event would get 429 even with the ring empty, and its sender would retry "+
+				"it for ever", FormatBytes(c.Ring.MaxBytes), FormatBytes(floor), FormatBytes(event),
+				ring.ItemOverhead)
+		}
+	}
+	if !(c.Ring.HighWater > 0 && c.Ring.HighWater <= 1) { // NaN too (SPEC §13.5)
 		return nil, fmt.Errorf("ring.high_water: must be in (0, 1], got %g", c.Ring.HighWater)
 	}
 	if c.Sink.Workers < 1 {
@@ -131,6 +149,16 @@ func Validate(c *Config) (warnings []string, err error) {
 	}
 	if c.Sink.Batch > maxSinkBatch {
 		return nil, fmt.Errorf("sink.batch: %d is above %d", c.Sink.Batch, maxSinkBatch)
+	}
+	// One byte is coherent with the rule -- every event then goes alone -- so
+	// it is the floor; zero would read as "no ceiling", which is what the key
+	// exists to end (SPEC §8.1 step 2, §10.1). Above 256 MiB no destination
+	// writes a piece within sink.op_timeout -- the very failure the ceiling
+	// exists for (the form of go-syslog-pg-server and of the webhook family).
+	if c.Sink.BatchMaxBytes < 1 || c.Sink.BatchMaxBytes > maxBatchMaxBytes {
+		return nil, fmt.Errorf("sink.batch_max_bytes: %s is outside 1 byte..256MiB "+
+			"(a batch goes out in pieces under it; above 256MiB no destination writes it within sink.op_timeout)",
+			FormatBytes(c.Sink.BatchMaxBytes))
 	}
 	if c.Sink.MaxRetries < 1 {
 		return nil, fmt.Errorf("sink.max_retries: must be at least 1")
@@ -172,7 +200,7 @@ func Validate(c *Config) (warnings []string, err error) {
 		return nil, fmt.Errorf("sink.postgres.pool_size: %d is above %d; 0 derives sink.workers + 1",
 			c.SinkPG.PoolSize, maxPoolSize)
 	}
-	if c.Log.AccessSample < 0 || c.Log.AccessSample > 1 {
+	if !(c.Log.AccessSample >= 0 && c.Log.AccessSample <= 1) { // NaN too
 		return nil, fmt.Errorf("log.access_sample: must be in [0, 1], got %g", c.Log.AccessSample)
 	}
 
@@ -189,8 +217,25 @@ func Validate(c *Config) (warnings []string, err error) {
 		return nil, err
 	}
 
+	// An empty admin.bind made net.Listen bind every interface on a random
+	// port, publishing /metrics wherever the host is reachable, with a WARN
+	// only. admin.enabled=false is how the admin port is turned off (SPEC §11;
+	// port of go-webhook-server, W 25; the rule of go-webhook-nats-server).
+	if c.Admin.Enabled {
+		if c.Admin.Bind == "" {
+			return nil, fmt.Errorf("admin.bind is empty with admin.enabled=true: set host:port, " +
+				"or admin.enabled=false to turn the admin port off")
+		}
+		// SplitHostPort takes an empty port ("127.0.0.1:", ":") without
+		// error, and net.Listen then picked a random one -- with ":" on every
+		// interface, the exposure the empty bind was refused for (W 40).
+		if _, port, err := net.SplitHostPort(c.Admin.Bind); err != nil || !validPort(port) {
+			return nil, fmt.Errorf("admin.bind: %q is not host:port with a port 1..65535", c.Admin.Bind)
+		}
+	}
+
 	// --- exposure warnings --------------------------------------------------
-	if !isLoopbackBind(c.Admin.Bind) {
+	if c.Admin.Enabled && !isLoopbackBind(c.Admin.Bind) {
 		warn("admin.bind=%q is not loopback: /metrics and /readyz are reachable off-host", c.Admin.Bind)
 	}
 	if !c.Emergency.Enabled {
@@ -258,7 +303,7 @@ func validatePostgres(c *Config, warn func(string, ...any)) error {
 	// 1 GiB (SPEC §8.5.4).
 	if worst := WorstBatchBytes(c); worst > pgParamCeiling {
 		warn("one batch can carry up to %s of envelopes, above the 1 GiB ceiling of a single "+
-			"protocol parameter; lower sink.batch, server.max_body_bytes or ring.max_bytes",
+			"protocol parameter; lower server.max_body_bytes: one envelope alone is above it",
 			FormatBytes(worst))
 	}
 	return nil
@@ -315,16 +360,20 @@ func validPort(s string) bool {
 }
 
 // WorstBatchBytes is the most envelope bytes one sink write can carry (SPEC
-// §8.5.4): sink.batch envelopes, but never more than the ring may hold. The
-// count-only batch limit cannot see bytes, and the ring's byte ceiling is what
-// bounds them in practice, so the smaller of the two worst cases is used
-// rather than one that always fires.
+// §8.5.4): a piece of a batch, at most sink.batch envelopes, never more than
+// the ring may hold, and never more than sink.batch_max_bytes (SPEC §8.1 step
+// 2) -- unless one envelope alone is larger than that ceiling, and then it
+// goes alone, so the largest envelope the ring can hold is the floor.
 func WorstBatchBytes(c *Config) int64 {
-	worst := MaxEventBytes(c) * int64(c.Sink.Batch)
+	event := MaxEventBytes(c)
+	worst := event * int64(c.Sink.Batch)
 	if c.Ring.MaxBytes < worst {
 		worst = c.Ring.MaxBytes
 	}
-	return worst
+	if c.Sink.BatchMaxBytes > 0 && c.Sink.BatchMaxBytes < worst {
+		worst = c.Sink.BatchMaxBytes
+	}
+	return max(worst, min(event, c.Ring.MaxBytes))
 }
 
 // MaxEventBytes is the largest envelope one accepted request can produce

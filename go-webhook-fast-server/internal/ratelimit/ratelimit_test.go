@@ -1,7 +1,9 @@
 package ratelimit
 
 import (
+	"hash/maphash"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -565,6 +567,144 @@ func TestConcurrentAllowSweepAndReload(t *testing.T) {
 	// a negative value would mean a double decrement.
 	if l.Len() < 0 {
 		t.Errorf("Len went negative: %d", l.Len())
+	}
+	// At rest the counter is exact (SPEC §6.3).
+	if got, want := l.Len(), mapLen(l); got != want {
+		t.Errorf("Len = %d at rest, but %d buckets exist", got, want)
+	}
+}
+
+// shardOf is the index of the shard addr's bucket lives in, computed the way
+// Allow computes it.
+func shardOf(l *Limiter, addr netip.Addr) int {
+	p := l.params.Load()
+	return int(maphash.Comparable(l.seed, Key(addr, p.V4Mask, p.V6Mask)) & l.mask)
+}
+
+// addrsInShard returns n addresses with distinct /24 keys whose buckets all
+// land in shard want.
+func addrsInShard(t *testing.T, l *Limiter, want, n int) []netip.Addr {
+	t.Helper()
+	var out []netip.Addr
+	for i := 0; i < 1<<16 && len(out) < n; i++ {
+		a := netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1})
+		if shardOf(l, a) == want {
+			out = append(out, a)
+		}
+	}
+	if len(out) < n {
+		t.Fatalf("found only %d addresses in shard %d", len(out), want)
+	}
+	return out
+}
+
+// mapLen counts the buckets that really exist, under each shard's lock.
+func mapLen(l *Limiter) int {
+	n := 0
+	for i := range l.shards {
+		s := &l.shards[i]
+		s.mu.Lock()
+		n += len(s.m)
+		s.mu.Unlock()
+	}
+	return n
+}
+
+// TestResetDoesNotLoseConcurrentInserts pins SPEC §6.3: the bucket counter
+// moves with the map, under the lock of the shard that changes. A Reset that
+// cleared shard by shard and zeroed the counter at the end, outside the locks,
+// forgot a bucket inserted into an already-cleared shard while it was still
+// walking the others: the counter read 0 with a bucket alive, the next sweep
+// drove it to -1, and max_buckets let one prefix too many in.
+//
+// The interleaving is forced, not hoped for: the test holds shard 1's lock so
+// the Reset parks there after clearing shard 0, inserts into shard 0, and
+// only then lets the Reset finish.
+func TestResetDoesNotLoseConcurrentInserts(t *testing.T) {
+	p := defaults()
+	p.MaxBuckets = 3
+	l, clock := newTest(p, 2)
+
+	in0 := addrsInShard(t, l, 0, 2)
+	in1 := addrsInShard(t, l, 1, 3)
+	b, a := in0[0], in0[1]
+
+	l.Allow(b) // shard 0 holds one bucket, which the Reset will clear
+	if l.Len() != 1 {
+		t.Fatalf("Len = %d after one insert, want 1", l.Len())
+	}
+
+	s0, s1 := &l.shards[0], &l.shards[1]
+	s1.mu.Lock()
+	done := make(chan struct{})
+	go func() { l.Reset(); close(done) }()
+
+	// Wait for an observable state: shard 0 empty means the Reset went
+	// through it and is now parked on shard 1.
+	for {
+		s0.mu.Lock()
+		n := len(s0.m)
+		s0.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		runtime.Gosched()
+	}
+
+	l.Allow(a) // a fresh bucket in the already-cleared shard 0
+	s1.mu.Unlock()
+	<-done
+
+	if got, want := l.Len(), mapLen(l); got != want || got != 1 {
+		t.Fatalf("after Reset with a concurrent insert: Len = %d, buckets = %d; want both 1", got, want)
+	}
+
+	// max_buckets = 3: two more prefixes fit, the third passes unlimited.
+	for _, x := range in1 {
+		l.Allow(x)
+	}
+	if got, want := l.Len(), mapLen(l); got != want || got != 3 {
+		t.Fatalf("after filling the ceiling: Len = %d, buckets = %d; want both 3 (max_buckets)", got, want)
+	}
+
+	// Every bucket refilled: the sweep removes them all and the counter
+	// lands on exactly zero, never below.
+	clock.advance(time.Hour)
+	l.Sweep()
+	if got, want := l.Len(), mapLen(l); got != 0 || want != 0 {
+		t.Fatalf("after a full sweep: Len = %d, buckets = %d; want 0 and 0", got, want)
+	}
+}
+
+// TestMaxBucketsHoldsUnderConcurrentInserts: the ceiling is reserved before
+// the bucket is created (SPEC §6.3), so inserts racing on different shards
+// cannot overshoot it. Without the reservation the check and the increment
+// were atomic only per shard. This one catches that by load, so it guards
+// against a regression rather than proving the rule; the deterministic proof
+// of the counter is the test above.
+func TestMaxBucketsHoldsUnderConcurrentInserts(t *testing.T) {
+	p := defaults()
+	p.MaxBuckets = 8
+	l, _ := newTest(p, 64)
+
+	for round := 0; round < 200; round++ {
+		l.Reset()
+		var start sync.WaitGroup
+		start.Add(1)
+		var wg sync.WaitGroup
+		for g := 0; g < 32; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				start.Wait()
+				l.Allow(netip.AddrFrom4([4]byte{10, byte(round), byte(g), 1}))
+			}(g)
+		}
+		start.Done()
+		wg.Wait()
+		if got, want := l.Len(), mapLen(l); got != want || want > p.MaxBuckets {
+			t.Fatalf("round %d: Len = %d, buckets = %d, max_buckets = %d", round, got, want, p.MaxBuckets)
+		}
 	}
 }
 

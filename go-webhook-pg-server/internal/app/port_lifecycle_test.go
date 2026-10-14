@@ -468,7 +468,7 @@ func TestSignalBeforeTheBindExits130(t *testing.T) {
 func TestCancelledAdminBindIsAnAbortNotAConfigError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	args := []string{"--admin.bind=localhost:0", "--server.bind=127.0.0.1:0",
+	args := []string{"--admin.bind=localhost:9101", "--server.bind=127.0.0.1:0",
 		"--ring.data_dir=" + t.TempDir(), "--log.level=error"}
 	code := runContext(ctx, args, testID, func(a *App) { a.sinkOverride = &memSink{} })
 	if code != ExitAborted {

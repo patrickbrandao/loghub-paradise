@@ -444,8 +444,19 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   não é veredito (`soleServer`, SPEC §8.7.9). O `10077` tem dois sentidos pela
   descrição do *store* (`storeFailedIsTransient`): confira o texto no
   `server/store.go` do `nats-server`, não na memória.
-- **`ring.Commit` antes do `Release`**, também na recusa `logic`: o ring
-  desconta `len(Env)`, que o `Release` zera.
+- **`ring.Commit` antes do `Release`**, também na recusa `logic`: o
+  `ring=sqlite` desconta `len(Env)`, que o `Release` zera. O ring de memória
+  cobra `cap(Env)` mais `ring.ItemOverhead` e desconta o `Item.Charged` que
+  gravou no `Enqueue` (`SPEC.md` §7.2); não troque por um recálculo.
+- **Os dois tetos do ring contam os lotes retidos.** No ring de memória o
+  `Enqueue` reserva o item no contador antes do canal; no `ring=sqlite`,
+  item e bytes antes do `COMMIT` (`resItems`/`resBytes`). Comparar só com o
+  que já está no canal, ou só com o que já foi commitado, deixa passar
+  `workers × batch` ou um grupo inteiro além do teto.
+- **O lote sai em pedaços de `sink.batch_max_bytes`** (`sink.SplitByBytes`),
+  nos workers, na reingestão e no dreno do `ring.db`. Um worker que retenta um
+  pedaço segura também os que ainda não escreveu (`unhold` tira só o pedaço
+  resolvido); são eles que o dump precisa.
 - **O dump só está salvo no nome final** (temporário oculto e `link`; sem
   *hard link*, `rename` depois de conferir o nome livre). O `fsync` do
   diretório é melhor esforço; só arquivos regulares são dumps.

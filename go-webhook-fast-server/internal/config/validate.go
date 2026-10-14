@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-fast-server/internal/envelope"
+	"github.com/patrickbrandao/loghub-paradise/go-webhook-fast-server/internal/ring"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -62,9 +63,14 @@ const (
 	maxInflight            = 1 << 20
 	maxCommitBatch         = 65536
 	maxSinkBatch           = 1 << 20
-	maxSinkWorkers         = 1024
-	maxPoolSize            = 4096
-	maxListeners           = 256
+	// maxBatchMaxBytes is sink.batch_max_bytes's ceiling (SPEC §8.1 step 2,
+	// the form of go-syslog-pg-server): above it a PostgreSQL batch nears the
+	// 1 GiB of one protocol parameter, and no destination writes hundreds of
+	// MiB within sink.op_timeout -- the very failure the ceiling exists for.
+	maxBatchMaxBytes = int64(256) << 20
+	maxSinkWorkers   = 1024
+	maxPoolSize      = 4096
+	maxListeners     = 256
 
 	// rueidis: a ring of 2^n slots per connection, each with a channel and
 	// two condition variables (about 20 MiB at 16, 300 MiB at 20); 2^(n-1)
@@ -180,6 +186,32 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	if c.Ring.MaxBytes < 1 {
 		return nil, fmt.Errorf("ring.max_bytes: must be positive")
 	}
+	// The largest event the configuration accepts must fit an empty memory
+	// ring: below what it costs there -- its pool class plus the per-item
+	// overhead, the ring's own charge -- it got 429 always and its sender
+	// retried it for ever (SPEC §7.2, W §19.1 item 35; the floor of the RELP
+	// cuts). The server.max_* above are already positive.
+	if c.Ring.Mode == RingMemory {
+		event := envelope.MaxEventBytes(c.Server.MaxBodyBytes, c.Server.MaxHeaderBytes, c.Server.MaxURIBytes)
+		if floor := envelope.PooledCap(event) + ring.ItemOverhead; c.Ring.MaxBytes < floor {
+			return nil, fmt.Errorf("ring.max_bytes (%s) is below what the largest event the server.max_* "+
+				"limits accept costs the ring, %s (an envelope of up to %s in its pool class, plus %d "+
+				"bytes): that event would get 429 even with the ring empty, and its sender would retry "+
+				"it for ever", FormatBytes(c.Ring.MaxBytes), FormatBytes(floor), FormatBytes(event),
+				ring.ItemOverhead)
+		}
+	}
+	// ring=sqlite charges the JLH's length (nbytes), so its floor is the
+	// largest event itself (W §19.1 item 43; the rule of the syslog and RELP
+	// parents for the rings that count the data).
+	if c.Ring.Mode == RingSQLiteMode {
+		event := envelope.MaxEventBytes(c.Server.MaxBodyBytes, c.Server.MaxHeaderBytes, c.Server.MaxURIBytes)
+		if c.Ring.MaxBytes < event {
+			return nil, fmt.Errorf("ring.max_bytes (%s) is below the largest event the server.max_* limits "+
+				"accept, %s: that event would get 429 even with the ring empty, and its sender would "+
+				"retry it for ever", FormatBytes(c.Ring.MaxBytes), FormatBytes(event))
+		}
+	}
 	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
 		return nil, fmt.Errorf("ring.high_water: must be in (0, 1], got %g", c.Ring.HighWater)
 	}
@@ -209,6 +241,14 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	}
 	if c.Sink.Batch > maxSinkBatch {
 		return nil, fmt.Errorf("sink.batch: %d is above %d", c.Sink.Batch, maxSinkBatch)
+	}
+	// One byte is coherent with the rule -- every event then goes alone -- so
+	// it is the floor; zero would read as "no ceiling", which is what the key
+	// exists to end (SPEC §8.1 step 2, §10.1).
+	if c.Sink.BatchMaxBytes < 1 || c.Sink.BatchMaxBytes > maxBatchMaxBytes {
+		return nil, fmt.Errorf("sink.batch_max_bytes: %s is outside 1 byte..256MiB "+
+			"(a batch goes out in pieces under it; above 256MiB no destination writes it within sink.op_timeout)",
+			FormatBytes(c.Sink.BatchMaxBytes))
 	}
 	if c.Sink.MaxRetries < 1 {
 		return nil, fmt.Errorf("sink.max_retries: must be at least 1")
@@ -346,6 +386,12 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 		if c.SinkRedis.Stream == "" {
 			return nil, fmt.Errorf("sink.redis.stream: cannot be empty")
 		}
+		if c.SinkRedis.TLSCA != "" && !c.SinkRedis.TLS {
+			// The same rule as every other destination (SPEC §8.2.2,
+			// W pendência 13): the CA was ignored and the connection, with the
+			// password, went out in the clear.
+			return nil, fmt.Errorf("sink.redis.tls_ca is set but sink.redis.tls=false: enable tls or drop the CA")
+		}
 		if c.SinkRedis.SentinelMaster != "" && c.SinkRedis.DB != 0 {
 			warn("sink.redis.db=%d with Sentinel: verify the replica set exposes that database", c.SinkRedis.DB)
 		}
@@ -395,13 +441,30 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 		c.Sink.Workers = 1
 	}
 
+	// An empty admin.bind made net.Listen bind every interface on a random
+	// port, publishing /metrics wherever the host is reachable, with a WARN
+	// only. admin.enabled=false is how the admin port is turned off (SPEC §11,
+	// W pendência 25; the rule of go-webhook-nats-server).
+	if c.Admin.Enabled {
+		if c.Admin.Bind == "" {
+			return nil, fmt.Errorf("admin.bind is empty with admin.enabled=true: set host:port, " +
+				"or admin.enabled=false to turn the admin port off")
+		}
+		// SplitHostPort takes an empty port ("127.0.0.1:", ":") without
+		// error, and net.Listen then picked a random one -- with ":" on every
+		// interface, the exposure the empty bind was refused for (W §19.1 item 40).
+		if _, port, err := net.SplitHostPort(c.Admin.Bind); err != nil || !validPort(port) {
+			return nil, fmt.Errorf("admin.bind: %q is not host:port with a port 1..65535", c.Admin.Bind)
+		}
+	}
+
 	// --- exposure warnings --------------------------------------------------
 	if !c.RateLimit.Enabled && !isLoopbackBind(c.Server.Bind) {
 		warn("ratelimit.enabled=false with server.bind=%q: this instance is reachable off-host "+
 			"with no rate protection. Configure proxy.trusted first, then enable the limiter",
 			c.Server.Bind)
 	}
-	if !isLoopbackBind(c.Admin.Bind) {
+	if c.Admin.Enabled && !isLoopbackBind(c.Admin.Bind) {
 		warn("admin.bind=%q is not loopback: /metrics and /readyz are reachable off-host", c.Admin.Bind)
 	}
 	if c.Ring.Mode == RingNone && c.Sink.Type == SinkNoneType {
@@ -495,18 +558,19 @@ func validatePostgres(c *Config, setIn map[string]bool, warn func(string, ...any
 	// 1 GiB (SPEC §8.5.4).
 	if worst := WorstBatchBytes(c); worst > pgParamCeiling {
 		warn("sink.type=postgres: one batch can carry up to %s of envelopes, above the 1 GiB "+
-			"ceiling of a single protocol parameter; lower sink.batch, server.max_body_bytes "+
-			"or ring.max_bytes", FormatBytes(worst))
+			"ceiling of a single protocol parameter; lower server.max_body_bytes: one envelope "+
+			"alone is above it", FormatBytes(worst))
 	}
 	return nil
 }
 
 // WorstBatchBytes is the most envelope bytes one sink write can carry (SPEC
 // §8.5.4, §8.8.5). With ring=none a write is one request, so it is the largest
-// envelope (SPEC §3.2). Otherwise a batch is sink.batch envelopes, but never
-// more than the ring may hold: the count-only batch limit cannot see bytes, and
-// the ring's byte ceiling is what bounds them in practice, so the smaller of
-// the two worst cases is used rather than one that always fires.
+// envelope (SPEC §3.2). Otherwise a write is a piece of a batch: at most
+// sink.batch envelopes, never more than the ring may hold, and never more than
+// sink.batch_max_bytes (SPEC §8.1 step 2) -- unless one envelope alone is
+// larger than that ceiling, and then it goes alone, so the largest envelope
+// the ring can hold is the floor.
 func WorstBatchBytes(c *Config) int64 {
 	event := envelope.MaxEventBytes(c.Server.MaxBodyBytes, c.Server.MaxHeaderBytes, c.Server.MaxURIBytes)
 	if c.Ring.Mode == RingNone {
@@ -516,7 +580,10 @@ func WorstBatchBytes(c *Config) int64 {
 	if c.Ring.MaxBytes < worst {
 		worst = c.Ring.MaxBytes
 	}
-	return worst
+	if c.Sink.BatchMaxBytes > 0 && c.Sink.BatchMaxBytes < worst {
+		worst = c.Sink.BatchMaxBytes
+	}
+	return max(worst, min(event, c.Ring.MaxBytes))
 }
 
 // validateMySQL holds the [sink.mysql] rules of SPEC §8.6 and §10.1. They are

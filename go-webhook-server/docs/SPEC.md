@@ -705,15 +705,29 @@ Ordem estrita. A primeira condição que falha encerra o processamento.
 6.  rate-limit                 (§6, desligado por padrão)            -> 429
 7.  Content-Length declarado > max_body_bytes                        -> 413
 8.  sink DOWN                                                        -> 503
-9.  ring saturado (checagem rápida, otimização)                      -> 429
+9.  ring saturado em itens, ou em bytes pelo Content-Length          -> 429
+    (checagem rápida, só para recusar; o Enqueue decide no passo 13)
 10. UMA amostra de relógio t: uuid = GenerateAt(Level3, t), event = t
 11. lê corpo com http.MaxBytesReader (read_timeout)                  -> 413
+    o buffer cresce com o que chegou, não com o Content-Length (§12.2)
 12. pré-passada no corpo (utf-8 ou base64, §3.2); serializa o JLH
     UMA vez num buffer do pool; o buffer do corpo volta ao pool
 13. entrega ao ring, não-bloqueante                                  -> 429
 14. aguarda a aceitação conforme §2.2
 15. 200 OK, X-LogHub-UUID: <uuid>, corpo JSON (§4.4)
 ```
+
+**Checagem rápida do passo 9.** Recusa sem ler o corpo quando o ring já está
+cheio em itens, ou quando os bytes ocupados mais uma **estimativa por baixo**
+do evento já chegam ao teto de bytes. A estimativa é só o `Content-Length`
+declarado (0 sem ele): o corpo entra inteiro no JLH, em utf-8 escapado ou em
+base64, ambos maiores ou iguais ao tamanho bruto, e o JLH tem sempre mais
+que o corpo, então um evento que a checagem recusa o `Enqueue` também
+recusaria. O cabeçalho não entra na estimativa: `headers.exclude` tira
+cabeçalhos do envelope, e o tamanho do cabeçalho recebido não é limite
+inferior do JLH. A checagem nunca aceita nada: um `Content-Length` mentiroso
+para menos só passa para o `Enqueue`, que decide (o `429` de lá leva UUID,
+§4.4). O `429` da checagem rápida, de itens ou de bytes, sai **sem** UUID.
 
 **Rejeições nos passos 4–9** (antes de ler o corpo) drenam e descartam até
 `server.reject_drain_bytes` (64 KiB) do corpo antes de responder, para que um
@@ -723,6 +737,27 @@ conexão. Se o corpo exceder isso, responde com `Connection: close`.
 Sem esse dreno, o cliente recebe `ECONNRESET` em vez do `429`, não vê o
 `Retry-After` e retenta sem backoff — piorando exatamente a sobrecarga que o
 rate-limit deveria conter.
+
+O dreno só acontece em **HTTP/1.x** e **sem `Expect: 100-continue`
+pendente**; nos outros casos a recusa responde sem ler o corpo:
+
+- Em HTTP/2 não há dreno nem `Connection: close`. O `net/http` encerra só
+  aquele fluxo depois da resposta (`RST_STREAM`) e a conexão segue; um
+  `Connection: close` ali vira GOAWAY e derruba a conexão inteira, que um
+  proxy divide entre muitos clientes.
+- Com `Expect: 100-continue` ainda sem resposta, ler o corpo faria o
+  `net/http` enviar o `100 Continue`, convidando o corpo que vai ser recusado.
+  Sem a leitura, o `100` nunca sai: o cliente recebe a recusa no lugar dele e o
+  `net/http` fecha a conexão depois da resposta (o corpo não enviado não pode
+  ficar no meio do fluxo).
+- Um cliente que manda `Expect: 100-continue` e **envia o corpo sem esperar**
+  o `100` (vários fazem isso depois de ~1 s) também não é drenado: o
+  `net/http` fecha a conexão depois da resposta sem o `closeWriteAndWait`
+  (o corpo é um `expectContinueReader`, não o `body` que ele confere), e com
+  bytes ainda chegando o fechamento pode virar RST e o cliente perder o
+  `429`/`503`. Aceito e só documentado (revisão independente de 2026-10-14): a
+  resposta sai em milissegundos, antes de o cliente desistir de esperar, e
+  corpos acima de `reject_drain_bytes` já fechavam assim antes.
 
 ### 4.4 Respostas
 
@@ -907,6 +942,17 @@ Sem LRU, sem heurística de idade, sem perda de precisão — a regra é exata.
 atingir o teto, novas chaves passam sem limite e `whs_ratelimit_buckets` fica no
 máximo, tornando a saturação visível.
 
+O contador de buckets (`whs_ratelimit_buckets`) muda sempre junto com o mapa,
+sob a trava do shard que muda: a inserção, o sweep e o `Reset` de um `SIGHUP`
+que troca a máscara descontam ou somam no mesmo instante em que mexem no
+shard, e o `Reset` desconta shard a shard, nunca zera o contador fora das
+travas (um bucket inserido num shard já limpo, enquanto o `Reset` ainda
+percorria os outros, sumiria da conta e a deixaria negativa no sweep
+seguinte). A inserção reserva a vaga no teto antes de criar o bucket (uma
+troca atômica que só passa abaixo de `max_buckets`), então inserções
+concorrentes em shards diferentes não passam do teto. Com isso o contador é
+exato em repouso e `max_buckets` nunca é excedido.
+
 ### 6.4 Isenções
 
 `ratelimit.exempt` — lista de CIDRs isentos, vazia por padrão. Para
@@ -942,10 +988,44 @@ type Ring interface {
 Dois tetos, avaliados simultaneamente:
 
 - `ring.capacity_items` (padrão 65536)
-- `ring.max_bytes` (padrão 512 MiB), contando envelope + corpo
+- `ring.max_bytes` (padrão 512 MiB). O que ele mede depende do modo, e é o que
+  o modo de fato ocupa:
+  - `memory`: a memória que o item **retém** — `cap(Env)`, o buffer inteiro da
+    classe do pool em que o JLH foi escrito (§12.2), mais um custo fixo por
+    item (`ring.ItemOverhead`, 256 bytes: a `struct` do item, o `uuid` em texto,
+    o canal de confirmação e a vaga no canal do ring). Um JLH de ~2,4 KiB numa
+    classe de 16 KiB conta ~16,25 KiB, não 2,4 KiB. O valor cobrado é gravado
+    no item no `Enqueue` e é **esse** valor que o `Commit` e o `Drain`
+    descontam, qualquer que seja o estado do buffer depois;
+  - `sqlite`: os bytes do JLH guardados (`nbytes`, `len(jlh)`), o que o
+    `ring.db` de fato contém e o que a recontagem do boot (`SUM(nbytes)`)
+    reencontra.
 
 `429 ring_full` dispara quando **qualquer um** estourar. `ring.high_water`
-(padrão 0.80) é avaliado nos dois e controla `/readyz`.
+(padrão 0.80) é avaliado nos dois e controla `/readyz`. Os gauges
+`whs_ring_items` e `whs_ring_bytes` (§11.1) mostram as mesmas grandezas que os
+tetos comparam.
+
+**Os dois tetos contam a mesma população: aceitos e ainda não confirmados**,
+o que inclui os lotes que os workers retiraram do ring e seguram enquanto
+retentam (§10.4). No ring de memória o teto de itens era só o tamanho do
+canal: um item retirado por `Dequeue` saía do canal sem sair da conta, e o
+ring aceitava até `sink.workers × sink.batch` itens além de
+`capacity_items`, enquanto o teto de bytes, contado até o `Commit`, dizia o
+contrário (achado da triagem de 2026-10-14; a família syslog já contava assim).
+Agora o `Enqueue` reserva o item no contador antes de pôr no canal, e o
+`Commit` o devolve.
+
+**Decisão do usuário (2026-10-14): cobrar o buffer retido, sem copiar o JLH
+para uma classe menor** e sem mudar os padrões. Cobrar `len(Env)` deixava o
+ring reter de 4 a 7× `ring.max_bytes` com eventos pequenos (classes espaçadas
+4×), além de `GOMEMLIMIT` e do limite do contêiner (§12.4); copiar para a
+classe justa custaria uma cópia por requisição e não eliminaria o fator. A
+consequência aceita: com eventos pequenos o teto de bytes passa a mandar antes
+— 512 MiB / ~16 KiB ≈ 32 000 eventos, abaixo de `capacity_items` —, e uma
+instância que vivia perto do teto vê `429` antes. `Item.Size()` continua
+`len(Env)`: é o tamanho do **dado**, que o `ring=sqlite` grava em `nbytes` e
+o `sink=mysql` usa para dividir o lote.
 
 Os dois são necessários: com corpos de 200 bytes o teto de itens é quem manda;
 com corpos de 5 MiB, o de bytes. Só o de itens permitiria 65536 × 5 MiB = 320
@@ -953,9 +1033,32 @@ GiB de exposição teórica; só o de bytes permitiria 2,6 milhões de itens
 pequenos, com profundidade e latência de dreno absurdas e um shutdown que nunca
 termina dentro do `drain_timeout`.
 
+**O que o `ItemOverhead` não conta** (revisão independente de 2026-10-14, só
+documentado). A cópia que os workers guardam dos lotes retidos (`held`, 8
+bytes por ponteiro) e a fatia que o `Dequeue` devolve ficam fora da cobrança:
+no máximo `sink.workers × sink.batch × 16` bytes (64 KiB com os padrões), fora
+da conta de `ring.max_bytes`. O "pior caso" do número é o do item no canal;
+contar também essas fatias pediria cobrar na saída o que já saiu do ring.
+
+**Piso de `ring.max_bytes` com `ring=memory`** (§19.1 item 35, revisão
+independente de 2026-10-14; o piso que o `go-relplog-pg-server` e o
+`go-relplog-nats-server` já tinham). O maior evento que a configuração aceita,
+`envelope.MaxEventBytes` de `server.max_body_bytes`, `server.max_header_bytes`
+e `server.max_uri_bytes` (§3.2), custa ao ring de memória a capacidade da
+classe do pool que o comporta (o próprio valor acima de 256 KiB, §12.2) mais
+`ring.ItemOverhead`. Um `ring.max_bytes` menor que essa cobrança é `exit 1` na
+validação, com os dois valores e o piso na mensagem: abaixo dele um evento que
+a configuração aceita receberia `429` sempre, mesmo com o ring vazio, e o
+emissor o retentaria para sempre. Com os padrões o piso é ~7,7 MiB, muito
+abaixo dos 512 MiB. Com `ring=sqlite`, que cobra `len(JLH)` sem classe nem
+custo fixo, o piso é o próprio `MaxEventBytes` (§19.1 item 43; a regra dos
+pais syslog e RELP para os rings que contam o dado); `ring=none` não tem piso.
+
 ### 7.3 `ring.mode = memory`
 
-Canal buffered de `capacity_items`, com um contador atômico de bytes.
+Canal buffered de `capacity_items`, com dois contadores atômicos (itens e
+bytes retidos, §7.2) que sobem no `Enqueue` antes do canal e descem no
+`Commit`.
 
 `Enqueue` retorna assim que o item entra no canal.
 
@@ -1025,6 +1128,38 @@ file:<ring.sqlite.path>
   escritor). `SELECT rowid_, uuid, jlh FROM jlh_ring WHERE rowid_ > ? ORDER BY
   rowid_ LIMIT n` e entrega ao canal dos workers de dreno.
 
+**Os tetos valem antes do `COMMIT`.** O `Enqueue` **reserva** o item e os
+seus bytes antes de entregá-lo à escritora, numa soma atômica que inclui as
+reservas concorrentes: dois handlers nunca levam a última vaga. A reserva vira
+contagem no `COMMIT` (a contagem sobe primeiro e a reserva desce depois: a soma
+pode contar o grupo duas vezes por um instante, recusando um pouco cedo, mas
+nunca zero vezes) e é desfeita quando a entrega à escritora falha (canal
+cheio), quando o `BEGIN`, um `INSERT` ou o `COMMIT` falham e quando o ring
+fecha sem ter recebido o item. `Stats()` — e com ele `/readyz` e os gauges
+`whs_ring_*` — soma as reservas. Até 2026-10-14 o `Enqueue` comparava com
+contadores que só subiam depois do `COMMIT`: um grupo inteiro (até
+`2 × commit_batch` na fila da escritora, mais o grupo em montagem) passava
+junto pelo teto, e o `ring.db` excedia `ring.max_bytes` em gigabytes com
+corpos grandes (§19.1 item 9; porte do `go-syslog-server`).
+
+**Uma leitura que falha no meio entrega o que já leu.** As linhas lidas antes
+da falha já passaram do cursor; descartá-las as deixava atrás dele, sem
+entrega, até o boot seguinte. O `Dequeue` devolve esses itens sem erro, e a
+linha que falhou é relida na chamada seguinte (o cursor não passou dela). Só
+uma leitura que não leu nada devolve o erro, que o worker trata como
+transitório (§8.1).
+
+**Uma linha que falha sempre trava o dreno** (revisão independente de
+2026-10-14, só documentado). Por desenho o cursor não passa da linha que
+falhou, então uma falha **permanente** do `Scan` na mesma linha (um `jlh_ring`
+antigo sem `STRICT` com um `NULL`, ou uma página corrompida) não avança mais:
+os workers retentam com backoff para sempre, o ring enche até o `429`, o
+`/healthz` segue `200` com o `WARN` amostrado, e no boot o dreno sai com 3 a
+cada reinício. Com o esquema `STRICT` atual só a corrupção de página produz
+isso, e ela é dano de disco: o operador move o `ring.db` de lado. Quarentena
+automática da linha foi considerada e não entrou — pular uma linha ilegível
+perde, sem contagem certa, um evento respondido com `200`.
+
 Mais de um escritor só geraria `SQLITE_BUSY`: o SQLite serializa escritores por
 construção. Uma coluna de `claim` foi descartada por dobrar as escritas (um
 `UPDATE` + um `DELETE` por item) num caminho onde cada `COMMIT` custa um `fsync`.
@@ -1086,8 +1221,9 @@ achado):
   (§10.1);
 - as linhas da `jlh_ring` são entregues ao sink como o backlog do próprio
   `ring=sqlite`: porta pública fechada, `/readyz` em "draining backlog: N
-  pending", uma recusa do sink encerra o boot com 3 e um `SIGTERM` com 130, e
-  nos dois casos as linhas ficam (§9.2);
+  pending", uma linha recusada como `logic` descartada e contada como nos
+  workers (§10.1 passo 5), qualquer outra recusa do sink encerra o boot com 3
+  e um `SIGTERM` com 130, e nesses dois casos as linhas ficam (§9.2);
 - sem nada pendente, o arquivo é **removido** — `-wal` e `-shm` primeiro e o
   `ring.db` por último, para nunca deixar um WAL velho ao lado de um banco que
   não existe mais. Vale também para o `ring.db` vazio de um shutdown limpo,
@@ -1178,18 +1314,48 @@ Os workers de dreno (`sink.workers`, padrão 8) são **idênticos** para todos o
 sinks:
 
 1. `Dequeue` até `sink.batch` (256) itens, esperando no máximo
-   `sink.batch_max_delay` (5ms) para completar o lote.
-2. `sink.Write(ctx, items)`.
-3. Em sucesso: `ring.Commit(items)`, devolve os buffers ao pool,
+   `sink.batch_max_delay` (5ms) para completar o lote. O worker só termina
+   quando o contexto acaba ou o ring diz `ErrClosed` ou `ErrNoBacklog`
+   (`ring=none`, que estaciona aqui até o shutdown); qualquer outro erro — o
+   `ring=sqlite` devolve `SQLITE_BUSY` além do `busy_timeout` e erros de I/O do
+   seu `SELECT` — é logado com amostragem (um `WARN` a cada 30 s, com a
+   contagem dos suprimidos) e retentado com backoff (`retry_backoff_min` →
+   `retry_backoff_max`). Até 2026-10-14 qualquer erro encerrava o worker em
+   silêncio: com `sink=sqlite`, que tem um só, o dreno parava, o ring enchia e
+   tudo virava `429` com `/healthz` em 200 (§19.1 item 10; porte do
+   `go-syslog-server`). Uma leitura parcial entrega o que já leu (§7.4).
+2. **Corta o lote em pedaços por bytes.** O pedaço fecha quando a soma dos JLH
+   (`len(Env)`) passaria de `sink.batch_max_bytes` (padrão 16 MiB); o item que
+   passaria abre o pedaço seguinte, e um JLH maior que o teto forma um pedaço
+   sozinho. Nenhum JLH é dividido nem recusado por tamanho.
+3. `sink.Write(ctx, pedaço)`, com a retentativa de §10.4: o worker segura o
+   pedaço **e o resto do lote** (os dois ficam registrados para o dump, §9), e
+   não puxa mais nada do ring.
+4. Em sucesso: `ring.Commit(pedaço)`, devolve os buffers ao pool,
    `whs_events_written_total += n`.
-4. Num `logic`, o lote sai do ring do mesmo jeito — `ring.Commit(items)`
+5. Num `logic`, o pedaço sai do ring do mesmo jeito — `ring.Commit(pedaço)`
    **antes** de devolver os buffers (§12.3) — e é perda contada em
    `whs_events_dropped_total{reason="sink_logic"}` e num `ERROR` com os `uuid`.
    **Entrega parcial:** um destino que recusa uma mensagem do lote e guarda as
    outras (`sink=nats`, §8.7.2) diz quais guardou (`Error.Delivered`); só as
    recusadas contam como perda, e as guardadas contam em
-   `whs_events_written_total`. Sem essa lista, o lote inteiro é perda. A escrita
-   direta de `ring=none` (§7.5) conta do mesmo jeito.
+   `whs_events_written_total`. Sem essa lista, o pedaço inteiro é perda. A
+   escrita direta de `ring=none` (§7.5) conta do mesmo jeito.
+6. Próximo pedaço; com o lote esgotado, volta ao passo 1.
+
+**Por que o teto de bytes** (decisão do usuário, 2026-10-14; §19.1 item 11).
+O lote era limitado só por contagem: com corpos grandes, 256 envelopes chegam a
+centenas de MiB, que não cabem em `sink.op_timeout` (5 s); a escrita estoura o
+prazo, é `network`, e o mesmo lote é retentado para sempre com o sink UP — e a
+reingestão repetia o mesmo lote a cada boot. `ring.max_bytes` não servia de
+teto: com `ring=sqlite` ele não limitava nada antes da reserva (§7.4), e mesmo
+limitado, 512 MiB num lote é o mesmo problema. O teto vale em todo caminho que
+escreve um lote: os workers (ring de memória e `ring=sqlite`), a reingestão do
+dump (§9.2) e o dreno do `ring.db` no boot (§10.1 passo 5). `ring=none`
+escreve um evento por vez e não é afetado. O teto é por pedaço, não por
+`Dequeue`: o ring entrega até `sink.batch` itens como antes, e o worker os
+entrega em um ou mais pedaços — o ring de memória não pode devolver um item à
+cabeça do canal, e cortar no worker serve aos dois rings com uma regra só.
 
 ### 8.2 `sink.type = redis`
 
@@ -1213,6 +1379,9 @@ Knobs de memória do rueidis expostos: `sink.redis.ring_scale_each_conn`,
 - Auth ACL (`sink.redis.username` / `sink.redis.password`), `sink.redis.db`.
 - TLS opcional (`sink.redis.tls`, `.tls_ca`, `.tls_insecure`). Diferente do HTTP,
   aqui o proxy reverso não resolve, e Redis gerenciado em nuvem exige TLS.
+  Um `tls_ca` sem `tls` é erro de configuração (`exit 1`), como em §8.5.11:
+  quem aponta uma CA acredita que o TLS está ligado, e a conexão sairia em
+  claro, com a senha (pendência 13, 2026-10-14).
 
 **Cluster fora de escopo na v1**: um stream vive num único slot, então cluster
 não traz vazão nenhuma — só complexidade de teste e documentação.
@@ -1249,6 +1418,7 @@ Um JLH que o leitor do cabeçalho recusa não vira comando: o lote falha como
 | `OOM command not allowed...` | `ErrFatal` | FATAL imediato — o Redis está vivo mas não aceita escrita |
 | `WRONGTYPE` | `ErrFatal` | FATAL imediato — a chave da stream é outro tipo. Não muda sozinho, e **todo** lote falharia igual |
 | `NOPERM`, `NOAUTH`, `WRONGPASS` | `ErrFatal` | FATAL imediato — credencial ou ACL. Idem: não muda sozinho |
+| `maxmemory-policy` `allkeys-*`, lido pela sonda (§8.2.5) | `ErrFatal` | FATAL imediato — um Redis cheio apagaria o stream inteiro em vez de responder `OOM` |
 | `LOADING`, `BUSY`, `MASTERDOWN`, `READONLY`, `CLUSTERDOWN`, `TRYAGAIN` | `ErrNetwork` | Vivo mas temporariamente incapaz; retentar é o certo, e se persistir os fusíveis de §10.2 escalam |
 | qualquer outra resposta de erro | `ErrNetwork` | Descartar por palpite é pior que retentar um lote sem esperança: o ring enche, o `429` aparece e o operador vê |
 
@@ -1285,6 +1455,62 @@ encerra o boot na hora, não depois de `sink.boot_timeout`.
 
 Se o worker atrasa, o stream cresce e o alerta vem da métrica de `XLEN`. Se o
 Redis atinge `maxmemory`, o `XADD` retorna `OOM`, que é fatal.
+
+**A política de despejo é conferida** (pendência 12, 2026-10-14; o
+`CheckEviction` do `go-syslog-server`). O `OOM` só existe com
+`maxmemory-policy noeviction` ou `volatile-*` (as chaves deste servidor nunca
+têm TTL, então um `volatile-*` cheio também recusa). Com `allkeys-*` (`lru`,
+`lfu`, `random`, e qualquer `allkeys-` futuro) um Redis cheio **apaga chaves**
+para abrir espaço, e um stream é uma chave: todo evento já respondido com `200`
+some de uma vez, sem erro, com a sonda de escrita passando (o `XADD` no limite
+dá certo, despejando). Por isso a sonda de saúde — a do boot (§10.1 passo 3) e
+cada uma de `sink.health_interval` depois, já que um `CONFIG SET` muda a
+política com o servidor no ar — lê a política depois do `XLEN` e do `XADD`,
+com o `INFO memory` no mesmo *pipeline* deles (a sonda continua uma ida e
+volta só, dentro de `sink.health_timeout`; o `CONFIG GET` só sai quando o
+`INFO` não respondeu a política):
+
+- `INFO memory` (linha `maxmemory_policy`), que um Redis gerenciado ainda
+  responde e cuja categoria de ACL é mais estreita; se o `INFO` é recusado ou
+  não traz a linha, `CONFIG GET maxmemory-policy`;
+- `allkeys-*` (em qualquer caixa) é `ErrFatal`: `exit 3` no boot, FATAL depois;
+- `noeviction` e `volatile-*` passam;
+- os dois recusados por resposta que esperar não muda (`NOPERM`, comando
+  desconhecido, um proxy que não os implementa) dão um `WARN` com a premissa,
+  **uma vez por processo**, e a sonda passa: recusar travaria toda implantação
+  com ACL mínima; repetir o `WARN` a cada checagem inundaria o log;
+- erro de transporte ou resposta transitória (`LOADING`, `BUSY`…) é
+  `ErrNetwork`, como o resto da sonda.
+
+**A sonda lembra qual leitura funciona** (§19.1 item 42, revisão independente de
+2026-10-14). Com o `INFO` negado e o `CONFIG GET` permitido (uma ACL
+`-info +config`), cada checagem fazia o *pipeline* e depois um `CONFIG GET`
+à parte — duas idas e voltas no mesmo `sink.health_timeout`, e com RTT alto
+um DOWN periódico. Agora:
+
+- o `INFO` não respondeu a política e o `CONFIG GET` respondeu: as sondas
+  seguintes pedem o `CONFIG GET` **no *pipeline***, no lugar do `INFO`;
+- os dois recusados (o `WARN` já dado): as sondas seguintes não pedem nenhum,
+  até o processo reiniciar — conceder o `INFO` depois pede um restart para a
+  conferência voltar;
+- com o `CONFIG GET` no *pipeline*, uma recusa nova dele (a ACL mudou) dá o
+  `WARN` (se ainda não foi dado) e a sonda seguinte volta a começar pelo
+  `INFO`.
+
+Assim a sonda fica sempre em uma ida e volta, salvo a checagem em que aprende.
+
+A política lida é a de um nó (o do cliente; com Sentinel, o primário). **Redis
+Cluster** (`addrs` com vários nós e sem Sentinel): o cliente de cluster do
+rueidis manda o `INFO memory` sem chave a um nó qualquer, então cada checagem
+confere a política de um nó só, e um nó isolado com `allkeys-*` só é pego
+quando é o sorteado. É uma limitação aceita: a conferência é uma precaução, e
+iterar sobre os primários a cada checagem multiplicaria o custo da sonda pelo
+número de nós (revisão independente de 2026-10-14, documentado). **Um proxy
+que responde o `INFO` com um tipo inesperado** (array ou mapa no lugar de
+texto) dá um erro de leitura que não é resposta de erro do Redis: é tratado
+como transporte, retentado até `sink.boot_timeout`, e o boot sai com 3 e "not
+reachable" em vez do `WARN` de "ilegível". Raro, e o log traz o erro de
+leitura; fica como está.
 
 `MAXLEN ~ N` foi rejeitado como padrão porque descarta eventos
 **silenciosamente** quando o consumidor atrasa — exatamente o cenário contra o
@@ -1364,6 +1590,65 @@ sob a mesma trava da escritora. Custo constante, independente do tamanho de
 `inbox`, e a pergunta certa — "ainda consigo escrever?" — que é a que um
 volume desmontado, um arquivo somente leitura ou um disco cheio respondem.
 
+**A sonda espera a trava só dentro do próprio prazo** (pendência 23, decisão do
+usuário em 2026-10-14). A escritora segura a trava durante o lote inteiro, até
+`sink.op_timeout`; a sonda esperava por ela sem prazo, e um lote mais longo que
+`sink.health_timeout` a fazia falhar com o banco íntegro — um ciclo DOWN, com
+`503` na porta pública, por lentidão. Agora a sonda tenta tomar a trava dentro
+de `sink.health_timeout`:
+
+- obtida, faz o heartbeat como sempre;
+- **não obtida no prazo** (a escritora está ocupada) e o **último `Write`
+  terminou sem erro**: a sonda conta **UP sem tocar o banco**. A escrita em
+  curso é a prova de vida, e o que a sonda procura (disco cheio, arquivo
+  somente leitura, volume desmontado) o próprio `Write` devolve como `ErrFatal`
+  (§8.3.4) — e passa a contar como último `Write` com erro;
+- não obtida no prazo e o último `Write` **falhou** (qualquer erro), ou nunca
+  houve `Write` neste processo: DOWN, como antes (`ErrNetwork`, alimentando os
+  fusíveis de §10.2).
+
+**A prova de vida vence** (§19.1 itens 36 e 37, revisão independente de 2026-10-14).
+A premissa acima — "o próprio `Write` devolve" — só vale para um `Write` que
+termina. Um volume que trava em I/O (NFS sem resposta, disco morrendo) deixa o
+`fsync` do `COMMIT`, ou a abertura e a poda da rotação, sem retorno e sem
+contexto: a trava ficava tomada para sempre, o último `Write` continuava "sem
+erro" e toda sonda dava UP — `/readyz` e `whs_sink_up` mentiam sem prazo, os
+fusíveis nunca escalavam, e o ring enchia até o `429`. Por isso o `Write`
+grava o instante em que tomou a trava, e a escritora ocupada só conta UP se o
+lote em curso a tomou há **no máximo `sink.op_timeout + sink.health_timeout`**
+(o prazo do próprio lote, mais o da sonda que o observa); passado isso, DOWN
+(`ErrNetwork`), qualquer que seja o resultado do último `Write`. O que importa
+não é a idade do último lote terminado, e sim há quanto tempo o lote em curso
+segura a trava. A idade é medida no relógio **monotônico** (o tempo desde a abertura do
+sink, não o instante de parede): com o relógio de parede, um passo do NTP para
+trás deixava a escritora presa em UP, e um para a frente dava DOWN com a
+escrita normal, pelo tamanho do passo (achado da revisão da família syslog,
+portado no mesmo dia).
+
+**A falha do próprio heartbeat conta como último `Write` com erro.** A sonda
+que toma a trava e falha no heartbeat (arquivo somente leitura, disco cheio)
+dá DOWN; a seguinte, com a escritora ocupada num lote que ainda não terminou,
+lia o último `Write` "sem erro" e dava UP, e o UP intercalado zerava a
+sequência que os fusíveis de §10.2 contam. Agora o heartbeat é uma escrita
+como as outras para essa regra: com erro, grava o estado de um `Write` com
+erro; **sem erro, o de um `Write` bom** — senão, depois de um heartbeat falho
+e da recuperação do banco, o primeiro lote lento dava DOWN com o arquivo
+íntegro (achado da revisão da família syslog). O "nunca houve `Write`" acima
+passa a ser "nunca houve escrita, `Write` ou heartbeat". **A exceção é o
+heartbeat cortado pelo prazo da própria sonda** (`context deadline exceeded`,
+ou o contexto cancelado no shutdown): a sonda pode tomar a trava logo antes do
+prazo, solta por um lote em `prazo − ε`, e então o arquivo não disse nada;
+gravado como falha, voltava o ciclo DOWN por lentidão (achado da revisão da
+família RELP). Esse erro não muda o estado.
+
+**A recusa `logic` também conta como `Write` com erro** (decidido,
+intencional). Um lote recusado pelo registro (`inboxRowOf`, um `CHECK`) não diz
+nada ruim do banco, mas a sonda que acha a escritora ocupada logo depois dá
+DOWN. A regra é "qualquer erro" de propósito: a sonda não distingue a classe, e
+uma recusa `logic` é rara fora de uma reingestão de dump ruim — que já é um
+incidente. O custo é um ciclo DOWN/`503` possível durante uma reingestão com
+registros recusados, com o banco são.
+
 `PRAGMA quick_check` roda **uma vez, no boot**, e só. Ele lê o arquivo inteiro
 sob a trava da escritora; como o `events.db` cresce sem limite com
 `rotate = none`, uma checagem periódica um dia passaria de
@@ -1434,6 +1719,29 @@ nomeados por padrão e o modo transaction os quebra; ver §18.
 O pool nasce **preguiçoso** — nenhuma conexão é aberta até o primeiro
 `Health()`. É o `WaitReady` do boot (§10.1) quem retenta, com a mesma
 disciplina de backoff dos outros destinos.
+
+**A configuração vem só do registry.** O pool é parseado com todo `PG*` do
+ambiente escondido (sob mutex, só no boot, e restaurado depois) e
+`sslmode=disable`; o TLS vem só de `[sink.postgres]` (§8.5.11). Nenhuma
+variável libpq (`PGSSLMODE`, `PGPORT`, `PGSERVICE`, `PGCHANNELBINDING`,
+`PGREQUIREAUTH`, `PGSSLNEGOTIATION`, `PG{MIN,MAX}PROTOCOLVERSION`,
+`PGCONNECT_TIMEOUT`, `PGOPTIONS`, `PGTARGETSESSIONATTRS`, `PGAPPNAME`…) chega ao
+pool nem derruba o parse: antes, um `PGSSLMODE` inválido ou um `PGSERVICE`
+inexistente era exit 1, e um `PGCHANNELBINDING=require` recusava toda conexão
+sem SQLSTATE, retentado como rede até o `boot_timeout`. O discador do pool não
+tem prazo próprio: o da conexão é `sink.op_timeout`, aplicado
+pelo contexto; o discador que o pgx monta para um `connect_timeout`
+(`PGCONNECT_TIMEOUT`) cortaria cada discagem no prazo dele (pendência 15,
+2026-10-14; o `parseWithoutLibpqEnv` do `go-syslog-server`).
+
+**Dois efeitos laterais, aceitos** (revisão independente de 2026-10-14, só
+documentados). O discador é um `net.Dialer{}` sem campos: o *keep-alive* TCP é
+o padrão do Go (15 s), não os 5 minutos do discador padrão do pgx — inofensivo
+(detecta antes uma conexão morta) e agora escrito. E o ambiente `PG*` fica
+escondido do **processo inteiro** enquanto o parse dura: seguro em produção,
+porque o parse roda só no boot e nada mais no processo lê `PG*`; um teste paralelo que lesse `PG*` nesse instante falharia de forma
+intermitente, e os testes que mexem no ambiente usam `t.Setenv`, que já
+impede `t.Parallel`.
 
 #### 8.5.3 Concorrência e conexões
 
@@ -1509,12 +1817,17 @@ reusá-los sem risco. A armadilha é outra, e é prima da de §12.3: o slice de
 os slices são **zerados**; um slice devolvido cheio prenderia buffers que já
 voltaram ao pool, e o lote seguinte enxergaria o envelope de outro cliente.
 
-**Teto de bytes.** O lote é limitado por contagem, nunca por bytes. Um
-parâmetro do protocolo não passa de 1 GiB, e o pior caso teórico (o maior
-envelope de §3.2 × `sink.batch`) excede isso com os padrões. O que salva hoje é
-`ring.max_bytes`, de outro eixo: um lote nunca carrega mais do que o ring
-aceita conter. O servidor **não divide** o lote; avisa no boot quando
-`min(maior envelope × batch, ring.max_bytes)` passa de 1 GiB.
+**Teto de bytes.** O lote é limitado por contagem (`sink.batch`) **e** por
+bytes: os workers, a reingestão e o dreno do `ring.db` escrevem em pedaços de
+no máximo `sink.batch_max_bytes` de JLH (16 MiB; §8.1 passo 2). Um parâmetro do
+protocolo não passa de 1 GiB, e o teto da chave (256 MiB) fica abaixo disso;
+só um envelope maior que o teto, que vai sozinho, pode passar dele. O boot
+avisa quando o pior lote — `max(maior envelope, min(maior envelope × batch,
+ring.max_bytes, sink.batch_max_bytes))` (`config.WorstBatchBytes`) — passa de
+1 GiB, o que com o teto de bytes só acontece com um `server.max_body_bytes`
+acima de ~750 MiB. Até 2026-10-14 o servidor **não dividia** o lote e contava
+com `ring.max_bytes` para limitá-lo, o que o `ring=sqlite` nem cumpria (§7.4);
+a regra foi revista por decisão do usuário (§8.1, §19.1 item 11).
 
 #### 8.5.5 Validação no boot
 
@@ -2354,7 +2667,7 @@ Na primeira checagem de saúde bem-sucedida, com a regra de §8.5.5: cada recusa
 | As dez colunas são colunas comuns (sem `default_kind`, ou `DEFAULT`) | `system.columns.default_kind` | exit 3 — uma `EPHEMERAL` aceita o `INSERT` e não guarda nada (o `payload` inteiro sumia com o `Write` devolvendo sucesso); `MATERIALIZED` e `ALIAS` recusam o `INSERT` |
 | `received_at`, se existir, `DateTime64` de 6 a 9 dígitos com `DEFAULT` ou `MATERIALIZED` | `system.columns` (`default_kind`) | exit 3 — sem expressão, o ClickHouse a preencheria com o zero do tipo, 1970, e o atraso medido por ela seria mentira |
 | Nenhuma `CONSTRAINT … CHECK`, com o nome nu ou entre crases | `system.tables.create_table_query` | exit 3 — §3.9: a sonda vazia não a exercita, e uma violação seria `logic` em todo lote |
-| `max_memory_usage` (quando não é `0`) comporta o pior lote: 128 MiB + 8 × `min(maior envelope × sink.batch, ring.max_bytes)` | `getSetting(...)` na sessão do servidor de webhooks | exit 3, com os números na mensagem — medido no 25.8: o `INSERT` de um lote de `payload` JSON consome ~6× os bytes do lote mais ~130 MiB fixos, e `241` é fatal (§8.8.7); sem a conta, um lote legítimo derrubaria a frota |
+| `max_memory_usage` (quando não é `0`) comporta o pior lote: 128 MiB + 8 × o pior lote de §8.5.4 (`max(maior envelope, min(maior envelope × sink.batch, ring.max_bytes, sink.batch_max_bytes))`) | `getSetting(...)` na sessão do servidor de webhooks | exit 3, com os números na mensagem — medido no 25.8: o `INSERT` de um lote de `payload` JSON consome ~6× os bytes do lote mais ~130 MiB fixos, e `241` é fatal (§8.8.7); sem a conta, um lote legítimo derrubaria a frota |
 | `max_memory_usage_for_user` (quando não é `0`) comporta `min(pool_size, escritores)` vezes isso — escritores são `sink.workers` com ring e `ring.max_inflight` com `ring=none`, passados pela montagem | `getSetting(...)` | exit 3 — o limite do usuário soma todas as consultas dele: quatro lotes legítimos e simultâneos estouravam um limite que a comparação com um só aceitava, e `241` é fatal. Outras instâncias no mesmo usuário somam por cima, e nenhuma as enxerga: dê a cada uma o seu usuário. A conta multiplicava pelo `pool_size`, e a folga do `sink.workers + 1` (que nenhum escritor usa) e a conexão do check (um `SELECT`, fora do pool) não fazem `INSERT`: um limite de exatamente `sink.workers` piores lotes era recusado sem que escrita alguma pudesse estourá-lo; e a mensagem mandava "baixar o pool", que abaixo dos workers só os faz esperar conexão (porte da família syslog/RELP, 2026-10-13) |
 | `INSERT` concedido nas dez colunas, sessão gravável, ajustes aceitos | um `INSERT` **vazio**: `PrepareBatch` com o mesmo comando e os mesmos ajustes do dreno, e `Send` sem linhas, sob o mesmo prazo do dreno (`sink.op_timeout`) | exit 3 — `497` é o grant (a mensagem nomeia as colunas), `164` o modo `readonly` (com `readonly=1` o servidor recusa já a mudança de ajuste); zero linhas não criam parte (medido) |
 
@@ -2374,8 +2687,12 @@ são contadas como descartadas.
 
 O pior lote e o número de escritores são calculados pela montagem (`app`), que conhece os dois eixos: com
 `ring=none` é o maior envelope (§3.2); com os outros rings,
-`min(maior envelope × sink.batch, ring.max_bytes)`. Com os padrões (`5 MiB` de
-corpo, lote de 256, `ring.max_bytes` de 512 MiB) dá ~4,1 GiB de exigência. Um
+`max(maior envelope, min(maior envelope × sink.batch, ring.max_bytes,
+sink.batch_max_bytes))` — o lote é escrito em pedaços de no máximo
+`sink.batch_max_bytes` (§8.1 passo 2), e só um envelope maior que o teto vai
+sozinho acima dele. Com os padrões (`5 MiB` de corpo, ~6,7 MiB de maior
+envelope, 16 MiB de teto) dá 128 MiB + 8 × 16 MiB = 256 MiB de exigência; antes
+do teto de bytes (2026-10-14) eram ~4,1 GiB. Um
 `max_memory_usage = 0` (o padrão do ClickHouse) passa: aí o teto é o do
 servidor inteiro (`max_server_memory_usage`), que esta sessão não enxerga.
 
@@ -2570,7 +2887,26 @@ confirmados no sink**.
 Cada registro tem o cabeçalho do JLH conferido (o mesmo leitor de §12.1 que os
 destinos usam) e o JSON inteiro validado (`json.Valid`: o leitor só varre as
 chaves do payload, e `{]` passaria): um registro que não é o que este servidor
-escreve conta como corrompido.
+escreve conta como corrompido. **O que este servidor escreve** inclui também a
+forma do texto (porte do `go-webhook-pg-server`, 2026-10-14; §19.1 item 20):
+UTF-8 válido (`utf8.Valid`), e só os escapes que o serializador de §12.1
+escreve — os de dois caracteres (`\"`, `\\`, `\n`, `\r`, `\t`), `\u00XX` em
+hex **minúsculo** só para os bytes de controle sem forma curta (`\u0000` a
+`\u001f`, fora `\n`, `\r` e `\t`) e `\u2028`/`\u2029` —, **e nada mais**:
+`\/`, `\b`, `\f`, o `\u` de um caractere imprimível (`\u00e9`, `\u0041`), o
+`\u000a` no lugar do `\n` e o hex maiúsculo (`\u001F`) são JSON válido que o
+serializador nunca escreve, e o registro conta como corrompido (§19.1 item 34,
+revisão independente de 2026-10-14: a porta aceitava qualquer escape de dois
+caracteres e qualquer `\u00XX`, e o teste afirmava o contrário desta seção;
+a porta do `go-webhook-nats-server` já era a estrita) —, e nenhum
+U+2028/U+2029 **cru**, que o serializador sempre escapa. O `json.Valid` não confere nem UTF-8 nem
+escape: um byte inválido ou um surrogate solto escapado (`"\ud800"`) passam
+por ele e são recusados pelo `jsonb` (`22021`, `22P02`, classe 22, `logic`) e
+pelo MySQL — dano de disco ou edição à mão que só aparecia no destino.
+
+Os lotes da reingestão são os dos workers (§8.1 passo 2): até `sink.batch`
+envelopes e no máximo `sink.batch_max_bytes` de JLH, um envelope maior que o
+teto sozinho.
 
 Um arquivo corrompido ou truncado (comprimento declarado maior que os bytes
 restantes: um dump de antes de 2026-10-11, escrito direto no nome final e
@@ -2609,7 +2945,37 @@ precisará dele. Nos outros modos vira um `ERROR` nomeando o diretório, e o boo
 segue sem reingerir: uma vida que nunca escreve ali não para por causa dele —
 até 2026-10-11 nem o olhava.
 
-Uma recusa do sink durante a reingestão mantém o arquivo e encerra o boot com 3.
+**Linha recusada pelo destino** (porte do `go-webhook-pg-server`, 2026-10-14;
+§19.1 item 20). Um lote que o destino recusa como `logic` é refeito **item a
+item**: os aceitos são entregues e contados em `whs_events_written_total`; o
+recusado de novo fica no arquivo, num `ERROR` com o seu `uuid`, e o arquivo vai
+para `.corrupt` em vez de ser removido (o `ERROR` da quarentena traz a contagem
+dos recusados). O boot segue. Nada se perde: o registro continua no disco para
+quem quiser examiná-lo. Até aqui uma linha assim — que passou por toda a porta
+e o destino ainda não guarda — encerrava todo boot com 3, com a porta pública
+fechada e todos os outros registros e arquivos sem entrega, em laço.
+**A recusa que diz o que foi guardado não é refeita** (§19.1 item 33, revisão
+independente de 2026-10-14). Um `logic` com `Error.Delivered` (§8.1 passo 5;
+`sink=nats`, §8.7.2) já é o veredito por item: os guardados contam em
+`whs_events_written_total`, os outros são os recusados, e nada é reenviado —
+a mesma regra dos workers e do `go-webhook-nats-server`. O refazer item a
+item vale só para o lote recusado inteiro. Antes, o boot republicava um a um
+todos os itens do lote, inclusive os que o stream já guardara: duplicatas que
+só o `Nats-Msg-Id` absorve, e só dentro de `sink.nats.duplicates`. Vale para a
+reingestão do dump e para o dreno do `ring.db` (§10.1 passo 5).
+
+**O recusado fica no `.corrupt`, fora dos *gauges*** (revisão independente de
+2026-10-14, só documentado). O registro recusado como `logic` na reingestão
+fica no arquivo, que vai para `.corrupt` junto com os já entregues; ele não
+entra em `whs_events_dropped_total` (não se perdeu) nem em
+`whs_emergency_events_pending` (o `.corrupt` não é listado como dump), e o
+único rastro é o `ERROR` com o `uuid`. Reprocessar o arquivo à mão (renomeá-lo
+para o nome de dump) entrega de novo todos os outros registros, que um destino
+que deduplica por `uuid` absorve; para reaproveitar só o recusado, o operador
+o extrai pelo `uuid` do log.
+
+Uma recusa de outra classe (`network`, `fatal`, prazo) durante a reingestão
+mantém o arquivo e encerra o boot com 3.
 Um `SIGTERM` no meio dela — ou da drenagem do backlog do passo 5 — encerra com
 130, a saída de um boot interrompido, e também mantém o arquivo (ou as linhas
 no `ring.db`); até 2026-10-07 saía com 3, como se o destino tivesse recusado
@@ -2655,10 +3021,10 @@ punha em `emergency_failed`, ao contrário do código e do
       /readyz  -> 503 com o motivo em texto
       /metrics -> já exportando
 3. inicializa o SINK
-      redis:  conecta e sonda (XLEN + XADD NOMKSTREAM); retry com
-              backoff 100ms -> 5s até sink.boot_timeout (300s);
-              estourou => exit 3; recusa permanente (WRONGPASS,
-              NOPERM, WRONGTYPE) => exit 3 na hora
+      redis:  conecta e sonda (XLEN + XADD NOMKSTREAM + maxmemory-policy,
+              §8.2.5); retry com backoff 100ms -> 5s até sink.boot_timeout
+              (300s); estourou => exit 3; recusa permanente (WRONGPASS,
+              NOPERM, WRONGTYPE, allkeys-*) => exit 3 na hora
       sqlite: abre o arquivo corrente, cria esquema e índices
               erro de I/O => exit 3
       postgres: pool preguiçoso; a primeira checagem de saúde válida
@@ -2683,6 +3049,25 @@ punha em `emergency_failed`, ao contrário do código e do
       permanently", não "did not become reachable within
       sink.boot_timeout", que mandava o operador olhar a rede quando o
       esquema, o stream ou a credencial estavam errados
+      UM prazo só, sink.boot_timeout contado do início do passo 3, cobre a
+      construção do cliente (o laço do redis) e a espera pela primeira
+      checagem de saúde: cada tentativa do redis dura no máximo o que
+      falta dele (e sink.op_timeout), o backoff não dorme além dele, e a
+      espera da checagem recebe só o resto (com o prazo já vencido, uma
+      checagem só). Antes eram dois prazos inteiros em sequência, e o
+      pior caso passava de 2× sink.boot_timeout (pendência 22, 2026-10-14)
+      e a tentativa do redis respeita o prazo também DENTRO do cliente: o
+      rueidis.NewClient não recebe contexto e disca e faz o handshake
+      (HELLO/AUTH) sob o Dialer.Timeout dele (5 s), então um endereço que
+      aceita TCP e não fala (balanceador sem backend, Redis travado)
+      segurava a tentativa 5 s com sink.boot_timeout=2s. Agora o
+      Dialer.Timeout é sink.op_timeout (vale também para as reconexões) e
+      a construção corre numa goroutine com select sobre o prazo da
+      tentativa; o cliente que chega tarde é fechado (§19.1 item 38,
+      revisão independente de 2026-10-14)
+      o backoff entre as checagens do WaitReady também dorme
+      min(backoff, o que falta do prazo): dormia o backoff inteiro (até
+      5 s) e ainda fazia mais uma checagem depois do prazo (§19.1 item 39)
 4. se ring.mode = sqlite: abre ring.db e conta o backlog
    (uma tabela `ring` da v1 com linhas => ERROR e fica intocada, §7.4;
    com sink=none o backlog encontrado fica no arquivo, fora da conta
@@ -2698,6 +3083,17 @@ punha em `emergency_failed`, ao contrário do código e do
       entregue e então removido se o arquivo é só do ring (§7.4)
       com sink=none o backlog de uma vida anterior não é entregue => WARN,
       e o arquivo que o tem fica (§7.4)
+      em lotes de até sink.batch linhas e sink.batch_max_bytes de JLH (§8.1)
+      uma linha que o destino recusa como logic: o lote é refeito item a
+      item; a recusada é descartada e contada em
+      whs_events_dropped_total{reason="sink_logic"}, num ERROR com o uuid,
+      como nos workers (§8.1 passo 5) — Commit antes do Release —; o boot
+      segue. Qualquer outra recusa => exit 3, as linhas ficam no ring.db
+      um erro transitório do Dequeue no dreno do boot (SQLITE_BUSY além
+      de busy_timeout) é exit 3 na hora, sem a retentativa dos workers
+      (§8.1 passo 1): aceito, porque o boot seguinte retenta e, no boot,
+      só a escritora do próprio processo escreve no ring.db (os DELETE),
+      e o WAL não bloqueia o leitor (revisão independente de 2026-10-14)
       a porta pública permanece FECHADA
       /readyz reporta: "draining backlog: 412k pending"
 6. abre a porta pública
@@ -2724,7 +3120,8 @@ dispara os alertas de `CrashLoopBackOff` que os times já têm.
 | `sink=postgres` com `sink.workers` **no default** | Rebaixado para 4, com `WARN` (§8.5.3). Um valor configurado é respeitado; `WARN` acima de 16 |
 | `sink=postgres` com `ring=none` e `ring.max_inflight > pool_size` | Permitido, com `WARN`: o excedente espera conexão dentro do pool (§7.5) |
 | `sink=postgres`, `sink=mysql` ou `sink=clickhouse` com um ring e `pool_size` explícito abaixo de `sink.workers` | Permitido, com `WARN`: os workers esperam conexão uns dos outros. Igual a `sink.workers` é legítimo: o check tem conexão própria (§8.5.3) |
-| `sink=postgres` com `min(max_body_bytes × batch, ring.max_bytes) > 1 GiB` | Permitido, com `WARN`: um lote pode exceder o teto de um parâmetro do protocolo (§8.5.4) |
+| `sink=postgres` com o pior lote de §8.5.4 (`config.WorstBatchBytes`) > 1 GiB | Permitido, com `WARN`: um lote pode exceder o teto de um parâmetro do protocolo (§8.5.4); com o teto de bytes do lote, só um envelope acima de 1 GiB chega lá |
+| `sink.batch_max_bytes` abaixo de 1 ou acima de 256 MiB | `exit 1`, nomeando a chave (§8.1 passo 2). 1 é coerente com a regra (cada evento vai sozinho) e por isso é o mínimo; acima de 256 MiB um lote do PostgreSQL chegaria ao teto de 1 GiB de um parâmetro, e nenhum destino escreve centenas de MiB dentro de `sink.op_timeout` |
 | `sink=postgres` com `tls_ca` sem `tls` | `exit 1` (§8.5.11) |
 | `sink=postgres` com `table` que não é identificador simples (`nome` ou `esquema.nome`, minúsculos) | `exit 1` |
 | `sink=mysql` com `sink.workers` **no default** | Rebaixado para 4, com `WARN` (§8.6.2) |
@@ -2738,10 +3135,13 @@ dispara os alertas de `CrashLoopBackOff` que os times já têm.
 | `sink=clickhouse` com `ring=none` e `ring.max_inflight > pool_size` | Permitido, com `WARN` (§7.5) |
 | `sink=clickhouse` com `addrs` vazio ou fora de `host:porta`, `username` ou `database` vazios, `pool_size` negativo, `tls_ca` sem `tls`, ou `table` que não é identificador simples (`nome` ou `banco.nome`, caixa preservada) | `exit 1` (§8.8.1, §8.8.11) |
 | `ratelimit.enabled=false` + `server.bind` não-loopback | Permitido, com `WARN` (§6.1) |
+| `admin.enabled=true` com `admin.bind` vazio ou fora de `host:porta` (`9101`, `127.0.0.1`) | `exit 1` (§11). Com `admin.enabled=false` o `bind` não é conferido nem avisado |
+| `admin.enabled=true` com `admin.bind` não-loopback (`:9101`, `0.0.0.0:9101`) | Permitido, com `WARN` (§11) |
 | `GOMEMLIMIT` ausente, ou `< ring.max_bytes * 2` com `ring=memory` | Permitido, com `WARN` (§12.4) |
 | Linha de INI sem `=` ou cabeçalho sem `]`; argumento sem `--` | `exit 1` com o número da linha ou o nome antes do `=`, nunca o valor (`password: x` é exatamente a linha que cai aqui) (§13.2) |
 | **Tetos** (porte da família syslog/RELP, 2026-10-13): `ring.capacity_items` > 16 777 216 com `ring.mode=memory`, > 2⁴⁰ com `sqlite` ou `none`; `ring.max_inflight` > 1 048 576; `ring.sqlite.commit_batch` > 65 536; `sink.batch` > 1 048 576 (o MySQL mantém os seus 5000); `sink.workers` > 1024; `sink.postgres`/`mysql`/`clickhouse.pool_size` > 4096; `server.listeners` > 256; `sink.redis.ring_scale_each_conn` fora de 0–20; `sink.redis.pipeline_multiplex` fora de −1–8; `sink.redis.read_buffer_each_conn` ou `write_buffer_each_conn` > 256 MiB | `exit 1`, nomeando a chave. Sem eles um erro de digitação de poucos dígitos derrubava o boot com pânico (`makechan` do ring de memória e do `ring.sqlite`; `makeslice` do anel e dos buffers do rueidis), alocava um gigabyte por `Dequeue` (`sink.batch`), dava a volta no `int32` do pool do pgx (`pool_size = 4294967300` virava 4) ou tornava negativo o `MaxPending` do NATS (`workers × batch + max_inflight`), que o sink trocava por 4096 em silêncio; um `pipeline_multiplex` acima de 8 o próprio rueidis recusa, mas no `connect`, retentado até o `boot_timeout`. Só o ring de memória faz um canal de `capacity_items` posições: no `ring.db` 50 milhões de linhas são configuração legítima, e um lote de 100 000 linhas no ClickHouse também. O par `ring.max_inflight` ↔ `MaxPending` é da área do NATS (§8.7) |
 | `sink=postgres` com `addr` que não é um servidor só — `host:porta` (porta 1–65535 escrita sem sinal nem zero à esquerda) ou diretório de socket (começa com `/`, com `:porta` opcional, sem vírgula nem branco); recusados `h1,h2:5432`, tab, `[h:5432]:5433`, `pg-1` sem porta | `exit 1` (§8.5.2): passava aqui e falhava no DNS ou no *dial*, erro `network` retentado até o `boot_timeout` (porte do `go-syslog-pg-server`/`go-relplog-pg-server`, 2026-10-13) |
+| `sink=redis` com `tls_ca` sem `tls` | `exit 1` (§8.2.2) |
 | `sink=redis` com uma entrada de `addrs` que não é `host:porta` (sem porta, com branco, porta fora de 1–65535) | `exit 1`: o rueidis disca toda entrada como TCP `host:porta`, e o erro do *dial* era retentado até o `boot_timeout`. A vírgula é o separador da lista: não há URL Redis neste servidor cujo host pudesse levar uma (porte da família syslog/RELP, 2026-10-13) |
 | `--help`, `--version` ou `--dump-config` com `=valor`; `--config=` vazio | `exit 1`, sem o valor (§13.2) |
 | Nome de parâmetro desconhecido sem forma de nome, ou que começa com o nome de um parâmetro e continua; chave desconhecida do INI fora de uma seção deste servidor, sem forma de chave ou logo depois de um segredo; flag desconhecida fora das seções deste servidor logo depois de uma flag com valor | `exit 1`, nomeando só a linha ou a flag anterior, **nunca o conteúdo** (§13.2) |
@@ -2792,13 +3192,37 @@ fase 4  drena o ring inteiro para o sink
 fase 5  fecha o sink, fecha o SQLite, exit 0
 ```
 
+**Erro no `accept` e listener parado.** Um erro do `accept` que não seja o
+fechamento do próprio listener (`ENOBUFS`, `ENOMEM`, `EPERM` de uma regra de
+firewall, `EPROTO`, e também os temporários `EMFILE`/`ENFILE`) é **retentado
+no listener**, com pausa crescente de 5 ms a 1 s e um `WARN` amostrado (um a
+cada 10 s, com a contagem dos suprimidos); o listener nunca desiste, como o
+laço de `accept` da família syslog/RELP. Só o fechamento pelo próprio servidor
+(`net.ErrClosed`) encerra o `accept`. Se ainda assim o `Serve` de **um**
+listener terminar com erro, o processo não espera os outros (com
+`server.listeners > 1`, um listener morto ficava invisível até todos
+morrerem): sai pelo shutdown gracioso, como num `SIGTERM` (as cinco fases
+e o dump com `ring=memory` se o destino não der conta), e termina com
+`exit 1` se o shutdown foi completo, ou com o código que o shutdown der (`3`,
+`130`). Até 2026-10-14 esse caminho saía com `1` na hora, sem dreno nem dump:
+com `ring=memory`, os eventos já respondidos com `200` sumiam sem contagem.
+Como no shutdown por FATAL, **nenhum sinal o iniciou**: o primeiro `SIGTERM`
+ou `SIGINT` que chega durante ele — o do orquestrador que viu o `/readyz`
+falhar — é tolerado com um `WARN`, e só um segundo aborta. Na primeira versão
+da correção ele contava como segundo sinal, e o shutdown que existia para
+salvar o ring abortava ali: com `ring=memory` e o destino retido, os eventos
+respondidos com `200` iam para `reason="abort"` em vez do dump (§19.1 item
+31). O dreno e o `pre_stop_delay` continuam os de um `SIGTERM`: tolerar o
+primeiro sinal é um parâmetro à parte do modo FATAL.
+
 **Segundo sinal** em qualquer fase → pula direto para a saída, aceitando a perda
 (contada em `whs_events_dropped_total{reason="abort"}`, inclusive o que já tinha
 sido recolhido para um dump ainda não ligado ao nome final, e uma vez só: o que o aborto
 conta o dump não conta de novo), `exit 130`. No shutdown **por FATAL** nenhum
 sinal o iniciou: o primeiro `SIGTERM` ou `SIGINT` que chega — o comum de um
 orquestrador — é o primeiro, registra um `WARN` e o dump continua; só um
-segundo aborta. Até 2026-10-07 esse primeiro sinal jogava o dump fora (achado
+segundo aborta. O mesmo vale para o shutdown que começa porque o listener
+público parou com erro (acima). Até 2026-10-07 esse primeiro sinal jogava o dump fora (achado
 no `go-webhook-pg-server`). **`SIGQUIT`** durante o shutdown aborta como o
 segundo sinal e nunca é tolerado, nem como primeiro sinal do shutdown por
 FATAL; fora dele vale a ação padrão do Go (despejo das goroutines e saída `2`),
@@ -2882,7 +3306,8 @@ Um `SIGHUP` em qualquer fase não interrompe nada (§13.3).
 
 ### 10.4 Falha de lote
 
-O worker **segura o lote no próprio buffer** e retenta com backoff
+O worker **segura o lote no próprio buffer** — o pedaço em retentativa e os
+que ainda não foram escritos (§8.1 passo 3) — e retenta com backoff
 (`sink.retry_backoff_min` 100ms → `sink.retry_backoff_max` 2s), **sem puxar mais
 nada do ring**.
 
@@ -2903,7 +3328,7 @@ loop de CPU girando os mesmos itens.
 | Código | Significado |
 |---|---|
 | `0` | Shutdown gracioso completo: ring vazio, ou `ring=sqlite` com linhas que o próximo boot drena |
-| `1` | Erro de configuração ou falha de inicialização não relacionada ao sink |
+| `1` | Erro de configuração ou falha de inicialização não relacionada ao sink; ou o listener público parou com erro e o shutdown que se seguiu foi completo (§10.3) |
 | `3` | Sink indisponível (FATAL, `boot_timeout`, ou `drain_timeout` estourado) |
 | `100`–`114` | Identidade: o `go-loghub-ident` sai sozinho (`DATADIR` inválido ou sem escrita, `AGENT_UUID` que não é UUIDv7, `HOSTNAME` fora da RFC 1123, `WORKSPACE` com `_`...). A tabela completa está na skill `go-loghub-ident` §8 |
 | `130` | Abortado por segundo sinal, ou boot interrompido por sinal: na espera do sink, na reingestão, na drenagem do backlog e no `bind` da porta admin ou da pública. Um nome de host no `bind` falha com "operation was canceled" e saía com 1, como um endereço errado; um IP literal nem olha o sinal, e o boot abria a porta, respondia `/readyz` 200 e saía com 0 pelo caminho gracioso. Agora o boot confere o sinal depois do último `bind` e antes de servir (porte da família syslog/RELP, 2026-10-13) |
@@ -2914,6 +3339,18 @@ loop de CPU girando os mesmos itens.
 
 `admin.bind`, padrão `127.0.0.1:9101`. Loopback por padrão para não expor à
 internet. HTTP/1.1 apenas.
+
+Com `admin.enabled=true`, `admin.bind` precisa ser `host:porta`
+(`net.SplitHostPort`) com **porta numérica de 1 a 65535** (escrita sem
+sinal nem zero à esquerda); vazio, sem porta (`127.0.0.1:`, `:`, `[::1]:`) ou
+com porta não numérica (`localhost:abc`) é `exit 1`. O `SplitHostPort` aceita
+porta vazia sem erro, e o `net.Listen` abria então uma porta sorteada — com
+`:`, em todas as interfaces —, o mesmo risco do vazio; a porta 0 também fica
+de fora, pelo mesmo motivo (§19.1 item 40, revisão independente de 2026-10-14). O vazio fazia o
+`net.Listen` escutar em todas as interfaces, numa porta sorteada, com um `WARN`
+só: `/metrics` publicado onde o host fosse alcançável, num endereço que ninguém
+monitora. Para desligar a porta, `admin.enabled=false` (pendência 25,
+2026-10-14; a regra do `go-webhook-nats-server` e do `go-syslog-server`).
 
 Existe porque a porta pública é **100% opaca** — reservar paths nela criaria um
 buraco onde qualquer webhook legítimo que usasse esse path seria engolido pelo
@@ -3281,6 +3718,26 @@ capacidade, e o buffer do corpo volta ao pool assim que o JLH é escrito — nad
 mais o referencia. Um JLH que cresceu além da capacidade pedida (só se a
 estimativa do cabeçalho falhar) deixa de ser do pool e vai para o GC.
 
+O `Content-Length` declarado só **pré-dimensiona** o buffer do corpo até
+64 KiB (a classe de 64 KiB, ou a menor que comporte o declarado). Acima disso
+o buffer cresce só quando está cheio de bytes **recebidos**, dobrando, e
+nunca além do declarado, salvo o arredondamento à classe do pool: até 256 KiB
+o buffer pedido vem da classe que o comporta (um corpo de 200 KiB cresce de
+64 KiB para a classe de 256 KiB); acima dela o último passo é exatamente o
+declarado, então um corpo honesto de 1 MiB termina num buffer de 1 MiB. Nada
+é alocado pelo que o par promete: uma requisição que declara 5 MiB e não manda
+nada segura no máximo 64 KiB até o `read_timeout`, e não 5 MiB (em h2c, vezes
+`http2_max_concurrent_streams` por conexão; com `read_timeout = 0`, até o
+`write_timeout` do fluxo, §13.5). O custo é uma cópia por
+dobra num corpo grande e honesto, que já é o caso raro.
+
+**O ring de memória cobra o buffer, não o JLH** (§7.2): o item retém o buffer
+inteiro da classe, e é `cap(Env)` mais `ring.ItemOverhead` que entra em
+`ring.max_bytes` e em `whs_ring_bytes`. As classes são espaçadas 4×, então um
+JLH logo acima de uma fronteira custa até 4× o seu tamanho; o JLH **não** é
+copiado para uma classe menor depois de escrito (decisão do usuário,
+2026-10-14: uma cópia por requisição no caminho quente, e o fator não some).
+
 ### 12.3 Regra de propriedade única
 
 > O item do ring é **dono** do buffer do JLH. Ele volta ao pool **apenas**
@@ -3295,8 +3752,10 @@ Ponto de devolução por combinação:
 | `none` | O `sink.Write()` síncrono retorna |
 
 Nos workers, o `ring.Commit` vem **antes** do `Release`, no sucesso e na
-recusa `logic`: o ring desconta `it.Size()`, que é `len(Env)`, e o `Release`
-esvazia o `Env`. Na ordem inversa — a da recusa `logic` até 2026-10-11 — o ring
+recusa `logic`: o `ring=sqlite` desconta `it.Size()`, que é `len(Env)`, e o
+`Release` esvazia o `Env`. (O ring de memória desconta o valor que gravou no
+item no `Enqueue`, §7.2, e não relê o buffer; a ordem vale igual, por ser a
+única que serve aos dois.) Na ordem inversa — a da recusa `logic` até 2026-10-11 — o ring
 continuava contando os bytes de um lote que ninguém mais tinha, até recusar tudo
 como cheio com nada dentro (achado no `go-webhook-nats-server`).
 
@@ -3331,7 +3790,11 @@ teste explícito com `-race`.
   automaticamente e reavalia dinamicamente. A dependência `automaxprocs` é
   desnecessária.
 - **`GOMEMLIMIT`: não define automaticamente**, mas emite `WARN` no boot se
-  estiver ausente ou, com `ring=memory`, menor que `ring.max_bytes * 2`. Com
+  estiver ausente ou, com `ring=memory`, menor que `ring.max_bytes * 2`. O
+  fator 2 só é teto porque `ring.max_bytes` mede a memória **retida** pelo ring
+  de memória — buffer inteiro da classe mais o custo fixo por item (§7.2,
+  §12.2) —; enquanto ele contava `len(Env)`, o ring retinha de 4 a 7× o
+  número com eventos pequenos, e o `GOMEMLIMIT` sugerido não o cobria. Com
   `ring=sqlite` e `ring=none` não há número a sugerir: o que fica residente são
   os corpos em voo (`ring.max_inflight × server.max_body_bytes` com `none`;
   `sink.workers × sink.batch × server.max_body_bytes` com `sqlite`), tetos de
@@ -3445,6 +3908,24 @@ seguem:
   seguir `ring.data_dir` — para fora da única área gravável (§13.6). Um valor
   explícito continua chave.
 
+**O dump relido é igual** (pendência 26, 2026-10-14; o `quoteINI` do
+`go-webhook-nats-server`). O leitor de INI tira os brancos das pontas do valor e
+**uma** camada de aspas externas (`"` ou `'`). Por isso o `--dump-config` põe
+entre aspas duplas o valor que tem branco numa ponta ou que começa e termina
+com a mesma aspa (`" /tmp/e "`, `""q""`): relido, ele volta exatamente como
+estava. Os outros valores saem crus, como sempre saíram. A regra vale também
+para a linha comentada de um valor derivado.
+
+**Nenhum valor de texto carrega byte de controle** (§19.1 item 41, revisão
+independente de 2026-10-14). Um valor de string ou de lista vindo do ambiente
+ou de uma flag com um byte abaixo de `0x20` (fora o tab) ou `0x7f` —
+`WHS_SINK_SQLITE_PATH=$'a\nb'` — é `exit 1`, nomeando a chave (a variável ou
+a flag) e o byte, **nunca o valor**. O INI não tem como representá-lo: no
+`--dump-config` o valor saía em duas linhas, e relido dava "expected 'key =
+value'" ou, com o resto na forma `k = v`, injetava uma chave ou uma seção; na
+linha comentada de um valor derivado, a segunda linha deixava de ser
+comentário. O tab fica, porque o INI o aceita e o dump o relê (entre aspas).
+
 **Padrões assumidos nesse porte** (este módulo não tem `DECISOES.md`; os mesmos
 do `go-webhook-fast-server`, `DECISOES.md` 4b de lá; contestáveis): os tetos da
 tabela de §10.1 são os do `go-syslog-server`, que tem os mesmos rings e sinks
@@ -3456,8 +3937,9 @@ tetos dos botões do rueidis (`ring_scale_each_conn` 0–20, `pipeline_multiplex
 orçamento — um valor legítimo acima deles é motivo para subir o teto;
 `sink.redis.addrs` exige `host:porta` em cada entrada (a `,` no host de uma URL
 Redis dos irmãos não se aplica: aqui não há URL, e a vírgula é o separador).
-Não se aplicam `sink.batch_max_bytes` (a chave não existe; o teto de 1 GiB de um
-parâmetro já é `WARN` de §8.5.4) nem as regras de URL PostgreSQL da
+`sink.batch_max_bytes` existe desde 2026-10-14 (decisão do usuário, §8.1 passo
+2), na forma da família syslog (`go-syslog-pg-server`): 16 MiB, de 1 a 256 MiB.
+Não se aplicam as regras de URL PostgreSQL da
 `LOGHUB_EB_URL`: não há `LOGHUB_EB_URL` nem outro leitor de URL ou DSN
 PostgreSQL/MySQL na configuração.
 
@@ -3558,6 +4040,14 @@ legítimo onde é o que diz: `shutdown.pre_stop_delay` (sem espera),
 (sem fusível por tempo; o FATAL vem só de `sink.max_retries`) e os timeouts do
 `net/http` em `[server]` (sem limite).
 
+**Números não finitos.** `NaN`, `Inf` e `-Inf` (em qualquer caixa) são recusados
+pelo parser de todo número com fração (`ring.high_water`, `log.access_sample`,
+`ratelimit.rate`, `ratelimit.burst`), com `exit 1` no boot e recusa no `SIGHUP`,
+qualquer que seja o resto da configuração. Toda comparação de faixa com `NaN` é
+falsa: `ratelimit.rate = NaN` dava `429` para sempre, `ring.high_water = NaN`
+desligava a saturação do `/readyz` e `log.access_sample = NaN` o access log
+(pendência 24, 2026-10-14; o parser do `go-syslog-server`).
+
 #### `[server]`
 
 | Chave | Padrão | Descrição |
@@ -3566,23 +4056,40 @@ legítimo onde é o que diz: `shutdown.pre_stop_delay` (sem espera),
 | `listeners` | `1` | Nº de listeners; `>1` habilita `SO_REUSEPORT` |
 | `read_header_timeout` | `5s` | Defesa principal contra Slowloris |
 | `read_timeout` | `30s` | Headers + corpo. Generoso: 5 MiB em link ruim demora |
-| `write_timeout` | `10s` | |
+| `write_timeout` | `10s` | Prazo da escrita da **resposta**, contado de quando ela começa: o handler limpa o prazo que o `net/http` arma ao fim dos cabeçalhos (no HTTP/1, na conexão; no h2c, no fluxo) e o rearma logo antes de responder. A leitura do corpo é limitada por `read_timeout`, e a espera do destino por `sink.op_timeout`; contado desde os cabeçalhos, um upload que terminasse depois de `write_timeout` entrava no ring e o `200` não chegava (o cliente reenviava, e o evento duplicava com outro `uuid`). O handler **só limpa o prazo quando `read_timeout > 0`**: com `read_timeout = 0` (sem prazo de leitura, aceito) fica o comportamento do `net/http`, e o `write_timeout` limita também o upload — no h2c ele é o único prazo de um fluxo que lê o corpo, e sem ele um fluxo lento seguraria até 64 KiB, uma goroutine e uma vaga de `http2_max_concurrent_streams` para sempre (§19.1 item 32) |
 | `idle_timeout` | `60s` | Keep-alive |
 | `max_body_bytes` | `5MiB` | `413` acima disso |
 | `max_header_bytes` | `64KiB` | `431` acima disso |
 | `max_uri_bytes` | `8KiB` | `414` acima disso |
 | `max_conns` | `0` | `0` = ilimitado. Teto do **servidor inteiro**, somando todos os `listeners`; cheio, o accept espera uma vaga |
-| `max_conns_per_ip` | `0` | `0` = ilimitado. Também somado entre `listeners`. Conta o par TCP (nenhum cabeçalho existe no accept); a conexão excedente é fechada na hora, sem segurar os outros endereços, e conta em `whs_rejected_total{reason="bad_request"}`. Inútil atrás de proxy único |
+| `max_conns_per_ip` | `0` | `0` = ilimitado. Também somado entre `listeners`. Conta o endereço **exato** do par TCP (nenhum cabeçalho existe no accept; regra abaixo); a conexão excedente é fechada na hora, sem segurar os outros endereços, e conta em `whs_rejected_total{reason="bad_request"}`. Inútil atrás de proxy único |
 | `reject_drain_bytes` | `64KiB` | Dreno antes de rejeitar (§4.3) |
 | `http2` | `true` | h2c por prior-knowledge |
 | `http2_max_concurrent_streams` | `250` | |
+
+**`max_conns_per_ip` conta o endereço exato.** A chave é o endereço do par TCP,
+um /128 no IPv6; a zona é descartada e um IPv4 mapeado em IPv6
+(`::ffff:192.0.2.7`) é a mesma chave que o IPv4 (a forma única de endereço que o
+servidor usa em toda comparação, a mesma de `proxy.trusted`), então
+o mapeamento não contorna o teto. Quem tem um /64 pode abrir cada conexão de
+um endereço novo e passar do teto por IP; contra um /64 hostil valem
+`max_conns` (o teto global, que espera no accept), o firewall e o rate-limit
+por prefixo (`ratelimit.v6_mask`, /48, §6.2), que vê o IP resolvido. Contar
+por prefixo IPv6 foi recusado (decisão contestável do `go-webhook-fast-server`, `DECISOES.md` 4c de lá, que vale
+também aqui (este módulo não tem `DECISOES.md`); o mesmo do
+`go-relplog-server`, decisão 16, e do `go-syslog-server`): um /64 pode ser uma
+LAN inteira de emissores, e os emissores de webhook são em geral provedores
+que saem de *pools* de endereços IPv6 vizinhos; uma cota por prefixo juntaria
+as entregas legítimas de um provedor numa só e as recusaria com um fechamento
+de conexão, que o emissor vê como falha de entrega. Teste de trava:
+`TestPerIPLimitCountsTheExactAddress`.
 
 #### `[admin]`
 
 | Chave | Padrão |
 |---|---|
 | `enabled` | `true` |
-| `bind` | `127.0.0.1:9101` |
+| `bind` | `127.0.0.1:9101`. Com `enabled`, `host:porta` obrigatório, porta de 1 a 65535: vazio, sem porta ou com porta inválida, `exit 1` (§11) |
 
 #### `[proxy]`
 
@@ -3610,7 +4117,7 @@ legítimo onde é o que diz: `shutdown.pre_stop_delay` (sem espera),
 |---|---|---|
 | `mode` | `memory` | `memory` \| `sqlite` \| `none` |
 | `capacity_items` | `65536` | |
-| `max_bytes` | `512MiB` | |
+| `max_bytes` | `512MiB` | Com `memory`, a memória retida: `cap` do buffer do JLH mais 256 bytes por item; com `sqlite`, os bytes do JLH guardados (§7.2). Com `memory`, abaixo da cobrança do maior evento (`MaxEventBytes` pela classe do pool, mais 256) é `exit 1` (§7.2) |
 | `high_water` | `0.80` | Fração que faz `/readyz` falhar |
 | `max_inflight` | `2048` | Só em `mode=none`. De 1 a 1 Mi (`1048576`): é um termo do `MaxPending` do NATS (§8.7.2), que um valor sem teto fazia dar a volta |
 | `data_dir` | `./data` | Raiz de **toda** escrita em disco do serviço (§13.6). Em contêiner é sempre `/data` |
@@ -3634,6 +4141,7 @@ legítimo onde é o que diz: `shutdown.pre_stop_delay` (sem espera),
 | `workers` | `8` | Forçado a `1` quando `type=sqlite`; `4` quando `type=postgres`, `type=mysql` ou `type=clickhouse` e não configurado (§8.5.3, §8.6.2, §8.8.2) |
 | `batch` | `256` | |
 | `batch_max_delay` | `5ms` | |
+| `batch_max_bytes` | `16MiB` | Teto de JLH por escrita: o lote é escrito em pedaços que não passam dele; um envelope maior vai sozinho. De 1 a 256 MiB (§8.1 passo 2) |
 | `op_timeout` | `5s` | |
 | `health_interval` | `2s` | |
 | `health_timeout` | `1s` | |
@@ -3830,6 +4338,18 @@ grava e trabalha lá.
 Sendo de `root`, o binário é executável pelo processo e não reescrevível por ele.
 `/tmp` não é área de trabalho: o serviço não escreve nele, e o que alguma
 biblioteca porventura escrevesse ali morre com o contêiner.
+
+**Os compose repassam o que o `.env.example` oferece** (pendências 27 e 28,
+2026-10-14). Cada `compose.<ring>-<sink>.yml` lista o ambiente do serviço
+explicitamente, então uma variável fora da lista é ignorada em silêncio. Todo
+`WHS_SINK_<X>_*` do `docker/.env.example` aparece como `${NOME:-padrão}` em todo
+compose do destino `<x>` — entre eles `WHS_SINK_{POSTGRES,MYSQL,CLICKHOUSE,NATS}_TLS_CA`,
+`WHS_SINK_NATS_CREDENTIALS` e `WHS_SINK_NATS_TOKEN`, com padrão vazio, que o
+servidor trata como ausente. E as imagens auxiliares dos compose são fixadas
+por versão, nunca `latest` (`natsio/nats-box:0.20.0`, a dos irmãos): o `stream
+add` do `nats-init` podia mudar sem mudança neste projeto. O
+`TestComposeForwardsEverySinkVariable` e o `TestComposeImagesArePinned`
+(`internal/config/compose_test.go`) conferem os dois, sem Docker.
 
 ---
 
@@ -4044,6 +4564,13 @@ Lógica pura, com tabela de casos:
 - `emergency` — round-trip do formato de um comprimento com JLH reais, arquivo
   truncado, comprimento declarado maior que o disponível, registro cujo JLH o
   `ParseHead` recusa, e o dump de dois comprimentos (v1) como `ErrLegacy`.
+
+**Um teste de regressão falha, nunca pula** (pendência 29, 2026-10-14). O
+guarda de um defeito já corrigido termina em `t.Fatalf` (ou `t.Errorf`) com
+"regressão de §…"; `t.Skip` fica só para ambiente ausente (o servidor externo
+sem a variável `WHS_TEST_*`, o privilégio que o DSN não tem). Um `t.Skip("BUG
+…")` disparava exatamente quando o defeito voltava, e o `go test` contava o
+pulo como aprovado.
 
 ### 15.2 Fuzz — obrigatório
 
@@ -4312,152 +4839,50 @@ da correção. Corrigir um é mudar primeiro a seção normativa citada, depois 
 código e o teste, e então trocar o item por uma linha só, com o número (que
 o `docs/TESTING.md` e os comentários do código citam) e a seção da regra.
 
-**Superfície HTTP e conexões**
+Em 2026-10-14 nenhum item ficou aberto: todos estão corrigidos ou decididos.
+Os números ficam porque os testes, os comentários e o `go-webhook-fast-server`
+os citam.
 
-1. **Alocação pelo `Content-Length` declarado** (§4.3, §12.2). O corpo é
-   pré-alocado com o tamanho que o cabeçalho declara (até
-   `server.max_body_bytes`), antes de chegar um byte: requisições que declaram
-   5 MiB e não mandam nada seguram 5 MiB cada até o `read_timeout` (em h2c, 250
-   por conexão), e o OOM leva o ring, já respondido com `200`. Direção:
-   pré-dimensionar até um teto pequeno (64 KiB) e crescer só com bytes
-   recebidos, limitado ao declarado.
-2. **A checagem rápida do passo 9 olha só os itens** (§4.3, §4.4). Com o ring
-   cheio por bytes, o corpo é lido e serializado antes do `429`, que sai com
-   UUID, e não sem ele, como diz a tabela de §4.4. Direção: incluir os bytes na
-   checagem, com uma estimativa por baixo (cabeçalho mais `Content-Length`) que
-   só serve para recusar.
-3. **O dreno de recusa ignora o protocolo** (§4.3). Em h2c, o
-   `Connection: close` de uma recusa com corpo acima de `reject_drain_bytes`
-   vira GOAWAY e derruba a conexão que o proxy divide entre muitos clientes; com
-   `Expect: 100-continue`, o dreno envia o `100 Continue` e convida o corpo que
-   vai recusar. Direção: drenar só em HTTP/1.x sem `Expect` pendente e nunca
-   pôr `Connection: close` em h2.
-4. **`server.write_timeout` conta desde os cabeçalhos** (§13.5). Com o padrão
-   de 10 s contra 30 s de `read_timeout`, um upload que termina aos 15 s entra
-   no ring e o `200` não chega: o cliente reenvia, e o evento duplica com outro
-   `uuid`; em h2c o stream é cortado aos 10 s. Direção: rearmar o prazo de
-   escrita na hora da resposta, ou exigir `write_timeout` acima de
-   `read_timeout + sink.op_timeout`.
-5. **Erro não temporário no accept encerra sem dreno** (§10.3, §10.5).
-   `ENOBUFS`, `ENOMEM`, `EPERM` ou `EPROTO` terminam o `Serve`, e o processo sai
-   com 1 sem passar pelo shutdown: com `ring=memory`, o ring e os lotes retidos,
-   já respondidos com `200`, somem sem dump nem contagem. Direção: retentar
-   esses erros no listener, com backoff e log amostrado, e levar uma falha
-   definitiva ao shutdown gracioso, com um código de saída próprio.
-6. **`max_conns_per_ip` conta o endereço exato** (§13.5). Em IPv6 a chave é o
-   /128: quem tem um /64 abre conexões sem limite por IP e, com `max_conns`,
-   ocupa o teto global. Direção: decidir entre documentar o limite e contar por
-   prefixo IPv6 configurável, com a chave do rate-limit.
-7. **O contador de buckets do rate-limit deriva** (§6.3). O `Reset` de um
-   `SIGHUP` que troca a máscara limpa shard a shard e zera o contador no fim,
-   fora das travas; `Allow` e `Sweep` concorrentes deixam
-   `whs_ratelimit_buckets` errado (até negativo) e `max_buckets` frouxo até o
-   próximo `Reset`. Direção: cada incremento e decremento sob a trava do shard
-   que muda.
-
-**Ring**
-
-8. **O ring de memória conta `len(Env)`, não o buffer retido** (§7.2, §12.2,
-   §12.4). O JLH fica no buffer inteiro da classe do pool: um evento de ~2,4 KiB
-   numa classe de 16 KiB conta 2,4 KiB. Com o destino fora, o ring retém de 4 a
-   7× `ring.max_bytes`, além de `GOMEMLIMIT` e do limite do contêiner. Direção:
-   cobrar `cap(Env)` mais um custo fixo por item, gravar no item o valor cobrado
-   para descontar o mesmo, e mover o JLH para a classe justa depois de escrito.
-9. **O teto do `ring=sqlite` ignora o que vai para o `COMMIT`** (§7.4). O
-   `Enqueue` compara com contadores que só sobem depois do `COMMIT`, sem
-   reservar: centenas de itens passam juntos, o `ring.db` excede
-   `ring.max_bytes` em gigabytes, e o pior lote de §8.5.4 e §8.8.5 deixa de ser
-   teto. Direção: reservar no `Enqueue`, como o ring de memória.
-10. **Um erro de leitura do `ring=sqlite` encerra o worker em silêncio** (§8.1).
-    Qualquer erro do `Dequeue` (I/O, `SQLITE_BUSY` além do `busy_timeout`)
-    termina o worker sem log; com `sink=sqlite`, que tem um só, o dreno para, o
-    ring enche e tudo é `429` com `/healthz` em 200. Uma leitura parcial
-    descarta os itens já lidos. Direção: sair só com o fim do contexto,
-    `ErrClosed` ou `ErrNoBacklog`; nos outros erros, log amostrado, backoff e
-    nova tentativa, entregando o que já foi lido.
-
-**Destinos**
-
-11. **O lote não tem teto de bytes** (§8.5.4, §10.4), hipótese não medida. Com
-    corpos grandes um lote chega a centenas de MiB; se não couber em
-    `sink.op_timeout`, ele é retentado para sempre como `network`, com o sink
-    UP, e a reingestão repete o mesmo lote a cada boot. Direção: um teto de
-    bytes por lote, no `Dequeue` e na reingestão.
-12. **A política de despejo do Redis não é conferida** (§8.2.5). "`maxmemory`
-    dá `OOM`, que é fatal" só vale com `noeviction` (ou `volatile-*` sem TTL);
-    com `allkeys-*` o Redis apaga o stream inteiro, já respondido com `200`, sem
-    erro. Direção: ler `maxmemory_policy` no boot e na checagem, recusar
-    `allkeys-*` como fatal, e só avisar quando o `INFO` for negado.
-13. **`sink.redis.tls_ca` sem `tls` passa calado** (§8.2.2, §10.1). Os outros
-    destinos recusam com exit 1 (§8.5.11); no Redis a CA é descartada e a
-    conexão, com a senha, sai em claro. Direção: a mesma recusa.
-14. *Corrigido no porte da família syslog/RELP (2026-10-13):* `23502` do
-    PostgreSQL é fatal; a regra está em §8.5.7.
-15. **O ambiente libpq ainda chega ao pool** (§8.5.2). Os campos que o
-    servidor não sobrescreve depois do `ParseConfig("")` (`PGCHANNELBINDING`,
-    `PGREQUIREAUTH`, `PGSSLNEGOTIATION`, `PGMIN/MAXPROTOCOLVERSION`, o prazo de
-    `PGCONNECT_TIMEOUT`) sobrevivem, e um `PGSSLMODE` ou `PGSERVICE` inválido
-    derruba o boot com exit 1. Direção: parsear com o ambiente `PG*` escondido.
-16. *Corrigido no porte da família syslog/RELP (2026-10-13):* a sessão do MySQL
-    fixa `autocommit=1` no `SET` de conexão e o boot confere
-    `@@session.autocommit`; a regra está em §8.6.1.
-17. *Corrigido no porte da família syslog/RELP (2026-10-13):* o nome do banco
-    do MySQL e do ClickHouse é validado na configuração e no destino (sem
-    crase, barra invertida nem byte de controle; até 64 caracteres); a regra
-    está em §8.6.3 e §8.8.3.
-18. *Corrigido no porte da família syslog/RELP (2026-10-13):* `retention:
-    interest` é recusado na validação de toda checagem, e
-    `max_msgs_per_subject > 0` dá um `WARN` por valor; a regra está em §8.7.5.
-19. *Corrigido no porte da família syslog/RELP (2026-10-13):* `10158`, `10167`
-    e todo `Code` 429 são `ErrNetwork`; a regra está em §8.7.6.
-
-**Boot, shutdown e emergência**
-
-20. **Uma recusa `logic` no boot vira laço de reinício** (§9.2, §10.1). A
-    reingestão e o dreno do `ring.db` saem com 3 em qualquer erro, `logic`
-    inclusive, e o boot seguinte encontra o mesmo registro com a porta fechada.
-    A porta do dump não confere UTF-8 nem os escapes do serializador, e deixa
-    passar dano que o PostgreSQL e o MySQL recusam. Direção: refazer item a item
-    o lote recusado, descartar e contar o item recusado (o dump vai para
-    `.corrupt`), e exigir na porta UTF-8 válido e só os escapes que o
-    serializador escreve.
-21. *Corrigido no porte da família syslog/RELP (2026-10-13):* um FATAL durante
-    o dreno do `SIGTERM` encerra a espera e o processo sai com 3, em qualquer
-    ring; a regra está em §10.3.
-22. **Com `sink=redis` o boot espera até 2× `sink.boot_timeout`** (§10.1): a
-    construção do cliente tem o seu prazo, e a espera pela primeira checagem
-    começa outro. Direção: um prazo só, contado do início do passo 3.
-23. **A sonda do `sink=sqlite` espera a trava da escritora sem prazo**
-    (§8.3.5). Um lote mais longo que `sink.health_timeout` faz a sonda falhar
-    com o banco íntegro, um ciclo DOWN por lentidão. Direção: tomar a trava
-    dentro do prazo da sonda.
-
-**Configuração e implantação**
-
-24. **`NaN` passa nos números da configuração** (§13.5). Toda comparação de
-    faixa com `NaN` é falsa: `ratelimit.rate` ou `burst` em `NaN` dão `429` para
-    sempre (o estado sobrevive ao `SIGHUP` que corrige o valor),
-    `ring.high_water` desliga a saturação do `/readyz`, e `log.access_sample`
-    desliga o access log. Direção: recusar valor não finito no parser.
-25. **`admin.bind` vazio escuta em todas as interfaces** (§11, §13.5), numa
-    porta efêmera, com um `WARN` só. Direção: com `admin.enabled`, recusar vazio
-    e exigir `host:porta` (exit 1).
-26. **O `--dump-config` não volta igual** (§13.2). O valor de texto sai sem
-    aspas, e o leitor de INI tira os espaços das pontas e um par de aspas
-    externo. Direção: pôr aspas no valor que tem espaço nas pontas ou começa e
-    termina com a mesma aspa.
-27. **Os compose não repassam a CA nem as credenciais do NATS** (§13.6).
-    `WHS_SINK_{POSTGRES,MYSQL,CLICKHOUSE,NATS}_TLS_CA`,
-    `WHS_SINK_NATS_CREDENTIALS` e `WHS_SINK_NATS_TOKEN` estão no `.env.example`
-    e no README do Docker, mas nenhum compose os passa ao contêiner: a
-    configuração é ignorada. Direção: repassá-los com padrão vazio.
-28. **O `nats-init` dos compose usa `natsio/nats-box:latest`**: a criação do
-    stream pode mudar sem mudança no projeto. Direção: fixar a versão.
-
-**Testes**
-
-29. **Testes de regressão pulam em vez de falhar** (§15). Seis guardas
-    `t.Skip("BUG ...")` (lote do MySQL em pedaços, cabeçalho de dois campos do
-    dump, papel do PostgreSQL só com `INSERT`, JA3 com vírgulas, porta do host
-    recusado, `OPTIONS *`) só disparam quando o defeito volta, e o `go test`
-    conta o pulo como aprovado. Direção: `t.Fatalf` com "regressão".
+1. *Corrigido em 2026-10-14:* o `Content-Length` só pré-dimensiona o corpo até 64 KiB; o buffer cresce com o que chegou, sem passar do declarado; regra em §12.2 e §4.3 passo 11.
+2. *Corrigido em 2026-10-14:* a checagem rápida do passo 9 olha também os bytes, com o `Content-Length` como estimativa por baixo (só para recusar), e o `429` dela sai sem UUID; regra em §4.3.
+3. *Corrigido em 2026-10-14:* o dreno de recusa só roda em HTTP/1.x sem `Expect: 100-continue` pendente, e o h2 nunca recebe `Connection: close`; regra em §4.3.
+4. *Corrigido em 2026-10-14:* `server.write_timeout` conta da resposta (o handler limpa o prazo ao entrar e o rearma antes de responder), sem mudar padrão nem recusar configuração; regra em §13.5.
+5. *Corrigido em 2026-10-14:* o listener retenta todo erro do `accept` salvo o próprio fechamento (5 ms a 1 s, `WARN` amostrado); um `Serve` que ainda termine com erro (basta um listener) passa pelo shutdown gracioso; regra em §10.3 e §10.5.
+6. *Decidido em 2026-10-14 (contestável):* `max_conns_per_ip` conta o endereço exato (/128; IPv4 mapeado = IPv4), como a família syslog/RELP; regra em §13.5, decisão em `go-webhook-fast-server/docs/DECISOES.md` 4c.
+7. *Corrigido em 2026-10-14:* o contador de buckets muda sob a trava do shard que muda (inserção, sweep, `Reset` sem `Store(0)`), e a inserção reserva a vaga no teto; regra em §6.3.
+8. *Corrigido em 2026-10-14 (decisão do usuário):* o ring de memória cobra `cap(Env)` mais `ring.ItemOverhead` e desconta o `Item.Charged` gravado; sem cópia para classe menor, padrões mantidos; regra em §7.2 e §12.2.
+9. *Corrigido em 2026-10-14:* o `Enqueue` do `ring=sqlite` reserva item e bytes antes do `COMMIT`; regra em §7.4.
+10. *Corrigido em 2026-10-14:* o worker só sai com o contexto, `ErrClosed` ou `ErrNoBacklog`; os outros erros do `Dequeue` têm log amostrado e backoff, e uma leitura parcial entrega o que leu; regra em §8.1 passo 1 e §7.4.
+11. *Corrigido em 2026-10-14 (decisão do usuário):* `sink.batch_max_bytes` (16 MiB, até 256 MiB) corta o lote em pedaços nos workers, na reingestão e no dreno do `ring.db`; regra em §8.1 passo 2 e §8.5.4.
+12. *Corrigido em 2026-10-14:* a `maxmemory-policy` do Redis é lida no boot e em toda checagem; `allkeys-*` é fatal, ilegível dá um `WARN` (uma vez); regra em §8.2.5.
+13. *Corrigido em 2026-10-14:* `sink.redis.tls_ca` sem `tls` é exit 1, como nos outros destinos; regra em §8.2.2 e na tabela de §10.1.
+14. *Corrigido em 2026-10-13:* `23502` do PostgreSQL é fatal; regra em §8.5.7.
+15. *Corrigido em 2026-10-14:* o pool do PostgreSQL é parseado com o ambiente `PG*` escondido e disca sem o prazo de `PGCONNECT_TIMEOUT`; regra em §8.5.2.
+16. *Corrigido em 2026-10-13:* a sessão do MySQL fixa `autocommit=1`, conferido no boot; regra em §8.6.1.
+17. *Corrigido em 2026-10-13:* o nome do banco do MySQL e do ClickHouse é validado; regra em §8.6.3 e §8.8.3.
+18. *Corrigido em 2026-10-13:* `retention: interest` é recusado em toda checagem e `max_msgs_per_subject > 0` dá `WARN`; regra em §8.7.5.
+19. *Corrigido em 2026-10-13:* `10158`, `10167` e todo `Code` 429 do JetStream são `ErrNetwork`; regra em §8.7.6.
+20. *Corrigido em 2026-10-14:* a recusa `logic` no boot é refeita item a item: no dump o recusado fica e o arquivo vai para `.corrupt`; no `ring.db` a linha é descartada e contada em `sink_logic` (contestável, `go-webhook-fast-server/docs/DECISOES.md` 4d). A porta do dump exige UTF-8 válido, só os escapes do serializador e nenhum U+2028/U+2029 cru; regra em §9.2 e §10.1 passo 5.
+21. *Corrigido em 2026-10-13:* um FATAL durante o dreno do `SIGTERM` encerra a espera e sai com 3; regra em §10.3.
+22. *Corrigido em 2026-10-14:* um `sink.boot_timeout` só, contado do início do passo 3, cobre o cliente Redis e a primeira checagem; regra em §10.1.
+23. *Corrigido em 2026-10-14 (decisão do usuário):* a sonda do `sink=sqlite` espera a trava só no próprio prazo; escritora ocupada com o último `Write` sem erro conta UP; regra em §8.3.5.
+24. *Corrigido em 2026-10-14:* `NaN` e `±Inf` são recusados no parser; regra em §13.5.
+25. *Corrigido em 2026-10-14:* com `admin.enabled`, `admin.bind` vazio ou sem porta é exit 1; regra em §11 e §13.5.
+26. *Corrigido em 2026-10-14:* o `--dump-config` põe aspas no valor com branco nas pontas ou entre aspas iguais; regra em §13.2.
+27. *Corrigido em 2026-10-14:* os compose repassam os `TLS_CA`, `WHS_SINK_NATS_CREDENTIALS` e `WHS_SINK_NATS_TOKEN` (padrão vazio), e um teste confere o `.env.example` contra eles; regra em §13.6.
+28. *Corrigido em 2026-10-14:* `natsio/nats-box:0.20.0` nos compose e no `.env.example`; regra em §13.6.
+29. *Corrigido em 2026-10-14:* os seis guardas de regressão terminam em `t.Fatalf("regressão de §…")`, não em `t.Skip`; regra em §15.1.
+30. *Corrigido em 2026-10-14 (achado da triagem, porte de S/R):* o teto de itens do ring de memória conta os lotes retidos pelos workers; regra em §7.2.
+31. *Corrigido em 2026-10-14 (revisão independente):* o shutdown que começa por erro do `Serve` tolera o primeiro sinal, como o do FATAL (`tolerateFirst` separado de `fatal`); um sinal depois do erro com o destino retido dá exit 3 com dump, não 130; regra em §10.3.
+32. *Corrigido em 2026-10-14 (revisão independente):* o handler só limpa o prazo de escrita na entrada com `server.read_timeout > 0` (com 0 o `write_timeout` limita o upload, como antes); regra em §13.5, e o texto de §12.2 diz o arredondamento à classe do pool.
+33. *Corrigido em 2026-10-14 (revisão independente):* a escrita direta do boot (`writeOrSingle`) resolve uma recusa `logic` com `Error.Delivered` pela lista, sem republicar o que o destino guardou; regra em §9.2.
+34. *Corrigido em 2026-10-14 (revisão independente):* a porta do dump aceita só os escapes que o serializador escreve (`\"`, `\\`, `\n`, `\r`, `\t`, `\u00XX` minúsculo de controle sem forma curta, `\u2028`/`\u2029`), e o `TestOnlyOurEscapes` segue a SPEC; regra em §9.2.
+35. *Corrigido em 2026-10-14 (revisão independente):* com `ring=memory`, `ring.max_bytes` abaixo da cobrança do maior evento (`MaxEventBytes` pela classe do pool, mais `ItemOverhead`) é exit 1; regra em §7.2 e §13.5.
+36. *Corrigido em 2026-10-14 (revisão independente):* a sonda do `sink=sqlite` com a escritora ocupada só conta UP se o lote em curso tomou a trava há no máximo `sink.op_timeout + sink.health_timeout`, medido no relógio monotônico; regra em §8.3.5.
+37. *Corrigido em 2026-10-14 (revisão independente):* o heartbeat do `sink=sqlite` é uma escrita para a sonda: falha grava "último `Write` falhou" (salvo o erro do próprio prazo da sonda), sucesso grava "bom"; regra em §8.3.5.
+38. *Corrigido em 2026-10-14 (revisão independente):* o `rueidis.NewClient` do boot respeita o prazo da tentativa (goroutine com `select`, `Dialer.Timeout = sink.op_timeout`); regra em §10.1 passo 3.
+39. *Corrigido em 2026-10-14 (revisão independente):* o `WaitReady` dorme `min(backoff, o que falta do prazo)`; regra em §10.1 passo 3.
+40. *Corrigido em 2026-10-14 (revisão independente):* `admin.bind` exige porta numérica de 1 a 65535 (`127.0.0.1:`, `:` e `localhost:abc` são exit 1); regra em §11 e §13.5.
+41. *Corrigido em 2026-10-14 (revisão independente):* valor de texto da configuração com byte de controle (fora o tab) é exit 1, nomeando a chave e nunca o valor; regra em §13.2.
+42. *Corrigido em 2026-10-14 (revisão independente):* a sonda do Redis lembra qual leitura da política funciona (o `CONFIG GET` no *pipeline* no lugar do `INFO`, ou nenhuma depois de as duas serem recusadas) e fica em uma ida e volta; regra em §8.2.5.
+43. *Corrigido em 2026-10-14 (integração da revisão):* com `ring=sqlite`, `ring.max_bytes` abaixo do maior evento (`MaxEventBytes`) é exit 1; regra em §7.2.

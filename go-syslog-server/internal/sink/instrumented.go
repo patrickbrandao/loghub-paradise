@@ -92,6 +92,10 @@ func (i *Instrumented) Write(ctx context.Context, items []*item.Item) error {
 			return nil
 		}
 		if err := i.writeChunk(ctx, c); err != nil {
+			// ring=none writes in a context the reception's cancellation
+			// does not reach (SPEC §9.6): every network error here is the
+			// destination's.
+			i.countNetwork(err)
 			return err
 		}
 		b.advance()
@@ -164,6 +168,12 @@ func (i *Instrumented) Deliver(ctx context.Context, items []*item.Item, opTimeou
 			if class == ClassFatal {
 				return err
 			}
+			// Counted only here, past the context check, as in the workers: a
+			// write cut short by the caller's own cancellation -- SIGTERM during
+			// the boot -- is not a sink failure (SPEC §14.1). writeChunk
+			// counted it before this check (port of the RP/RN round,
+			// 2026-10-14).
+			i.countNetwork(err)
 			if werr := wait(attempt, err); werr != nil {
 				return werr
 			}
@@ -216,10 +226,19 @@ func (i *Instrumented) writeChunk(ctx context.Context, c *chunk) error {
 		i.m.EventsWrittenTotal.Add(uint64(stored))
 		i.m.EventsDroppedTotal[obs.EventDropSinkLogic].Add(uint64(len(lost)))
 
-	default:
+	}
+	// Network and timeout are counted by the caller (countNetwork), which
+	// alone knows whether the attempt ended because the caller is going away.
+	return err
+}
+
+// countNetwork counts a network or timeout failure of one attempt. Fatal and
+// logic are counted by writeChunk, always: a verdict does not come from a
+// cancellation.
+func (i *Instrumented) countNetwork(err error) {
+	if c := ClassOf(err); c != ClassFatal && c != ClassLogic {
 		i.m.SinkErrorsTotal[errKind(err)].Inc()
 	}
-	return err
 }
 
 // countRefused records the malformed messages refused by

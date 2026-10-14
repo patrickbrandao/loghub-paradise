@@ -1045,7 +1045,7 @@ Traefik) está na frente e o `RemoteAddr` seria o dele.
   já estão no leitor quando o shutdown chega (o parser viu que não é cabeçalho:
   sem erro, sem cabeçalho) segue para a moldura, e as linhas entram no ring como
   qualquer mensagem já lida (§13.4); em `required`, a mesma conexão fecha sem
-  contar. A regra copiada do R — "sem cabeçalho ou com erro, e fechando" —
+  contar. Com cabeçalho **válido** já lido, `required` também segue: o balanceador manda o cabeçalho e as primeiras linhas no mesmo segmento, o `Close` chega antes de o parser olhar, e o cabeçalho e as linhas já estão no leitor; fechar ali perdia as linhas sem contagem (revisão independente de 2026-10-14, A1). A regra é "fechando, e com erro ou, em `required`, sem cabeçalho". A regra copiada do R — "sem cabeçalho ou com erro, e fechando" —
   descartava até 4 KiB dessas linhas sem contagem a cada `Close`: no RELP nada
   é confirmado antes do cabeçalho, aqui a janela TCP já as tinha aceitado
   (revisão independente do porte, 2026-10-13). `LOCAL`, `UNSPEC`,
@@ -1147,6 +1147,26 @@ gravaria fragmentos como mensagens. No TLS a moldura é sempre octet-counting
   N × 6 KiB de heap no TCP (leitor, estruturas da conexão) e N × 20 KiB no TLS
   (mais os buffers de registro do `crypto/tls`), mais a pilha da goroutine de
   cada uma, **fora** de `ring.max_bytes` (§15.1).
+- **Limite do "até 8 KiB": vale entre frames, com o leitor vazio** (revisão
+  independente de 2026-10-14, A5 e D4; registrado, não corrigido). A soltura
+  acontece na entrada de `Next`, só com `Buffered() == 0`. Um par que manda um
+  frame de 17–64 KiB (o buffer vai à classe de 64 KiB) seguido de **um** byte
+  do próximo e se cala passa por `Next` com `Buffered() == 1`: o buffer fica, a
+  moldura copia o byte nele e estaciona no `Peek(1)` até o `idle_timeout`. 17
+  KiB enviados seguram 68 KiB (64 + o leitor de 4), 4×, contra os 16× que a
+  pendência 1 de 2026-10-11 fechou; não é perda de dado. Soltar no ponto de
+  espera **dentro** do frame (o `Peek(1)` de `nextLF`/`readCounted`, copiando
+  o pendente para uma classe pequena) foi medido e recusado: o leitor de 4 KiB
+  esvazia no meio de todo frame acima de 4 KiB, a moldura não distingue "vai
+  esperar" de "o próximo `read` já tem dados", e um fluxo contínuo de frames
+  de 24 KiB foi de 111 µs para 1,12 ms e de 78 KB para 9,97 MB alocados por 64
+  frames — a mesma regressão que a revisão do porte (2026-10-13) desfez. O
+  contrário (D4) também é custo e não defeito: com um emissor que escreve um
+  frame por `write()` e um leitor mais rápido, o leitor esvazia entre frames e
+  frames de 17–64 KiB realocam a classe de 64 KiB a cada um — a taxa, nesse
+  caso, é baixa por definição (o leitor espera o emissor). O teto do caso
+  hostil é o mesmo das conexões caladas: `tcp.max_conns`/`tls.max_conns` e o
+  `GOMEMLIMIT` (§15.4).
 
 ### 5.5 Tamanho e truncamento (decisão 13)
 
@@ -1570,7 +1590,7 @@ Ordem canônica (a do schema):
 | `version-unsupported` | RFC 5424 com VERSION ≠ 1 |
 | `header-invalid` | campo do cabeçalho RFC 5424 fora da ABNF, cabeçalho incompleto, timestamp com `t`/`z` minúsculo ou fração > 6 |
 | `timestamp-missing` | RFC 3164 sem timestamp reconhecível |
-| `timestamp-invalid` | timestamp com forma reconhecida e data, hora ou offset inválidos |
+| `timestamp-invalid` | timestamp com forma reconhecida e data, hora ou offset inválidos (na RFC 3164 o offset não é conferido, §6.5.1) |
 | `timestamp-year-inferred` | timestamp BSD sem ano |
 | `timestamp-zone-inferred` | timestamp sem fuso |
 | `hostname-missing` | RFC 3164 com timestamp e sem HOSTNAME |
@@ -2104,6 +2124,86 @@ Destino final local, `<data_dir>/events.db` (ou `sink.sqlite.path`), esquema de
   CONFLICT DO UPDATE`) sob a trava da escritora: custo constante, prova o que
   importa. `PRAGMA quick_check` só no boot; periódico, ele leria o arquivo inteiro
   a cada sonda (bug real).
+- **A sonda espera a trava da escritora só dentro do próprio prazo** (decisão do
+  usuário em 2026-10-14, a mesma do item 23 do `go-webhook-server`). A
+  escritora segura a trava durante o pedaço inteiro, até `sink.op_timeout`; a
+  sonda esperava por ela sem prazo, e um pedaço mais longo que
+  `sink.health_timeout` a fazia falhar com o banco íntegro — um ciclo DOWN (§13.3),
+  com o backpressure de §2.3, por lentidão. Agora a sonda tenta tomar a trava
+  dentro de `sink.health_timeout` (a trava é um semáforo de uma vaga, não um
+  `sync.Mutex`, justamente para poder desistir):
+  - obtida, faz o heartbeat como sempre;
+  - **não obtida no prazo** (a escritora está ocupada) e o **último `Write`
+    terminou sem erro**: a sonda conta **UP sem tocar o banco**. A escrita em
+    curso é a prova de vida, e o que a sonda procura (disco cheio, arquivo
+    somente leitura, volume desmontado) o próprio `Write` devolve como `fatal`
+    — e passa a contar como último `Write` com erro;
+  - não obtida no prazo e o último `Write` **falhou** (qualquer erro, de
+    qualquer classe), ou nunca houve `Write` nem heartbeat bom neste processo: DOWN, como antes
+    (`network`, alimentando os fusíveis de §13.3).
+  - **a escritora ocupada só conta UP dentro de um prazo** (revisão
+    independente de 2026-10-14, A1): o `Write` grava o instante em que tomou a
+    trava, e a sonda só conta UP se o pedaço em curso a segura há no máximo
+    `sink.op_timeout + sink.health_timeout`. Passado isso, DOWN (`network`),
+    mesmo com o último `Write` sem erro. O `COMMIT` e a rotação não recebem
+    contexto: um `fsync` preso (NFS sem resposta, disco morrendo) segurava a
+    trava para sempre, e o "último `Write` sem erro" — o pedaço **anterior** —
+    mantinha o sink em UP sem prazo, sem fusível, sem FATAL nem dump. O que
+    conta é há quanto tempo o pedaço em curso segura a trava, não a idade do
+    último que terminou.
+  - **a falha do próprio heartbeat conta como último `Write` com erro**
+    (revisão, A2): sem isso, uma sonda que tomou a trava e falhou (arquivo
+    somente leitura, disco cheio) dava DOWN, e a seguinte, com a escritora
+    ocupada e o `writeOK` de antes, dava UP; o UP intercalado zerava a
+    sequência que os fusíveis de §13.3 contam.
+
+  - **a idade do pedaço em curso é medida no relógio monotônico** (revisão
+    independente de 2026-10-14, A3): o `Write` grava `time.Since(base)`, com
+    `base` tomado no `NewSQLite`, e a sonda compara com `time.Since(base)`.
+    Com o relógio de parede (`time.Now().UnixNano()` e
+    `time.Since(time.Unix(0, …))`, sem leitura monotônica), um passo do NTP
+    para trás (ou ajuste manual) durante um pedaço preso dava idade negativa
+    ou pequena e UP com a escritora presa, pelo tamanho do passo; um passo
+    para frente dava um DOWN espúrio com escrita normal.
+  - **um heartbeat bem-sucedido grava "último `Write` sem erro"** (revisão,
+    A4): ele tomou a trava e escreveu no arquivo, a mesma prova de um pedaço
+    bom. Sem isso, depois de um heartbeat falho (disco cheio, liberado
+    depois) o `writeFailed` ficava até o próximo `Write` bom, e o primeiro
+    pedaço mais longo que `sink.health_timeout` dava DOWN com tudo íntegro —
+    o ciclo DOWN que esta regra existe para eliminar. Consequência: o
+    heartbeat do `WaitReady` do boot (§13.1) já deixa a marca, e o primeiro
+    pedaço lento depois do boot também conta como escritora ocupada (D5 da
+    revisão do syslog: antes, um *backlog* grande logo após o boot, com o
+    primeiro pedaço acima de `sink.health_timeout`, dava um DOWN — "nunca houve
+    `Write`").
+  - **o heartbeat que falha pelo próprio contexto não marca o `Write` como
+    falho** (revisão, A1 da família RELP): a sonda pode tomar a trava pouco
+    antes do prazo, porque o `Write` a soltou em `prazo − ε`, e o
+    `ExecContext` roda com ε e falha com `context deadline exceeded`; o
+    cancelamento do shutdown dá `context canceled`. A sonda devolve o erro
+    (DOWN dessa vez, `network`), mas só grava `writeFailed` quando
+    `ctx.Err()` é nulo e o erro não é `DeadlineExceeded`/`Canceled`: um
+    prazo da sonda não diz nada do arquivo, e marcá-lo fazia as sondas
+    seguintes, com a escritora ocupada, darem DOWN até o próximo `Write` —
+    o mesmo ciclo, com probabilidade ε/duração do pedaço a cada sonda.
+  - "qualquer classe" inclui `logic` (registrado em 2026-10-14, D5 da
+    revisão do RELP): com `ON CONFLICT DO NOTHING`, um `logic` (`TOOBIG`,
+    `MISMATCH`) é improvável e dá no máximo um DOWN pontual com o banco são
+    até o próximo `Write` ou heartbeat bom; separar as classes não compensa a
+    regra a mais.
+  - só o `Write` grava o instante da trava (registrado em 2026-10-14, D6 da
+    revisão do RELP): quando quem segura a trava é o `Close`, a troca de
+    `keep_files` ou a rotação de teste, a idade lida é a do último `Write`,
+    possivelmente antiga, e a sonda dá DOWN. Na prática só o `Close` do
+    shutdown segura a trava por tempo relevante, e então o resultado da sonda
+    já é ignorado.
+
+  Travas: `TestSQLiteProbeDoesNotWaitForTheWriterPastItsDeadline` (segura a
+  trava no próprio teste, sem corrida; inclui a escritora presa além do prazo),
+  `TestSQLiteFailedHeartbeatCountsAsAFailedWrite`,
+  `TestSQLiteProbeAgeIgnoresWallClockSteps` (A3),
+  `TestSQLiteGoodHeartbeatClearsAFailedWrite` (A4) e
+  `TestSQLiteHeartbeatCutByItsOwnContextIsNotAFailedWrite` (A1 do RELP).
 
 ### 10.5 `sink.type = postgres`
 
@@ -2226,6 +2326,18 @@ todo pedaço com o sink UP; o `1364` do MySQL já era `fatal` por isso. A classe
 adiava o exit 3 com a mensagem de rede. `0A000` (`feature_not_supported`) é o
 que o `INSERT ... ON CONFLICT` recebe de uma `RULE` criada depois do boot:
 `fatal`, não `network` retentado para sempre (2026-10-13).
+
+**SQLSTATE fora da tabela é `network`** (`P0001` de uma trigger que levanta
+exceção, ou qualquer outro código não listado). É regra, não pendência (porte do
+RP/RN, decidido em 2026-10-14): nunca descartado, nunca FATAL. O pedaço é
+retentado com o sink UP, o ring enche e segura a recepção (§20.18: um ring que
+enche é visível, um pedaço descartado não), e o operador vê
+`syslog_sink_errors_total{kind="network"}` subir, com o SQLSTATE no `WARN`
+"sink write failed, retrying". As alternativas são piores: `logic` descartaria
+pedaços em silêncio a cada poucos milissegundos se a trigger recusa tudo;
+`fatal` derrubaria o servidor (dump, exit 3) por uma trigger que talvez recuse
+uma linha só. Tratar a classe `P0` como `fatal` seria uma decisão de contrato
+separada, sem caso real que a peça.
 
 **A validação do boot tem prazo próprio** (pendência 6 de 2026-10-11), aqui,
 no MySQL (§10.6) e no ClickHouse (§10.10.5): roda com `sink.op_timeout`, não no
@@ -2471,8 +2583,12 @@ Antes, a checagem dizia "connection is RECONNECTING", `network`, e o FATAL vinha
 dos fusíveis uns 20 s depois, com o motivo errado, ou nunca, com os dois
 fusíveis desligados (revisão independente do `go-relplog-nats-server`,
 2026-10-13, adaptada: lá não há TLS e todo servidor que o exige é recusado).
-O `ReconnectErrHandler` só loga quando grava o veredito: um `ERROR` por discagem
-falha numa queda longa repetiria o que o `/readyz` já mostra.
+**Uma discagem que falha na reconexão não é logada**: o `WARN` de desconexão,
+o `/readyz` e `syslog_sink_up` já dizem o estado, e um `ERROR` amostrado a cada
+30 s durante uma queda longa só repetia isso; o `ReconnectErrHandler`
+(`onReconnectErr`) só põe e loga (`ERROR`) o veredito — a recusa de TLS do
+servidor único, abaixo. Era regra só do código; escrita e travada no porte do
+RP/RN, 2026-10-14 (`TestNATSReconnectDialFailureIsNotLogged`).
 
 **Só é veredito quando nenhum outro servidor pode servir** (revisão
 independente do porte, 2026-10-13). Com um *pool* — mais de uma URL em
@@ -2489,7 +2605,15 @@ nenhum servidor do pool voltar, os fusíveis de §13.3 dão o FATAL nomeando o
 TLS. No primeiro `CONNECT` com mais de uma URL o `nats.go` tenta todas uma vez e
 devolve o erro da última: a recusa de TLS vira `network` e o boot espera o
 `boot_timeout` por um servidor que sirva (a linha do exit 3 nomeia o TLS). Com
-um servidor só, continua o veredito imediato.
+um servidor só, continua o veredito imediato. Travado com `nats-server` real e TLS de
+verdade (`TestNATSTLSPoolOneUntrustedNodeIsNotAVerdict`,
+`TestNATSTLSPoolBootWaitsForATrustedNode`,
+`TestNATSTLSPoolTrustedServerSurvivesARestart`, com
+`SYSLOG_TEST_NATS_SERVER_BIN`).
+
+**Pool só de servidores que recusam** (registrado em 2026-10-14, D2 da revisão do syslog): com duas ou mais URLs e **todas** recusando o TLS (certificado de outra CA, nome fora do certificado, servidor que exige TLS sem `tls://`), nunca há veredito — cada checagem é `network`, com o motivo no erro do `Health`, e o FATAL só vem dos fusíveis de §13.3; com os dois fusíveis desligados, nunca vem. É consequência da regra acima: o `LastError` é o do último servidor tentado, e saber que **nenhum** nó vai servir exigiria acompanhar a volta inteira do pool. O sinal é `syslog_sink_up` em 0 e o `/readyz`.
+
+**Uma URL só cujo nome resolve a vários IPs** (registrado em 2026-10-14, D3 da revisão do RELP): o `nats.go` resolve o nome e tenta um IP, mas `nc.Servers()` tem uma entrada só, então a recusa de TLS do IP sorteado é veredito FATAL, embora outro IP do mesmo nome pudesse servir (um serviço *headless* do Kubernetes com nós configurados de jeitos diferentes). Não há como distinguir sem `SkipHostLookup`, que tiraria o rodízio entre os IPs: é limite aceito — os nós atrás de um nome devem ter a mesma configuração de TLS, ou entram como URLs separadas, e a regra do *pool* vale.
 
 **Um *flush* que atravessa uma reconexão não confirma** (`mode=core`). O `nats.go`
 falha um *flush* pendente com `ErrConnectionClosed` quando a conexão **cai**,
@@ -2979,7 +3103,12 @@ outra instância o pegava enquanto era escrito.
 (§13.4) desiste: o `Write` confere o aborto no início, a cada 1024 registros e
 antes da publicação, e remove o temporário em vez de publicar um arquivo que o
 boot seguinte reingeriria. Um aborto que chega depois da última conferência
-deixa o dump publicado e contado — sobreconta, nunca perda.
+deixa o dump publicado e contado — sobreconta, nunca perda: o boot seguinte o
+entrega, e `reason="abort"` sobreconta. É regra, não pendência (porte do RP/RN,
+decidido em 2026-10-14): o aborto **não espera o disco** — segurar o mutex da
+contagem durante o `link` e o `fsync` do diretório faria um `SIGQUIT`, cujo
+contrato é "agora", esperar um disco que pode estar preso; a janela é inerente a
+qualquer `os.Exit` assíncrono a uma escrita.
 
 ### 12.2 Reingestão
 
@@ -3030,7 +3159,8 @@ shutdown **soma** aos gauges em vez de fixá-los.
 seguinte entregaria o dump inteiro de novo (com os mesmos `uuid`, deduplicados só
 onde o destino deduplica). Um `fsync` (ou a abertura do diretório para ele) que
 falha depois do `unlink` é `WARN` ("may reappear"): o arquivo já saiu, e "cannot
-remove" seria falso.
+remove" seria falso. Uma falha da própria remoção é `ERROR` ("cannot remove a
+reingested dump"), e o arquivo volta no boot seguinte. É regra, não pendência (porte do RP/RN, decidido em 2026-10-14): sair com erro deixaria o boot em laço por um problema (permissão do diretório) que não impede a entrega, e os gauges de §14.1, recontados do disco no fim da reingestão, continuam contando o arquivo, então o alerta segue disparando (`TestQuarantineAndRemovalReportTheirOutcome`).
 
 Arquivo truncado ou corrompido: processado até o último registro íntegro, o resto
 logado em `ERROR` com a contagem de bytes, e o arquivo renomeado para
@@ -3135,6 +3265,7 @@ independente do porte, 2026-10-13).
 | Nenhum `listen.*` | exit 1 |
 | Dois `listen.*` no mesmo endereço e protocolo (TCP e TLS na mesma porta inclusive) | exit 1; com a mesma porta, um **nome** de host de qualquer lado conta como o mesmo endereço (`localhost` e `127.0.0.1`): para dividir a porta, dois literais IP distintos |
 | `admin.enabled = true` com `admin.bind` vazio ou fora de `host:port` | exit 1 (vazio publicaria `/metrics` em todas as interfaces numa porta aleatória; desligar é `admin.enabled = false`) |
+| `admin.enabled = true` com `admin.bind` no mesmo endereço TCP de `listen.tcp` ou de `listen.tls`: a mesma porta com o mesmo literal IP (o IPv4 mapeado em IPv6 conta como o IPv4), um curinga (`""` ou um literal não especificado: `0.0.0.0`, `::`, `::0`) de um lado, ou um **nome** de host de qualquer lado | exit 1, nomeando os dois endereços. A regra é a da linha anterior (`sameStreamSocket`), estendida à porta admin: nenhum nome é resolvido na validação; para dividir a porta, dois literais IP distintos; a porta `0` nunca colide. `listen.udp` não colide (outro protocolo) e `listen.unix` é caminho. Antes a colisão só aparecia ao abrir o transporte (passo 12), com a porta admin já tendo servido o boot inteiro, e no macOS/BSD nem isso: o `SO_REUSEADDR` deixa `127.0.0.1:P` e `*:P` coexistirem, e a porta admin tomava em silêncio as conexões de `localhost` (porte do RP/RN, 2026-10-14; `TestAdminBindCollidesWithListen`). O curinga é reconhecido pelo **valor**, não pela grafia: `""` ou qualquer literal com `IsUnspecified()` (`0.0.0.0`, `::`, `::0`, `0:0::0`); e a **porta é comparada como número**, lida como o `net.Listen` a lê (`net.LookupPort`): `0514` é `514`, e um nome de serviço (`syslog`, `http`) vale o número do banco de serviços; uma porta que não é número nem serviço conhecido é exit 1 aqui, nomeando as duas chaves, em vez de falhar no bind (revisão independente de 2026-10-14, D1 do syslog e D4 do RELP: `[::0]:P` contra `127.0.0.1:P` e `0514` contra `514` passavam como endereços distintos; `TestSameStreamSocketReadsValuesNotSpellings`) |
 | Número real `NaN` ou `±Inf` em qualquer parâmetro | exit 1 (o `NaN` passa por toda comparação de faixa) |
 | `ring.sqlite.path`, `sink.sqlite.path` ou `emergency.dir` fora de `server.data_dir` | `WARN` (§20.16) |
 | `listen.unix` relativo ou maior que `sun_path` | exit 1 |
@@ -3147,6 +3278,7 @@ independente do porte, 2026-10-13).
 | `syslog.rfc3164_timezone` desconhecido para o `time.LoadLocation` | exit 1 (a imagem embute `time/tzdata`) |
 | `syslog.legacy_charset` fora de `""`, `cp1252`, `latin1`, `windows-1252`, `iso-8859-1` | exit 1 |
 | `syslog.max_message_bytes` < 480 ou > 16 MiB | exit 1 (480 é o mínimo da RFC 5424) |
+| `ring.max_bytes` abaixo do custo de uma mensagem do tamanho máximo, na medida do ring **efetivo** (§9.2, o pedido ou o que `ring=redis` vira ao degradar, §9.7): com `memory`, a classe do pool de `syslog.max_message_bytes` + 384 B (`item.PooledCap(n) + ring.ItemOverhead`, §15.1; 65 920 B com o padrão de 64 KiB); com `sqlite` e `redis`, o próprio `syslog.max_message_bytes` (eles contam `len(cru)`). Com `none` a chave não é usada e só precisa ser positiva | exit 1, nomeando a chave e o piso: essa mensagem nunca caberia num ring vazio; no TCP/TLS a conexão ficaria parada até o `tcp.backpressure_timeout` e a mensagem seria descartada, e no UDP descartada sempre como `ring_full`, com o ring vazio. Porte do RP/RN, 2026-10-14 (`TestRingMaxBytesFitsTheLargestMessage`) |
 | `ring=sqlite` + `sink=sqlite` no mesmo arquivo | exit 1 |
 | combinações de §9.7 que degradam | `WARN` |
 | `sink=sqlite` com `workers > 1` | `WARN`, forçado a 1 |
@@ -3272,6 +3404,30 @@ fase 5  para o beacon, fecha o sink, o ring e o SQLite, exit 0
   como `emergency_failed`, com o aborto logando que nada se perdeu — uma
   contagem só, com o motivo errado (revisão independente do porte,
   2026-10-13).
+- **O aborto fecha o ring antes de contar** (porte do RP/RN, 2026-10-14). Com
+  `ring=memory`/`none`, fora da fase de dump, o `abortLoss` chama
+  `ring.Close()` **antes** de ler a ocupação: um `Enqueue` depois disso é
+  recusado com `ring.ErrClosed`, que a recepção trata como shutdown (TCP/TLS
+  fecham a conexão sem ler adiante; UDP e unix descartam), contado em
+  `syslog_messages_dropped_total{reason="shutdown"}`, e nenhuma mensagem é
+  aceita depois da contagem sem ser contada. O `Enqueue` do ring em memória
+  reconfere o fechamento **depois** de reservar a vaga (`items.Add(1)`): ou a
+  reserva é vista pela leitura do aborto (contada), ou o `Enqueue` vê o
+  fechamento e desiste — no máximo uma sobrecontagem transitória, nunca uma
+  mensagem aceita sem contagem. A sobrecontagem tem uma segunda fonte (registrado em 2026-10-14, D3 da revisão do syslog): um `Enqueue` que reservou a vaga (`items.Add(1)`) e vai desistir por falta de bytes (`ErrFull`) pode ser lido pelo aborto entre a reserva e o recuo, e conta em `abort` uma mensagem que a recepção trata como ring cheio. É transitória, de no máximo uma por recepção concorrente, e nunca esconde uma perda. A janela não era só o `pre_stop_delay`: um
+  `SIGQUIT` em operação normal tinha a mesma, com todos os transportes abertos.
+  O `ring=none` faz o mesmo depois de `cur.Add(1)`, que é a ocupação que o
+  aborto lê: fechado, desfaz a reserva e o semáforo e devolve `ErrClosed`
+  (revisão independente de 2026-10-14, A2: só o `memory` reconferia, e uma
+  linha TCP já lida que passava do primeiro `closed` antes do `Close` era
+  escrita depois da contagem, e o `os.Exit` a perdia sem conta;
+  `TestNoneEnqueueSeesACloseThatRacedTheReservation`). Uma escrita síncrona já
+  contada pode ainda terminar no destino antes do `os.Exit`: entregue e contada
+  em `abort`, uma sobrecontagem, nunca uma perda.
+  Com `ring=sqlite`/`redis` o aborto não conta o ring (o que sobrou continua
+  lá) e não o fecha: o `Close` deles espera o *group commit* e o cliente, e o
+  aborto é "agora" (`TestAbortClosesTheRingBeforeCounting`,
+  `TestEnqueueSeesACloseThatRacedTheReservation`).
 - **Sink FATAL durante a fase 4** (o `SIGTERM` chegou com o sink UP e ele virou
   FATAL no dreno): a espera termina na hora, em vez de gastar o `drain_timeout`
   num dreno que não acontece mais, e a saída é **3** em qualquer ring; com
@@ -3304,6 +3460,10 @@ fase 5  para o beacon, fecha o sink, o ring e o SQLite, exit 0
 
 `admin.bind`, padrão `127.0.0.1:9102` (o `go-webhook-server` usa `9101`; os dois
 rodam lado a lado). HTTP/1.1.
+
+O `admin.bind` nunca divide o endereço TCP do `listen.tcp` nem do `listen.tls` (§13.2): mesma
+porta com o mesmo literal, um curinga ou um nome de qualquer lado é exit 1 na
+validação.
 
 | Path | Semântica |
 |---|---|
@@ -3344,7 +3504,7 @@ destino, onde é coluna indexada.
 | `syslog_sink_batch_size`, `syslog_sink_batch_bytes` | histogram | — (por pedaço) |
 | `syslog_sink_duration_seconds` | histogram | — |
 | `syslog_sink_health_duration_seconds` | histogram | — |
-| `syslog_sink_errors_total` | counter | `kind` (network, logic, fatal, timeout); o cancelamento do shutdown não conta |
+| `syslog_sink_errors_total` | counter | `kind` (network, logic, fatal, timeout); o cancelamento do shutdown não conta. `fatal` conta **toda** recusa fatal do destino, mesmo durante um cancelamento (boot cancelado, shutdown): ela não nasce dele, é um veredito real, e o processo sai logo depois. Só o `network` cortado pelo cancelamento deixa de contar, porque o cancelamento **causa** erros de rede (prazo, conexão fechada). Regra, não pendência (porte do RP/RN, decidido em 2026-10-14). Vale também para o cancelamento do boot na reingestão e no backlog (`Instrumented.Deliver`): o `network` cortado por ele não conta, como nos workers e no SP/SN (achado do porte do RP/RN, 2026-10-14: o `writeChunk` contava antes de olhar o contexto; `TestDeliverCancellationIsNotANetworkError`). |
 | `syslog_sink_up` | gauge | — |
 | `syslog_sink_sqlite_file_bytes`, `_rotations_total`, `_files_removed_total` | gauge, counter | — |
 | `syslog_sink_postgres_duplicates_total`, `syslog_sink_mysql_duplicates_total`, `syslog_sink_nats_duplicates_total` | counter | — |
@@ -3393,10 +3553,22 @@ mediana de uma mensagem syslog fica em 150–250 bytes e o p99 raramente passa d
 
 **Memória por conexão, fora do ring.** Uma conexão TCP ou TLS viva segura o
 leitor de 4 KiB e o buffer de frame (até 8 KiB quando ociosa; o de um frame
-maior enquanto os frames seguintes já estão no leitor), ociosa ou não;
+maior enquanto os frames seguintes já estão no leitor, ou com alguns bytes do próximo frame no leitor e o par calado), ociosa ou não;
 os números e a regra estão em §5.4 (pendência 1 de 2026-10-11). Não entram em
 `ring.max_bytes`: o teto delas é `tcp.max_conns`/`tls.max_conns`, e com `0` é o
 `GOMEMLIMIT` (§15.4) que segura um enxame de conexões caladas.
+
+**Teto pequeno demais.** Uma mensagem de `n` bytes (já truncada) custa ao ring
+em memória a classe do pool de `n` + 384 B (§9.2): 2 KiB, 8 KiB ou 64 KiB, e
+acima da maior classe o próprio `n`. O piso de `ring.max_bytes` é o custo de
+uma mensagem do tamanho máximo, `item.PooledCap(syslog.max_message_bytes) +
+ring.ItemOverhead` (65 920 B com o padrão), e um valor menor é recusado na
+validação (§13.2, exit 1); com `sqlite` e `redis` o piso é o próprio
+`max_message_bytes`, a medida deles. O piso da **menor** classe não basta: um
+ring de 4 KiB aceitaria as linhas curtas e recusaria **sempre** qualquer linha
+de 3 KiB, mesmo vazio — no TCP a conexão daquele emissor parava até o
+`backpressure_timeout` a cada uma. Com o piso, toda mensagem que o truncamento
+guarda cabe num ring vazio (porte do RP/RN, 2026-10-14).
 
 ### 15.2 Regra de propriedade única
 
@@ -3550,6 +3722,15 @@ primeiro `SIGHUP` e nunca mais. **Sinônimos são um valor só**: `windows-1252`
 (revisão independente do RP, 2026-10-13, portada;
 `TestCharsetSynonymsAreOneValue`): antes, um `SIGHUP` avisava "requires a
 restart" de um restart que não mudaria nada.
+
+**Chave derivada não é relatada.** Uma chave **derivada** no boot e no arquivo
+novo (§16.2, a nota `derived` do `--dump-config`: `emergency.dir`, `ring.sqlite.path` e `sink.sqlite.path` de `server.data_dir`, e `sink.<tipo>.pool_size` de `sink.workers` com `postgres`, `mysql` e `clickhouse`) não entra na lista
+"requires a restart": muda só porque a chave que a deriva mudou, e essa é
+relatada. Uma que passa de explícita a derivada, ou o contrário, é relatada;
+notas que não começam com `derived` (`lowered to 4`, `forced to 1`, `resolved to
+an absolute path`) dizem como um valor dado foi ajustado e continuam relatadas.
+A comparação usa as notas que o `Load` já grava (`Loaded.Notes`), as mesmas do
+`--dump-config` (porte do RP/RN, 2026-10-14; `TestReloadDoesNotReportDerivedKeys`, `TestReloadDoesNotReportTheDerivedPoolSize`).
 
 **Chave sombreada.** Como env e flag vencem o arquivo (§16.1) e não mudam num
 processo em execução, uma chave que o arquivo define mas um env ou uma flag
@@ -3706,7 +3887,7 @@ a validação recusa `0` com exit 1. Zero é legítimo onde diz o que faz:
 |---|---|---|
 | `mode` | `memory` | `memory` \| `sqlite` \| `redis` \| `none` |
 | `capacity_items` | `65536` | global com `redis` |
-| `max_bytes` | `512MiB` | bytes do cru; global com `redis` |
+| `max_bytes` | `512MiB` | bytes do cru; global com `redis`. No mínimo o custo de uma mensagem de `syslog.max_message_bytes` na medida do modo (com `memory`, a classe do pool + 384 B; §13.2) |
 | `high_water` | `0.80` | `/readyz` falha acima |
 | `max_inflight` | `2048` | escritas síncronas com `none` |
 
@@ -4242,5 +4423,32 @@ O que **não** veio, com o motivo, está na entrada S de 2026-10-13 do
 
 ### 22.1 Pendências conhecidas
 
-Nenhuma conhecida em 2026-10-13. O que os testes ainda não provam está em
-`docs/TESTING.md` §8.
+Nenhuma aberta em 2026-10-14. O que os testes ainda não provam está em
+`docs/TESTING.md` §8. Para que a história fique registrada, o que o porte das
+pendências do RP/RN (`tasks/port-to-R-S-SP-SN.md`) achou igual aqui, uma linha
+por item, com a regra na seção do assunto:
+
+1. *Corrigido em 2026-10-14 (porte do RP/RN):* o aborto fecha o ring (`memory`/`none`) antes de contar, e o `Enqueue` do ring em memória reconfere o fechamento depois da reserva; regra em §13.4.
+2. *Corrigido em 2026-10-14 (porte do RP/RN):* `ring.max_bytes` abaixo do custo de uma mensagem de `syslog.max_message_bytes` na medida do ring efetivo (com `memory`, a classe do pool + 384 B) é exit 1; regra em §13.2 e §15.1.
+3. *Corrigido em 2026-10-14 (porte do RP/RN):* `admin.bind` no mesmo endereço TCP de `listen.tcp` ou `listen.tls` é exit 1 na validação (`sameStreamSocket`); regra em §13.2 e §14.
+4. *Corrigido em 2026-10-14 (porte do RP/RN):* `SIGHUP` não relata mais a chave derivada (`emergency.dir`, `ring.sqlite.path`, `sink.sqlite.path`, `sink.<tipo>.pool_size`) junto com a que a deriva; regra em §16.3.
+5. *Corrigido em 2026-10-14 (porte do RP/RN):* a discagem falha da reconexão NATS não é logada, só o veredito (já no código; agora regra escrita e `TestNATSReconnectDialFailureIsNotLogged`); o veredito TLS só com servidor único já era regra; regra em §10.7.
+6. *Corrigido em 2026-10-14 (achado do porte do RP/RN):* o `Instrumented.Deliver` contava em `syslog_sink_errors_total{kind="network"}` a escrita cortada pelo cancelamento do boot; regra em §14.1.
+7. *Corrigido em 2026-10-14 (porte do SP/SN):* `TestProxyOptionalBufferedLinesSurviveClose` confere que `required` não conta `absent` nem `reason="proxy"` no shutdown (sem isso, a remoção de `|| mode == required` passava nos testes); regra em §4.6.
+8. *Corrigido em 2026-10-14 (porte do SP/SN):* a tabela de §6.9 definia `timestamp-invalid` sem a ressalva da RFC 3164, contradizendo §6.5.1; regra em §6.5.1 e §6.9.
+9. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* a falha ao remover um dump já entregue continua só `ERROR`; regra em §12.2 / DECISOES §2.
+10. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* SQLSTATE fora da tabela (`P0001`) é `network`, nunca descarte nem FATAL; regra em §10.5 e §20.18 / DECISOES §2.
+11. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* dump publicado no instante do aborto fica contado e no disco, e o aborto não espera o disco; regra em §12.1 / DECISOES §2.
+12. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* `syslog_sink_errors_total{kind="fatal"}` conta a recusa fatal mesmo com o boot cancelado; regra em §14.1 / DECISOES §2.
+13. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* contadores da recepção sem *padding*, sem defeito observável; lacuna de medição em TESTING §8 / DECISOES §2.
+14. *Corrigido em 2026-10-14 (decisão do usuário, a do item 23 do `go-webhook-server`):* a sonda do `sink=sqlite` espera a trava da escritora só no próprio prazo; escritora ocupada com o último `Write` sem erro conta UP sem tocar o banco, só até `sink.op_timeout + sink.health_timeout` de trava tomada pelo pedaço em curso (revisão A1), e o heartbeat falho conta como `Write` falho (A2); regra em §10.4 / DECISOES §1 (19).
+15. *Corrigido em 2026-10-14 (revisão independente):* com `proxy.protocol=required`, um cabeçalho PROXY **válido** já no leitor quando o shutdown chega segue para a moldura, e as linhas que vieram com ele entram no ring; só a espera (sem cabeçalho, ou com erro) fecha sem contar (A1); regra em §4.6.
+16. *Corrigido em 2026-10-14 (revisão independente):* o `ring=none` reconfere o fechamento depois de `cur.Add(1)` e desfaz a reserva e o semáforo, como o `memory` (A2); regra em §13.4.
+17. *Corrigido em 2026-10-14 (revisão independente):* a sonda do `sink=sqlite` mede a idade do pedaço em curso no relógio monotônico (A3); regra em §10.4.
+18. *Corrigido em 2026-10-14 (revisão independente):* um heartbeat bem-sucedido da sonda do `sink=sqlite` grava "último `Write` sem erro" (A4; fecha também o D5, o primeiro pedaço lento depois do boot); regra em §10.4.
+19. *Corrigido em 2026-10-14 (revisão independente):* o heartbeat que falha pelo próprio contexto (prazo da sonda, cancelamento) não marca o `Write` como falho (A1 da revisão do RELP); regra em §10.4.
+20. *Registrado em 2026-10-14 (revisão independente):* na sonda do `sink=sqlite`, "qualquer classe" inclui `logic` (D5 do RELP) e só o `Write` grava o instante da trava (D6 do RELP); regra em §10.4.
+21. *Corrigido em 2026-10-14 (revisão independente):* `sameStreamSocket` compara valores: curinga por `IsUnspecified()` (`[::0]`, `0:0::0`) e porta como número (`0514` = `514`, nome de serviço resolvido, porta irresolúvel recusada) (D1 do syslog, D4 do RELP); regra em §13.2.
+22. *Registrado em 2026-10-14 (revisão independente):* o "até 8 KiB quando ociosa" vale entre frames, com o leitor vazio: um frame grande seguido de alguns bytes do próximo segura o buffer grande até o idle; soltar no ponto de espera dentro do frame foi medido (24 KiB: 10× mais lento, 128× mais alocação) e recusado (A5, D4); regra em §5.4 e §15.1.
+23. *Registrado em 2026-10-14 (revisão independente):* *pool* NATS só de servidores que recusam o TLS nunca dá veredito (FATAL só pelos fusíveis; D2 do syslog), e uma URL única cujo nome resolve a vários IPs dá veredito pela recusa do IP sorteado (D3 do RELP); regra em §10.7.
+24. *Registrado em 2026-10-14 (revisão independente):* sobrecontagem transitória do aborto também por um `Enqueue` que reservou a vaga e recua por falta de bytes (D3 do syslog); e o comentário do `Memory.Enqueue` corrigido ("pelo menos um dos dois", D1 do RELP); regra em §13.4.

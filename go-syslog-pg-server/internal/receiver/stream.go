@@ -28,8 +28,17 @@ const defaultBackpressureTimeout = 30 * time.Second
 
 // streamReadBuffer is the bufio.Reader size of one TCP connection. It is
 // not a configuration key: a frame is read through it one refill at a time, so
-// a bigger buffer buys nothing and a smaller one only costs syscalls.
-const streamReadBuffer = 64 << 10
+// a bigger buffer buys little and a smaller one only costs syscalls.
+//
+// 4 KiB, not 64 (a known pendência, fixed on 2026-10-14 as in
+// go-syslog-server; SPEC §5.4, §15.1): the reader is held for as long as the
+// connection lives, idle or not, outside ring.max_bytes, and with
+// max_conns = 0 (the default) a few thousand silent connections at 64 KiB
+// each took the heap to GOMEMLIMIT. The largest Peek of the code is the
+// 12-byte PROXY v2 signature (the framer's detection peeks eleven, the v1
+// header is read byte by byte), so 4 KiB holds every one of them;
+// BenchmarkTCPReceive measured the refills it adds (TESTING §4).
+const streamReadBuffer = 4 << 10
 
 // keepAlivePeriod is the SO_KEEPALIVE period of SPEC §4.4.
 const keepAlivePeriod = 30 * time.Second
@@ -305,6 +314,27 @@ func (s *Stream) readProxy(c net.Conn, br *bufio.Reader, a *connAddrs) bool {
 
 	armDeadline(c, px.headerTimeout(), &s.closing)
 	hdr, found, err := ReadProxyHeader(br)
+	if s.closing.Load() && (err != nil || (!found && px.Mode == ProxyRequired)) {
+		// The shutdown expired the deadline of a connection still waiting for
+		// its header (or halfway through one). That is a deploy, not the
+		// balancer's fault: nothing is counted and nothing is logged (SPEC
+		// §4.6; a known pendência, fixed on 2026-10-14 as in go-syslog-server).
+		//
+		// Only then. With proxy.protocol=optional, found=false and err=nil is
+		// a connection that sent no header and whose syslog lines are already
+		// in the reader: they are messages read off the socket, and SPEC §13.4
+		// lets what was read finish entering the ring. The rule of
+		// go-relplog-server -- "(err != nil || !found) && closing" -- dropped
+		// up to 4 KiB of them uncounted on every Close (independent review of
+		// the go-syslog-server port, 2026-10-13); in RELP nothing is confirmed
+		// before the header, here the TCP window already took them.
+		//
+		// And only without a header in required mode: a VALID header the
+		// balancer sent in the same segment as the first lines is not a wait.
+		// Header and lines are already in the reader, and closing here lost
+		// them uncounted (independent review of 2026-10-14, A1).
+		return false
+	}
 	switch {
 	case errors.Is(err, ErrProxyHeader):
 		s.m.ProxyHeadersTotal[obs.ProxyInvalid].Inc()

@@ -78,9 +78,11 @@ type Ring interface {
 
 	// Commit is called after the sink confirmed the batch, or refused it for
 	// good (logic). It is where the ring drops its own record of the items.
-	// Their buffers are released by the caller, AFTER Commit: the ring
+	// Their buffers are released by the caller, AFTER Commit: ring=sqlite
 	// subtracts it.Size(), which is len(Env), and Release empties Env
-	// (SPEC §12.3).
+	// (SPEC §12.3). The memory ring subtracts the Charged it recorded at
+	// Enqueue (SPEC §7.2), so either order would do for it; this one serves
+	// both.
 	Commit(items []*envelope.Item) error
 
 	// Drain returns everything still pending and empties the ring. It is used

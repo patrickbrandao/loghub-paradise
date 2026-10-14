@@ -383,22 +383,36 @@ var errNotOurs = errors.New("emergency: not an envelope of this server")
 //     hand edit, made every boot exit 3 before the public port opened
 //     (independent review, 2026-10-07). The serializer writes UTF-8 only and
 //     only two kinds of \u escape: \u00XX for control bytes and \u2028/\u2029
-//     (SPEC §12.1); anything else did not come from it.
+//     (SPEC §12.1); anything else did not come from it -- and neither does a
+//     raw U+2028 or U+2029, which it always escapes.
 func checkLine(env []byte) (envelope.Head, error) {
 	h, _, err := envelope.ParseHead(env)
 	if err != nil {
 		return h, err
 	}
-	if !utf8.Valid(env) || !json.Valid(env) || !onlyOurEscapes(env) {
+	if !utf8.Valid(env) || !json.Valid(env) || !onlyOurEscapes(env) ||
+		bytes.Contains(env, rawLS) || bytes.Contains(env, rawPS) {
 		return h, errNotOurs
 	}
 	return h, nil
 }
 
-// onlyOurEscapes reports whether every \u escape in env is one the serializer
-// writes. A backslash always starts an escape in valid JSON, so the pairs are
-// walked in order and "\\u0000" (an escaped backslash, then text) is not
-// mistaken for one.
+// rawLS and rawPS are U+2028 and U+2029 in UTF-8. The serializer always
+// escapes them (SPEC §12.1), so a raw one did not come from it (SPEC §9.2;
+// port of go-webhook-server, W 20). Here nothing compares keys by bytes and
+// jsonb normalises, so it was only slack, but the gate is the family's.
+var rawLS, rawPS = []byte("\xe2\x80\xa8"), []byte("\xe2\x80\xa9")
+
+// onlyOurEscapes reports whether every escape in env is one the serializer
+// writes (envelope.appendEscape and the U+2028/U+2029 case, SPEC §9.2): \"
+// \\ \n \r \t, \u00XX in lowercase hex for a control byte with no short
+// form, and \u2028/\u2029 -- nothing else. \/ \b \f, the \u of a printable
+// character and uppercase hex are valid JSON this server never writes, so a
+// record carrying one is not ours (W 34; until 2026-10-14 any
+// two-character escape and any \u00XX passed, against §9.2). A backslash
+// always starts an escape in valid JSON, so the pairs are walked in order and
+// "\\u0000" (an escaped backslash, then text) is not mistaken for one. It is
+// go-webhook-nats-server's check (emergency/shape.go).
 func onlyOurEscapes(env []byte) bool {
 	for i := 0; i < len(env); i++ {
 		if env[i] != '\\' {
@@ -407,23 +421,50 @@ func onlyOurEscapes(env []byte) bool {
 		if i+1 >= len(env) {
 			return false
 		}
-		if env[i+1] != 'u' {
-			i++ // a two-byte escape: \" \\ \/ \b \f \n \r \t
+		switch env[i+1] {
+		case '"', '\\', 'n', 'r', 't':
+			i++
 			continue
-		}
-		if i+6 > len(env) {
-			return false
-		}
-		q := env[i+2 : i+6]
-		switch {
-		case q[0] == '0' && q[1] == '0':
-		case q[0] == '2' && q[1] == '0' && q[2] == '2' && (q[3] == '8' || q[3] == '9'):
+		case 'u':
 		default:
+			return false // \/ \b \f: valid JSON, never written
+		}
+		if i+6 > len(env) || !ourUnicodeEscape(env[i+2:i+6]) {
 			return false
 		}
 		i += 5
 	}
 	return true
+}
+
+// ourUnicodeEscape is the four hex digits of a \u escape the serializer writes:
+// lowercase hex, a control byte without a short form, or a JavaScript line
+// terminator.
+func ourUnicodeEscape(q []byte) bool {
+	if string(q) == "2028" || string(q) == "2029" {
+		return true
+	}
+	if q[0] != '0' || q[1] != '0' || (q[2] != '0' && q[2] != '1') {
+		return false
+	}
+	lo := lowerHex(q[3])
+	if lo < 0 {
+		return false
+	}
+	v := int(q[2]-'0')<<4 | lo
+	return v != '\n' && v != '\r' && v != '\t'
+}
+
+// lowerHex is the value of a lowercase hex digit, or -1: the serializer's
+// hexDigits are lowercase, so 'A'-'F' is not ours.
+func lowerHex(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	}
+	return -1
 }
 
 // readLine reads one line of at most max bytes before its newline.

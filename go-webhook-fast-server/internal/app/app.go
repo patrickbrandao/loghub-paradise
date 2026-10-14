@@ -166,6 +166,10 @@ type App struct {
 	srv     *server.Server
 	admin   *server.Admin
 
+	// sinkDeadline is the one sink.boot_timeout of boot step 3, shared by
+	// the client build and the wait for the first check (SPEC §10.1).
+	sinkDeadline time.Time
+
 	// emg reads the dumps of a previous life at every boot, whatever this
 	// one's ring mode; dumps says whether this life writes them (SPEC §9).
 	// The reader used to exist only beside the writer, and a next life with
@@ -232,6 +236,11 @@ type App struct {
 	beforeDump    func()
 	beforeCollect func()
 	inAbort       func()
+
+	// wrapServe, when a test sets it, wraps the public Serve, so the test can
+	// make it return an error the retrying listener never lets through
+	// (SPEC §10.3). nil in the binary.
+	wrapServe func(serve func() error) func() error
 }
 
 func (a *App) run(ctx context.Context, stopSignals func()) int {
@@ -289,6 +298,11 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	// Step 3: the sink. Redis dials on construction, so this is where a
 	// destination that is not up yet is waited for, within sink.boot_timeout.
 	a.admin.SetBootState("connecting to the sink")
+	// ONE sink.boot_timeout, counted from here, covers building the client
+	// and the wait for the first health check (SPEC §10.1 step 3, W pendência
+	// 22): two whole budgets in a row made the worst case more than twice the
+	// configured one.
+	a.sinkDeadline = time.Now().Add(a.cfg.Sink.BootTimeout)
 	if code := a.buildSink(ctx); code != ExitOK {
 		return code
 	}
@@ -307,7 +321,9 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	// The public port stays closed until the destination answers, so nothing
 	// is ever accepted that cannot be stored.
 	a.admin.SetBootState("waiting for the sink")
-	if err := a.health.WaitReady(ctx, a.cfg.Sink.BootTimeout,
+	// What is left of the step's budget; with nothing left WaitReady still
+	// makes one check, which is what a client built at the last moment needs.
+	if err := a.health.WaitReady(ctx, max(time.Until(a.sinkDeadline), 0),
 		100*time.Millisecond, 5*time.Second); err != nil {
 		if ctx.Err() != nil {
 			a.log.Info("interrupted while waiting for the sink")
@@ -382,25 +398,44 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	// (SPEC §10.1 step 6).
 	a.admin.SetBootState("")
 
+	serve := a.srv.Serve
+	if a.wrapServe != nil {
+		serve = a.wrapServe(serve)
+	}
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- a.srv.Serve() }()
+	go func() { serveErr <- serve() }()
 
 	// Reloads run from here until the shutdown stops the workers.
 	a.reloads.Store(true)
 
 	select {
 	case err := <-serveErr:
-		if err != nil {
-			a.log.Error("public listener stopped", "error", err)
-			return ExitConfig
+		if err == nil {
+			return ExitOK
 		}
-		return ExitOK
+		// The listener retries every accept error but its own close, so
+		// this is rare; when it happens, the ring and the batches the
+		// workers hold were already answered 200. Exiting here dropped them
+		// with no dump and no count: they go through the shutdown like a
+		// SIGTERM's, and a complete one still exits 1, because the process
+		// did fail (SPEC §10.3, §10.5).
+		a.log.Error("public listener stopped; shutting down", "error", err)
+		abort, stopAbort := a.watchAbort()
+		defer stopAbort()
+		// No signal started this shutdown, so -- as in a FATAL one -- the
+		// first SIGTERM/SIGINT, the orchestrator's answer to /readyz
+		// failing, is tolerated; the drain stays a SIGTERM's (W §19.1 item 31).
+		stopSignals()
+		if code := a.shutdown(stopWorkers, false, true, abort); code != ExitOK {
+			return code
+		}
+		return ExitConfig
 
 	case <-a.health.Fatal():
 		a.log.Error("sink became permanently unusable", "error", a.health.FatalErr())
 		abort, stopAbort := a.watchAbort()
 		defer stopAbort()
-		return a.shutdown(stopWorkers, true, abort)
+		return a.shutdown(stopWorkers, true, true, abort)
 
 	case <-ctx.Done():
 		// The abort watcher is registered BEFORE the signal context lets go
@@ -411,7 +446,7 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 		defer stopAbort()
 		stopSignals() // a second signal now reaches abort, not the context
 		a.log.Info("shutdown requested")
-		return a.shutdown(stopWorkers, false, abort)
+		return a.shutdown(stopWorkers, false, false, abort)
 	}
 }
 
@@ -448,6 +483,9 @@ func (a *App) buildSink(ctx context.Context) int {
 			Synchronous:       a.cfg.SinkSQL.Synchronous,
 			BusyTimeout:       a.cfg.SinkSQL.BusyTimeout,
 			WALAutocheckpoint: a.cfg.SinkSQL.WALAutocheckpoint,
+			// A batch older than its own deadline plus the probe's is
+			// stuck, not busy (SPEC §8.3.5, W §19.1 item 36).
+			HeldLimit: a.cfg.Sink.OpTimeout + a.cfg.Sink.HealthTimeout,
 		}, a.log.Logger, a.metrics)
 		if err != nil {
 			a.log.Error("cannot open the events database", "error", err)
@@ -460,10 +498,11 @@ func (a *App) buildSink(ctx context.Context) int {
 		return ExitOK
 
 	case config.SinkRedisType:
-		deadline := time.Now().Add(a.cfg.Sink.BootTimeout)
+		deadline := a.sinkDeadline
 		backoff := 100 * time.Millisecond
 		for attempt := 1; ; attempt++ {
-			octx, cancel := context.WithTimeout(ctx, a.cfg.Sink.OpTimeout)
+			// An attempt never outlives the step's budget (SPEC §10.1 step 3).
+			octx, cancel := context.WithTimeout(ctx, min(a.cfg.Sink.OpTimeout, max(time.Until(deadline), 0)))
 			s, err := sink.NewRedis(octx, sink.RedisConfig{
 				Addrs:               a.cfg.SinkRedis.Addrs,
 				Username:            a.cfg.SinkRedis.Username,
@@ -481,6 +520,7 @@ func (a *App) buildSink(ctx context.Context) int {
 				ReadBufferEachConn:  a.cfg.SinkRedis.ReadBufferEachConn,
 				WriteBufferEachConn: a.cfg.SinkRedis.WriteBufferEachConn,
 				ClientName:          a.clientName(),
+				DialTimeout:         a.cfg.Sink.OpTimeout,
 			}, a.log.Logger, a.metrics)
 			cancel()
 			if err == nil {
@@ -505,12 +545,16 @@ func (a *App) buildSink(ctx context.Context) int {
 					"error", err)
 				return ExitSink
 			}
+			// The backoff does not sleep past the budget either: the next
+			// attempt runs with what is left, and the check above ends the
+			// loop after it.
+			sleep := min(backoff, time.Until(deadline))
 			a.log.Warn("Redis not reachable yet, retrying",
-				"attempt", attempt, "error", err, "retry_in", backoff.String())
+				"attempt", attempt, "error", err, "retry_in", sleep.String())
 			select {
 			case <-ctx.Done():
 				return ExitAborted
-			case <-time.After(backoff):
+			case <-time.After(sleep):
 			}
 			if backoff *= 2; backoff > 5*time.Second {
 				backoff = 5 * time.Second
@@ -771,6 +815,8 @@ func (a *App) build() int {
 		OpTimeout:  a.cfg.Sink.OpTimeout,
 		BackoffMin: a.cfg.Sink.RetryBackoffMin,
 		BackoffMax: a.cfg.Sink.RetryBackoffMax,
+		// SPEC §8.1 step 2: a batch goes out in pieces under this ceiling.
+		BatchMaxBytes: a.cfg.Sink.BatchMaxBytes,
 	}, a.log.Logger, a.metrics)
 
 	trusted, err := config.ParsePrefixes(a.cfg.Proxy.Trusted)
@@ -813,12 +859,14 @@ func (a *App) build() int {
 // SIGINT that arrives during it -- the orchestrator's ordinary one, while the
 // dump is being written -- is not the second signal of SPEC §10.3: it is
 // logged and the shutdown goes on; the next one aborts (found while building
-// go-webhook-pg-server, 2026-10-07). SIGQUIT is never tolerated: it means
-// "now", in every phase.
-func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool, abort <-chan os.Signal) int {
+// go-webhook-pg-server, 2026-10-07). The same holds for the shutdown a
+// public Serve error starts, which is otherwise a SIGTERM's: tolerateFirst is
+// therefore its own parameter, not fatal (W §19.1 item 31). SIGQUIT is never
+// tolerated: it means "now", in every phase.
+func (a *App) shutdown(stopWorkers context.CancelFunc, fatal, tolerateFirst bool, abort <-chan os.Signal) int {
 	return a.shutdownWith(func(abortCtx context.Context) int {
 		return a.gracefulShutdown(abortCtx, stopWorkers, fatal)
-	}, fatal, abort)
+	}, tolerateFirst, abort)
 }
 
 // shutdownWith is shutdown around any graceful procedure, so the signal rules
@@ -826,14 +874,14 @@ func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool, abort <-chan 
 // cancelled when the abort wins: in the binary os.Exit makes that moot, but in
 // the tests the instance would otherwise keep draining and dumping into a
 // directory the test has removed.
-func (a *App) shutdownWith(graceful func(abortCtx context.Context) int, fatal bool, abort <-chan os.Signal) int {
+func (a *App) shutdownWith(graceful func(abortCtx context.Context) int, tolerateFirst bool, abort <-chan os.Signal) int {
 	abortCtx, stopGraceful := context.WithCancel(context.Background())
 	defer stopGraceful()
 
 	done := make(chan int, 1)
 	go func() { done <- graceful(abortCtx) }()
 
-	tolerate := fatal
+	tolerate := tolerateFirst
 	for {
 		select {
 		case code := <-done:
@@ -841,7 +889,7 @@ func (a *App) shutdownWith(graceful func(abortCtx context.Context) int, fatal bo
 		case sig := <-abort:
 			if tolerate && sig != syscall.SIGQUIT {
 				tolerate = false
-				a.log.Warn("signal during the emergency shutdown; it goes on -- a second one aborts "+
+				a.log.Warn("signal during a shutdown no signal started; it goes on -- a second one aborts "+
 					"and accepts the loss", "signal", sig.String())
 				continue
 			}

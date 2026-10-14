@@ -144,6 +144,12 @@ type relpSession struct {
 	reason     atomic.Uint32
 	// broken is set by the writer when the socket stops taking answers.
 	broken atomic.Bool
+	// held counts the transactions in decide, from before the first Accept
+	// to the end of the hold loop (a full or
+	// unavailable ring, a DOWN sink, the rate-limit). An idle timeout with one
+	// of them waiting is backpressure, not server_closed (SPEC §5.4).
+	// inFlight is a WaitGroup and cannot be read.
+	held atomic.Int32
 }
 
 // runRELP serves one connection until it ends. It returns after every
@@ -213,8 +219,16 @@ func (ss *relpSession) readLoop(br *bufio.Reader) (closeHint bool) {
 			if hint && ss.ctx.Err() == nil && !ss.parentDone() {
 				// The server ended a session its peer is still on (a bad
 				// frame, the idle timeout): what it leaves unanswered is not a
-				// lost connection.
-				ss.setReason(obs.UnansweredServerClosed)
+				// lost connection. An idle timeout that fires while a
+				// transaction is held -- the idle below
+				// relp.backpressure_timeout -- ends a session that was waiting
+				// on the ring, the sink or the rate-limit: that is
+				// backpressure (SPEC §5.4).
+				if isTimeout(err) && ss.held.Load() > 0 {
+					ss.setReason(obs.UnansweredBackpressure)
+				} else {
+					ss.setReason(obs.UnansweredServerClosed)
+				}
 			}
 			return hint
 		}
@@ -343,6 +357,14 @@ func (ss *relpSession) dispatch(f *RELPFrame, now time.Time) bool {
 func (ss *relpSession) decide(raw []byte, w *Wire) (string, bool) {
 	s := ss.s
 	held := w.Time
+	// Held from BEFORE the first Accept (SPEC §5.4, independent review of
+	// 2026-10-14, A2): that Accept can wait a group COMMIT, a Redis round
+	// trip or a synchronous sink write, and an idle timeout firing meanwhile
+	// recorded server_closed for a transaction that was waiting on the ring
+	// or the sink. One accepted in that race gets its 200 and is never
+	// counted as unanswered, so counting it as held costs nothing.
+	ss.held.Add(1)
+	defer ss.held.Add(-1)
 	out := s.in.Accept(ss.ctx, raw, w)
 	if body, answered, final := ss.verdict(out, held); final {
 		return body, answered

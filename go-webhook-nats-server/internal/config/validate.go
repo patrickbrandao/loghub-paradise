@@ -5,10 +5,12 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-nats-server/internal/envelope"
+	"github.com/patrickbrandao/loghub-paradise/go-webhook-nats-server/internal/ring"
 )
 
 // natsToken is one dot-separated token of a subject, or a whole stream name: no
@@ -27,10 +29,12 @@ var natsToken = regexp.MustCompile(`^[^\s.*>/\\]+$`)
 // platform. maxSinkBatch is 1 Mi, the family's: a Dequeue slice of 1 Mi
 // pointers is 8 MiB.
 const (
-	maxRingItems   = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
-	maxSinkBatch   = 1 << 20
-	maxSinkWorkers = 256
-	maxListeners   = 256
+	maxRingItems = 1 << 24 // 16 Mi items: 128 MiB of channel slots alone
+	maxSinkBatch = 1 << 20
+	// maxBatchMaxBytes is sink.batch_max_bytes's ceiling (SPEC §8.1 step 2).
+	maxBatchMaxBytes = int64(256) << 20
+	maxSinkWorkers   = 256
+	maxListeners     = 256
 )
 
 // Validate checks every constraint the server depends on and returns the boot
@@ -113,6 +117,21 @@ func Validate(c *Config) (warnings []string, err error) {
 	if c.Ring.MaxBytes < 1 {
 		return nil, fmt.Errorf("ring.max_bytes: must be positive")
 	}
+	// The largest event the configuration accepts must fit an empty memory
+	// ring: below what it costs there -- its pool class plus the per-item
+	// overhead, the ring's own charge -- it got 429 always and its sender
+	// retried it for ever (SPEC §7.2, W 35; the floor of the RELP
+	// cuts). The server.max_* above are already positive.
+	{ // ring.mode is always memory here
+		event := envelope.MaxEventBytes(c.Server.MaxBodyBytes, c.Server.MaxHeaderBytes, c.Server.MaxURIBytes)
+		if floor := envelope.PooledCap(event) + ring.ItemOverhead; c.Ring.MaxBytes < floor {
+			return nil, fmt.Errorf("ring.max_bytes (%s) is below what the largest event the server.max_* "+
+				"limits accept costs the ring, %s (an envelope of up to %s in its pool class, plus %d "+
+				"bytes): that event would get 429 even with the ring empty, and its sender would retry "+
+				"it for ever", FormatBytes(c.Ring.MaxBytes), FormatBytes(floor), FormatBytes(event),
+				ring.ItemOverhead)
+		}
+	}
 	// Written as "not inside" so NaN, which every comparison refuses, is
 	// refused too: a NaN high water never saturates the ring, which turned
 	// the /readyz gate off in silence.
@@ -130,6 +149,16 @@ func Validate(c *Config) (warnings []string, err error) {
 	}
 	if c.Sink.Batch > maxSinkBatch {
 		return nil, fmt.Errorf("sink.batch: %d is above %d", c.Sink.Batch, maxSinkBatch)
+	}
+	// One byte is coherent with the rule -- every event then goes alone -- so
+	// it is the floor; zero would read as "no ceiling", which is what the key
+	// exists to end (SPEC §8.1 step 2, §10.1). Above 256 MiB no destination
+	// writes a piece within sink.op_timeout -- the very failure the ceiling
+	// exists for (the form of go-syslog-pg-server and of the webhook family).
+	if c.Sink.BatchMaxBytes < 1 || c.Sink.BatchMaxBytes > maxBatchMaxBytes {
+		return nil, fmt.Errorf("sink.batch_max_bytes: %s is outside 1 byte..256MiB "+
+			"(a batch goes out in pieces under it; above 256MiB no destination writes it within sink.op_timeout)",
+			FormatBytes(c.Sink.BatchMaxBytes))
 	}
 	if c.Sink.MaxRetries < 1 {
 		return nil, fmt.Errorf("sink.max_retries: must be at least 1")
@@ -194,8 +223,11 @@ func Validate(c *Config) (warnings []string, err error) {
 			return nil, fmt.Errorf("admin.bind is empty with admin.enabled=true: set host:port, " +
 				"or admin.enabled=false to turn the admin port off")
 		}
-		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
-			return nil, fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
+		// SplitHostPort takes an empty port ("127.0.0.1:", ":") without
+		// error, and net.Listen then picked a random one -- with ":" on every
+		// interface, the exposure the empty bind was refused for (W 40).
+		if _, port, err := net.SplitHostPort(c.Admin.Bind); err != nil || !validPort(port) {
+			return nil, fmt.Errorf("admin.bind: %q is not host:port with a port 1..65535", c.Admin.Bind)
 		}
 	}
 
@@ -381,4 +413,11 @@ func isLoopbackBind(bind string) bool {
 		return false
 	}
 	return a.Unmap().IsLoopback()
+}
+
+// validPort is a TCP port as the configuration writes one: 1..65535, with no
+// sign and no leading zero.
+func validPort(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == s
 }

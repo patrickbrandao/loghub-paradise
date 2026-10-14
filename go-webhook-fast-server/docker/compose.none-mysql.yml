@@ -54,6 +54,7 @@ services:
       # Rede interna do compose: sem TLS. Contra um banco gerenciado, ligue
       # WHS_SINK_MYSQL_TLS e monte a CA em /etc/webhook (somente leitura).
       WHS_SINK_MYSQL_TLS: ${WHS_SINK_MYSQL_TLS:-false}
+      WHS_SINK_MYSQL_TLS_CA: ${WHS_SINK_MYSQL_TLS_CA:-}
       # Nao ha' dreno em background neste modo: workers/batch ficam sem efeito
       # sobre o caminho da requisicao.
       WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}

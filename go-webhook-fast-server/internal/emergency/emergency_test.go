@@ -763,7 +763,7 @@ func TestTwoNonLengthsAreNotLegacy(t *testing.T) {
 			}
 			res, err := NewStore(dir, testAgent).Read(p)
 			if errors.Is(err, ErrLegacy) {
-				t.Skip("BUG: parseHeader (emergency.go) flags any two-field header as legacy, " +
+				t.Fatal("regressão de §9.2: parseHeader (emergency.go) flags any two-field header as legacy, " +
 					"numbers or not; a damaged dump is renamed .legacy instead of .corrupt")
 			}
 			if err != nil || !res.Truncated || len(res.Items) != 0 {

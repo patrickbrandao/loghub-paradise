@@ -649,6 +649,7 @@ func (a *App) buildSink() int {
 			Synchronous:       a.cfg.SinkSQL.Synchronous,
 			BusyTimeout:       a.cfg.SinkSQL.BusyTimeout,
 			WALAutocheckpoint: a.cfg.SinkSQL.WALAutocheckpoint,
+			StuckAfter:        a.cfg.Sink.OpTimeout + a.cfg.Sink.HealthTimeout,
 		}, a.log.Logger, a.metrics)
 		if err != nil {
 			// A database that cannot be opened is a destination failure, not
@@ -1106,6 +1107,17 @@ func (a *App) abortLoss() {
 	}
 	if a.ring == nil {
 		return
+	}
+	if !a.persistentRing() {
+		// Close BEFORE counting (SPEC §13.4): the transports are still open (a
+		// SIGQUIT in normal operation, or a second signal in pre_stop_delay),
+		// and an Enqueue after the read would answer 200 for a message the
+		// os.Exit loses uncounted. Closed, the ring refuses it with ErrClosed,
+		// which the receiver treats as shutdown: no answer, librelp
+		// retransmits. Only memory and none: the sqlite and redis Close flush
+		// their writer and wait for the disk or the network, which an abort
+		// must not, and those rings count no loss anyway.
+		_ = a.ring.Close()
 	}
 	st := a.ring.Stats()
 	if st.Items == 0 {

@@ -119,10 +119,27 @@ grandeza):
 | recusa com o ring cheio (pré-checagem, SPEC §2.2) | ~25 ns, 0 alloc | ~115 ns, 2 allocs (sem pré-checagem) |
 
 A alocação a menos é a caixa `*[]byte` do buffer do pool, que volta com o
-buffer (SPEC §15.1); a que sobra é o próprio `Item` (224 B). Nada foi remedido
-neste módulo (§8). Não há benchmark do sink NATS: o custo de
+buffer (SPEC §15.1); a que sobra é o próprio `Item` (224 B). Fora o bloco abaixo,
+nada foi remedido neste módulo (§8). Não há benchmark do sink NATS: o custo de
 publicação depende do servidor e da rede, e só uma carga contra um servidor real
 o mede.
+
+**Leitor de 4 KiB e `frameKeepCap`** (2026-10-14, SPEC §5.4; medido no
+`go-syslog-pg-server`, cujo `internal/receiver` é idêntico a este; Apple M2,
+máquina compartilhada, três rodadas cada, leia como ordem de grandeza):
+
+| Benchmark | 4 KiB (atual) | 64 KiB (antes) |
+|---|---|---|
+| `TCPReceive/octet` (~200 B, socket real até o ring) | 1,2–3,2 µs/op, 1 alloc/op | 1,2–1,7 µs/op, 1 alloc/op |
+| `TCPReceive/lf` | 2,0–3,6 µs/op, 1 alloc/op | 1,6–2,3 µs/op, 1 alloc/op |
+| `Framer12K` (64 frames de 12 KiB pelo leitor de 4 KiB) | 194–235 µs/op, 78 KB/op, 5 allocs/op | — |
+
+A dispersão entre rodadas é maior que a diferença entre os dois tamanhos: sem
+perda mensurável nesta máquina, como no `go-syslog-server`. O `Framer12K` fica
+nos 78 KB e 5 alocações que a forma "solta só com o leitor vazio" promete (a
+forma que soltava a cada frame chegava a 4,7 MB no S). Custo de uma conexão
+TCP ociosa (`TestIdleTCPConnectionFixedCost`, 200 conexões): ~5,6–5,8 KiB de
+heap, contra ~66 KiB antes.
 
 ---
 
@@ -284,8 +301,11 @@ Registradas por honestidade, não por esquecimento.
    o servidor anuncia são reprefixados `nats://`), a posse de buffer, o
    `Nats-Msg-Id`, a validação do stream, a ligação do beacon e o
    `MaxPending` contra a reingestão. **Conhecidos e não corrigidos:**
-   - com várias URLs, o veredito do boot (`fatal` ou `network`) pode depender da
-     ordem aleatória em que o cliente tenta os servidores;
+   - com várias URLs, o veredito do boot pode depender da ordem aleatória em
+     que o cliente tenta os servidores; a recusa de TLS, o caso que mais
+     pesava, é `network` com mais de uma URL desde 2026-10-14 (SPEC §10.7,
+     `TestNATSBootTLSRefusalOfAPoolIsNetwork`), e as outras recusas fatais
+     (credenciais) valem para o *pool* inteiro;
    - o ramo `ErrMaxBytesExceeded` da classificação é inalcançável (só existe em
      consumidores *pull*);
    - uma corrida teórica entre `Health` e `Close` pode deixar uma conexão sem
@@ -303,7 +323,10 @@ Registradas por honestidade, não por esquecimento.
    `TestNATSRealServerRequiringTLSIsRefusedWithoutAHandshake` (servidor real com
    `tls {}`, atrás de um proxy que grava os bytes: nenhum registro TLS sai).
 5. **Cluster NATS** (várias URLs, troca de servidor no meio da carga) não foi
-   testado; só um servidor, caindo e voltando.
+   testado com servidores reais. O *pool* de dois servidores falsos (um que
+   serve, outro que exige TLS; o que serve cai e volta) é o
+   `TestNATSOneTLSServerOfAPoolIsNoVerdict` (2026-10-14); um cluster real com
+   rotas e servidores descobertos, não.
 6. **Dump de outro Workspace** (conhecido, não corrigido, por desenho): se
    nenhum stream cobre o subject dele, o boot fica preso até o
    `boot_timeout` (ou sai na hora com `10060`, se outro stream o cobre) e sai
@@ -327,21 +350,16 @@ Registradas por honestidade, não por esquecimento.
     leitura.
 14. **Conhecidos e não corrigidos**, herdados do `go-syslog-pg-server` (achados
     da revisão independente de lá, 2026-10-07):
-    - o `SIGHUP` relata como "requires a restart" chaves **derivadas**
-      (`emergency.dir` quando muda `server.data_dir`). Os sinônimos do charset
-      legado foram corrigidos em 2026-10-13 (§9);
-    - `proxy.*` e `tcp.*` são aceitos com `listen.tcp` vazio, sem aviso;
-    - `listen.tcp` e `admin.bind` na mesma porta só falham ao abrir o
-      transporte, não na validação;
-    - uma falha ao remover um dump já entregue só é logada: o arquivo volta no
-      boot seguinte e é republicado, deduplicado pelo stream só dentro da
-      `duplicate_window` (em `core`, nunca);
-    - `ring.max_bytes` aceita valores em que nenhuma mensagem cabe (cada item
-      custa ao menos 2 KiB + 256 B, SPEC §15.1): um emissor TCP é segurado,
-      desconectado no `backpressure_timeout` e reconecta para sempre. Herdado
-      do pai;
-    - os contadores da recepção não têm *padding*: com vários listeners
-      `SO_REUSEPORT` eles disputam a mesma linha de cache.
+    - `proxy.*` e `tcp.*` são aceitos com `listen.tcp` vazio, sem aviso.
+
+    Fechados no porte das pendências do RP/RN (2026-10-14, §9): o `SIGHUP` não
+    relata mais `emergency.dir` derivado (SPEC §16.3); `listen.tcp` e
+    `admin.bind` na mesma porta são exit 1 na validação (§13.2);
+    `ring.max_bytes` abaixo do custo de uma mensagem de
+    `syslog.max_message_bytes` é exit 1 (§13.2, §15.1); a falha ao remover um
+    dump já entregue continua só `ERROR`, agora como regra (§12.2,
+    `TestRemovalFailureIsOnlyAnError`). Os contadores sem *padding* viraram o
+    item 20.
 15. **O `docker/docker-compose.yml`** foi validado com
     `docker compose config -q`; subir o conjunto (servidor, NATS e o `nats-init`
     que cria o stream) não foi exercitado nesta escrita. Em 2026-10-11 o
@@ -362,7 +380,45 @@ Registradas por honestidade, não por esquecimento.
     conhecida.
 17. **Defeitos conhecidos do código, ainda não corrigidos**, ficam em SPEC
     §21.1, cada um com a consequência e a direção da correção. Quem corrige um
-    o tira de lá, com um teste que falha sem a correção.
+    o tira de lá, com um teste que falha sem a correção. Em 2026-10-14 os quatro
+    de lá foram fechados (§9, "Pendências conhecidas fechadas") e, no mesmo dia,
+    o porte das pendências do RP/RN fechou mais sete, registrados lá como
+    corrigidos ou decididos (§9, "Porte das pendências do RP/RN"): nenhum
+    aberto.
+18. **O custo por conexão é medido no heap, não no RSS.**
+    `TestIdleTCPConnectionFixedCost` mede `HeapAlloc` depois de dois GC, com
+    as duas pontas no mesmo processo; a pilha da goroutine de cada conexão
+    (SPEC §5.4) e a memória do kernel por socket ficam fora. Nenhuma prova com
+    milhares de conexões reais nem sob `GOMEMLIMIT`.
+19. **O prazo vencido no meio da assinatura PROXY** (SPEC §4.6, aceito em
+    2026-10-14) não tem teste próprio: o comportamento é o do parser
+    (`TestProxyAbsentConsumesNothing` cobre o "não é cabeçalho"), não o de um
+    `header_timeout` vencendo depois de `PRO`.
+20. **Os contadores da recepção não têm *padding*** (herdado do
+    `go-syslog-pg-server`; registrado como lacuna de medição no porte do RP/RN,
+    2026-10-14): com vários listeners `SO_REUSEPORT` eles disputam a mesma
+    linha de cache (*true sharing* da mesma palavra, não *false sharing*: são
+    os mesmos contadores). Sem defeito de correção observável; nunca medido como
+    gargalo. O benchmark de recepção de §4 com `tcp_listeners` > 1 é o lugar de
+    medir antes de mudar.
+21. **O "até 8 KiB quando ociosa" vale só entre frames** (revisão independente
+    de 2026-10-14, A5 e D4; SPEC §5.4/§15.1): um frame de 17–64 KiB seguido de
+    alguns bytes do próximo segura a classe de 64 KiB até o idle. Não
+    corrigido (a soltura no ponto de espera custou 10× em fluxo contínuo de
+    frames de 24 KiB) e sem teste que fixe o número; o teto é `max_conns` e o
+    `GOMEMLIMIT`.
+22. **`sameStreamSocket` com nome de serviço** (revisão de 2026-10-14) é
+    provado com `http` (a tabela embutida do Go) e com um nome inexistente; um
+    nome que só o `/etc/services` conhece (`syslog`) depende do arquivo da
+    máquina ou da imagem, e na imagem sem ele é recusado na validação, como o
+    bind o recusaria.
+23. **O PROXY `required` com cabeçalho válido no shutdown** (A1 de 2026-10-14)
+    é provado no `readProxy` com o leitor cheio e `closing` ligado à mão, não
+    com um `Close` de verdade correndo contra uma conexão do balanceador.
+24. **NATS: *pool* só de servidores que recusam e uma URL com vários IPs** (D2
+    do syslog, D3 do RELP, 2026-10-14; SPEC §10.7): registrados como limite,
+    sem teste; o primeiro precisaria de dois `nats-server` com TLS recusado, o
+    segundo de um nome com vários IPs.
 
 ---
 
@@ -515,3 +571,89 @@ Rodada final, nats-server 2.14.6, Apple M2, Go 1.27.1:
 | Fuzz | nenhum: nenhum alvo de fuzz cobre o código que mudou (`app`, `sink/nats.go`) |
 | Mutação | cada correção revertida sozinha: o teste da linha falha (ver acima) |
 | Não rodou | fuzz de 10 min; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |
+
+### Pendências conhecidas fechadas (2026-10-14)
+
+As quatro pendências de SPEC §21.1, triadas contra o `go-syslog-server` (S),
+que já as resolvera (DECISOES §9). Duas correções portadas do S, com os testes
+dele, e duas decisões do R portadas como contestáveis, com o teste que as trava.
+A mesma implementação no irmão (`diff -r` de `internal/receiver` e
+`internal/convert`: só os caminhos de import). **Ordem:** SPEC, teste que falha
+no código de antes, correção. **Mutação:** cada correção revertida sozinha (e o
+código de antes, via `git show HEAD:`, também no irmão), com o teste da linha
+falhando e a correção restaurada depois.
+
+| Item | Falha antes / com o mutante | Teste |
+|---|---|---|
+| Shutdown contado como falha do PROXY (SPEC §4.6) | sem o bloco: `proxy_headers_total{absent} = 1` (`{invalid} = 1` com meio cabeçalho), `messages_dropped_total{proxy} = 1` e o `WARN` "closing a connection without a PROXY header" nos quatro subcasos; com a forma do R: "optional: two lines already read off the socket (20 bytes in the reader) were dropped"; sem `\|\| mode == required`: "required: proxy_headers_total{absent} = 1" | `TestProxyShutdownIsNotAProxyFailure`, `TestProxyOptionalBufferedLinesSurviveClose` |
+| Leitor de 64 KiB por conexão (SPEC §5.4, §15.1) | "an idle TCP connection costs 67353 bytes of heap" (plain; 66902 com PROXY `optional`); depois ~5,8 KiB | `TestIdleTCPConnectionFixedCost` |
+| Buffer de frame nunca solto | "buffer of 65536 kept before a wait" (octet e lf) | `TestFramerReleasesALargeBuffer` |
+| Liberação a cada frame (sem `Buffered() == 0`) | "frame 1: buffer reallocated with the frame already buffered" | `TestFramerKeepsTheBufferBetweenBufferedFrames` |
+| Teto por IP, endereço exato (pin, SPEC §4.4) | chave `PrefixFrom(a, 64).Masked()`: "accepted [2001:db8:: 192.0.2.7], want [2001:db8::1 2001:db8::2 192.0.2.7]" | `TestPerIPLimitCountsTheExactAddress` |
+| Offset 3164 sem faixa (pin, SPEC §6.5.1) | offset fora de faixa zerado: os três casos dão "timestamp 2026-10-03T08:00:00.000Z, want …" | `TestRFC3164ISOOffsetIsNotRangeChecked` |
+
+A mutação achou uma lacuna nos testes do S: sem `|| mode == required` nenhum
+dos dois testes dele falhava (sem cabeçalho, o `Peek` já devolve o *timeout*, e
+cai em `err != nil`; o `required` só pesa quando a conexão mandou linhas e não
+cabeçalho). O ramo `required` de `TestProxyOptionalBufferedLinesSurviveClose`
+confere agora que nada é contado; o S não foi tocado.
+
+Rodada final, Apple M2, Go 1.27.1, serviços de `tasks/infra/env.sh`:
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `SYSLOG_TEST_NATS_*` (os quatro de `env.sh`: 24222 JetStream, 24223 sem JetStream, 24224 permissões, 24225 `tls {}`) `SYSLOG_TEST_EMITTERS=1 go test -race -count=1 -timeout 1200s ./...` | **verde duas vezes seguidas** (120 s e 87 s), sem *flake* |
+| Testes | **437** de primeiro nível e **350** subtestes passaram, **2** pulados (`TestGoldenVectors/arquivo-sem-pri`, D5; `TestNATSOversizedMessageIsRefusedAlone`, porque o servidor de `env.sh` tem `max_payload` de 8 MiB e o teste precisa de um abaixo de 4 MiB — ambiente, não código), 0 falhas |
+| Por pacote (primeiro nível / subtestes) | `app` 69/74, `config` 64/0, `control` 8/0, `convert` 16/70, `emergency` 28/45, `ident` 2/0, `item` 5/0, `jlh` 4/0, `jlhcheck` 4/0, `obs` 10/0, `receiver` 116/58, `ring` 13/0, `sink` 98/103 |
+| Emissores reais (Docker, `rls-test-rsyslog` e syslog-ng) | `TestEmittersRsyslog` (20,8 s e 14,0 s), `TestEmittersSyslogNG` (24,2 s e 18,6 s), verdes nas duas rodadas |
+| Benchmarks | §4 (`TCPReceive`, `Framer12K`) |
+| Fuzz | nenhum, por instrução da rodada; `FuzzFrame`, `FuzzFrameOracle` e `FuzzProxy` cobrem código que mudou (moldura e leitura do PROXY) e devem rodar antes do release (§3) |
+| Não rodou | fuzz; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |
+
+### Porte das pendências do RP/RN (2026-10-14)
+
+Receita: `tasks/port-to-R-S-SP-SN.md` (o que a triagem do RP/RN achou igual
+aqui). **Ordem:** SPEC, teste que falha no código de antes, correção.
+**Mutação:** cada correção revertida sozinha, com o teste da linha falhando e a
+correção restaurada depois. Testes novos em `internal/*/known_issues_test.go`.
+
+| Item | Falha antes / com o mutante | Teste |
+|---|---|---|
+| O aborto fecha o ring antes de contar (SPEC §13.4) | "Enqueue racing a Close = <nil>, want ErrClosed"; "Enqueue after the abort counted = <nil>, want ring.ErrClosed" | `TestEnqueueSeesACloseThatRacedTheReservation`, `TestEnqueueWithoutACloseIsUnaffectedByTheHook`, `TestAbortClosesTheRingBeforeCounting` |
+| Piso de `ring.max_bytes` (§13.2, §15.1) | "Load([--ring.max_bytes=65791]): err = <nil>, want one mentioning "ring.max_bytes"" (piso 65 792 = 64 KiB + 256); mutante com o piso desligado: a mesma | `TestRingMaxBytesFitsTheLargestMessage`, `TestRingMinBytesIsWhatTheRingCharges` |
+| `admin.bind` × `listen.tcp` (§13.2, §14) | "Load([--listen.tcp=127.0.0.1:20514 --admin.bind=127.0.0.1:20514]): err = <nil>, want one mentioning "admin.bind""; mutante com a conferência desligada: a mesma | `TestAdminBindCollidesWithListen` |
+| `SIGHUP` não relata derivada (§16.3) | "ignored = [server.data_dir emergency.dir]"; com `\|\|` no lugar de `&&`, o controle explícito→derivado: "ignored = [], want emergency.dir" | `TestReloadDoesNotReportDerivedKeys` |
+| Discagem falha da reconexão NATS não logada (§10.7; antes, refatoração pura: `onReconnectErr`, `natsFake` com `stop`/`restart`) | "a failed reconnection dial was logged as an ERROR"; mutante `asyncError` fora do `if`: a mesma | `TestNATSReconnectDialFailureIsNotLogged` |
+| Veredito TLS só com servidor único (§10.7, `soleServer`) | "a TLS refusal reported with a pool of 2 set a verdict"; "boot Health of a pool with one TLS-only server = connect: the NATS server requires TLS …, want network"; mutantes: sem `soleServer` no handler (verdict), no `noteLastError` ("Health while the good server is down = … refused this server permanently"), sem o ramo de *pool* no `connect` (Boot), `Health` sem nomear ("never named the TLS refusal") | `TestNATSOneTLSServerOfAPoolIsNoVerdict`, `TestNATSBootTLSRefusalOfAPoolIsNetwork` |
+| Remoção falha de um dump entregue é só `ERROR` (§12.2, regra) | sem teste antes; trava nova (a mesma do SP) | `TestRemovalFailureIsOnlyAnError` |
+
+Registrados sem código (regra ou lacuna): o dump publicado no instante do aborto e o aborto que não espera o disco (SPEC §12.3); `kind="fatal"` com o boot cancelado (§14.1); o *padding* dos contadores (§8 item 20).
+
+Rodada final, Apple M2, Go 1.27.1, serviços de `tasks/infra/env.sh` (outros
+agentes os usavam ao mesmo tempo; nenhuma falha por carga):
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `source tasks/infra/env.sh; go test -race -count=1 -timeout 1200s ./...` | **verde duas vezes seguidas** (64 s e 57 s), sem *flake* |
+| Testes (`-v`) | **448** PASS de primeiro nível e **350** subtestes por rodada; pulados: `TestNATSOversizedMessageIsRefusedAlone` (o NATS de `env.sh` tem `max_payload` de 8 MiB; rodado à parte com `SYSLOG_TEST_NATS_URL=nats://127.0.0.1:24226`: **PASS**, `jetstream` e `core`) e `TestGoldenVectors/arquivo-sem-pri` (D5); 0 falhas |
+| Emissores reais (Docker, rsyslog e syslog-ng) | `TestEmittersRsyslog` e `TestEmittersSyslogNG` verdes nas duas rodadas |
+| Fuzz | nenhum, por instrução da rodada |
+| Não rodou | fuzz; carga; `docker compose` (o `docker/` não mudou) |
+
+### Revisão independente de 2026-10-14 (S, SP, SN, R, RP, RN)
+
+Entrada: `tasks/review-syslog.md` e `tasks/review-relp.md`; progresso em
+`tasks/progress-review-fixes-syslog-relp.md`. **Ordem:** SPEC, teste que falha
+no código de antes, correção. **Mutação:** cada correção revertida sozinha,
+com o teste da linha falhando e a correção restaurada depois.
+
+| Item | Falha antes / com o mutante | Teste |
+|---|---|---|
+| PROXY `required` com cabeçalho **válido** no shutdown (§4.6; A1) | "required: a valid header and a line already read off the socket (6 bytes in the reader) were dropped uncounted"; mutante (volta a `err != nil \|\| required`): a mesma | `TestProxyRequiredValidHeaderBufferedLinesSurviveClose` |
+| `sameStreamSocket` por valor (§13.2; D1 do syslog, D4 do RELP) | 7 casos, p.ex. `sameStreamSocket("[::0]:9102", "127.0.0.1:9102") = false, want true`, `("127.0.0.1:0514", "127.0.0.1:514")`, `("127.0.0.1:http", "127.0.0.1:80")`; mutantes (curinga por grafia; porta comparada como texto): mortos | `TestSameStreamSocketReadsValuesNotSpellings` |
+
+Registrados sem código: o "até 8 KiB" vale entre frames (A5, D4; medido no S e revertido; SPEC §5.4/§15.1); *pool* NATS só de servidores que exigem TLS e URL única com vários IPs (D2; D3 do RELP; §10.7); sobrecontagem do aborto pelo recuo de bytes (D3; §13.4); comentário do `Memory.Enqueue` (D1 do RELP). Sonda sqlite e `ring=none` não existem no corte.
+
+Rodadas: `tasks/run2.sh go-syslog-nats-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh`), logs em `tasks/logs/go-syslog-nats-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*; e o pacote `sink` com `SYSLOG_TEST_NATS_URL=nats://127.0.0.1:24226` (`max_payload` 1 MiB): **ok**. Fuzz: nenhum, por instrução da rodada.

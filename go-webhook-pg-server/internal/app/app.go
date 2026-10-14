@@ -221,6 +221,11 @@ type App struct {
 	beforeDump    func()
 	beforeCollect func()
 	inAbort       func()
+
+	// wrapServe, when a test sets it, wraps the public Serve, so the test can
+	// make it return an error the retrying listener never lets through
+	// (SPEC §10.3). nil in the binary.
+	wrapServe func(serve func() error) func() error
 }
 
 func (a *App) run(ctx context.Context, stopSignals func()) int {
@@ -360,22 +365,41 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	// (SPEC §10.1 step 6).
 	a.admin.SetBootState("")
 
+	serve := a.srv.Serve
+	if a.wrapServe != nil {
+		serve = a.wrapServe(serve)
+	}
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- a.srv.Serve() }()
+	go func() { serveErr <- serve() }()
 
 	select {
 	case err := <-serveErr:
-		if err != nil {
-			a.log.Error("public listener stopped", "error", err)
-			return ExitConfig
+		if err == nil {
+			return ExitOK
 		}
-		return ExitOK
+		// The listener retries every accept error but its own close, so
+		// this is rare; when it happens, the ring and the batches the
+		// workers hold were already answered 200. Exiting here dropped them
+		// with no dump and no count: they go through the shutdown like a
+		// SIGTERM's, and a complete one still exits 1, because the process
+		// did fail (SPEC §10.3, §10.5).
+		a.log.Error("public listener stopped; shutting down", "error", err)
+		abort, stopAbort := a.watchAbort()
+		defer stopAbort()
+		// No signal started this shutdown, so -- as in a FATAL one -- the
+		// first SIGTERM/SIGINT, the orchestrator's answer to /readyz
+		// failing, is tolerated; the drain stays a SIGTERM's (W 31).
+		stopSignals()
+		if code := a.shutdown(stopWorkers, false, true, abort); code != ExitOK {
+			return code
+		}
+		return ExitConfig
 
 	case <-a.health.Fatal():
 		a.log.Error("sink became permanently unusable", "error", a.health.FatalErr())
 		abort, stopAbort := a.watchAbort()
 		defer stopAbort()
-		return a.shutdown(stopWorkers, true, abort)
+		return a.shutdown(stopWorkers, true, true, abort)
 
 	case <-ctx.Done():
 		// The abort watcher is registered BEFORE the signal context lets go
@@ -386,7 +410,7 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 		defer stopAbort()
 		stopSignals() // a second signal now reaches abort, not the context
 		a.log.Info("shutdown requested")
-		return a.shutdown(stopWorkers, false, abort)
+		return a.shutdown(stopWorkers, false, false, abort)
 	}
 }
 
@@ -478,6 +502,8 @@ func (a *App) build() int {
 		OpTimeout:  a.cfg.Sink.OpTimeout,
 		BackoffMin: a.cfg.Sink.RetryBackoffMin,
 		BackoffMax: a.cfg.Sink.RetryBackoffMax,
+		// SPEC §8.1 step 2: a batch goes out in pieces under this ceiling.
+		BatchMaxBytes: a.cfg.Sink.BatchMaxBytes,
 	}, a.log.Logger, a.metrics)
 
 	trusted, err := config.ParsePrefixes(a.cfg.Proxy.Trusted)
@@ -520,11 +546,14 @@ func (a *App) build() int {
 // SIGINT that arrives during it -- the orchestrator's ordinary one, while the
 // dump is being written -- is not the second signal of SPEC §10.3: it is
 // logged and the shutdown goes on; the next one aborts (independent review,
-// 2026-10-07). SIGQUIT is never tolerated: it means "now", in every phase.
-func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool, abort <-chan os.Signal) int {
+// 2026-10-07). The same holds for the shutdown a public Serve error starts,
+// which is otherwise a SIGTERM's: tolerateFirst is therefore its own
+// parameter, not fatal (W 31). SIGQUIT is never tolerated: it means "now", in
+// every phase.
+func (a *App) shutdown(stopWorkers context.CancelFunc, fatal, tolerateFirst bool, abort <-chan os.Signal) int {
 	return a.shutdownWith(func(abortCtx context.Context) int {
 		return a.gracefulShutdown(abortCtx, stopWorkers, fatal)
-	}, fatal, abort)
+	}, tolerateFirst, abort)
 }
 
 // shutdownWith is shutdown around any graceful procedure, so the signal rules
@@ -532,14 +561,14 @@ func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool, abort <-chan 
 // cancelled when the abort wins: in the binary os.Exit makes that moot, but in
 // the tests the instance would otherwise keep draining and dumping into a
 // directory the test has removed.
-func (a *App) shutdownWith(graceful func(abortCtx context.Context) int, fatal bool, abort <-chan os.Signal) int {
+func (a *App) shutdownWith(graceful func(abortCtx context.Context) int, tolerateFirst bool, abort <-chan os.Signal) int {
 	abortCtx, stopGraceful := context.WithCancel(context.Background())
 	defer stopGraceful()
 
 	done := make(chan int, 1)
 	go func() { done <- graceful(abortCtx) }()
 
-	tolerate := fatal
+	tolerate := tolerateFirst
 	for {
 		select {
 		case code := <-done:
@@ -547,7 +576,7 @@ func (a *App) shutdownWith(graceful func(abortCtx context.Context) int, fatal bo
 		case sig := <-abort:
 			if tolerate && sig != syscall.SIGQUIT {
 				tolerate = false
-				a.log.Warn("signal during the emergency shutdown; it goes on -- a second one aborts "+
+				a.log.Warn("signal during a shutdown no signal started; it goes on -- a second one aborts "+
 					"and accepts the loss", "signal", sig.String())
 				continue
 			}

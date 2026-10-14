@@ -41,6 +41,7 @@ type natsFake struct {
 	addr  string
 	first chan []byte
 	pubs  atomic.Int64
+	ln    net.Listener // guarded by mu; stop and restart replace it
 
 	mu       sync.Mutex
 	info     string
@@ -68,18 +69,45 @@ func startNATSFake(t *testing.T, info string) *natsFake {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	f := &natsFake{addr: ln.Addr().String(), first: make(chan []byte, 16), info: info}
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go f.serve(c)
-		}
-	}()
+	f := &natsFake{addr: ln.Addr().String(), first: make(chan []byte, 16), info: info, ln: ln}
+	t.Cleanup(func() { f.stop() })
+	go f.accept(ln)
 	return f
+}
+
+func (f *natsFake) accept(ln net.Listener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go f.serve(c)
+	}
+}
+
+// stop closes the listener and hangs up every connection: the server is down,
+// and a dial to its address is refused until restart.
+func (f *natsFake) stop() {
+	f.mu.Lock()
+	if f.ln != nil {
+		f.ln.Close()
+		f.ln = nil
+	}
+	f.mu.Unlock()
+	f.drop()
+}
+
+// restart listens again on the same address.
+func (f *natsFake) restart(t *testing.T) {
+	t.Helper()
+	ln, err := net.Listen("tcp", f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.ln = ln
+	f.mu.Unlock()
+	go f.accept(ln)
 }
 
 func natsFakeINFO(extra string) string {

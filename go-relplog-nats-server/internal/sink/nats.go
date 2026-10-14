@@ -250,16 +250,7 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 			}
 			log.Warn("nats disconnected", "error", err)
 		}),
-		nats.ReconnectErrHandler(func(_ *nats.Conn, err error) {
-			// nats.go calls this only for a reconnection whose TCP dial
-			// failed; the refusal of a server that demands TLS comes later,
-			// in the handshake, and is caught by noteLastError from Health.
-			// Kept for a client version that reports it here.
-			if errors.Is(err, errNATSServerRequiresTLS) {
-				n.setVerdict(err)
-			}
-			n.asyncError(err)
-		}),
+		nats.ReconnectErrHandler(n.onReconnectErr),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			m.SinkNATSReconnectsTotal.Inc()
 			log.Warn("nats reconnected", "url", connectedURL(nc))
@@ -318,6 +309,28 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 
 func (n *NATS) Type() string { return "nats" }
 
+// onReconnectErr is the client's ReconnectErrCB. nats.go calls it only for a
+// reconnection whose TCP dial failed; the refusal of a server that demands
+// TLS comes later, in the handshake, and is caught by noteLastError from
+// Health. Kept for a client version that reports it here.
+//
+// Only a verdict is logged (SPEC §10.7): every failed dial of a long outage
+// as an ERROR, one every 30 s, repeated what the disconnection WARN, /readyz
+// and relplog_sink_up already say. And the verdict only with no other server
+// to go to (soleServer). The form of go-relplog-server and go-syslog-server.
+func (n *NATS) onReconnectErr(nc *nats.Conn, err error) {
+	if errors.Is(err, errNATSServerRequiresTLS) && soleServer(nc) {
+		n.setVerdict(err)
+		n.asyncError(err)
+	}
+}
+
+// soleServer reports that the client has no server to go to but the one it
+// is using: its pool -- the configured URLs plus every server the cluster
+// announced since (nats.go adds them on its own) -- has one entry. Only then
+// is a server that demands TLS a verdict on this client (SPEC §10.7).
+func soleServer(nc *nats.Conn) bool { return nc == nil || len(nc.Servers()) <= 1 }
+
 // asyncError logs an asynchronous client error, at most once per interval,
 // with the count of what was suppressed in between, and keeps a permanent
 // refusal of the data path as the verdict.
@@ -357,7 +370,15 @@ func (n *NATS) noteLastError(nc *nats.Conn) {
 	// Without this the FATAL came from the fuses, ~20 s later, reading
 	// "connection is RECONNECTING" -- or never, with both fuses off
 	// (independent review, 2026-10-13; SPEC §10.7).
-	if deniesTheDataPath(last) || errors.Is(last, errNATSServerRequiresTLS) {
+	//
+	// Only when no other server can serve (soleServer). LastError is the last
+	// server TRIED: with a pool -- several sink.nats.urls, or servers the
+	// cluster announced -- the client cycles through them while the one that
+	// serves is down, and the TLS demand of the other, read here, made a
+	// permanent FATAL, a dump and exit 3, though the good one came back a
+	// moment later (go-syslog-server review, 2026-10-13, ported 2026-10-14).
+	// With a pool it stays network, and Health names it as the reason.
+	if deniesTheDataPath(last) || (errors.Is(last, errNATSServerRequiresTLS) && soleServer(nc)) {
 		n.setVerdict(last)
 	}
 }
@@ -461,6 +482,14 @@ func (n *NATS) connect() (*nats.Conn, jetstream.JetStream, error) {
 	nc, err := nats.Connect(strings.Join(n.cfg.URLs, ","), n.opts...)
 	if err != nil {
 		n.mu.Unlock()
+		if errors.Is(err, errNATSServerRequiresTLS) && len(n.cfg.URLs) > 1 {
+			// nats.Connect tries every URL and returns the error of the last
+			// one: one server demanding TLS does not say the others cannot
+			// serve -- one may be down for a moment. Network, waited out to
+			// sink.boot_timeout, with the refusal named (SPEC §10.7).
+			return nil, nil, networkErr("connect", fmt.Errorf(
+				"a server of sink.nats.urls requires TLS, and no other answered: %w", err))
+		}
 		return nil, nil, classifyNATS("connect", err)
 	}
 	var js jetstream.JetStream
@@ -858,8 +887,14 @@ func (n *NATS) Health(ctx context.Context) error {
 		return fatalErr("health", fmt.Errorf("connection closed for good: %w", last))
 	default:
 		// escalate reads LastError: what keeps the client RECONNECTING may be
-		// permanent (a server that now demands TLS, see noteLastError).
-		return n.escalate(nc, "health", networkErr("health", fmt.Errorf("connection is %s", st)))
+		// permanent (a server that now demands TLS, see noteLastError). With a
+		// pool it is not a verdict, but it is the reason, and it goes in the
+		// error: the FATAL of the fuses keeps the error of the last check.
+		down := networkErr("health", fmt.Errorf("connection is %s", st))
+		if last := nc.LastError(); errors.Is(last, errNATSServerRequiresTLS) {
+			down = networkErr("health", fmt.Errorf("connection is %s; a server of the pool requires TLS: %w", st, last))
+		}
+		return n.escalate(nc, "health", down)
 	}
 
 	if n.cfg.Mode == NATSModeCore {

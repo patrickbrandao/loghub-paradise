@@ -711,6 +711,12 @@ func TestOurShapeEscapes(t *testing.T) {
 		`"\u20AC"`:       false,
 		`"\`:             false,
 		`"\u00`:          false,
+		// SPEC §9.2 (§18.1 item 10): a raw U+2028/U+2029 is a second spelling
+		// of the escape the writer always uses; its neighbours stay text.
+		"\"a\xe2\x80\xa8b\"":       false,
+		"\"\xe2\x80\xa9\"":         false,
+		"\"\xe2\x80\xa7\"":         true, // U+2027, raw: an ordinary rune
+		"\"\xc3\xa9\xe2\x82\xac\"": true,
 	} {
 		sc := shapeScanner{b: []byte(in)}
 		_, got := sc.str()
@@ -765,6 +771,11 @@ func TestGateRefusesWhatTheWriterNeverWrites(t *testing.T) {
 		"escaped letter": withPayload(strings.Replace(gp, `"path":"/x"`, `"path":"/\u0078"`, 1)),
 		"escaped slash":  withPayload(strings.Replace(gp, `"path":"/x"`, `"path":"\/x"`, 1)),
 		"escaped é":      withPayload(strings.Replace(gp, `"path":"/x"`, `"path":"/\u00e9"`, 1)),
+		// A raw U+2028, and the same key in its two spellings, which a
+		// byte-wise duplicate check took for two keys (§18.1 item 10).
+		"raw U+2028": withPayload(strings.Replace(gp, `"path":"/x"`, "\"path\":\"/\xe2\x80\xa8\"", 1)),
+		"same key in two spellings": withPayload(strings.Replace(gp, `"query":{"a":"1"}`,
+			`"query":{"a\u2028":"1",`+"\"a\xe2\x80\xa8\":\"2\"}", 1)),
 	}
 	// The uuid of another instant than the event's.
 	h, _, _ := envelope.ParseHead(good)

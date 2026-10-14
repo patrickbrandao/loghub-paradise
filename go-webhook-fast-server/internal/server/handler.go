@@ -25,6 +25,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	s.noteProtocol(r)
 
+	// write_timeout counts from the answer, not from the headers (SPEC
+	// §13.5). net/http arms it when the headers end -- on the connection in
+	// HTTP/1, on the stream in h2 -- so an upload slower than write_timeout
+	// went into the ring and then lost its 200, and the client sent the event
+	// again under another uuid. The read is bounded by read_timeout and the
+	// destination by sink.op_timeout; armWrite re-arms it before every answer.
+	// Only with a read_timeout, though: with 0 nothing else bounds the body,
+	// and an h2c stream reading a slow one held a goroutine, up to 64 KiB and
+	// a max_concurrent_streams slot for ever. There write_timeout keeps
+	// limiting the upload, as net/http arms it (W §19.1 item 32).
+	if s.cfg.WriteTimeout > 0 && s.cfg.ReadTimeout > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	}
+
 	// 2. Header ceiling.
 	if n := headerSize(r); n > s.cfg.MaxHeaderBytes {
 		s.reject(w, r, start, http.StatusRequestHeaderFieldsTooLarge, obs.ReasonBadRequest,
@@ -108,9 +122,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 9. Fast ring check. This is an optimisation only; the authoritative
-	// answer comes from Enqueue below, which cannot race.
-	if st := s.ring.Stats(); st.CapItems > 0 && st.Items >= st.CapItems {
+	// 9. Fast ring check, by items and by bytes. It only ever refuses; the
+	// authoritative answer comes from Enqueue below, which cannot race. The
+	// byte side uses a lower bound of the event, the declared body (0
+	// without one): the JLH carries the body whole, escaped or in base64, so
+	// it is always larger, and whatever this refuses Enqueue would refuse too.
+	// The header is not added: headers.exclude takes headers out of the
+	// envelope, so its size is no lower bound (SPEC §4.3).
+	if st := s.ring.Stats(); (st.CapItems > 0 && st.Items >= st.CapItems) ||
+		(st.CapBytes > 0 && st.Bytes+max(r.ContentLength, 0) >= st.CapBytes) {
 		s.reject(w, r, start, http.StatusTooManyRequests, obs.ReasonRingFull,
 			"ring full", time.Second)
 		return
@@ -229,8 +249,20 @@ func (s *Server) writeAnswer(w http.ResponseWriter, code int, id, status string)
 	h.Set("X-LogHub-UUID", id)
 	h.Set("Content-Type", "application/json")
 	h.Set("Content-Length", strconv.Itoa(len(b)))
+	s.armWrite(w)
 	w.WriteHeader(code)
 	_, _ = w.Write(b)
+}
+
+// armWrite starts write_timeout for the answer about to be written (SPEC
+// §13.5). ServeHTTP cleared the deadline net/http armed at the end of the
+// headers; this puts it back, so a client that stops reading still cannot
+// hold the connection past write_timeout. A writer without deadlines (a test
+// recorder) is left alone.
+func (s *Server) armWrite(w http.ResponseWriter) {
+	if s.cfg.WriteTimeout > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+	}
 }
 
 // rejectWithID answers a refusal decided after the uuid existed (SPEC §4.4):
@@ -287,22 +319,31 @@ func headerSize(r *http.Request) int64 {
 	return n + 2 // the empty line that terminates the head
 }
 
+// bodyPreSizeMax is how far a declared Content-Length is trusted before any of
+// the body has arrived (SPEC §12.2): the largest pool class that is not the
+// huge one.
+const bodyPreSizeMax = 64 << 10
+
 // readBody reads the whole body into a pooled buffer.
 //
-// The buffer is sized from Content-Length when it is present and trustworthy;
-// a chunked request with no declared length starts in the smallest class and
-// grows. MaxBytesReader enforces the ceiling during the read, which is the only
+// Content-Length only pre-sizes the buffer, up to bodyPreSizeMax; past that
+// it grows only once it is full of bytes that ARRIVED, doubling, and never
+// past the declared length (SPEC §12.2). Sizing by the header alone let a peer
+// that declares 5 MiB and sends nothing hold 5 MiB until read_timeout, times
+// http2_max_concurrent_streams per h2c connection. A chunked request with no
+// declared length starts in the smallest class and grows the same way.
+// MaxBytesReader enforces the ceiling during the read, which is the only
 // defence against a chunked body that lies about its size.
 func (s *Server) readBody(r *http.Request) ([]byte, int, error) {
 	if r.Body == nil {
 		return nil, -1, nil
 	}
 
-	want := r.ContentLength
-	if want < 0 || want > s.cfg.MaxBodyBytes {
-		want = 0 // unknown length: start small and grow
+	declared := r.ContentLength
+	if declared < 0 || declared > s.cfg.MaxBodyBytes {
+		declared = -1 // unknown length: start small and grow
 	}
-	buf, class := envelope.GetBody(want)
+	buf, class := envelope.GetBody(min(max(declared, 0), bodyPreSizeMax))
 
 	limited := http.MaxBytesReader(nil, r.Body, s.cfg.MaxBodyBytes)
 
@@ -326,8 +367,13 @@ func (s *Server) readBody(r *http.Request) ([]byte, int, error) {
 			}
 			// Grow. The replacement is not pooled if it outgrows the classes,
 			// and the old buffer is returned immediately since nothing else has
-			// seen it yet.
-			grown, gclass := envelope.GetBody(int64(cap(buf))*2 + 1)
+			// seen it yet. The last doubling stops at the declared length: an
+			// honest 1 MiB body ends in a 1 MiB buffer, not a 2 MiB one.
+			next := int64(cap(buf))*2 + 1
+			if declared > int64(cap(buf)) && next > declared {
+				next = declared
+			}
+			grown, gclass := envelope.GetBody(next)
 			grown = append(grown, buf...)
 			envelope.PutBody(buf, class)
 			buf, class = append(grown, probe[0]), gclass
@@ -357,6 +403,7 @@ func (s *Server) readBody(r *http.Request) ([]byte, int, error) {
 // actually READ the response on the same connection. Without that it gets
 // ECONNRESET instead of the status, never sees Retry-After, and retries with no
 // backoff -- making the very overload the rejection was meant to shed worse.
+// HTTP/2 and a pending Expect: 100-continue are not drained (drainForReject).
 func (s *Server) reject(w http.ResponseWriter, r *http.Request, start time.Time,
 	code int, reason obs.Reason, msg string, retryAfter time.Duration) {
 
@@ -370,6 +417,7 @@ func (s *Server) reject(w http.ResponseWriter, r *http.Request, start time.Time,
 	if closeConn {
 		h.Set("Connection", "close")
 	}
+	s.armWrite(w)
 	w.WriteHeader(code)
 	_, _ = io.WriteString(w, msg+"\n")
 
@@ -403,8 +451,17 @@ func (s *Server) failLogic(w http.ResponseWriter, r *http.Request, start time.Ti
 
 // drainForReject discards up to reject_drain_bytes of the request body and
 // reports whether the connection must be closed because more remained.
+//
+// Only HTTP/1.x without a pending Expect: 100-continue is drained (SPEC §4.3).
+// On HTTP/2 the stream is reset by net/http after the answer and the
+// connection lives on; a Connection: close there becomes a GOAWAY for the
+// whole connection, which a proxy shares among many clients. With Expect
+// pending, the first Read is what makes net/http send 100 Continue -- inviting
+// the very body being refused; left unread, the 100 never goes out and
+// net/http closes the connection after the answer on its own.
 func (s *Server) drainForReject(r *http.Request) bool {
-	if r.Body == nil || s.cfg.RejectDrainBytes <= 0 {
+	if r.Body == nil || s.cfg.RejectDrainBytes <= 0 || r.ProtoMajor >= 2 ||
+		strings.EqualFold(r.Header.Get("Expect"), "100-continue") {
 		return false
 	}
 	// Read one byte past the limit: if it arrives, there is more than we are

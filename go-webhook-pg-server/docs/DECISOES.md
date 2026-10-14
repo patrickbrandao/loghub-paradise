@@ -141,7 +141,9 @@ contestáveis:
   (`retiredSections`) para a regra da cauda: `--sink.redis.addrs=x` depois de
   uma flag com valor é nomeada, como sozinha, em vez de culpar a flag anterior
   (a mesma escolha do SP com as seções do `go-syslog-server`).
-- **Não se aplica:** `sink.batch_max_bytes`, `ring.max_inflight` e
+- **Não se aplica:** `sink.batch_max_bytes` (*revisto em 2026-10-14: a chave
+  existe agora, por decisão do usuário; ver "Porte das correções de W e F"*),
+  `ring.max_inflight` e
   `ring.sqlite.commit_batch` (não existem aqui; o teto de 1 GiB de um parâmetro
   já é `WARN` de §8.5.4), as regras de URL PostgreSQL da `LOGHUB_EB_URL` (não
   há `LOGHUB_EB_URL` nem outro leitor de URL ou DSN: `[sink.postgres]` são
@@ -169,6 +171,86 @@ comentários que já diferiam). Contestáveis:
   daqui já tratavam a classe antes do contexto; ficou um teste de guarda); o
   prazo próprio da validação (já existia; veio a prova contra o servidor real,
   `validation_deadline_test.go`, do fast).
+
+## Porte das correções de W e F (2026-10-14)
+
+Porte das correções que fecharam a SPEC §19.1 do `go-webhook-server` (W) e do
+`go-webhook-fast-server` (F) em 2026-10-14 (relatórios `tasks/W-A-result.md`,
+`W-B-result.md`, `W-C-result.md` e a triagem `tasks/triage-FPN.md` da raiz). O
+código é o de F, portado por `diff`; as regras estão na seção normativa da
+SPEC. Aqui fica o que foi decisão:
+
+- **CONTESTÁVEL -- `max_conns_per_ip` conta o endereço exato** (SPEC §13.5; W
+  6). O usuário não decidiu para a família webhook; a decisão segue a do F
+  (`go-webhook-fast-server/docs/DECISOES.md` 4c), que segue o precedente da
+  família syslog/RELP (`go-relplog-server`, decisão 16). Um /128 no IPv6, IPv4
+  mapeado = IPv4. Contar por prefixo IPv6 foi recusado: um /64 pode ser uma LAN
+  inteira de emissores, e os emissores de webhook saem de *pools* de endereços
+  IPv6 vizinhos. Contra um /64 hostil: `max_conns` e o firewall (aqui não há
+  rate-limit). Alternativa registrada no F: uma chave aditiva
+  `server.max_conns_v6_prefix` (padrão 128). Teste de trava:
+  `TestPerIPLimitCountsTheExactAddress`.
+- **Saída de um listener parado** (SPEC §10.3, §10.5; W 5), padrão assumido, o
+  do F: o listener retenta todo erro do `accept` salvo o próprio fechamento e
+  nunca desiste, então não há código de saída novo (a direção da pendência
+  sugeria um); um `Serve` que ainda assim termine com erro passa pelo shutdown
+  gracioso e sai com `1` se ele foi completo, ou com o que o shutdown der (`3`,
+  `130`).
+- **O ring de memória cobra o buffer retido** (decisão do usuário,
+  2026-10-14, para a família webhook; SPEC §7.2, §12.2, §12.4; W 8).
+  `cap(Env)` mais `ring.ItemOverhead` = 256 bytes (`unsafe.Sizeof` do
+  `envelope.Item` medido aqui: 80 bytes com o `Charged`, o mesmo do F), gravado
+  em `Item.Charged`. Só cobrar: sem cópia para a classe justa e sem mudar os
+  padrões; com eventos pequenos o teto de bytes manda antes e uma instância
+  perto do teto vê `429` antes. Os lotes retidos pelos workers passam a contar
+  no teto de itens (W 30, achado da triagem, sem decisão nova).
+- **`sink.batch_max_bytes`** (decisão do usuário, 2026-10-14; SPEC §8.1; W 11).
+  Padrão 16 MiB, de 1 byte a 256 MiB (exit 1 fora), corte no worker depois do
+  `Dequeue` e na reingestão do dump, com `sink.SplitByBytes`; um envelope
+  maior que o teto vai sozinho. O compose repassa `WHS_SINK_BATCH_MAX_BYTES`
+  (padrão `16MiB`).
+- **O worker sobrevive a um erro de `Dequeue`** (SPEC §8.1 passo 1; W 10). O
+  ring de memória não devolve outro erro que não o fim do contexto; a regra
+  veio por simetria com o F e o SP, para o laço dos workers continuar igual ao
+  deles.
+- **A porta do dump recusa U+2028/U+2029 crus** (SPEC §9.2; W 20). Aqui não
+  havia defeito (sem conferência de chave repetida, e o `jsonb` normaliza),
+  só a mesma folga; a recusa veio para a porta ser a da família.
+- **Também portados:** a checagem rápida do passo 9 por bytes (W 2), o dreno
+  de recusa só em HTTP/1.x sem `Expect` (W 3), `write_timeout` contado da
+  resposta (W 4), o ambiente libpq escondido no parse do pool (W 15), `NaN`
+  recusado no parser, `admin.bind` vazio recusado e o `quoteINI` no dump
+  (W 24, 25, 26, as regras do N), a CA no compose e o teste do compose (W 27,
+  com o de imagens fixadas de W 28) e os guardas de regressão em `t.Fatalf`
+  (W 29). Sem decisão nova.
+
+## Revisão independente da família webhook (2026-10-14)
+
+Correções da revisão independente da família webhook (`tasks/review-web-*.md`),
+com teste e mutação; as decisões do coordenador da rodada foram seguidas, e o
+que segue é o que ficou a escolher no caminho (padrões assumidos,
+contestáveis). A linha de cada item está na §19.1 do `go-webhook-server`.
+
+- **Primeiro sinal no shutdown por erro do `Serve`** (W 31): tolerado como no
+  FATAL; o dreno e o `pre_stop_delay` continuam os de um `SIGTERM`
+  (`tolerateFirst` é um parâmetro à parte de `fatal`).
+- **`read_timeout = 0`** (W 32): continua aceito; nesse caso o handler não limpa
+  o prazo de escrita e o `write_timeout` volta a limitar o upload. A
+  alternativa, exigir `read_timeout > 0`, foi descartada para não recusar uma
+  configuração que já subia.
+- **Piso de `ring.max_bytes`** (W 35): `PooledCap(MaxEventBytes) +
+  ItemOverhead`, exit 1 (não `WARN`), como o piso dos cortes RELP.
+- **`admin.bind`** (W 40): a porta 0 também é recusada (o mesmo sorteio da
+  porta vazia); os testes que usavam `:0` passaram a uma porta fixa que não
+  chegam a abrir.
+- **Byte de controle num valor de texto** (W 41): recusado abaixo de `0x20`
+  salvo o tab, e o `0x7f`; o tab fica porque o INI o lê e o dump o relê entre
+  aspas. A mensagem dá o byte e o *offset*, nunca o valor.
+- **Só documentados**: o `Expect: 100-continue` com corpo enviado sem esperar
+  (§4.3), o `ItemOverhead` sem a cópia do `held` (§7.2) e o recusado no
+  `.corrupt` sem *gauge* (§9.2).
+- **Só documentados também**: o *keep-alive* do `dialPostgres` e o ambiente
+  `PG*` escondido do processo no parse (§8.5.2).
 
 ## Riscos
 

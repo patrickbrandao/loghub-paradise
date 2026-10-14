@@ -33,8 +33,8 @@ const (
 //   - a string holds only the escapes the serializer writes: \" \\ \n \r
 //     \t, \u00XX for another control byte, \u2028 and \u2029. That also
 //     makes the escaping canonical, so two keys are the same key exactly when
-//     their bytes are -- except that str still lets a raw U+2028/U+2029
-//     through, a second spelling of the escaped one (SPEC §18.1).
+//     their bytes are; a raw U+2028/U+2029, a second spelling of the escaped
+//     one, is refused (SPEC §9.2; until 2026-10-14 str let it through).
 func ourShape(payload []byte) bool {
 	s := shapeScanner{b: payload}
 	keys, ok := s.object(1)
@@ -176,6 +176,13 @@ func (s *shapeScanner) str() ([]byte, bool) {
 		case c < 0x20:
 			return nil, false
 		case c != '\\':
+			// A raw U+2028/U+2029 (E2 80 A8/A9): the writer always escapes
+			// them (SPEC §9.2, §12.1). Accepted, it would be a second
+			// spelling of a key the duplicate check compares by bytes.
+			if c == 0xE2 && s.i+2 < len(s.b) && s.b[s.i+1] == 0x80 &&
+				(s.b[s.i+2] == 0xA8 || s.b[s.i+2] == 0xA9) {
+				return nil, false
+			}
 			s.i++
 			continue
 		}

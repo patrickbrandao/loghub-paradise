@@ -134,9 +134,10 @@ func TestMemoryItemCeiling(t *testing.T) {
 }
 
 func TestMemoryByteCeiling(t *testing.T) {
-	// The bytes counted are the whole JLH, body included (Size = len(Env)).
-	// Room for two 1000-byte bodies and one small one, not three large.
-	big, small := mkItem(1000).Size(), mkItem(10).Size()
+	// The bytes counted are what each item retains: its JLH buffer, body
+	// included, plus ItemOverhead (SPEC §7.2). Room for two 1000-byte bodies
+	// and one small one, not three large.
+	big, small := charge(mkItem(1000)), charge(mkItem(10))
 	if small >= big {
 		t.Fatalf("test setup: small envelope %d bytes, large %d", small, big)
 	}

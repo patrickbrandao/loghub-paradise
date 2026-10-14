@@ -663,9 +663,14 @@ transporte com backpressure real.
 - `tcp.max_conns` e `tcp.max_conns_per_ip` (`0` = ilimitado) valem para o
   transporte inteiro, somando os listeners: um limitador por listener
   multiplicaria os tetos. O teto global **bloqueia no accept**; o por IP
-  **fecha na hora**. O IP é o do par TCP, **antes** do PROXY protocol: com um
-  balanceador na frente, o teto por IP vê o balanceador (§4.6). A chave é o
-  endereço exato: em IPv6, um /128 (§22.1).
+  **fecha na hora**. O IP é o endereço **exato** do par TCP (um /128 no IPv6;
+  um IPv4 mapeado em IPv6 é a mesma chave que o IPv4, §4.2), **antes** do PROXY
+  protocol: com um balanceador na frente, o teto por IP vê o balanceador (§4.6).
+  Quem tem um /64 pode abrir cada conexão de um endereço novo e passar do teto;
+  contar por prefixo IPv6 foi recusado (decisão do `go-relplog-server`, portada
+  pelo `go-syslog-server` e daqui em 2026-10-14, DECISOES §9): um /64 pode ser
+  uma LAN inteira de emissores, e uma cota por prefixo deixaria um deles calar
+  os outros. Contra um /64 hostil, o teto global e o firewall.
 - `tcp.idle_timeout` (120 s) fecha conexão sem tráfego; `0` desliga.
 - `SO_KEEPALIVE` ligado, com período de 30 s, inclusive sob o limitador de
   conexões (o *wrapper* é desembrulhado para chegar ao socket).
@@ -707,8 +712,29 @@ num proxy à frente deste servidor (§1.2).
   conexão (`invalid` e `reason="proxy"`); um cabeçalho que declara origem não
   especificada é inválido; de par não confiável nada é lido nem contado; uma
   conexão que fecha antes do primeiro byte (sonda de saúde do balanceador) não
-  conta nada. `LOCAL`, `UNSPEC`, `UNIX`, `DGRAM` e `UNKNOWN` contam como
-  `local`.
+  conta nada; e uma espera de cabeçalho vencida pelo **shutdown** (com ou sem
+  cabeçalho pela metade) não conta nada (nem `absent`, nem `invalid`, nem
+  `reason="proxy"`) nem loga: é um deploy, não uma falha do balanceador
+  (corrigido em 2026-10-14, na forma do `go-syslog-server`). Só a **espera**:
+  em `optional`, um par confiável que não mandou cabeçalho e cujas linhas
+  syslog já estão no leitor quando o shutdown chega (o parser viu que não é
+  cabeçalho: sem erro, sem cabeçalho) segue para a moldura, e as linhas entram
+  no ring como qualquer mensagem já lida (§13.4); em `required`, a mesma conexão
+  fecha sem contar. Com cabeçalho **válido** já lido, `required` também segue: o balanceador manda o cabeçalho e as primeiras linhas no mesmo segmento, o `Close` chega antes de o parser olhar, e o cabeçalho e as linhas já estão no leitor; fechar ali perdia as linhas sem contagem (revisão independente de 2026-10-14, A1). A regra é "fechando, e com erro ou, em `required`, sem cabeçalho". A regra do `go-relplog-server` — "sem cabeçalho ou com
+  erro, e fechando" — descartaria até 4 KiB (o leitor, §5.4) dessas linhas sem
+  contagem a cada `Close`: no RELP nada é confirmado antes do cabeçalho, aqui a
+  janela TCP já as tinha aceitado. `LOCAL`, `UNSPEC`, `UNIX`, `DGRAM` e
+  `UNKNOWN` contam como `local`.
+- **Prazo vencido no meio da assinatura** (comportamento conhecido, sem perda):
+  se `proxy.header_timeout` vence quando só o começo da assinatura chegou (de 1
+  a 5 bytes do `PROXY ` do v1, de 1 a 11 dos 12 do v2, por exemplo `PRO`), o
+  parser não tem como saber se é um cabeçalho e devolve "sem cabeçalho": conta
+  `absent`; em `required` fecha (`reason="proxy"`), como para qualquer conexão
+  sem cabeçalho; em `optional` os bytes ficam no leitor e viram o começo da
+  primeira linha, registrada como qualquer linha que começa com `P` (em geral
+  `malformed`). Nada do que chegou se perde, e só acontece com um balanceador
+  **confiável** que mandou o começo da assinatura e parou por `header_timeout`.
+  Igual no `go-syslog-server`; aceito como está (2026-10-14).
 - **Efeito no payload:** `host.src-*` e `host.dst-*` vêm do cabeçalho (o
   cliente e o endereço que ele discou), o `sid` é calculado com eles, e o par TCP
   real vai em **`x-proxy: {"peer-ip", "peer-port"}`**, para que a ponta real do
@@ -787,6 +813,43 @@ gravaria fragmentos como mensagens.
   um bloco. Nunca alocar pelo que o par declara.
 - Conexão encerrada no meio de um frame: entrega o que chegou, com `size` = o
   MSG-LEN declarado (portanto `truncated`, §5.5).
+- **Custo fixo por conexão** (corrigido em 2026-10-14, como no
+  `go-syslog-server`; vale para as duas molduras): o `bufio.Reader` de cada
+  conexão TCP, alocado no accept, tem **4 KiB**, não 64. O maior `Peek` do
+  código é a assinatura PROXY v2, de 12 bytes (a detecção de §5.2 espia onze; o
+  v1 é lido byte a byte), e o frame atravessa o leitor uma recarga por vez,
+  então um leitor maior só economiza `read`s (`BenchmarkTCPReceive`, TESTING
+  §4). Antes de esperar o próximo frame (o leitor vazio), a moldura solta o
+  buffer de frame que passou de 16 KiB — na prática o da classe de 64 KiB: as
+  classes são 2, 8 e 64 KiB, então uma conexão ociosa segura **até 8 KiB** de
+  buffer de frame — em vez de segurá-lo enquanto a conexão viver ociosa. Com o
+  próximo frame já no leitor o buffer fica: soltá-lo depois de todo frame acima
+  de 16 KiB realocaria a classe de 64 KiB a cada um numa sequência de frames de
+  8–64 KiB (`BenchmarkFramer12K`; revisão independente do porte do
+  `go-syslog-server`, 2026-10-13). Com `tcp.max_conns = 0` (o padrão), N
+  conexões caladas custam cerca de N × 6 KiB de heap (leitor, estruturas da
+  conexão), mais a pilha da goroutine de cada uma, **fora** de `ring.max_bytes`
+  (§15.1): em produção, ligue `tcp.max_conns`.
+- **Limite do "até 8 KiB": vale entre frames, com o leitor vazio** (revisão
+  independente de 2026-10-14, A5 e D4; registrado, não corrigido). A soltura
+  acontece na entrada de `Next`, só com `Buffered() == 0`. Um par que manda um
+  frame de 17–64 KiB (o buffer vai à classe de 64 KiB) seguido de **um** byte
+  do próximo e se cala passa por `Next` com `Buffered() == 1`: o buffer fica, a
+  moldura copia o byte nele e estaciona no `Peek(1)` até o `idle_timeout`. 17
+  KiB enviados seguram 68 KiB (64 + o leitor de 4), 4×, contra os 16× que a
+  pendência 1 de 2026-10-11 fechou; não é perda de dado. Soltar no ponto de
+  espera **dentro** do frame (o `Peek(1)` de `nextLF`/`readCounted`, copiando
+  o pendente para uma classe pequena) foi medido e recusado: o leitor de 4 KiB
+  esvazia no meio de todo frame acima de 4 KiB, a moldura não distingue "vai
+  esperar" de "o próximo `read` já tem dados", e um fluxo contínuo de frames
+  de 24 KiB foi de 111 µs para 1,12 ms e de 78 KB para 9,97 MB alocados por 64
+  frames — a mesma regressão que a revisão do porte (2026-10-13) desfez. O
+  contrário (D4) também é custo e não defeito: com um emissor que escreve um
+  frame por `write()` e um leitor mais rápido, o leitor esvazia entre frames e
+  frames de 17–64 KiB realocam a classe de 64 KiB a cada um — a taxa, nesse
+  caso, é baixa por definição (o leitor espera o emissor). O teto do caso
+  hostil é o mesmo das conexões caladas: `tcp.max_conns` e o
+  `GOMEMLIMIT` (§15.4).
 
 ### 5.5 Tamanho e truncamento
 
@@ -1048,6 +1111,16 @@ Logo depois do PRI (ou no início, sem PRI):
 Depois do timestamp: um `:` opcional (Cisco, ASA) e então espaço ou fim. Sem isso
 não é timestamp.
 
+**O offset ISO na RFC 3164 não tem conferência de faixa**: `+25:00` e `+05:75`
+são aplicados como vierem, deslocando `payload.timestamp`, sem aviso, como faz o
+conversor de referência da skill (na RFC 5424 o mesmo offset dá
+`timestamp-invalid`, §6.4.2). Decidido seguir a skill, sem desvio novo (decisão
+do `go-relplog-server`, portada pelo `go-syslog-server` e daqui em 2026-10-14,
+DECISOES §9): um desvio de conversão quebraria a igualdade com o irmão RELP e
+com o pai, que publicam o mesmo `type` no mesmo destino. Se a skill passar a
+conferir, todos mudam juntos. `TestRFC3164ISOOffsetIsNotRangeChecked` trava as
+duas metades.
+
 #### 6.5.2 Fuso e ano
 
 - **Sem fuso:** `syslog.rfc3164_timezone` (IANA, padrão `UTC`) e aviso
@@ -1200,7 +1273,7 @@ Ordem canônica (a do schema):
 | `version-unsupported` | RFC 5424 com VERSION ≠ 1 |
 | `header-invalid` | campo do cabeçalho RFC 5424 fora da ABNF, cabeçalho incompleto, timestamp com `t`/`z` minúsculo ou fração > 6 |
 | `timestamp-missing` | RFC 3164 sem timestamp reconhecível |
-| `timestamp-invalid` | timestamp com forma reconhecida e data, hora ou offset inválidos |
+| `timestamp-invalid` | timestamp com forma reconhecida e data, hora ou offset inválidos (na RFC 3164 o offset não é conferido, §6.5.1) |
 | `timestamp-year-inferred` | timestamp BSD sem ano |
 | `timestamp-zone-inferred` | timestamp sem fuso |
 | `hostname-missing` | RFC 3164 com timestamp e sem HOSTNAME |
@@ -1563,6 +1636,18 @@ pelo nome. O custo, aceito: um trigger que anula uma coluna só em certas linhas
 passa a derrubar o processo na primeira delas, em vez de descartar só aqueles
 pedaços.
 
+**SQLSTATE fora da tabela é `network`** (`P0001` de uma trigger que levanta
+exceção, ou qualquer outro código não listado). É regra, não pendência (porte do
+RP/RN, decidido em 2026-10-14): nunca descartado, nunca FATAL. O pedaço é
+retentado com o sink UP, o ring enche e segura a recepção (§20.18: um ring que
+enche é visível, um pedaço descartado não), e o operador vê
+`syslog_sink_errors_total{kind="network"}` subir, com o SQLSTATE no `WARN`
+"sink write failed, retrying". As alternativas são piores: `logic` descartaria
+pedaços em silêncio a cada poucos milissegundos se a trigger recusa tudo;
+`fatal` derrubaria o servidor (dump, exit 3) por uma trigger que talvez recuse
+uma linha só. Tratar a classe `P0` como `fatal` seria uma decisão de contrato
+separada, sem caso real que a peça.
+
 **A validação do boot tem prazo próprio** (porte do `go-relplog-pg-server`,
 2026-10-13; antes §22.1 item 6): roda com `sink.op_timeout`, não no
 `sink.health_timeout` (1 s) da checagem que a dispara. São ~18 idas e voltas
@@ -1896,7 +1981,7 @@ O que passa não pode ser recusado pelas CHECKs da fila nem pelo `jsonb`.
 | linha completa que `ParseLine` recusa | **inválida**: pulada; o `\n` localiza a próxima |
 | linha maior que `emergency.MaxLine` | **inválida**: descartada durante a leitura, nunca guardada |
 | arquivo com cauda truncada ou linha inválida | **danificado**: as linhas íntegras são entregues e o arquivo é renomeado para `.corrupt` (com `fsync` do diretório), com as contagens de bytes em `ERROR`; destruir a evidência de uma queda não é decisão deste programa |
-| arquivo limpo | removido (com `fsync` do diretório) **só depois** de todos os seus envelopes serem confirmados. Uma falha da remoção só é logada: o arquivo volta no boot seguinte, e a fila só deduplica enquanto o `uuid` ainda estiver nela (TESTING §8) |
+| arquivo limpo | removido (com `fsync` do diretório) **só depois** de todos os seus envelopes serem confirmados. Uma falha da remoção é só `ERROR`: o arquivo volta no boot seguinte, e a fila só deduplica enquanto o `uuid` ainda estiver nela (TESTING §8). É regra, não pendência (porte do RP/RN, decidido em 2026-10-14): sair com erro deixaria o boot em laço por um problema (permissão do diretório) que não impede a entrega, e os gauges de §14.1, recontados do disco no fim da reingestão, continuam contando o arquivo, então o alerta segue disparando (`TestRemovalFailureIsOnlyAnError`). |
 
 `emergency.MaxLine` = 12 × 16 MiB + 8 KiB: o pior JLH de §3.9 com o **maior**
 `max_message_bytes` que a config aceita, e não o da execução atual, para que um
@@ -1925,6 +2010,11 @@ escrita confere o abort entre linhas (a cada 1024) e antes de publicar, e
 remove o temporário em vez de deixar no disco um arquivo que o boot seguinte
 reingeriria. Um dump publicado entre a última conferência e o abort fica contado
 como perdido **e** guardado: sobra, nunca perda, e nada mais é contado (§13.4).
+O boot seguinte o entrega, e `reason="abort"` sobreconta. É regra, não
+pendência (porte do RP/RN, decidido em 2026-10-14): o aborto **não espera o
+disco** — segurar o `lossMu` durante o `link` e o `fsync` do diretório faria um
+`SIGQUIT`, cujo contrato é "agora", esperar um disco que pode estar preso; a
+janela é inerente a qualquer `os.Exit` assíncrono a uma escrita.
 
 ---
 
@@ -2000,6 +2090,7 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | Nenhum `listen.*` | exit 1 |
 | `listen.udp` ou `listen.tcp` fora de `host:port` (`:1514` serve); `*_listeners` fora de 1–256 | exit 1. UDP e TCP podem dividir a porta (são protocolos distintos; 1514 nos dois é o padrão) |
 | `admin.enabled = true` com `admin.bind` vazio ou fora de `host:port` | exit 1 (vazio publicaria `/metrics` em todas as interfaces numa porta aleatória; desligar é `admin.enabled = false`) |
+| `admin.enabled = true` com `admin.bind` e `listen.tcp` no mesmo endereço TCP: a mesma porta com o mesmo literal IP (o IPv4 mapeado em IPv6 conta como o IPv4), um curinga (`""` ou um literal não especificado: `0.0.0.0`, `::`, `::0`) de um lado, ou um **nome** de host de qualquer lado | exit 1, nomeando os dois endereços. Nenhum nome é resolvido na validação: um nome na mesma porta pode resolver ao outro endereço (`localhost` e `127.0.0.1`) e conta como colisão. Para dividir a porta, dois literais IP distintos; a porta `0` nunca colide; `listen.udp` não colide (outro protocolo). Antes a colisão só aparecia ao abrir o transporte, com a porta admin já tendo servido o boot inteiro, e no macOS/BSD nem isso: o `SO_REUSEADDR` deixa `127.0.0.1:P` e `*:P` coexistirem, e a porta admin tomava em silêncio as conexões TCP de `localhost`. A regra é a do `sameStreamSocket` do `go-syslog-server` (porte do RP/RN, 2026-10-14; `TestAdminBindCollidesWithListen`). O curinga é reconhecido pelo **valor**, não pela grafia: `""` ou qualquer literal com `IsUnspecified()` (`0.0.0.0`, `::`, `::0`, `0:0::0`); e a **porta é comparada como número**, lida como o `net.Listen` a lê (`net.LookupPort`): `0514` é `514`, e um nome de serviço (`syslog`, `http`) vale o número do banco de serviços; uma porta que não é número nem serviço conhecido é exit 1 aqui, nomeando as duas chaves, em vez de falhar no bind (revisão independente de 2026-10-14, D1 do syslog e D4 do RELP: `[::0]:P` contra `127.0.0.1:P` e `0514` contra `514` passavam como endereços distintos; `TestSameStreamSocketReadsValuesNotSpellings`) |
 | Número real `NaN` ou `±Inf` em qualquer parâmetro | exit 1 (o `NaN` passa por toda comparação de faixa) |
 | `emergency.dir` fora de `server.data_dir` | `WARN` (§20.16) |
 | `listen.unix` relativo ou maior que `sun_path`; `listen.unix_mode = 0` | exit 1 |
@@ -2010,6 +2101,7 @@ pronto e de os dumps terem voltado descartaria datagramas sem ninguém saber; a
 | `syslog.rfc3164_timezone` desconhecido para o `time.LoadLocation`, ou `Local` | exit 1 (a imagem embute `time/tzdata`; `Local` dependeria do host) |
 | `syslog.legacy_charset` fora de `""`, `cp1252`, `latin1`, `windows-1252`, `iso-8859-1` | exit 1 |
 | `syslog.max_message_bytes` < 480 ou > 16 MiB; `sd_max_elements` ou `sd_max_params` < 1 | exit 1 (480 é o mínimo da RFC 5424) |
+| `ring.max_bytes` abaixo do custo de uma mensagem do tamanho máximo: a classe do pool de `syslog.max_message_bytes` + 256 B (`item.PooledCap(n) + ring.ItemOverhead`, §9.2, §15.1; 65 792 B com o padrão de 64 KiB) | exit 1, nomeando a chave e o piso: essa mensagem nunca caberia num ring vazio; no TCP a conexão ficaria parada até o `tcp.backpressure_timeout` e a mensagem seria descartada, a cada uma, e no UDP descartada sempre como `ring_full`, com o ring vazio. Porte do RP/RN, 2026-10-14 (`TestRingMaxBytesFitsTheLargestMessage`) |
 | **Tetos** (revisão independente do `go-relplog-pg-server`, 2026-10-13, portada): `ring.capacity_items` > 16 777 216, `sink.workers` > 1024, `sink.batch` > 65 536, `sink.batch_max_bytes` > 256 MiB, `sink.postgres.pool_size` > 4096 | exit 1. Sem eles, um erro de digitação de poucos dígitos derrubava o boot em pânico (`makechan`), alocava um gigabyte por `Dequeue`, dava a volta no `int32` do pool (4294967300 virava 4) ou montava um pedaço cujo `Bind` passa do limite de 1 GiB da libpq e falha sem SQLSTATE, `network` para sempre. Os números são folgados: só barram o erro de digitação |
 | `ring.capacity_items`, `ring.max_bytes`, `sink.workers`, `sink.batch`, `sink.batch_max_bytes`, `sink.max_retries` abaixo de 1; `ring.high_water` fora de (0, 1]; `log.access_sample` fora de [0, 1]; `tcp.max_conns*` negativo; `retry_backoff_max < retry_backoff_min` | exit 1 |
 | `sink.workers > 16` | `WARN` (§10.5) |
@@ -2098,6 +2190,20 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
   `abort = 0`, a perda contada uma vez mas atribuída ao disco. Sob o
   `lossMu`, ou o aborto terminou (o dump acha 0) ou nem começou (o dump
   conta, o aborto acha 0) (`TestAbortInsideTheDumpKeepsItsReason`).
+- **O aborto fecha o ring antes de contar** (porte do RP/RN, 2026-10-14).
+  Fora da fase do dump, o `abortLoss` chama `ring.Close()` **antes** de ler a
+  ocupação: um `Enqueue` depois disso é recusado com `ring.ErrClosed`, que a
+  recepção trata como shutdown (TCP fecha a conexão sem ler adiante; UDP e unix
+  descartam), contado em `syslog_messages_dropped_total{reason="shutdown"}`, e
+  nenhuma mensagem é aceita depois da contagem sem ser contada. O `Enqueue`
+  reconfere o fechamento **depois** de reservar a vaga (`items.Add(1)`): ou a
+  reserva é vista pela leitura do aborto (contada), ou o `Enqueue` vê o
+  fechamento e desiste — no máximo uma sobrecontagem transitória, nunca uma
+  mensagem aceita sem contagem. A sobrecontagem tem uma segunda fonte (registrado em 2026-10-14, D3 da revisão do syslog): um `Enqueue` que reservou a vaga (`items.Add(1)`) e vai desistir por falta de bytes (`ErrFull`) pode ser lido pelo aborto entre a reserva e o recuo, e conta em `abort` uma mensagem que a recepção trata como ring cheio. É transitória, de no máximo uma por recepção concorrente, e nunca esconde uma perda. A janela não era só o `pre_stop_delay`: um
+  `SIGQUIT` em operação normal tinha a mesma, com todos os transportes abertos.
+  O `Close` do ring em memória é uma marca, e o aborto continua "agora"
+  (`TestAbortClosesTheRingBeforeCounting`,
+  `TestEnqueueSeesACloseThatRacedTheReservation`).
 - **Shutdown por FATAL** (que começa sem sinal nenhum): o **primeiro**
   `SIGTERM`/`SIGINT` é tolerado — logado, e o dump continua —, e só um segundo
   aborta. Um orquestrador que manda `SIGTERM` ao ver o processo sair do ar não
@@ -2144,6 +2250,10 @@ dois são da mesma família e um operador pode trocar um pelo outro sem mexer no
 monitoramento. Por isso **não rode os dois no mesmo host sem trocar o
 `admin.bind` de um deles** (o `go-webhook-server` usa `9101`). HTTP/1.1.
 
+O `admin.bind` nunca divide o endereço TCP do `listen.tcp` (§13.2): mesma
+porta com o mesmo literal, um curinga ou um nome de qualquer lado é exit 1 na
+validação.
+
 | Path | Semântica |
 |---|---|
 | `/healthz` | `200` enquanto o processo vive. Liveness. |
@@ -2181,7 +2291,7 @@ definitivo.
 | `syslog_sink_batch_size`, `syslog_sink_batch_bytes` | histogram | — (por pedaço) |
 | `syslog_sink_duration_seconds` | histogram | — |
 | `syslog_sink_health_duration_seconds` | histogram | — |
-| `syslog_sink_errors_total` | counter | `kind` (network, logic, fatal, timeout); o cancelamento do shutdown não conta |
+| `syslog_sink_errors_total` | counter | `kind` (network, logic, fatal, timeout); o cancelamento do shutdown não conta. `fatal` conta **toda** recusa fatal do destino, mesmo durante um cancelamento (boot cancelado, shutdown): ela não nasce dele, é um veredito real, e o processo sai logo depois. Só o `network` cortado pelo cancelamento deixa de contar, porque o cancelamento **causa** erros de rede (prazo, conexão fechada). Regra, não pendência (porte do RP/RN, decidido em 2026-10-14). |
 | `syslog_sink_up` | gauge | — |
 | `syslog_sink_postgres_duplicates_total` | counter | — |
 | `syslog_sink_postgres_pool_conns` | gauge | `state` (acquired, idle, max) |
@@ -2230,11 +2340,23 @@ O buffer volta ao pool **na mesma caixa `*[]byte`** de onde saiu
 aloca uma nova. Uma mensagem aceita custa assim **uma** alocação (o próprio
 `Item`, 224 B) em vez de duas (248 B).
 
-**Teto pequeno demais.** Cada item custa no mínimo 2 KiB (a menor classe) +
-256 B na contabilidade de §9.2. Um `ring.max_bytes` abaixo disso é aceito pela
-validação e nenhuma mensagem cabe: o TCP segura o emissor, fecha no
-`backpressure_timeout`, e ele reconecta para sempre. Herdado do pai, conhecido e
-não corrigido (TESTING §8).
+**Memória por conexão, fora do ring.** Uma conexão TCP viva segura o leitor de
+4 KiB e o buffer de frame (até 8 KiB quando ociosa; o de um frame maior enquanto
+os frames seguintes já estão no leitor, ou com alguns bytes do próximo frame no leitor e o par calado), ociosa ou não; os números e a regra
+estão em §5.4. Não entram em `ring.max_bytes`: o teto delas é `tcp.max_conns`,
+e com `0` é o `GOMEMLIMIT` (§15.4) que segura um enxame de conexões caladas.
+
+**Teto pequeno demais.** Uma mensagem de `n` bytes (já truncada) custa ao ring
+a classe do pool de `n` + 256 B (§9.2): 2 KiB, 8 KiB ou 64 KiB, e acima da
+maior classe o próprio `n`. O piso de `ring.max_bytes` é o custo de uma
+mensagem do tamanho máximo, `item.PooledCap(syslog.max_message_bytes) +
+ring.ItemOverhead` (65 792 B com o padrão), e um valor menor é recusado na
+validação (§13.2, exit 1). O piso da **menor** classe não basta: um ring de
+4 KiB aceitaria as linhas curtas e recusaria **sempre** qualquer linha de
+3 KiB, mesmo vazio — no TCP a conexão daquele emissor parava até o
+`backpressure_timeout` a cada uma. Com o piso, toda mensagem que o truncamento
+guarda cabe num ring vazio (porte do RP/RN, 2026-10-14; antes aceito e listado
+em TESTING §8).
 
 ### 15.2 Regra de propriedade única
 
@@ -2360,6 +2482,15 @@ Duas referências: chave recarregável comparada com o que está **em execução
 (para que reverter ao valor de boot seja aplicado); chave de restart comparada
 com o **boot** (para que todo `SIGHUP` avise sobre ela até o restart). Cada uma
 das duas sozinha falha num dos casos (bugs reais 009 e 010 da standard).
+
+**Chave derivada não é relatada.** Uma chave **derivada** no boot e no arquivo
+novo (§16.2, a nota `derived` do `--dump-config`: `emergency.dir` de `server.data_dir` e `sink.postgres.pool_size` de `sink.workers`) não entra na lista
+"requires a restart": muda só porque a chave que a deriva mudou, e essa é
+relatada. Uma que passa de explícita a derivada, ou o contrário, é relatada;
+notas que não começam com `derived` (`lowered to 4`, `forced to 1`, `resolved to
+an absolute path`) dizem como um valor dado foi ajustado e continuam relatadas.
+A comparação usa as notas que o `Load` já grava (`Loaded.Notes`), as mesmas do
+`--dump-config` (porte do RP/RN, 2026-10-14; `TestReloadDoesNotReportDerivedKeys`, `TestReloadDoesNotReportTheDerivedPoolSize`).
 
 **Chave sombreada.** Como env e flag vencem o arquivo (§16.1) e não mudam num
 processo em execução, uma chave que o arquivo define mas um env ou uma flag
@@ -2491,7 +2622,7 @@ Removido no go-syslog-pg-server (§1.2).
 | Chave | Padrão | Descrição |
 |---|---|---|
 | `capacity_items` | `65536` | teto de itens, 1–16 777 216; com mensagens de 200 bytes é o que pega primeiro |
-| `max_bytes` | `512MiB` | teto de bytes: o `cap` de cada buffer cru + 256 B por item (§9.2); o JLH não conta |
+| `max_bytes` | `512MiB` | teto de bytes: o `cap` de cada buffer cru + 256 B por item (§9.2); o JLH não conta. No mínimo o custo de uma mensagem de `syslog.max_message_bytes` (a classe do pool + 256 B, §13.2) |
 | `high_water` | `0.80` | fração de qualquer teto acima da qual o `/readyz` falha |
 
 Não há `mode` (sempre `memory`) nem `max_inflight` (era do `ring=none`).
@@ -2927,48 +3058,28 @@ Problemas reais, conferidos contra o código atual e ainda não corrigidos. Cada
 item diz o problema, a consequência e a direção da correção. Corrigido um, ele
 sai daqui e a regra vai para a seção que ele cita, spec primeiro.
 
-1. **Teto por IP contornável com IPv6** (§4.4). `tcp.max_conns_per_ip` conta
-   pelo endereço exato, e quem tem um /64 (qualquer host com SLAAC) usa um
-   endereço por conexão: o teto não o segura e, com `tcp.max_conns` ligado, ele
-   ocupa o teto global e trava os emissores legítimos no accept. Direção, a
-   decidir pelo usuário: aceitar como está (já dito em §4.4), ou contar o IPv6
-   por um prefixo configurável (uma LAN inteira costuma ser um /64, então o
-   padrão é escolha), com isenção por CIDR.
-2. **O shutdown é contado como falha do PROXY** (§4.6). Uma conexão parada à
-   espera do cabeçalho quando o transporte fecha (o `Close` vence o prazo) conta
-   `proxy_headers_total{result="absent"}`, ou `invalid` com um cabeçalho pela
-   metade, e em `required` também `messages_dropped_total{reason="proxy"}` com
-   um `WARN` que culpa o balanceador: todo deploy parece uma falha dele, sem
-   perda de dado. Direção: um erro de `ReadProxyHeader` com `closing` ligado
-   encerra a conexão sem contar nem logar nada. Na forma do S, conferida na revisão
-   independente do `go-syslog-server` (2026-10-13, E1): `closing && (err != nil
-   || mode == required)`, nunca `(err != nil || !found) && closing` (a do R),
-   que em `optional` sem cabeçalho fechava a conexão e perdia sem contar as
-   linhas já no buffer. Aqui não há `closing` nessa leitura: o defeito não
-   existe, e a pendência segue.
-3. **Custo fixo de 64 KiB por conexão TCP** (§4.4, §5.4). O `bufio.Reader` de
-   cada conexão (`streamReadBuffer`) é alocado no accept e fica preso enquanto
-   ela viver, ociosa ou não; com `tcp.max_conns = 0` por padrão, milhares de
-   conexões ociosas somam centenas de MiB que `ring.max_bytes` não vê, até o
-   `GOMEMLIMIT` ou o OOM (e o backlog do ring se perde, §19). O "custa um bloco"
-   de §5.4 vale para o buffer da moldura, não para a conexão. Direção: um buffer
-   de 4–8 KiB (o maior `Peek` é de 12 bytes, a assinatura do PROXY v2), medido
-   com o benchmark de recepção, e o custo fixo por conexão documentado com a
-   recomendação de um `max_conns` em produção.
-4. **Offset fora de faixa aceito no RFC 3339 da RFC 3164** (§6.5.1). Ali
-   `+25:00` ou `+05:75` são aceitos e `timestamp` sai deslocado, sem
-   `timestamp-invalid`, enquanto a RFC 5424 recusa o mesmo offset (§6.4.2); o
-   `raw` guarda o original. O conversor de referência da skill faz o mesmo (só
-   confere a faixa no ramo 5424), então corrigir é desvio. Direção, a decidir
-   pelo usuário: conferir `hh ≤ 23` e `mm ≤ 59` também ali (`timestamp-invalid`,
-   `timestamp` omitido, o resto do cabeçalho segue), registrado como desvio D9 e
-   levado ao mantenedor da skill; ou dizer em §6.5.1 que a referência aceita
-   qualquer offset de dois dígitos.
+1. *Decidido em 2026-10-14 (DECISOES §9, contestável):* teto por IP contornável com IPv6 — `tcp.max_conns_per_ip` conta o endereço exato (um /128), sem prefixo, como no `go-syslog-server` e no `go-relplog-server`; regra em §4.4, trava em `TestPerIPLimitCountsTheExactAddress`.
+2. *Corrigido em 2026-10-14:* o shutdown deixou de ser contado como falha do PROXY (`closing && (err != nil || mode == required)`, a forma do `go-syslog-server`); regra em §4.6, com o prazo vencido no meio da assinatura documentado ali como comportamento conhecido sem perda.
+3. *Corrigido em 2026-10-14:* custo fixo por conexão TCP — leitor de 4 KiB em vez de 64 e buffer de frame acima de 16 KiB solto antes de uma espera (`frameKeepCap`, só com o leitor vazio); regra em §5.4 e §15.1.
+4. *Decidido em 2026-10-14 (DECISOES §9, contestável):* offset ISO fora de faixa na RFC 3164 segue a skill (aplicado como veio, sem aviso, sem desvio D9), como no `go-syslog-server` e no `go-relplog-server`; regra em §6.5.1 (e a ressalva em §6.9), trava em `TestRFC3164ISOOffsetIsNotRangeChecked`.
+5. *Corrigido em 2026-10-14 (porte do RP/RN):* o aborto fecha o ring antes de contar, e o `Enqueue` reconfere o fechamento depois da reserva; regra em §13.4.
+6. *Corrigido em 2026-10-14 (porte do RP/RN):* `ring.max_bytes` abaixo da classe do pool de `syslog.max_message_bytes` + 256 B é exit 1; regra em §13.2 e §15.1.
+7. *Corrigido em 2026-10-14 (porte do RP/RN):* `admin.bind` e `listen.tcp` no mesmo endereço TCP são exit 1 na validação (`sameStreamSocket` do `go-syslog-server`); regra em §13.2 e §14.
+8. *Corrigido em 2026-10-14 (porte do RP/RN):* `SIGHUP` não relata mais a chave derivada (`emergency.dir`, `sink.postgres.pool_size`) junto com a que a deriva; regra em §16.3.
+9. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* a falha ao remover um dump já entregue continua só `ERROR`; regra em §12.2 / DECISOES §10.
+10. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* SQLSTATE fora da tabela (`P0001`) é `network`, nunca descarte nem FATAL; regra em §10.5 e §20.18 / DECISOES §10.
+11. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* dump publicado no instante do aborto fica contado e no disco, e o aborto não espera o disco; regra em §12.3 / DECISOES §10.
+12. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* `syslog_sink_errors_total{kind="fatal"}` conta a recusa fatal mesmo com o boot cancelado; regra em §14.1 / DECISOES §10.
+13. *Decidido/registrado em 2026-10-14 (porte do RP/RN):* contadores da recepção sem *padding*, sem defeito observável; lacuna de medição em TESTING §8 / DECISOES §10.
+14. *Corrigido em 2026-10-14 (revisão independente):* com `proxy.protocol=required`, um cabeçalho PROXY **válido** já no leitor quando o shutdown chega segue para a moldura, e as linhas que vieram com ele entram no ring; só a espera (sem cabeçalho, ou com erro) fecha sem contar (A1); regra em §4.6.
+15. *Corrigido em 2026-10-14 (revisão independente):* `sameStreamSocket` compara valores: curinga por `IsUnspecified()` (`[::0]`, `0:0::0`) e porta como número (`0514` = `514`, nome de serviço resolvido, porta irresolúvel recusada) (D1 do syslog, D4 do RELP); regra em §13.2.
+16. *Registrado em 2026-10-14 (revisão independente):* o "até 8 KiB quando ociosa" vale entre frames, com o leitor vazio: um frame grande seguido de alguns bytes do próximo segura o buffer grande até o idle; soltar no ponto de espera dentro do frame foi medido (24 KiB: 10× mais lento, 128× mais alocação) e recusado (A5, D4); regra em §5.4 e §15.1.
+17. *Registrado em 2026-10-14 (revisão independente):* sobrecontagem transitória do aborto também por um `Enqueue` que reservou a vaga e recua por falta de bytes (D3 do syslog); e o comentário do `Memory.Enqueue` corrigido ("pelo menos um dos dois", D1 do RELP); regra em §13.4.
 
-Os itens 7 a 10 de antes (erros da `LOGHUB_EB_URL` com trechos dela, logs
+Os itens 7 a 10 da lista de 2026-10-13 (erros da `LOGHUB_EB_URL` com trechos dela, logs
 falsos depois de um `fsync` de diretório falho, `syslog_emergency_files` zerado
 com dump no disco, `SIGQUIT` tolerado no shutdown por FATAL) foram corrigidos no
-porte de 2026-10-13 e vivem em §10.9, §12.2 e §13.4. Os itens 5 e 6 (`23502`
+porte de 2026-10-13 e vivem em §10.9, §12.2 e §13.4. Os itens 5 e 6 daquela lista (`23502`
 fatal, a validação do boot com prazo próprio de `sink.op_timeout`) foram
 portados do `go-relplog-pg-server` no mesmo dia e vivem em §10.5 e §13.1.
 

@@ -177,7 +177,10 @@ Registradas por honestidade, não por esquecimento:
 5. **A conta de conexões não foi aferida.** 4 workers e `pool_size = workers + 1`
    são raciocínio (SPEC §8.5.3), não medição.
 6. **O teto de 1 GiB de um parâmetro** só é coberto pelo aviso de boot
-   (`TestPostgresByteCeilingWarning`).
+   (`TestPostgresByteCeilingWarning`). Desde 2026-10-14 o lote vai em pedaços
+   de `sink.batch_max_bytes` (no máximo 256 MiB), provado pelo destino falso
+   (`TestWorkersSplitABatchByBytes`, `TestBootWritesInPiecesUnderBatchMaxBytes`);
+   um pedaço perto de 256 MiB contra o PostgreSQL real não foi escrito.
 7. **`kill -9`** perde o ring por desenho (SPEC §16.1); não há o que testar
    além de documentar.
 8. **A regra do `/data` (SPEC §13.6) não tem teste automatizado**; quem a
@@ -206,31 +209,46 @@ Registradas por honestidade, não por esquecimento:
     `obs.Logger.SetLevel` (da recarga).
 15. **`envelope.appendKey` não é usado** (`golangci-lint unused`); veio do fast,
     onde também não é, e fica até a correção ser portada nos dois.
-16. ~~**Segundo sinal no meio do dump**~~ — **fechada em 2026-10-13** (§9,
-    "Porte das correções da família syslog/RELP": o dump que o aborto contou
-    desiste, e o contador passa de mão sob uma trava antes do recolhimento).
-    O registro de então: (revisão de 2026-10-11): o aborto conta
-    os itens como perda, mas a escrita continua e, se o `link` acontecer antes
-    do `os.Exit`, o dump é reingerido no boot seguinte — perda contada a mais,
-    nenhum evento perdido. E entre o `Drain` (que já desconta o ring) e o
-    `collected.Store`, um aborto lê o ring sem os itens drenados e conta a
-    menos. Janela de milissegundos; correção proposta: o `link` como ponto de
-    compromisso (o caminho gracioso reivindica o `atRisk` antes dele) e
-    `atRisk`/`collected` num só atômico.
-17. ~~**`Count` pula um dump ilegível**~~ — **fechada em 2026-10-13** (§9,
-    "Porte das correções da família syslog/RELP"). O registro de então:
-    (revisão de 2026-10-11, anterior ao
-    porte): um arquivo sem permissão de leitura fica no disco e não entra em
-    `whs_emergency_files`, ao contrário do que diz a linha de 2026-10-07 abaixo.
-    É defeito, com a direção da correção em SPEC §19.1.
-18. ~~**Uma brecha deixada no parser de flags** (SPEC §13.2, como no N): a cauda
-    de um valor que o shell partiu num espaço, quando começa com traço e vem
-    depois de um valor não vazio (`--sink.postgres.password=a -b`), sai como
-    parâmetro desconhecido, com o nome. Escondê-la esconderia todo erro de
-    digitação de uma flag depois de outra.~~ — **fechada em
-    2026-10-13** (porte da família syslog/RELP, `knownSectionOf`): depois de um
-    valor, só se nomeia uma flag desconhecida dentro de uma seção deste
-    servidor; `TestFamilyPortTailAfterAValueIsNotNamed`.
+16. ~~Segundo sinal no meio do dump~~ — *fechada em 2026-10-13* (§9, "Porte das correções da família syslog/RELP").
+17. ~~`Count` pula um dump ilegível~~ — *fechada em 2026-10-13* (§9, "Porte das correções da família syslog/RELP").
+18. ~~Brecha no parser de flags (cauda de um valor partido pelo shell)~~ — *fechada em 2026-10-13* (`knownSectionOf`, `TestFamilyPortTailAfterAValueIsNotNamed`).
+19. **A retentativa do `accept`** (SPEC §10.3) é provada com um listener falso
+    que devolve `ENOBUFS` (`TestAcceptRetriesNonTemporaryErrors`), e o
+    `Serve` com erro, por um `Serve` embrulhado (`App.wrapServe`,
+    `TestServeErrorGoesThroughTheShutdown`): nenhum erro real do kernel foi
+    provocado.
+20. **O ring cobrando o buffer retido** (SPEC §7.2) é provado pela
+    contabilidade (`TestMemoryChargesTheRetainedBuffer`,
+    `TestItemOverheadCoversTheStruct`, `unsafe.Sizeof` = 80); o RSS de um ring
+    cheio com o destino fora, contra o `GOMEMLIMIT` em dobro, não foi medido
+    (§7).
+21. **`max_conns_per_ip` por endereço exato** é decisão contestável
+    (`DECISOES.md`, porte de W e F); `TestPerIPLimitCountsTheExactAddress` é
+    teste de **trava**: passa por desenho, e prova só que uma mudança da regra
+    será deliberada.
+22. **O compose** é conferido como texto (`internal/config/compose_test.go`):
+    que todo `WHS_SINK_*` do `.env.example` é repassado e as imagens são
+    fixadas. A CA montada em `/etc/webhook` não subiu de ponta a ponta (a
+    renderização com `docker compose config` foi conferida).
+
+23. **`Expect: 100-continue` com o corpo enviado sem esperar** (SPEC §4.3;
+    revisão independente de 2026-10-14) não tem teste: o `net/http` fecha
+    sem `closeWriteAndWait`, e um RST pode levar o `429`/`503`. Reproduzi-lo
+    pede um cliente que mande o corpo antes do `100` e um *timing* de RST
+    que o loopback não dá de forma estável; aceito e documentado.
+
+24. **A cópia do `held` e a fatia do `Dequeue` fora do `ItemOverhead`** (SPEC
+    §7.2; revisão independente de 2026-10-14): até `workers × batch × 16`
+    bytes fora de `ring.max_bytes`, sem teste, por ser um limite documentado
+    e não uma regra.
+
+25. **O recusado no `.corrupt` fica fora dos *gauges*** (SPEC §9.2; revisão
+    independente de 2026-10-14): só o `ERROR` com o `uuid` o registra;
+    documentado, sem teste de métrica.
+
+26. **O *keep-alive* do `dialPostgres` é o padrão do Go (15 s)**, não os 5 min
+    do pgx, e o ambiente `PG*` some do processo durante o parse (SPEC
+    §8.5.2): documentados, sem teste próprio além do `libpq_env_test`.
 
 ## 9. Histórico: bugs que os testes encontraram
 
@@ -362,7 +380,8 @@ guarda da regra nova) e cada correção revertida sozinha derruba ao menos um
 | Tetos (`capacity_items`, `batch`, `workers`, `pool_size`, `listeners`) | `TestFamilyPortConfigCeilings` |
 | `sink.postgres.addr` um servidor só | `TestFamilyPortPostgresAddrNamesOneServer` |
 
-Não se aplica (`DECISOES.md`): `sink.batch_max_bytes` (a chave não existe),
+Não se aplica (`DECISOES.md`): `sink.batch_max_bytes` (a chave não existia;
+*revisto em 2026-10-14: existe, por decisão do usuário, ver a rodada abaixo*),
 `ring.max_inflight` e `ring.sqlite.commit_batch` (não existem), as regras de
 URL PostgreSQL da `LOGHUB_EB_URL` (não há `LOGHUB_EB_URL` nem outro leitor de
 URL/DSN), e o socket com `tls=true`, que já era recusado.
@@ -407,3 +426,64 @@ write carried 1|2|3 of the 4 items"). Correção no teste: enfileirar antes do
 `Start` (como o `TestWorkersMarkFatal`) e conferir que a escrita parada levou
 os quatro (`stallOnceSink.stalled`); `-race -count=500` verde. O
 `go-syslog-standard-server` tem o mesmo teste com a mesma ordem.
+
+### Porte das correções de W e F (2026-10-14)
+
+As correções que fecharam a SPEC §19.1 do `go-webhook-server` (W) e do
+`go-webhook-fast-server` (F), portadas do código de F por `diff`. Cada item:
+SPEC primeiro, o teste abaixo falhando contra o código de antes (com só o
+mínimo para compilar: o campo ou a função vazia), a correção, o teste verde, e
+a correção revertida sozinha (mutação) derrubando o teste. Progresso e saídas
+em `tasks/progress-P-N.md` da raiz.
+
+| Item (W) | Regra | Teste | Falha antes | Mutantes mortos |
+|---|---|---|---|---|
+| W 1 `Content-Length` pré-aloca | §12.2, §4.3 passo 11 | `TestReadBodyAllocatesOnlyWhatArrives` | buffer cap 5242880 | sem o teto de 64 KiB |
+| W 2 checagem rápida por bytes | §4.3 passo 9 | 3 casos em `TestErrorAnswersBeforeTheUUIDArePlainText` + controle | `status = 200, want 429` ×3 | sem a cláusula de bytes |
+| W 3 dreno vs h2/`Expect` | §4.3 | `TestRejectDrainFollowsTheProtocol`, `TestRejectWithExpectSendsNo100Continue` | 65537 bytes lidos; `100 Continue` como primeira linha | sem o h2; sem o `Expect` |
+| W 4 `write_timeout` da resposta | §13.5 | `TestSlowUploadStillGetsItsAnswer`, `...OverH2C`, `TestWriteTimeoutIsArmedForEveryAnswer` | `unexpected EOF`; `INTERNAL_ERROR`; prazo não armado ×3 | sem limpar (h2c); sem rearmar |
+| W 5 `accept` e `Serve` com erro | §10.3, §10.5 | `TestAcceptRetriesNonTemporaryErrors`, `TestServeReturnsWhenOneListenerStops`, `TestServeErrorGoesThroughTheShutdown` (app: `memSink` com `hang` no lugar do `heldSink`/`sink=sqlite` de F) | conexão recusada; `Serve` esperando; `exit 1, want 3` e 5 de 5 sem entrega | sem `retryListener`; `Serve` esperando todos; `return ExitConfig` antes do shutdown |
+| W 6 endereço exato (contestável) | §13.5 | `TestPerIPLimitCountsTheExactAddress` (trava) | passa por desenho | chave por /64 |
+| W 8 ring cobra o buffer | §7.2, §12.2, §12.4 | `TestMemoryChargesTheRetainedBuffer`, `TestMemoryGivesBackWhatItCharged`, `TestItemOverheadCoversTheStruct`, `TestMemoryByteCeiling` ajustado | `bytes = 100, want 16640`; `Bytes:300, want 33280` | `it.Size()` no `Enqueue`; `it.Size()` no `Commit` |
+| W 30 retidos no teto de itens | §7.2 | `TestMemoryHeldItemsCountAgainstTheCeiling` | `err = <nil>, want ErrFull` | `capItems+1000` |
+| W 10 worker sobrevive ao `Dequeue` | §8.1 passo 1 | `TestWorkersSurviveTransientDequeueErrors`, `TestWorkersStopOnTheEndsOfTheRing` (sem `ErrNoBacklog`) | `delivered 0 of 5` | `dequeueEnds` sempre verdadeiro |
+| W 11 `sink.batch_max_bytes` | §8.1, §9.2, §13.5 | `TestSplitByBytes`, `TestWorkersSplitABatchByBytes`, `TestWorkersSendAnEnvelopeAboveTheCeilingAlone`, `TestWorkersHoldTheRestOfTheBatchWhileAPieceRetries`, `TestSinkBatchMaxBytes`, `TestBootWritesInPiecesUnderBatchMaxBytes` (dump e workers; novo, `internal/app/batch_bytes_test.go`) | `writes = [[4 4197748]]`; `[[3 68127]]`; lote dado como resolvido; `default = 0`; `a write of 5 items` | `n := len(rest)`; `unhold` que apaga tudo; sem o teto de 256 MiB; app sem `BatchMaxBytes`; boot sem o corte |
+| W 29 guardas em `t.Fatalf` | §15.1 | `describe_test.go` (3) | com o bug de volta: `SKIP`, `ok` | `lastElem` no JA3; `hostPort` não zerado; `DisableGeneralOptionsHandler: false` |
+| W 11 (P) o aviso de 1 GiB | §8.5.4 | `TestWorstBatchBytes`, `TestPostgresByteCeilingWarning` ajustados | `pieces of at most 256 MiB must not warn` | `WorstBatchBytes` sem o termo |
+| W 15 ambiente libpq | §8.5.2 | `TestNewPostgresParsesWithoutTheLibpqEnvironment` | `sslmode is invalid`, `invalid port`, `failed to read service`, `invalid connect_timeout`; `channel_binding="require"` sobreviveu; `DialFunc` do pgx | parse cru; sem `DialFunc` |
+| W 20 (P) U+2028/U+2029 crus | §9.2 | 2 casos em `TestDamagedLineInTheMiddleIsSkipped` | `recovered 3 items` ×2 | sem a cláusula |
+| W 24 `NaN` | §13.5 | `TestNonFiniteNumbersAreRefused` (`pending_config_test.go`, novo) | `[--ring.high_water=NaN] was accepted` | sem `IsNaN`/`IsInf` |
+| W 25 `admin.bind` vazio | §11 | `TestEmptyAdminBindIsRefused` | `[--admin.bind=] was accepted` | sem a regra; `WARN` sem `Enabled` |
+| W 26 dump com aspas | §13.2 | `TestDumpINIRoundTripsQuotedAndPaddedValues`, `TestQuoteINI` | `the dump did not read back` | `quoteINI` identidade |
+| W 27 CA no compose | §13.6 | `TestComposeForwardsEverySinkVariable`, `TestComposeImagesArePinned` (`compose_test.go`, novo) | `does not forward WHS_SINK_POSTGRES_TLS_CA` | a linha do `TLS_CA` tirada |
+| W 29 (P) papel só com `INSERT` | §15.1, §8.5.5 | `TestPostgresHealthValidatesTheRole` (PG real) | com o bug de volta: `SKIP`, `ok` | `!canSelectUUID` ignorado |
+
+A armadilha de 2026-10-14 (registrada pelo grupo B de W): o texto `\u2028`
+digitado na ferramenta de edição vira o caractere cru. Os testes novos usam
+`\xe2\x80\xa8` no Go, e a contagem de U+2028/U+2029 crus por arquivo foi
+conferida igual à de antes.
+
+**Rodadas.** `gofmt -l .` vazio e `go vet ./...` limpo. `go test -race
+-count=1 -timeout 1500s ./...` com `tasks/infra/env.sh` (PostgreSQL 18 real em
+25432): duas rodadas completas verdes (52 s e 55 s), nenhuma refeita.
+
+### Revisão independente da família webhook (2026-10-14)
+
+Os achados de `tasks/review-web-{http,ring,sinks}.md` que pediam código (e as
+três notas do coordenador sobre a sonda do `sink=sqlite`, vindas das revisões
+das famílias syslog e RELP). Ordem por item: SPEC, teste falhando contra o
+código de antes, correção, mutação (só a correção revertida). Os só
+documentados estão em §8 e na seção do assunto da SPEC.
+
+| Item (W) | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| W 31 — o shutdown por erro do `Serve` tolera o primeiro sinal (§10.3) | `TestServeErrorGoesThroughTheShutdown/held sink, then one signal: still dumped, exit 3` | `exit 130, want 3` | o ramo `serveErr` com `tolerateFirst=false` |
+| W 32 — prazo de escrita limpo só com `read_timeout > 0` (§13.5) | `TestWriteDeadlineIsKeptWithoutReadTimeout`, `TestSlowH2CUploadIsBoundedWithoutReadTimeout` (h2c real) | `deadline cleared on entry = true`; `status 200 … outlived write_timeout` | a condição antiga |
+| W 34 — a porta do dump aceita só os escapes do serializador (§9.2) | `TestOnlyOurEscapes` (reescrito segundo a SPEC), controle do escritor com `\r`, `\x1f`, `\x7f` | 10 casos `= true, want false` | a função antiga |
+| W 35 — piso de `ring.max_bytes` com `ring=memory` (§7.2) | `TestRingMaxBytesCoversTheLargestEvent` | `--ring.max_bytes=65791 … was accepted` | a condição com `&& false` |
+| W 39 — `WaitReady` dorme `min(backoff, restante)` (§10.1) | `TestWaitReadyDoesNotSleepPastItsDeadline` | `took 2.00s with a 300ms budget` | `time.After(backoff)` |
+| W 40 — `admin.bind` com porta 1–65535 (§11) | `TestEmptyAdminBindIsRefused` (+ `127.0.0.1:`, `:`, `[::1]:`, `localhost:abc`, `:0`, `:65536`, `:+80`, `:080`) | `--admin.bind=127.0.0.1: … was accepted` | sem o `validPort` |
+| W 41 — byte de controle num valor de texto é exit 1 (§13.2) | `TestControlBytesInTextValuesAreRefused` | as 4 entradas `was accepted` | a checagem desligada |
+| T2 — o resto do lote retido com falha no pedaço do meio, e com fatal (§8.1 passo 3) | `TestWorkersHoldTheRestOfTheBatchWhileAPieceRetries` (6 itens, 3 pedaços) | (lacuna de teste: passa no código) | `hold` por pedaço |
+
+**Rodadas.** `gofmt -l .` vazio e `go vet ./...` limpo. Duas rodadas completas `go test -race -count=1 -timeout 1500s ./...` (`tasks/run2.sh go-webhook-pg-server rev`, PostgreSQL 18 real): as duas verdes, nenhuma refeita.

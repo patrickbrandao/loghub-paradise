@@ -436,6 +436,21 @@ func TestErrorAnswersBeforeTheUUIDArePlainText(t *testing.T) {
 		{name: "429 ring full, fast check", code: http.StatusTooManyRequests,
 			stub: &stubRing{stats: ring.Stats{Items: 8, CapItems: 8}},
 			req:  func() *http.Request { return httptest.NewRequest("POST", "/hook", strings.NewReader("x")) }},
+		// SPEC §4.3 step 9: bytes count too, against the declared length as
+		// a lower bound of the event.
+		{name: "429 ring full by bytes, fast check", code: http.StatusTooManyRequests,
+			stub: &stubRing{stats: ring.Stats{Bytes: 1 << 20, CapBytes: 1 << 20, CapItems: 8}},
+			req:  func() *http.Request { return httptest.NewRequest("POST", "/hook", strings.NewReader("x")) }},
+		{name: "429 ring full by bytes, no declared length", code: http.StatusTooManyRequests,
+			stub: &stubRing{stats: ring.Stats{Bytes: 1 << 20, CapBytes: 1 << 20, CapItems: 8}},
+			req: func() *http.Request {
+				return httptest.NewRequest("POST", "/hook", io.MultiReader(strings.NewReader("x")))
+			}},
+		{name: "429 declared body does not fit", code: http.StatusTooManyRequests,
+			stub: &stubRing{stats: ring.Stats{Bytes: 1<<20 - 10, CapBytes: 1 << 20, CapItems: 8}},
+			req: func() *http.Request {
+				return httptest.NewRequest("POST", "/hook", strings.NewReader(strings.Repeat("b", 100)))
+			}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -472,6 +487,17 @@ func TestErrorAnswersBeforeTheUUIDArePlainText(t *testing.T) {
 		if e := envelopeOf(t, s, stub); e.Payload.Method != r.Method {
 			t.Errorf("control: method %q, want %q", e.Payload.Method, r.Method)
 		}
+	}
+
+	// The control of the byte check: the same 100 bytes with room to spare
+	// reach the ring, so the refusal above is about the declared length.
+	stub := &stubRing{stats: ring.Stats{Bytes: 1<<20 - 10000, CapBytes: 1 << 20, CapItems: 8}}
+	s, _ := testServer(t, stub, Config{})
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, onSocket(httptest.NewRequest("POST", "/hook", strings.NewReader(strings.Repeat("b", 100))),
+		"198.51.100.20:40000", "192.0.2.10:8080"))
+	if w.Code != http.StatusOK {
+		t.Errorf("control: 100 bytes with 10000 free: status %d, want 200", w.Code)
 	}
 }
 
@@ -732,4 +758,66 @@ func TestReadBodyDoesNotGrowAFullBufferAtEOF(t *testing.T) {
 		t.Fatalf("unknown length: err %v, %d bytes read, equal %v", err, len(buf), bytes.Equal(buf, body))
 	}
 	envelope.PutBody(buf, class)
+}
+
+// shortReader hands out its data and then EOF, and records the largest read
+// it was asked for: the size of the buffer the handler offered.
+type shortReader struct {
+	data    []byte
+	maxRead int
+}
+
+func (r *shortReader) Read(p []byte) (int, error) {
+	r.maxRead = max(r.maxRead, len(p))
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// SPEC §12.2: the declared Content-Length only pre-sizes the body up to 64
+// KiB; past that the buffer grows with bytes that ARRIVED, doubling and never
+// past the declared length. Sizing by the header let a request that declared 5
+// MiB and sent nothing hold 5 MiB until read_timeout -- 250 of them per h2c
+// connection.
+func TestReadBodyAllocatesOnlyWhatArrives(t *testing.T) {
+	s, _ := testServer(t, &stubRing{}, Config{})
+
+	// A peer that promises 5 MiB and sends 10 bytes.
+	rd := &shortReader{data: []byte("0123456789")}
+	r := httptest.NewRequest("POST", "/", rd)
+	r.ContentLength = 5 << 20
+	buf, class, err := s.readBody(r)
+	if err != nil || string(buf) != "0123456789" {
+		t.Fatalf("err %v, body %q", err, buf)
+	}
+	if cap(buf) > 64<<10 || rd.maxRead > 64<<10 {
+		t.Errorf("declared 5 MiB, sent 10 bytes: buffer cap %d, largest read offered %d; want both <= 64 KiB",
+			cap(buf), rd.maxRead)
+	}
+	envelope.PutBody(buf, class)
+
+	// Honest bodies above the pre-size: the growth lands on the declared
+	// length exactly, not on the next doubling past it.
+	for _, size := range []int{100 << 10, 1 << 20, 5 << 20} {
+		body := make([]byte, size)
+		for i := range body {
+			body[i] = byte(i * 7)
+		}
+		r := httptest.NewRequest("POST", "/", bytes.NewReader(body))
+		r.ContentLength = int64(size)
+		buf, class, err := s.readBody(r)
+		if err != nil || !bytes.Equal(buf, body) {
+			t.Fatalf("%d: err %v, %d bytes read, equal %v", size, err, len(buf), bytes.Equal(buf, body))
+		}
+		if size > envelope.PoolMaxBytes && cap(buf) != size {
+			t.Errorf("%d: buffer cap %d, want exactly the declared length", size, cap(buf))
+		}
+		if cap(buf) > max(size, envelope.PoolMaxBytes) {
+			t.Errorf("%d: buffer cap %d grew past the declared length", size, cap(buf))
+		}
+		envelope.PutBody(buf, class)
+	}
 }

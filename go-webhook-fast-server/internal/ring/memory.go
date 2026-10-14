@@ -40,6 +40,35 @@ type Memory struct {
 	sealMu sync.RWMutex
 }
 
+// ItemOverhead is what one queued item holds besides its JLH buffer, on
+// 64-bit, rounded to malloc size classes:
+//
+//	 80  the envelope.Item struct (unsafe.Sizeof is 80 with Charged, measured
+//	     2026-10-14): ID and Env headers, the pool class, the two atomic
+//	     flags, the done pointer, RowID and Charged.
+//	 48  the ID string's bytes: a canonical uuid is 36.
+//	112  the done channel (hchan plus one buffered error) when the handler
+//	     asked for one; counted always, because the ceiling must hold in the
+//	     worst case, not the average.
+//	  8  the item's slot in this ring's channel buffer.
+//	---
+//	248  rounded up to 256.
+//
+// TestItemOverheadCoversTheStruct fails if the struct outgrows the number.
+const ItemOverhead = 256
+
+// charge is what an item costs THIS ring in memory (SPEC §7.2): the whole
+// buffer of the pool class the JLH was written into, not len(Env). The pool
+// classes are 4x apart (SPEC §12.2), so a 2.4 KiB JLH in a 16 KiB buffer
+// holds 16 KiB, and a ceiling that counted 2.4 let max_bytes worth of such
+// events hold four to seven times max_bytes of RAM -- past GOMEMLIMIT and
+// the container's limit (SPEC §12.4).
+//
+// Only the memory ring counts this way. ring=sqlite counts len(Env), which is
+// what it STORES, so that the boot recount (SUM(nbytes)) agrees with the live
+// accounting.
+func charge(it *envelope.Item) int64 { return int64(cap(it.Env)) + ItemOverhead }
+
 // NewMemory builds the ring. Both ceilings are enforced; whichever is reached
 // first produces ErrFull.
 func NewMemory(capItems int, capBytes int64, batchDelay time.Duration) *Memory {
@@ -58,11 +87,12 @@ func (r *Memory) Mode() string { return "memory" }
 
 // Enqueue accepts the item or returns ErrFull at once.
 //
-// The byte ceiling is claimed BEFORE the channel send and released if the send
+// Both ceilings are claimed BEFORE the channel send and released if the send
 // fails, so the accounting can never drift above what is actually held. Both
-// ceilings matter: with 200-byte bodies the item count is what binds, and with
-// 5 MiB bodies the byte count is. Enforcing only items would allow
-// 65536 x 5 MiB = 320 GiB of theoretical exposure.
+// matter: with small bodies the item count -- or, now that the retained
+// buffer is what is charged, the byte count -- binds, and with 5 MiB bodies the
+// byte count does. Enforcing only items would allow 65536 x 5 MiB = 320 GiB
+// of theoretical exposure.
 func (r *Memory) Enqueue(ctx context.Context, it *envelope.Item) error {
 	r.sealMu.RLock()
 	defer r.sealMu.RUnlock()
@@ -70,17 +100,32 @@ func (r *Memory) Enqueue(ctx context.Context, it *envelope.Item) error {
 		return ErrClosed
 	}
 
-	size := it.Size()
+	// Both ceilings count the same population: accepted and not yet
+	// committed, which includes the batches the workers hold while they retry
+	// (SPEC §7.2). The channel alone only bounds what is still QUEUED: with a
+	// batch held, a capacity-3 ring accepted a fourth event and reported 4/3,
+	// up to workers x batch past capacity_items, while the byte ceiling,
+	// counted until Commit, said otherwise. The channel buffer is capItems
+	// long, so a send under this count never finds it full; the default
+	// branch below is a guard, not a path.
+	if r.items.Add(1) > r.capItems {
+		r.items.Add(-1)
+		return ErrFull
+	}
+	// Recorded in the item: Commit and Drain give back this number, never a
+	// recomputation from a buffer that Release may already have emptied.
+	size := charge(it)
+	it.Charged = size
 	if r.capBytes > 0 {
 		if r.bytes.Add(size) > r.capBytes {
 			r.bytes.Add(-size)
+			r.items.Add(-1)
 			return ErrFull
 		}
 	}
 
 	select {
 	case r.ch <- it:
-		r.items.Add(1)
 		return nil
 	default:
 		// Never block: a queued handler would be a hidden buffer with none of
@@ -88,6 +133,7 @@ func (r *Memory) Enqueue(ctx context.Context, it *envelope.Item) error {
 		if r.capBytes > 0 {
 			r.bytes.Add(-size)
 		}
+		r.items.Add(-1)
 		return ErrFull
 	}
 }
@@ -154,14 +200,14 @@ func (r *Memory) Dequeue(ctx context.Context, n int) ([]*envelope.Item, error) {
 	return out, nil
 }
 
-// Commit releases the accounting for a delivered batch. The buffers themselves
-// are released by the caller, which is the one place that owns them
-// (SPEC §12.3).
+// Commit releases the accounting for a delivered batch: one item each, and the
+// bytes Enqueue recorded in it (SPEC §7.2). The buffers themselves are
+// released by the caller, which is the one place that owns them (SPEC §12.3).
 func (r *Memory) Commit(items []*envelope.Item) error {
 	var n, b int64
 	for _, it := range items {
 		n++
-		b += it.Size()
+		b += it.Charged
 	}
 	r.items.Add(-n)
 	if r.capBytes > 0 {

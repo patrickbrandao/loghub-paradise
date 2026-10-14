@@ -137,6 +137,59 @@ func TestPerIPLimitRefusesExcessAndKeepsServingOthers(t *testing.T) {
 	}
 }
 
+// textAddr is a remote address that prints exactly as given, so a peer can
+// arrive IPv4-mapped or zoned the way a dual-stack socket reports it
+// (net.TCPAddr would print a mapped address in its IPv4 form).
+type textAddr string
+
+func (a textAddr) Network() string { return "tcp" }
+func (a textAddr) String() string  { return string(a) }
+
+// SPEC §13.5 (decided, contestable: docs/DECISOES.md, port of W and F of
+// 2026-10-14; the same as go-webhook-fast-server, DECISOES 4c):
+// max_conns_per_ip counts the EXACT peer address, a /128 in IPv6. Two
+// addresses of one /64 are two quotas; counting by prefix was declined,
+// because a /64 can be a whole LAN of emitters and webhook senders leave from
+// pools of neighbouring addresses. An IPv4-mapped peer is the same key as its
+// IPv4 form, so the mapping is no way around the cap. This test pins the rule,
+// so a change to it is a deliberate one.
+func TestPerIPLimitCountsTheExactAddress(t *testing.T) {
+	fl := newFakeListener(8)
+	var refused int
+	ln := newLimitListener(fl, 0, 1, func() { refused++ })
+
+	offered := []string{
+		"[2001:db8::1]:1001",
+		"[2001:db8::2]:1002",      // same /64, another address: its own quota
+		"[2001:db8::1]:1003",      // the first again: refused
+		"192.0.2.7:1004",          // IPv4
+		"[::ffff:192.0.2.7]:1005", // the same peer, IPv4-mapped: refused
+	}
+	conns := make([]*fakeConn, len(offered))
+	for i, a := range offered {
+		conns[i] = &fakeConn{remote: textAddr(a), closed: make(chan struct{})}
+		fl.offer(conns[i])
+	}
+	_ = fl.Close() // Accept ends with ErrClosed once the five are handled
+
+	var got []string
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			break
+		}
+		got = append(got, c.RemoteAddr().String())
+	}
+	want := []string{"[2001:db8::1]:1001", "[2001:db8::2]:1002", "192.0.2.7:1004"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("accepted %v, want %v", got, want)
+	}
+	if refused != 2 || !conns[2].wasClosed() || !conns[4].wasClosed() {
+		t.Fatalf("%d refusals (third closed %v, fifth closed %v), want the repeated /128 and the mapped IPv4",
+			refused, conns[2].wasClosed(), conns[4].wasClosed())
+	}
+}
+
 // The per-IP table must not grow by one entry for every address ever seen; a
 // long-running server facing the internet would otherwise leak unboundedly.
 func TestPerIPTableDoesNotLeak(t *testing.T) {

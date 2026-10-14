@@ -669,10 +669,18 @@ func TestPostgresByteCeilingWarning(t *testing.T) {
 		t.Errorf("the defaults are bounded by ring.max_bytes and must not warn: %v", l.Warnings)
 	}
 
+	// 2 GiB by count and by the ring, but written in pieces of
+	// sink.batch_max_bytes (SPEC §8.1 step 2): no batch reaches 1 GiB.
 	l = load(t, Options{Args: []string{
 		"--server.max_body_bytes=8MiB", "--sink.batch=256", "--ring.max_bytes=4GiB"}})
+	if hasWarning(l.Warnings, "ceiling of a single protocol parameter") {
+		t.Errorf("pieces of at most 256 MiB must not warn: %v", l.Warnings)
+	}
+	// One envelope above 1 GiB goes alone, above any ceiling: that warns.
+	l = load(t, Options{Args: []string{
+		"--server.max_body_bytes=1GiB", "--ring.max_bytes=4GiB"}})
 	if !hasWarning(l.Warnings, "ceiling of a single protocol parameter") {
-		t.Errorf("2 GiB per batch must warn: %v", l.Warnings)
+		t.Errorf("an envelope above 1 GiB must warn: %v", l.Warnings)
 	}
 }
 
@@ -694,7 +702,8 @@ func TestDumpRedactsPostgresPassword(t *testing.T) {
 }
 
 // SPEC §8.5.4: the worst batch -- sink.batch envelopes, capped by
-// ring.max_bytes -- and the largest envelope, which is also the ceiling of
+// ring.max_bytes and sink.batch_max_bytes, never less than one envelope --
+// and the largest envelope, which is also the ceiling of
 // one line of the emergency dump (SPEC §9.2).
 func TestWorstBatchBytes(t *testing.T) {
 	l := load(t, Options{})
@@ -703,9 +712,19 @@ func TestWorstBatchBytes(t *testing.T) {
 	if got := MaxEventBytes(l.Config); got != event {
 		t.Errorf("MaxEventBytes = %d, want %d", got, event)
 	}
-	l = load(t, Options{Args: []string{"--ring.max_bytes=64MiB"}})
+	l = load(t, Options{Args: []string{"--ring.max_bytes=64MiB", "--sink.batch_max_bytes=256MiB"}})
 	if got := WorstBatchBytes(l.Config); got != 64<<20 {
 		t.Errorf("ring capped: %d, want ring.max_bytes", got)
+	}
+	// SPEC §8.1 step 2: a write is a piece under sink.batch_max_bytes, unless
+	// one envelope alone is larger, and then it goes alone.
+	l = load(t, Options{})
+	if got := WorstBatchBytes(l.Config); got != 16<<20 {
+		t.Errorf("defaults: %d, want sink.batch_max_bytes (16 MiB)", got)
+	}
+	l = load(t, Options{Args: []string{"--sink.batch_max_bytes=1KiB"}})
+	if got := WorstBatchBytes(l.Config); got != event {
+		t.Errorf("a ceiling below one envelope: %d, want the envelope that goes alone %d", got, event)
 	}
 	l = load(t, Options{Args: []string{"--sink.batch=2"}})
 	if got := WorstBatchBytes(l.Config); got != 2*event {

@@ -62,6 +62,7 @@ só devem diferir onde SN e SP diferem; nenhum dos dois lê o diretório do outr
 | 12 | Prazo da reingestão | **Um `boot_timeout` sem progresso** (todo pedaço entregue adia o prazo), não um prazo fixo desde o começo como no SN | Revisão desta criação: uma reingestão saudável de um dump grande saía com 3 no primeiro soluço depois do `boot_timeout`, sem retentativa, e republicava o arquivo a cada boot. Um NATS que não aceita nada continua limitado a um `boot_timeout` | §12.2 |
 | 13 | Aborto durante o dump | A contagem passa por um mutex com o aborto; o dump que o aborto contou como perdido é **abandonado** (o temporário é removido) | Revisão desta criação: 10 contadas perdidas para 5, e um dump contado como perdido que voltava no boot seguinte | §13.4, §20.26 |
 | 14 | `WithPublishAsyncMaxPending` | `2 × sink.workers × sink.batch` (o SN usa 1×; o R somava o `ring.max_inflight`) | Revisão desta criação: os futuros de um pedaço contaminado contam até o próprio prazo; sem folga, uma retentativa rápida parava na janela cheia | §10.7 |
+| 15 | Dump publicado no instante do aborto (antiga pendência §22.1 item 2) | **Aceito** (decidido em 2026-10-14; contestável): um dump publicado entre a última conferência do abandono e o `link` fica contado em `reason="abort"` **e** no disco, e o boot seguinte o entrega — sobrecontagem, nunca perda. O aborto **não** segura o `lossMu` durante o `link` e o `fsync` do diretório | O contrato do aborto é "agora": esperar um disco que pode estar preso trocaria uma sobrecontagem de microssegundos por um `SIGQUIT` que não sai. A janela é inerente a qualquer `os.Exit` assíncrono a uma escrita | §13.4 |
 
 ---
 
@@ -262,3 +263,22 @@ E1, E2 e A2-minor. A mesma implementação no irmão (regra de sincronia).
   sessão que fecha nunca tiveram `200`, e o `librelp` as retransmite.
 - **A2-minor**: não se aplica. O comentário de `closeTransports` já diz
   "AT ONCE", e não há ring Redis.
+
+---
+
+## 6. Rodada das pendências conhecidas (2026-10-14)
+
+As nove pendências de SPEC §22.1 (e uma aresta nova) saíram da lista, cada uma
+com a regra na seção do assunto. Corrigidas, com teste que falhava antes e
+mutação: o aborto fecha o ring antes de contar (§13.4); piso de
+`ring.max_bytes` = classe do pool de `syslog.max_message_bytes` + 256 B, a
+direção do RP, não a da menor classe (§13.2, §15.1); `admin.bind` × `listen.tcp`
+pelo `sameStreamSocket` do R (§13.2, §14); discagem da reconexão sem log e
+veredito de TLS só com servidor único, `soleServer` do R/S (§10.7); rótulo
+`backpressure` do idle com transação segurada e `WARN` de
+`idle_timeout < backpressure_timeout`, **sem mudar o efeito** (§5.4, §13.2); a
+chave derivada fora do relato do `SIGHUP` (§16.3). Registradas como regra ou
+lacuna, sem mudança de código: o *padding* dos contadores (TESTING §8), o dump
+publicado no aborto (decisão 15), `kind="fatal"` com o boot cancelado (§14.1).
+O que vale para R, S, SP e SN está em `tasks/port-to-R-S-SP-SN.md` da raiz.
+

@@ -56,6 +56,7 @@ decisão abaixo e fica escrita na SPEC com o motivo.
 | 16 | Sink padrão | **`nats` em `jetstream`**: o LogHub é o eventbus. |
 | 17 | mTLS | `tls.client_auth = optional` (padrão) \| `require` \| `none`. Em `optional` o servidor pede o certificado; com `tls.client_ca` verifica quando ele vem; sem CA só registra `peer-subject` e `peer-fingerprint` (para pinning a jusante). |
 | 18 | Opcionais | Entram: **charset legado** (`SYSLOG_LEGACY_CHARSET = cp1252 \| latin1`, tabela própria, sem `golang.org/x/text`); **PROXY protocol v1/v2** no TCP e no TLS (`off \| optional \| required`, só de pares confiáveis, parser próprio com fuzz); **subjects por facility/severity** (opt-in, só NATS: `loghub.{space}.syslog.<facility>.<severity>`; o padrão continua o subject exato `loghub.{space}.syslog`). Fica fora: `space` por listener/rede. |
+| 19 | Sonda do `sink=sqlite` com a escritora ocupada (2026-10-14) | A sonda espera a trava da escritora **só dentro do próprio prazo** (`sink.health_timeout`). Não obtida no prazo e o último `Write` terminou sem erro: **UP sem tocar o banco**; o último `Write` falhou (qualquer erro) ou nunca houve `Write`: DOWN, como antes. A mesma decisão do item 23 do `go-webhook-server`: um pedaço mais longo que o prazo da sonda dava DOWN (e backpressure) com o banco íntegro. SPEC §10.4. Revisão independente de 2026-10-14 (A1, A2): a escritora ocupada só conta UP enquanto o pedaço em curso segura a trava há no máximo `sink.op_timeout + sink.health_timeout` (um `fsync` preso no `COMMIT`, que não recebe contexto, deixava o sink em UP para sempre), e a falha do próprio heartbeat conta como `Write` falho (sem isso a sonda alternava DOWN/UP e zerava os fusíveis). |
 
 ---
 
@@ -283,6 +284,30 @@ escolhas abaixo são minhas, feitas ao aplicá-las; contestáveis.
 - **TLS do NATS no primeiro `CONNECT`:** "pool" é mais de uma entrada em
   `sink.nats.urls` (os servidores anunciados por um cluster só existem depois
   da primeira conexão); depois dela, `nc.Servers()`.
+
+### Porte das pendências do RP/RN (2026-10-14)
+
+O usuário aprovou portar e listar o que a triagem achou igual aqui
+(`tasks/port-to-R-S-SP-SN.md`). Corrigidas, com teste e mutação: o aborto
+fecha o ring antes de contar (só `memory`/`none`; os persistentes não são
+contados nem fechados, porque o `Close` deles espera disco e cliente; SPEC
+§13.4); piso de `ring.max_bytes` na medida do ring **efetivo** (com `memory`, a
+classe do pool + 384 B; com `sqlite`/`redis`, o próprio `max_message_bytes`,
+que é o que eles contam; com `none`, sem piso; §13.2, §15.1) — escolha minha,
+contestável: a receita aceitava manter `< 1` fora do `memory`, e derivar da
+medida de cada modo fecha o mesmo defeito neles; `admin.bind` contra
+`listen.tcp` **e** `listen.tls` (§13.2, §14); a chave derivada fora do relato
+do `SIGHUP` (`emergency.dir`, `ring.sqlite.path`, `sink.sqlite.path`,
+`sink.<tipo>.pool_size`; §16.3); e, achado do porte, o `network` cortado pelo
+cancelamento do boot no `Instrumented.Deliver`, que o S contava antes de olhar
+o contexto (§14.1). Travadas sem mudança de comportamento: a discagem falha da
+reconexão NATS não é logada (§10.7). Registradas como regra (decididas,
+contestáveis, como no RP/RN): a falha ao remover um dump entregue é só `ERROR`
+(§12.2); SQLSTATE fora da tabela (`P0001`) é `network` (§10.5, §20.18); o dump
+publicado no instante do aborto fica contado e no disco, e o aborto não espera
+o disco (§12.1); `kind="fatal"` conta a recusa fatal mesmo com o boot cancelado
+(§14.1); os contadores da recepção sem *padding* são lacuna de medição
+(TESTING §8).
 
 ---
 

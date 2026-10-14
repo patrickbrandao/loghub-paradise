@@ -2,12 +2,15 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/clientip"
+	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/obs"
 )
 
 // listen opens a TCP listener, optionally with SO_REUSEPORT so several
@@ -30,6 +33,65 @@ func listen(ctx context.Context, addr string, reusePort bool) (net.Listener, err
 		}
 	}
 	return lc.Listen(ctx, "tcp", addr)
+}
+
+// The pause between two failed accepts doubles from acceptRetryMin to
+// acceptRetryMax; a success starts the next failure over at the minimum.
+const (
+	acceptRetryMin = 5 * time.Millisecond
+	acceptRetryMax = time.Second
+)
+
+// retryListener retries every accept error except the listener's own close
+// (SPEC §10.3), under the connection limiter, around every public socket.
+//
+// net/http's Serve retries only Temporary() errors and returns on anything
+// else -- ENOBUFS, ENOMEM, a firewall's EPERM, EPROTO -- and a returned Serve
+// took the process down without draining: with ring=memory the events already
+// answered 200 vanished uncounted. The listener itself is still good after
+// any of those, so giving up is never the right answer; the syslog/RELP
+// family's accept loop never gives up either. The pause keeps a persistent
+// failure from spinning, and the WARN is sampled because EMFILE under a
+// connection flood lasts, and one line per retry would flood the log.
+type retryListener struct {
+	net.Listener
+	log     *obs.Logger
+	sampler *obs.Sampler
+
+	closeOnce sync.Once
+	done      chan struct{}
+}
+
+func newRetryListener(l net.Listener, log *obs.Logger) *retryListener {
+	return &retryListener{Listener: l, log: log, sampler: obs.NewSampler(10 * time.Second),
+		done: make(chan struct{})}
+}
+
+func (l *retryListener) Accept() (net.Conn, error) {
+	delay := acceptRetryMin
+	for {
+		c, err := l.Listener.Accept()
+		if err == nil || errors.Is(err, net.ErrClosed) {
+			return c, err
+		}
+		if ok, suppressed := l.sampler.Allow(); ok {
+			l.log.Warn("accept failed; retrying", "addr", l.Addr().String(), "error", err,
+				"suppressed_since_last", suppressed)
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-t.C:
+		case <-l.done:
+			t.Stop()
+			return nil, net.ErrClosed
+		}
+		delay = min(delay*2, acceptRetryMax)
+	}
+}
+
+func (l *retryListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
 }
 
 // connLimiter enforces server.max_conns and server.max_conns_per_ip for the
@@ -56,7 +118,11 @@ func listen(ctx context.Context, addr string, reusePort bool) (net.Listener, err
 // Note the per-IP cap is keyed on the TCP peer, not on the resolved client
 // address: no request has been read yet, so no forwarding header exists. Behind
 // a single reverse proxy every connection shares one peer, which makes this
-// limit useless there -- hence the default of 0.
+// limit useless there -- hence the default of 0. The key is the EXACT address,
+// a /128 in IPv6, IPv4-mapped folded into IPv4 (SPEC §13.5, a contestable
+// decision): counting by IPv6 prefix was declined, because a /64 can be a
+// whole LAN of emitters and webhook senders leave from pools of neighbouring
+// addresses; against a hostile /64 there are max_conns and the firewall.
 type connLimiter struct {
 	sem     chan struct{}
 	perIP   int

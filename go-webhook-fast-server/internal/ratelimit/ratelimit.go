@@ -109,6 +109,13 @@ func nextPow2(n int) int {
 // the keys would otherwise describe prefixes of a different width and the
 // accounting would be meaningless. Rate, burst, exemptions and the ceiling can
 // all change without losing state.
+//
+// "Every bucket" is every bucket present at the Reset. An Allow that loaded
+// the old Params before the Store can still insert, after the Reset, one
+// bucket keyed at the old width. It is harmless: the counter stays exact (the
+// insertion reserves its slot under the shard lock), the bucket only limits
+// that one old-width key, and the next sweep removes it once full (independent
+// review of 2026-10-14).
 func (l *Limiter) SetParams(p Params) {
 	l.setMu.Lock()
 	old := l.params.Load()
@@ -125,14 +132,20 @@ func (l *Limiter) SetParams(p Params) {
 func (l *Limiter) Params() Params { return *l.params.Load() }
 
 // Reset drops every bucket.
+//
+// The counter is discounted shard by shard, under the lock of the shard being
+// cleared, never zeroed at the end (SPEC §6.3). An Allow may insert into a
+// shard this loop has already cleared while it is still walking the others; a
+// final Store(0) outside the locks erased that bucket from the count, the next
+// sweep drove the counter negative, and max_buckets let one prefix too many in.
 func (l *Limiter) Reset() {
 	for i := range l.shards {
 		s := &l.shards[i]
 		s.mu.Lock()
+		l.count.Add(-int64(len(s.m)))
 		clear(s.m)
 		s.mu.Unlock()
 	}
-	l.count.Store(0)
 }
 
 // Len is the number of tracked prefixes, exported as whs_ratelimit_buckets.
@@ -186,13 +199,16 @@ func (l *Limiter) Allow(addr netip.Addr) (bool, time.Duration) {
 		// The ceiling exists so hostile key churn cannot exhaust memory. Past
 		// it new prefixes pass unlimited, which is visible as Len() pinned at
 		// the maximum.
-		if l.count.Load() >= int64(p.MaxBuckets) {
+		//
+		// The slot is reserved with a compare-and-swap before the bucket
+		// exists (SPEC §6.3). A load followed by an add is atomic only per
+		// shard: inserts on different shards all read max-1 and all went in.
+		if !l.reserve(int64(p.MaxBuckets)) {
 			s.mu.Unlock()
 			return true, 0
 		}
 		b = &bucket{tokens: p.Burst, lastNS: now}
 		s.m[key] = b
-		l.count.Add(1)
 	} else {
 		refill(b, now, p.Rate, p.Burst)
 	}
@@ -206,6 +222,21 @@ func (l *Limiter) Allow(addr netip.Addr) (bool, time.Duration) {
 	s.mu.Unlock()
 
 	return false, retryAfter(deficit, p.Rate)
+}
+
+// reserve takes one slot under the max_buckets ceiling, or reports that none
+// is left. It is called with the inserting shard's lock held, so the slot and
+// the bucket appear together for every other holder of that lock.
+func (l *Limiter) reserve(ceiling int64) bool {
+	for {
+		c := l.count.Load()
+		if c >= ceiling {
+			return false
+		}
+		if l.count.CompareAndSwap(c, c+1) {
+			return true
+		}
+	}
 }
 
 // refill advances a bucket to now. Splitting this out keeps Allow and Sweep
@@ -256,17 +287,22 @@ func (l *Limiter) Sweep() int {
 	for i := range l.shards {
 		s := &l.shards[i]
 		s.mu.Lock()
+		n := 0
 		for k, b := range s.m {
 			refill(b, now, p.Rate, p.Burst)
 			if b.tokens >= p.Burst {
 				delete(s.m, k)
-				removed++
+				n++
 			}
 		}
+		// Discounted under this shard's lock, with the deletes (SPEC §6.3):
+		// one subtraction after the loop, outside every lock, could land
+		// after a concurrent Reset had already discounted the same buckets.
+		if n > 0 {
+			l.count.Add(int64(-n))
+		}
 		s.mu.Unlock()
-	}
-	if removed > 0 {
-		l.count.Add(int64(-removed))
+		removed += n
 	}
 	return removed
 }

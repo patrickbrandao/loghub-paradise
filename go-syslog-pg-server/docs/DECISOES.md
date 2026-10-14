@@ -260,12 +260,71 @@ E1, E2 e A2-minor. A mesma implementação no irmão (regra de sincronia).
 - **D1, a sonda sem conexão**: não se aplica. O `+ 1` basta com o ring só em
   memória (SPEC §10.5); registrado lá, com `TestPoolLeavesTheProbeAConnection`
   (três escritas presas, conferidas em `pg_stat_activity`).
-- **E2**: não se aplica. A moldura RFC 6587 cresce pelas classes 2/8/64 KiB e
-  nunca solta o buffer (não há `frameKeepCap` aqui), então não há
-  realocação por frame; o custo por conexão ociosa segue na pendência do
-  `streamReadBuffer` (SPEC §22.1, item 3).
-- **E1**: não se aplica. A leitura do cabeçalho PROXY não confere `closing`
-  (a pendência "shutdown contado como falha do PROXY" segue aberta); a forma
-  certa, se for corrigida, ficou escrita nela.
+- **E2**: em 2026-10-13 não se aplicava (a moldura nunca soltava o buffer, não
+  havia `frameKeepCap`). **Aplicado em 2026-10-14** (§9): com o `frameKeepCap`
+  portado, a liberação só acontece com o leitor vazio, na forma do S.
+- **E1**: em 2026-10-13 não se aplicava (a leitura do cabeçalho PROXY não
+  conferia `closing`). **Aplicado em 2026-10-14** (§9), na forma do S:
+  `closing && (err != nil || mode == required)`.
 - **A2-minor**: não se aplica. `closeTransports` fecha em ordem reversa, como o
   comentário diz, e não há ring Redis.
+
+## 9. Pendências conhecidas fechadas (2026-10-14)
+
+As quatro "Pendências conhecidas" de SPEC §22.1, triadas contra o
+`go-syslog-server` (S), que já as tinha resolvido no porte de 2026-10-13. Duas
+por correção, portada como está; duas por decisão do `go-relplog-server` (R,
+decisão 16 dele), que o S trouxe como contestável e que vem para cá do mesmo
+jeito: **o usuário não as decidiu para este módulo**. Mantêm a igualdade com o
+S, o R e o irmão (`go-syslog-pg-server` ↔ `go-syslog-nats-server`).
+
+### Correções (sem mudança de contrato)
+
+- **Shutdown contado como falha do PROXY** (SPEC §4.6): uma espera de cabeçalho
+  vencida pelo `Close` não conta nem loga nada; em `optional`, as linhas já no
+  leitor de um par sem cabeçalho seguem para a moldura. Forma do S
+  (`closing && (err != nil || mode == required)`), nunca a do R. Testes:
+  `TestProxyShutdownIsNotAProxyFailure`, `TestProxyOptionalBufferedLinesSurviveClose`
+  (este com a conferência, que o S não tem, de que `required` não conta
+  `absent` nem `reason="proxy"`).
+- **Custo fixo por conexão TCP** (SPEC §5.4, §15.1): leitor de 4 KiB e
+  `frameKeepCap` de 16 KiB, solto só com o leitor vazio. Testes:
+  `TestIdleTCPConnectionFixedCost`, `TestFramerReleasesALargeBuffer`,
+  `TestFramerKeepsTheBufferBetweenBufferedFrames`. Veio junto a busca do NUL só
+  antes do LF (`indexTerminator`, do S).
+- **Prazo vencido no meio da assinatura PROXY** (SPEC §4.6): aceito e
+  documentado, sem mudança — os bytes viram o começo de uma linha registrada;
+  nada se perde. Igual no S.
+
+### Decisões portadas (contestáveis)
+
+- **Teto por IP:** `tcp.max_conns_per_ip` conta o endereço **exato** (um /128 no
+  IPv6), documentado em SPEC §4.4. Contar por prefixo IPv6 foi recusado: um /64
+  pode ser uma LAN inteira de emissores, e uma cota por prefixo deixaria um
+  deles calar os outros. Contra um /64 hostil, `tcp.max_conns` e o firewall.
+  Teste: `TestPerIPLimitCountsTheExactAddress`.
+- **Offset ISO fora de faixa na RFC 3164:** segue a skill (aplicado como veio,
+  sem aviso), registrado em SPEC §6.5.1 e ressalvado em §6.9, **sem desvio
+  D9**: um desvio de conversão faria a mesma linha virar JLH diferente conforme
+  o transporte (o irmão RELP e o pai publicam o mesmo `type` no mesmo destino).
+  Se a skill passar a conferir, todos mudam juntos. Teste:
+  `TestRFC3164ISOOffsetIsNotRangeChecked`.
+
+---
+
+## 10. Porte das pendências do RP/RN (2026-10-14)
+
+O usuário aprovou portar e listar o que a triagem achou igual aqui
+(`tasks/port-to-R-S-SP-SN.md`); nenhum destes estava em §22.1. Corrigidas, com
+teste que falhava antes e mutação, na forma do RP/RN e em sincronia com o
+irmão: o aborto fecha o ring antes de contar (SPEC §13.4); piso de
+`ring.max_bytes` = classe do pool de `syslog.max_message_bytes` + 256 B (§13.2,
+§15.1); `admin.bind` × `listen.tcp` pelo `sameStreamSocket` do
+`go-syslog-server` (§13.2, §14); a chave derivada fora do relato do `SIGHUP`
+(§16.3). Registradas como regra ou lacuna, sem mudança de código (decididas,
+contestáveis, como no RP/RN): a falha ao remover um dump entregue é só `ERROR`
+(§12.2, travada agora por `TestRemovalFailureIsOnlyAnError`); o dump publicado
+no instante do aborto fica contado e no disco, e o aborto não espera o disco
+(§12.3, §13.4); `kind="fatal"` conta a recusa fatal mesmo com o boot cancelado
+(§14.1); SQLSTATE fora da tabela (`P0001`) é `network`, nunca descarte nem FATAL (§10.5, §20.18); os contadores da recepção sem *padding* são lacuna de medição
+(TESTING §8).

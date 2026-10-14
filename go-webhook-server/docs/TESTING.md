@@ -222,6 +222,29 @@ a interrompe; `TestValidationContext*` e `TestHealthChecksCarryTheirLifetime`
 provam as duas metades sem servidor, e `TestPostgresConfigCarriesTheValidationDeadline`
 a ligação com `sink.op_timeout`.
 
+A política de despejo (SPEC §8.2.5) pede um **segundo** Redis, com
+`--maxmemory-policy allkeys-lru`, em `WHS_TEST_REDIS_LRU_ADDR` (os testes que o
+usam pulam sem ele; o Redis normal precisa ser `noeviction` ou `volatile-*`):
+
+```bash
+docker run --rm -d -p 16380:6379 --name whs-test-redis-lru redis:7-alpine \
+  redis-server --maxmemory-policy allkeys-lru
+WHS_TEST_REDIS_ADDR=127.0.0.1:16379 WHS_TEST_REDIS_LRU_ADDR=127.0.0.1:16380 \
+  go test -race -timeout 600s ./internal/sink/ ./internal/app/
+```
+
+`TestRedisRefusesAnEvictingServer` (o `NewRedis` do boot é fatal com
+`ErrEvictionPolicy`, e um sink que subiu num servidor `noeviction` e passa a
+falar com o `allkeys-lru` é recusado na checagem seguinte, e na outra),
+`TestRedisEvictingServerEndsTheBoot` (exit 3 na hora, com a linha de recusa
+permanente), `TestRedisWarnsWhenThePolicyIsUnreadable` (um usuário ACL sem
+`INFO` nem `CONFIG` sobe, com **um** `WARN` em três checagens),
+`TestRedisAcceptsANonEvictingServer` e, sem servidor, `TestRedisEvictionVerdict`.
+O prazo único do passo 3 (SPEC §10.1): `TestRedisBootHasOneDeadline` (o Redis
+aparece aos 1,5 s de um `boot_timeout` de 2 s e a checagem nunca passa: o boot
+termina perto dos 2 s, não 1,5 s + 2 s) e
+`TestRedisBootClientLoopKeepsTheDeadline` (o backoff não dorme além do prazo).
+
 Os cenários que precisam do destino caindo e voltando passam por um **proxy TCP
 dentro do teste**, não por parar o Redis. Isso mantém a falha sob controle do
 teste e deixa um Redis compartilhado utilizável por tudo que estiver rodando
@@ -564,6 +587,8 @@ Registradas por honestidade, não por esquecimento:
 17. **O teto de um parâmetro do protocolo (1 GiB)** só é coberto pelo aviso de
    boot (`TestPostgresByteCeilingWarning`). Nenhum teste monta um lote que
    estoure de fato — seriam gigabytes de corpo num teste unitário.
+   Desde 2026-10-14 o `sink.batch_max_bytes` (padrão 16 MiB, teto 256 MiB)
+   corta o lote antes; o aviso só sobra para um envelope acima de 1 GiB.
 
 18. **O `Host` com bytes fora de ASCII** nunca chega ao sink pela porta
    pública: a stdlib responde `400` antes de qualquer handler. O saneamento da
@@ -599,10 +624,10 @@ Registradas por honestidade, não por esquecimento:
     boot. A suíte com Redis real usa o usuário padrão e não cobre a ACL
     restrita.
 
-22. **O heartbeat do `sink=sqlite` espera o mutex do escritor sem contexto.**
-    Um lote que dure mais que `sink.health_timeout` (1 s) faz a sonda falhar
-    por prazo com o banco íntegro — um ciclo DOWN por lentidão. A sonda em si
-    custa milissegundos; a janela é a do lote, e não há teste que a meça.
+22. ~~O heartbeat do `sink=sqlite` espera o mutex do escritor sem contexto~~ —
+    **fechada em 2026-10-14** (SPEC §8.3.5, §19.1 item 23): a sonda espera a trava só
+    no próprio prazo, e escritora ocupada com o último `Write` bom conta UP
+    (`TestSQLiteProbeDoesNotWaitForTheWriterPastItsDeadline`).
 
 23. **TLS do MySQL e do NATS** estão na situação dos itens 1 e 12: a montagem
     do `tls.Config` é exercitada pelo caminho de configuração e pelos casos de
@@ -681,14 +706,11 @@ Registradas por honestidade, não por esquecimento:
     `pre_stop_delay + drain_timeout + max(sink.op_timeout, 10 s)` com Redis.
     Não corrigido: é do cliente, e o prazo único foi provado com `sink=nats`.
 
-38. **Uma recusa `logic` na reingestão ainda encerra o boot com 3** (SPEC
-    §9.2): o `writeDirect` devolve qualquer erro, e o `drainBacklog` do
-    `ring=sqlite` também (uma linha recusada no `ring.db` vira laço de boot com
-    a porta fechada, reenviando a parte entregue a cada vez). O P refaz item a item e põe
-    o arquivo em quarentena; aqui o dump fica e o boot sai, em laço, até o
-    operador agir. Com a entrega parcial do `sink=nats` (§8.7.2) o erro já diz
-    quais itens foram guardados, mas o `writeDirect` não o usa. Não portado
-    nesta rodada: não estava na lista do N.
+38. ~~Uma recusa `logic` na reingestão ainda encerra o boot com 3~~ —
+    **fechada em 2026-10-14** (SPEC §9.2, §10.1 passo 5): refeita item a item;
+    no dump o recusado fica e o arquivo vai para `.corrupt`, no `ring.db` a
+    linha é descartada e contada (`TestBootLogicRefusalInADumpIsQuarantinedNotFatal`,
+    `TestBootLogicRefusalInRingDBIsDroppedAndCounted`).
 
 39. **Permissão negada não tem teste contra um servidor real com
     permissões.** O veredito é provado injetando o erro assíncrono
@@ -748,6 +770,57 @@ Registradas por honestidade, não por esquecimento:
     não há trava: numa troca `sqlite` → `memory` com as duas vidas de pé no
     mesmo volume, a nova drena o `ring.db` vivo da antiga (entrega dupla) e o
     remove de baixo dela.
+
+45. **O desconto do `Sweep` do rate-limit sob a trava do shard** (SPEC §6.3,
+    2026-10-14) não tem teste determinístico próprio: o `Reset` novo é provado
+    segurando a trava de um shard, e o atraso antigo do `Sweep` só dava excesso
+    passageiro na contagem, que a guarda por carga não distingue.
+
+46. **`Expect: 100-continue` com o corpo enviado sem esperar** (SPEC §4.3;
+    revisão independente de 2026-10-14) não tem teste: o `net/http` fecha
+    sem `closeWriteAndWait`, e um RST pode levar o `429`/`503`. Reproduzi-lo
+    pede um cliente que mande o corpo antes do `100` e um *timing* de RST
+    que o loopback não dá de forma estável; aceito e documentado.
+
+47. **A cópia do `held` e a fatia do `Dequeue` fora do `ItemOverhead`** (SPEC
+    §7.2; revisão independente de 2026-10-14): até `workers × batch × 16`
+    bytes fora de `ring.max_bytes`, sem teste, por ser um limite documentado
+    e não uma regra.
+
+48. **O recusado no `.corrupt` fica fora dos *gauges*** (SPEC §9.2; revisão
+    independente de 2026-10-14): só o `ERROR` com o `uuid` o registra;
+    documentado, sem teste de métrica.
+
+49. ~~`ring=sqlite` sem piso de `ring.max_bytes`~~ — **fechada em 2026-10-14**
+    (SPEC §7.2, §19.1 item 43): abaixo do maior evento é exit 1
+    (`TestSQLiteRingMaxBytesCoversTheLargestEvent`).
+
+50. **Uma linha do `ring.db` que falha sempre no `Scan` trava o dreno** (SPEC
+    §7.4; revisão independente de 2026-10-14): documentado como aceito; o
+    `TestSQLiteDequeueServesWhatItReadBeforeAFailure` monta o caso, mas nada
+    prova o comportamento de longo prazo (workers em backoff, `429`, boot
+    com 3).
+
+51. **O dreno do `ring.db` no boot sai com 3 num erro transitório do `Dequeue`**
+    (SPEC §10.1 passo 5; revisão independente de 2026-10-14): aceito (o boot
+    seguinte retenta), sem teste.
+
+52. **Redis Cluster**: a sonda confere a `maxmemory-policy` de um nó por
+    checagem (SPEC §8.2.5); não há teste de cluster, e um nó isolado com
+    `allkeys-*` só é pego quando sorteado.
+
+53. **Proxy Redis que responde o `INFO` com tipo inesperado** vira erro de
+    transporte e `exit 3` "not reachable" no boot, em vez do `WARN` de
+    ilegível (SPEC §8.2.5); sem teste.
+
+54. **A recusa `logic` conta como `Write` com erro na sonda do `sink=sqlite`**
+    (SPEC §8.3.5, intencional): um ciclo DOWN/`503` é possível numa
+    reingestão com registros recusados e o banco são; o comportamento está
+    nos testes da sonda (`busy, last Write failed`), a decisão não.
+
+55. **O *keep-alive* do `dialPostgres` é o padrão do Go (15 s)**, não os 5 min
+    do pgx, e o ambiente `PG*` some do processo durante o parse (SPEC
+    §8.5.2): documentados, sem teste próprio além do `libpq_env_test`.
 
 ## 9. Histórico: bugs que os testes encontraram
 
@@ -1046,7 +1119,8 @@ menos um (40 mutantes, 40 mortos).
 | `sink.postgres.addr` um servidor só; `sink.redis.addrs` `host:porta` | `TestFamilyPortPostgresAddrNamesOneServer`, `TestFamilyPortRedisAddrsAreHostPort` |
 
 Não se aplica (SPEC §10.1; `DECISOES.md` 4b do fast): `sink.batch_max_bytes` (a chave
-não existe aqui), as regras de URL PostgreSQL da `LOGHUB_EB_URL` (não há
+não existe aqui; revisto em 2026-10-14 por decisão do usuário, ver a rodada
+abaixo), as regras de URL PostgreSQL da `LOGHUB_EB_URL` (não há
 `LOGHUB_EB_URL` nem outro leitor de URL/DSN SQL), a `,` no host de uma URL
 Redis (não há URL Redis; a vírgula é o separador de `sink.redis.addrs`), e o
 socket PostgreSQL com `tls=true`, que já era recusado.
@@ -1131,3 +1205,98 @@ write carried 1|2|3 of the 4 items"). Correção no teste: enfileirar antes do
 `Start` (como o `TestWorkersMarkFatal`) e conferir que a escrita parada levou
 os quatro (`stallOnceSink.stalled`); `-race -count=500` verde. O
 `go-syslog-standard-server` tem o mesmo teste com a mesma ordem.
+
+### Superfície HTTP e conexões (2026-10-14)
+
+Os itens 1 a 7 de "Superfície HTTP e conexões" das pendências do
+`go-webhook-server` (SPEC §19.1 de lá), iguais nos dois módulos. Cada teste
+abaixo falhou contra o código de antes (o 6 é teste de trava de uma regra que
+o código já cumpria), e cada correção revertida sozinha numa cópia derrubou ao
+menos um (mutação). Sem serviço externo: tudo em `internal/server`,
+`internal/ratelimit` e `internal/app`.
+
+| Item | Regra | Teste |
+|---|---|---|
+| 1. Alocação pelo `Content-Length` | §12.2, §4.3 passo 11 | `TestReadBodyAllocatesOnlyWhatArrives` (5 MiB declarados e 10 bytes enviados: buffer e maior leitura oferecida ≤ 64 KiB; corpos honestos de 100 KiB, 1 MiB e 5 MiB terminam no tamanho declarado) |
+| 2. Checagem rápida por bytes | §4.3 passo 9, §4.4 | `TestErrorAnswersBeforeTheUUIDArePlainText`, casos "429 ring full by bytes, fast check", "... no declared length" e "429 declared body does not fit", com o controle de 100 bytes com folga |
+| 3. Dreno só em HTTP/1.x sem `Expect` | §4.3 | `TestRejectDrainFollowsTheProtocol` (h2: nem dreno nem `Connection: close`; `Expect: 100-continue` em qualquer caixa: sem dreno; HTTP/1.1: dreno e `close`, o controle), `TestRejectWithExpectSendsNo100Continue` (socket: a primeira linha é o `503`, nunca o `100 Continue`, e a conexão fecha) |
+| 4. `write_timeout` desde a resposta | §13.5 | `TestSlowUploadStillGetsItsAnswer` (HTTP/1.1, corpo 600 ms depois dos cabeçalhos com `write_timeout` de 200 ms), `TestSlowUploadStillGetsItsAnswerOverH2C`, `TestWriteTimeoutIsArmedForEveryAnswer` (200, recusa antes e depois do UUID) |
+| 5. Erro no `accept` e listener parado | §10.3, §10.5 | `TestAcceptRetriesNonTemporaryErrors` (três `ENOBUFS` e depois a conexão, servida), `TestServeReturnsWhenOneListenerStops` (`listeners = 2`), `TestServeErrorGoesThroughTheShutdown` (`internal/app`: com o destino preso, o dump e `exit 3`; com ele bom, tudo entregue e `exit 1`) |
+| 6. `max_conns_per_ip` pelo endereço exato | §13.5 (decisão contestável, `DECISOES.md` 4c do fast) | `TestPerIPLimitCountsTheExactAddress` (dois endereços do mesmo /64 são duas cotas; IPv4 mapeado = IPv4) |
+| 7. Contador de buckets | §6.3 | `TestResetDoesNotLoseConcurrentInserts` (determinístico: o teste segura a trava do shard 1, o `Reset` para nele, uma inserção entra no shard 0 já limpo; depois o teto e o sweep), `TestMaxBucketsHoldsUnderConcurrentInserts` (guarda por carga da reserva no teto), e `TestConcurrentAllowSweepAndReload` passou a exigir o contador exato em repouso |
+
+### Pendências 12, 13, 15 e 22–29 da SPEC §19.1 (2026-10-14)
+
+Cada item com a SPEC primeiro, o teste abaixo falhando contra o código de antes
+e a correção revertida sozinha (mutação), contra os serviços reais de teste
+(Redis normal e `allkeys-lru`, PostgreSQL, MySQL). O mesmo no
+`go-webhook-fast-server`.
+
+| Item | Teste |
+|---|---|
+| 12 — `maxmemory-policy` `allkeys-*` fatal no boot e em toda checagem; ilegível, um `WARN` (§8.2.5) | `TestRedisEvictionVerdict`, `TestRedisRefusesAnEvictingServer`, `TestRedisWarnsWhenThePolicyIsUnreadable`, `TestRedisAcceptsANonEvictingServer` (`internal/sink/redis_eviction_test.go`), `TestRedisEvictingServerEndsTheBoot` (`internal/app/redis_boot_test.go`) |
+| 13 — `sink.redis.tls_ca` sem `tls` é exit 1 (§8.2.2) | `TestRedisTLSCAWithoutTLSIsRefused` (`internal/config/pending_config_test.go`) |
+| 15 — o pool parseado com o ambiente `PG*` escondido; o discador sem o prazo de `PGCONNECT_TIMEOUT` (§8.5.2) | `TestNewPostgresParsesWithoutTheLibpqEnvironment` (`internal/sink/libpq_env_test.go`; sem servidor) |
+| 22 — um `sink.boot_timeout` só no passo 3 (§10.1) | `TestRedisBootHasOneDeadline`, `TestRedisBootClientLoopKeepsTheDeadline` |
+| 23 — a sonda do `sink=sqlite` espera a trava só no próprio prazo; escritora ocupada com o último `Write` bom é UP (§8.3.5) | `TestSQLiteProbeDoesNotWaitForTheWriterPastItsDeadline` (o teste segura a trava; sem corrida) |
+| 24 — `NaN`/`±Inf` recusados no parser (§13.5) | `TestNonFiniteNumbersAreRefused` |
+| 25 — `admin.bind` vazio ou sem porta com `admin.enabled` é exit 1 (§11) | `TestEmptyAdminBindIsRefused` |
+| 26 — o dump põe aspas no valor com branco nas pontas ou entre aspas iguais (§13.2) | `TestDumpINIRoundTripsQuotedAndPaddedValues`, `TestQuoteINI` |
+| 27, 28 — os compose repassam todo `WHS_SINK_<X>_*` do `.env.example`; imagens fixadas (§13.6) | `TestComposeForwardsEverySinkVariable`, `TestComposeImagesArePinned` (`internal/config/compose_test.go`, sem Docker); `docker compose -f <arquivo> config -q` nos 22 |
+| 29 — os seis guardas de regressão falham em vez de pular (§15.1) | os próprios: `TestMySQLRefusesAnEnvelopeItDidNotWrite`, `TestPostgresHealthValidatesTheRole`, `TestTwoNonLengthsAreNotLegacy`, `TestFingerprintsKeepTheirCommas`, `TestFallbackHostPortDoesNotReachTheURL`, `TestDescribeOnARealSocket/OPTIONS *`; cada defeito reintroduzido dava `SKIP` (saída 0) e agora dá `FAIL` |
+
+### Ring, lote e recusa no boot (2026-10-14)
+
+Itens 8, 9, 10, 11 e 20 da SPEC §19.1, e o achado da triagem sobre os lotes
+retidos. Cada teste abaixo falhou contra o código de antes (o 8 e o 11 com só
+a constante ou o campo novos acrescentados, para compilar), e cada correção
+revertida sozinha (mutação) derruba ao menos um deles. O mesmo no
+`go-webhook-fast-server`.
+
+| Item | Teste |
+|---|---|
+| Ring de memória cobra `cap(Env)` + `ItemOverhead` e desconta o `Item.Charged` gravado (SPEC §7.2, §12.2; decisão do usuário) | `TestMemoryChargesTheRetainedBuffer` (100 bytes num buffer de 16 KiB: o segundo não cabe em 20 KiB), `TestMemoryGivesBackWhatItCharged` (o `Commit` depois de um `Env` zerado devolve o cobrado), `TestItemOverheadCoversTheStruct`; `TestMemoryByteCeiling` passou a contar pelo cobrado |
+| Lotes retidos contam no teto de itens do ring de memória (SPEC §7.2; achado da triagem) | `TestMemoryHeldItemsCountAgainstTheCeiling` (porte do S) |
+| Reserva no `Enqueue` do `ring=sqlite` (SPEC §7.4) | `TestSQLiteConcurrentEnqueueRespectsTheCeilings` (porte do S: 200 *goroutines* num só grupo, `CommitMaxDelay` de 500 ms, itens e bytes; a recontagem conferida fechando e reabrindo o ring), `TestSQLiteReservationIsReleasedWhenTheRingCloses` |
+| Leitura parcial do `ring=sqlite` entrega o que leu (SPEC §7.4) | `TestSQLiteDequeueServesWhatItReadBeforeAFailure` (`jlh_ring` criada antes sem `STRICT`/`NOT NULL`, linha 2 com `uuid NULL`) |
+| Worker só termina com o contexto, `ErrClosed` ou `ErrNoBacklog`; o resto é log amostrado e backoff (SPEC §8.1 passo 1) | `TestWorkersSurviveTransientDequeueErrors`, `TestWorkersStopOnTheEndsOfTheRing` (porte do S, mais o contexto cancelado com o ring falhando) |
+| `sink.batch_max_bytes`: pedaços nos workers, na reingestão e no dreno do `ring.db`; o resto do lote retido durante a retentativa (SPEC §8.1 passo 2, §8.5.4; decisão do usuário) | `TestSplitByBytes`, `TestWorkersSplitABatchByBytes`, `TestWorkersSendAnEnvelopeAboveTheCeilingAlone`, `TestWorkersHoldTheRestOfTheBatchWhileAPieceRetries`, `TestBootWritesInPiecesUnderBatchMaxBytes` (dump, workers montados pela app, `ring.db`), `TestSinkBatchMaxBytes` (padrão, INI, flag, env, dump, recusas), `TestWorstBatchBytes` e `TestPostgresByteCeilingWarning` ajustados |
+| Recusa `logic` no boot: dump item a item e `.corrupt`; linha do `ring.db` descartada e contada (SPEC §9.2, §10.1 passo 5) | `TestBootLogicRefusalInADumpIsQuarantinedNotFatal`, `TestBootLogicRefusalInRingDBIsDroppedAndCounted` (`ring=sqlite` e `ring=memory`); `TestQuarantineWithoutDurabilityIsStillReported` com a assinatura nova |
+| Porta do dump: UTF-8, só os escapes do serializador, sem U+2028/U+2029 crus (SPEC §9.2) | `TestReadStopsAtInvalidUTF8AndForeignEscapes` (cada registro passa no `ParseHead` e no `json.Valid`; controle com tudo o que o serializador escapa), `TestOnlyOurEscapes` (do P, caso a caso) |
+
+### Revisão independente da família webhook (2026-10-14)
+
+Os achados de `tasks/review-web-{http,ring,sinks}.md` que pediam código (e as
+três notas do coordenador sobre a sonda do `sink=sqlite`, vindas das revisões
+das famílias syslog e RELP). Ordem por item: SPEC, teste falhando contra o
+código de antes, correção, mutação (só a correção revertida). Os só
+documentados estão em §8 e na seção do assunto da SPEC.
+
+| Item de §19.1 | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 31 — o shutdown por erro do `Serve` tolera o primeiro sinal (§10.3) | `TestServeErrorGoesThroughTheShutdown/held sink, then one signal: still dumped, exit 3` | `exit 130, want 3` | o ramo `serveErr` com `tolerateFirst=false` |
+| 32 — prazo de escrita limpo só com `read_timeout > 0` (§13.5) | `TestWriteDeadlineIsKeptWithoutReadTimeout`, `TestSlowH2CUploadIsBoundedWithoutReadTimeout` (h2c real) | `deadline cleared on entry = true`; `status 200 … outlived write_timeout` | a condição antiga |
+| 33 — a escrita direta do boot respeita `Error.Delivered` (§9.2) | `TestBootWriteHonoursPartialDelivery` | `item … written 2 times, want once` (3 itens) | o ramo `DeliveredOf` desligado |
+| 34 — a porta do dump aceita só os escapes do serializador (§9.2) | `TestOnlyOurEscapes` (reescrito segundo a SPEC), controle do escritor com `\r`, `\x1f`, `\x7f` | 10 casos `= true, want false` | a função antiga |
+| 35 — piso de `ring.max_bytes` com `ring=memory` (§7.2) | `TestRingMaxBytesCoversTheLargestEvent` | `--ring.max_bytes=65791 … was accepted` | a condição com `&& false` |
+| 36 — a escritora ocupada só é prova de vida até `op_timeout + health_timeout`, no relógio monotônico (§8.3.5) | `TestSQLiteProbeSeesAWriterStuckPastItsLimit`, `TestSQLiteProbeMeasuresTheBatchOnTheMonotonicClock` | `<nil> …, want … DOWN`; `Write recorded 0s, want … 10h` | sem limite; relógio de parede |
+| 37 — o heartbeat é escrita para a sonda (§8.3.5) | `TestSQLiteFailedHeartbeatCountsAsAFailedWrite`, `TestSQLiteGoodHeartbeatClearsAFailedOne`, `TestSQLiteHeartbeatCutByItsDeadlineIsNotAFailedWrite` | `UP, want DOWN`; `… cut by its own deadline … want UP` | sem gravar a falha; sem gravar o sucesso; sem a exceção do contexto |
+| 38 — `rueidis.NewClient` dentro do prazo do boot (§10.1) | `TestRedisBootDeadlineHoldsAgainstASilentServer` (listener que aceita e não fala; sem Redis) | `the boot took 5.00s with sink.boot_timeout=1s` | `rueidis.NewClient` direto |
+| 39 — `WaitReady` dorme `min(backoff, restante)` (§10.1) | `TestWaitReadyDoesNotSleepPastItsDeadline` | `took 2.00s with a 300ms budget` | `time.After(backoff)` |
+| 40 — `admin.bind` com porta 1–65535 (§11) | `TestEmptyAdminBindIsRefused` (+ `127.0.0.1:`, `:`, `[::1]:`, `localhost:abc`, `:0`, `:65536`, `:+80`, `:080`) | `--admin.bind=127.0.0.1: … was accepted` | sem o `validPort` |
+| 41 — byte de controle num valor de texto é exit 1 (§13.2) | `TestControlBytesInTextValuesAreRefused` | as 4 entradas `was accepted` | a checagem desligada |
+| 42 — a sonda do Redis em uma ida e volta (§8.2.5) | `TestRedisPolicyProbeStaysOneRoundTrip` (Redis real, ACL `-info` e `-info -config`) | `2 pipelines and 2 commands alone, want 2 and 0` | sem gravar o modo |
+| T1 — reserva devolvida com o writer já fora (§7.4) | `TestSQLiteReservationIsReleasedWhenTheWriterIsGone` | (lacuna de teste: passa no código) | sem o `unreserve` do ramo `writerDone` |
+| T2 — o resto do lote retido com falha no pedaço do meio, e com fatal (§8.1 passo 3) | `TestWorkersHoldTheRestOfTheBatchWhileAPieceRetries` (6 itens, 3 pedaços) | (lacuna de teste: passa no código) | `hold` por pedaço |
+
+**Rodadas.** `gofmt -l .` vazio e `go vet ./...` limpo. Duas rodadas completas `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh` e banco próprio (`tasks/run2.sh go-webhook-server rev`: Redis normal e `allkeys-lru`, PostgreSQL, MySQL, ClickHouse e NATS reais): as duas verdes (`internal/app` em 95 s), nenhuma refeita.
+
+### `TestRedisBootHasOneDeadline` instável (2026-10-14)
+
+Na rodada final o teste caiu uma vez com a máquina quieta: o proxy voltava aos
+1,5 s, o mesmo instante da quinta tentativa do cliente (0; 0,1; 0,3; 0,7;
+1,5 s), e às vezes a tentativa chegava antes e o boot esgotava o prazo sem
+construir o cliente ("control: the Redis client was never built"). A retomada
+passou para 1,2 s; `-race -count=8` verde em W e F. O teste continua pegando o
+prazo duplo: com o cliente construído aos 1,5 s, um segundo prazo de 2 s
+levaria o boot a ~3,5 s, acima do teto de 3 s.

@@ -3,11 +3,15 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/patrickbrandao/loghub-paradise/go-relplog-nats-server/internal/item"
+	"github.com/patrickbrandao/loghub-paradise/go-relplog-nats-server/internal/ring"
 )
 
 // natsToken is one dot-separated token of a subject, or a whole stream name: no
@@ -82,6 +86,21 @@ func (v *validator) outsideDataDir() {
 	}
 }
 
+// idleBelowBackpressure warns about tcp.idle_timeout below
+// relp.backpressure_timeout (SPEC §13.2). A held transaction then closes its
+// session on the idle, before the backpressure timeout -- counted as
+// backpressure (SPEC §5.4), retransmitted all the same -- so the effective
+// hold is the idle. A WARN, not an error: the effect is that of a shorter
+// backpressure_timeout, which is a legitimate choice.
+func (v *validator) idleBelowBackpressure() {
+	c := v.c
+	if c.TCP.IdleTimeout > 0 && c.TCP.IdleTimeout < c.RELP.BackpressureTimeout {
+		v.warn("tcp.idle_timeout (%s) is below relp.backpressure_timeout (%s): a held transaction "+
+			"closes its session on the idle first (counted as backpressure); the emitter retransmits "+
+			"either way (SPEC §5.4)", c.TCP.IdleTimeout, c.RELP.BackpressureTimeout)
+	}
+}
+
 func validate(c *Config, setIn map[string]bool) ([]string, map[string]string, error) {
 	if setIn == nil {
 		setIn = map[string]bool{}
@@ -103,6 +122,7 @@ func validate(c *Config, setIn map[string]bool) ([]string, map[string]string, er
 	}
 
 	v.outsideDataDir()
+	v.idleBelowBackpressure()
 	if c.SinkNATS.Mode == NATSModeCore {
 		v.warn("sink.nats.mode=core is best effort: success means the NATS server received " +
 			"the messages, not that anyone kept them; without a stream, a message with no " +
@@ -138,8 +158,63 @@ func validateListeners(c *Config) error {
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
 			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
 		}
+		// Refused here, not at boot step 12 after the admin port served the
+		// whole boot -- and on macOS/BSD not even there: SO_REUSEADDR lets
+		// 127.0.0.1:P and *:P coexist, and the admin port silently took
+		// localhost's RELP connections (SPEC §13.2, §14).
+		if sameStreamSocket(c.Listen.TCP, c.Admin.Bind) {
+			return fmt.Errorf("admin.bind (%q) and listen.tcp (%q) are, or may resolve to, the same "+
+				"TCP address: the admin port and RELP cannot share one stream socket (to share a "+
+				"port, use two distinct IP literals)", c.Admin.Bind, c.Listen.TCP)
+		}
 	}
 	return nil
+}
+
+// sameStreamSocket reports whether two host:port binds would collide; the
+// function of go-relplog-server, where it compares listen.tcp and listen.tls.
+// Port 0 asks the kernel for a free port and never collides.
+func sameStreamSocket(a, b string) bool {
+	ha, pa, errA := net.SplitHostPort(a)
+	hb, pb, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	// Values, not spellings (independent review of 2026-10-14, SPEC §13.2):
+	// the port is the number net.Listen would bind, read the way it reads it
+	// -- "0514" is 514, a service name is its number -- and a port that is
+	// neither fails at bind anyway, so it is refused here with both keys
+	// named. Compared as text, "0514" and "514" passed as different ports.
+	na, errA := net.LookupPort("tcp", pa)
+	nb, errB := net.LookupPort("tcp", pb)
+	if errA != nil || errB != nil {
+		return true
+	}
+	if na != nb || na == 0 {
+		return false
+	}
+	// Any unspecified literal is the wildcard ("::0", "0:0::0"), not only
+	// the three usual spellings.
+	wild := func(h string) bool {
+		if h == "" {
+			return true
+		}
+		ip, err := netip.ParseAddr(h)
+		return err == nil && ip.Unmap().IsUnspecified()
+	}
+	if wild(ha) || wild(hb) {
+		return true
+	}
+	ia, errA := netip.ParseAddr(ha)
+	ib, errB := netip.ParseAddr(hb)
+	if errA == nil && errB == nil {
+		return ia.Unmap() == ib.Unmap()
+	}
+	// A host NAME on the same port may resolve to the other address
+	// ("localhost" and "127.0.0.1"), and resolving here would make the
+	// validation depend on DNS. Same port with a name on either side is a
+	// collision; IP literals are how two stream sockets share a port.
+	return true
 }
 
 // validateRELP holds the [relp] rows of SPEC §13.2.
@@ -208,12 +283,31 @@ func validateSyslog(c *Config) error {
 	return nil
 }
 
+// ringMinBytes is what one n-byte message costs the memory ring (SPEC §9.2):
+// the capacity of the pooled buffer the receiver copies it into, plus the
+// per-item overhead. It is the ring's own heldBytes, computed before the copy
+// exists, as ring.Memory.FullFor computes it.
+func ringMinBytes(n int64) int64 {
+	return int64(item.PooledCap(int(n))) + ring.ItemOverhead
+}
+
 func validateRanges(c *Config) error {
 	if c.Ring.CapacityItems < 1 || c.Ring.CapacityItems > maxRingItems {
 		return fmt.Errorf("ring.capacity_items: %d is outside 1..%d", c.Ring.CapacityItems, maxRingItems)
 	}
-	if c.Ring.MaxBytes < 1 {
-		return fmt.Errorf("ring.max_bytes: must be positive")
+	// One message of the largest size the truncation keeps must fit an empty
+	// ring -- the rule of relp.inflight_max_bytes, applied to the ring. Below
+	// it that message could never be queued: its transaction is held until
+	// relp.backpressure_timeout and librelp retransmits it on every reconnect,
+	// the emitter's session stuck behind it for ever. The floor of the
+	// smallest class is not enough: a 4 KiB ring takes the short lines and
+	// holds any 3 KiB one for ever (SPEC §13.2, §15.1). validateSyslog has
+	// already bounded max_message_bytes.
+	if floor := ringMinBytes(c.Syslog.MaxMessageBytes); c.Ring.MaxBytes < floor {
+		return fmt.Errorf("ring.max_bytes (%s) is below what one message of syslog.max_message_bytes "+
+			"(%s) costs the ring, %s (its pool class plus %d bytes): that message could never be "+
+			"queued and its emitter would retransmit it for ever",
+			FormatBytes(c.Ring.MaxBytes), FormatBytes(c.Syslog.MaxMessageBytes), FormatBytes(floor), ring.ItemOverhead)
 	}
 	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
 		return fmt.Errorf("ring.high_water: %g is outside (0, 1]", c.Ring.HighWater)

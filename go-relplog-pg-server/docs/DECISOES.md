@@ -247,3 +247,24 @@ E1, E2 e A2-minor. A mesma implementação no irmão (regra de sincronia).
   sessão que fecha nunca tiveram `200`, e o `librelp` as retransmite.
 - **A2-minor**: não se aplica. O comentário de `closeTransports` já diz
   "AT ONCE", e não há ring Redis.
+
+---
+
+## 8. Rodada das pendências conhecidas (2026-10-14)
+
+As dez pendências de SPEC §22.1 saíram da lista, cada uma com a regra na seção
+do assunto. Corrigidas, com teste que falhava antes e mutação: o aborto fecha
+o ring antes de contar (§13.4); piso de `ring.max_bytes` = classe do pool de
+`syslog.max_message_bytes` + 256 B (§13.2, §15.1); `admin.bind` × `listen.tcp`
+pelo `sameStreamSocket` do R (§13.2, §14); rótulo `backpressure` do idle com
+transação segurada e `WARN` de `idle_timeout < backpressure_timeout`, **sem
+mudar o efeito** (§5.4, §13.2); a chave derivada (`emergency.dir`,
+`sink.postgres.pool_size`) fora do relato do `SIGHUP` (§16.3). Registradas como
+regra ou lacuna, sem mudança de código (decididas, contestáveis): a falha de
+remoção de um dump entregue é só `ERROR` (§12.2); o *padding* dos contadores
+(TESTING §8); SQLSTATE fora da tabela (`P0001`) é `network`, nunca descarte
+nem FATAL (§19, §20.18); o dump publicado no instante do aborto, contado e
+guardado, e o aborto não espera o disco (§13.4); `kind="fatal"` com o boot
+cancelado (§14.1). O que vale para R, S, SP e SN está em
+`tasks/port-to-R-S-SP-SN.md` da raiz.
+

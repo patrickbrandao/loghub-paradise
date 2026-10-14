@@ -348,8 +348,15 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   sempre, com o sink UP. Não volte a guardar o `validate` atrás do
   `validated`: ele só controla o log e o "sem respondedores" fatal da primeira
   checagem.
-- **`ring.Commit` antes do `Release`**, também na recusa `logic`: o ring
-  desconta `len(Env)`, que o `Release` zera.
+- **`ring.Commit` antes do `Release`**, também na recusa `logic`. Desde
+  2026-10-14 o ring cobra `cap(Env)` mais `ring.ItemOverhead` e desconta o
+  `Item.Charged` gravado no `Enqueue` (SPEC §7.2), sem reler o buffer; a ordem
+  continua a regra (é a única que serve também ao `ring=sqlite` do fast, que
+  desconta `len(Env)`, que o `Release` zera).
+- **O lote vai em pedaços de `sink.batch_max_bytes`** (SPEC §8.1): o worker
+  segura o pedaço em retentativa **e o resto do lote**, e o `unhold` tira só o
+  pedaço resolvido (`unhold(id, piece)`); apagar o registro inteiro perderia o
+  resto num dump.
 - **`no_ack` e JetStream desligado são fatais no boot, não `network`.** "Sem
   respondedores" na primeira checagem é FATAL nomeando o JetStream; depois de
   uma checagem validada, `network`. Não pergunte `AccountInfo`: ele não

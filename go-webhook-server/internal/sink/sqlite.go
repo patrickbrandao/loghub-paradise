@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/envelope"
@@ -29,6 +29,11 @@ type SQLiteConfig struct {
 	Synchronous       string // FULL | NORMAL | OFF
 	BusyTimeout       time.Duration
 	WALAutocheckpoint int
+	// HeldLimit is how long a batch in progress may hold the writer's lock
+	// and still count as proof of life for a probe that cannot get it:
+	// sink.op_timeout + sink.health_timeout (SPEC §8.3.5). 0 means no limit,
+	// for tests that build the sink alone.
+	HeldLimit time.Duration
 }
 
 // SQLite is the standalone final destination (SPEC §8.3). It needs no Redis.
@@ -47,7 +52,11 @@ type SQLite struct {
 	log *slog.Logger
 	m   *obs.Metrics
 
-	mu      sync.Mutex
+	// mu is the writer's lock, a one-slot semaphore rather than a
+	// sync.Mutex so that Health can give up waiting for it at its own
+	// deadline (SPEC §8.3.5): a batch holds it up to sink.op_timeout, longer
+	// than sink.health_timeout.
+	mu      chan struct{}
 	db      *sql.DB
 	insert  *sql.Stmt
 	current string // path of the open file
@@ -60,7 +69,29 @@ type SQLite struct {
 	now func() time.Time
 
 	closed bool
+
+	// lastWrite is how the last Write ended: writeNone before any,
+	// writeOK, writeFailed. A probe that cannot get the lock in time reads
+	// it to tell a busy writer from a stuck one (SPEC §8.3.5).
+	lastWrite atomic.Int32
+
+	// writeStart is when the batch in progress took the lock, as read by
+	// since, so a probe can tell a busy writer from one stuck in I/O (SPEC
+	// §8.3.5). since is the time elapsed from NewSQLite on the monotonic
+	// clock: time.Unix(0, x) of a wall-clock reading has none, and an NTP step
+	// would keep a stuck writer UP, or mark a normal one DOWN, by its size.
+	writeStart atomic.Int64
+	since      func() time.Duration
 }
+
+const (
+	writeNone int32 = iota
+	writeOK
+	writeFailed
+)
+
+func (s *SQLite) lock()   { s.mu <- struct{}{} }
+func (s *SQLite) unlock() { <-s.mu }
 
 // sqliteSchema is the inbox of SPEC §3.7: the columns, key and CHECKs of
 // loghub.inbox (§3.6) in SQLite's types. event_at is fixed-width ISO-8601 text
@@ -121,7 +152,9 @@ func NewSQLite(cfg SQLiteConfig, log *slog.Logger, m *obs.Metrics) (*SQLite, err
 		cfg.WALAutocheckpoint = 1000
 	}
 
-	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now}
+	base := time.Now()
+	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now, mu: make(chan struct{}, 1),
+		since: func() time.Duration { return time.Since(base) }}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o750); err != nil {
 		return nil, fmt.Errorf("sink sqlite: %w", err)
 	}
@@ -231,8 +264,8 @@ func (s *SQLite) maybeRotate(now time.Time) error {
 // setClock replaces the rotation clock. Test-only; the writer holds the same
 // lock, so the swap cannot land in the middle of a batch.
 func (s *SQLite) setClock(f func() time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	defer s.unlock()
 	s.now = f
 }
 
@@ -247,8 +280,8 @@ func (s *SQLite) SetKeepFiles(n int) {
 	if n < 0 {
 		n = 0
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	defer s.unlock()
 	s.cfg.KeepFiles = n
 }
 
@@ -305,13 +338,26 @@ func (s *SQLite) updateSizeGauge() {
 }
 
 // Write inserts the whole batch in one transaction.
-func (s *SQLite) Write(ctx context.Context, items []*envelope.Item) error {
+func (s *SQLite) Write(ctx context.Context, items []*envelope.Item) (err error) {
 	if len(items) == 0 {
 		return nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	// When this batch took the lock: past sink.op_timeout +
+	// sink.health_timeout a probe stops taking it as proof of life (SPEC
+	// §8.3.5, W §19.1 item 36).
+	s.writeStart.Store(int64(s.since()))
+	defer s.unlock()
+	defer func() {
+		// Any error, whatever its class: a probe that finds the writer busy
+		// trusts only a writer whose last batch went in (SPEC §8.3.5).
+		if err != nil {
+			s.lastWrite.Store(writeFailed)
+		} else {
+			s.lastWrite.Store(writeOK)
+		}
+	}()
 
 	if s.closed {
 		return ErrClosed
@@ -360,16 +406,56 @@ func (s *SQLite) Write(ctx context.Context, items []*envelope.Item) error {
 // outlasts sink.health_timeout, the sink is marked DOWN, the fuses escalate to
 // FATAL, and the next boot fails the same way, forever. The integrity scan is
 // still run once, at boot (SPEC §8.3.5).
+//
+// The writer's lock is waited for only within the probe's deadline (SPEC
+// §8.3.5, W pendência 23). A batch holds it up to sink.op_timeout, and a probe
+// that waited past sink.health_timeout failed with the file intact: a DOWN
+// cycle, 503 on the public port, for slowness. When the lock does not come in
+// time, a writer whose last batch ended without error is busy, not broken --
+// the batch in progress is the proof of life, and what the probe looks for
+// (a full disk, a read-only file) that batch reports itself as fatal -- so the
+// probe counts UP without touching the file. With the last batch failed, or
+// none yet, it is DOWN as before.
 func (s *SQLite) Health(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	select {
+	case s.mu <- struct{}{}:
+	case <-ctx.Done():
+		// The batch in progress is proof of life only while it is younger
+		// than its own deadline plus the probe's: a COMMIT stuck in I/O
+		// returns never, holds the lock for ever, and left every probe UP
+		// (W §19.1 item 36).
+		held := s.since() - time.Duration(s.writeStart.Load())
+		if s.lastWrite.Load() == writeOK && (s.cfg.HeldLimit <= 0 || held <= s.cfg.HeldLimit) {
+			return nil
+		}
+		if s.lastWrite.Load() == writeOK {
+			return networkErr("heartbeat", fmt.Errorf("the writer has held the database for %s, past "+
+				"sink.op_timeout + sink.health_timeout (%s): stuck, not busy", held.Round(time.Millisecond),
+				s.cfg.HeldLimit))
+		}
+		return networkErr("heartbeat", fmt.Errorf("the writer held the database past the probe's deadline: %w", ctx.Err()))
+	}
+	defer s.unlock()
 
 	if s.closed {
 		return ErrClosed
 	}
+	// The heartbeat is a write: its outcome is the last one a busy-writer
+	// probe reads. A failure counts like a failed Write (W §19.1 item 37: the
+	// UP in between reset the fuses' run), and a success like a good one, or
+	// the first slow batch after a recovery was DOWN with the file sound.
+	//
+	// Except a heartbeat cut by the probe's own deadline: the probe can get
+	// the lock just before it, released by a batch at deadline - ε, and the
+	// file says nothing then -- recorded as failed, it brought back the DOWN
+	// cycle for slowness (review of the RELP family, 2026-10-14, A1).
 	if _, err := s.db.ExecContext(ctx, sqliteHeartbeat, time.Now().UnixNano()); err != nil {
+		if ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			s.lastWrite.Store(writeFailed)
+		}
 		return classifySQLite("heartbeat", err)
 	}
+	s.lastWrite.Store(writeOK)
 	return nil
 }
 
@@ -387,8 +473,8 @@ func (s *SQLite) integrityCheck() error {
 }
 
 func (s *SQLite) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lock()
+	defer s.unlock()
 
 	if s.closed {
 		return nil

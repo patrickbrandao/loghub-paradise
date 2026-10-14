@@ -56,6 +56,7 @@ services:
       # para nao emitir o warning de boot.
       WHS_SINK_WORKERS: "1"
       WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_BYTES: ${WHS_SINK_BATCH_MAX_BYTES:-16MiB}
       WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
 
     ports:

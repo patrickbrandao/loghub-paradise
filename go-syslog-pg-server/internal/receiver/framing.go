@@ -77,6 +77,12 @@ var frameClasses = [...]int{2 << 10, 8 << 10, 64 << 10}
 // minFrameCap is the first block.
 const minFrameCap = 2 << 10
 
+// frameKeepCap is the largest buffer a framer keeps between frames. After one
+// 64 KiB message an idle connection would otherwise hold 64 KiB for as long as
+// it lives, outside every ceiling (a known pendência, fixed on 2026-10-14 as in
+// go-syslog-server; SPEC §5.4, §15.1).
+const frameKeepCap = 16 << 10
+
 // Framer reads messages off one stream connection (SPEC §5).
 //
 // RFC 6587 defines two framings and a real deployment uses either:
@@ -147,6 +153,21 @@ func (f *Framer) Framing() item.Framing { return f.framing }
 func (f *Framer) Next() (msg []byte, size int, framing item.Framing, err error) {
 	if f.err != nil {
 		return nil, 0, f.framing, f.err
+	}
+	// The previous message is no longer anyone's (Ingest copied it), and the
+	// read below may park for the whole idle timeout: a buffer a large frame
+	// grew is let go here, before the wait, not kept for the connection's
+	// life (SPEC §5.4, §15.1).
+	//
+	// Only before a wait: with bytes already in the reader the next frame is
+	// here and the buffer is about to be needed again. Released after every
+	// frame above 16 KiB, a stream of 8-64 KiB frames reallocated the 64 KiB
+	// class for each of them -- 12 KiB frames went from 62 µs to 583 µs per
+	// 64 frames and from 78 KB to 4.7 MB allocated in go-syslog-server
+	// (independent review of its port, 2026-10-13; TESTING §4). An idle
+	// connection still keeps no more than frameKeepCap.
+	if cap(f.buf) > frameKeepCap && f.r.Buffered() == 0 {
+		f.buf = nil
 	}
 	if !f.decided {
 		if err := f.detect(); err != nil {
@@ -397,16 +418,20 @@ func (f *Framer) nextLF() ([]byte, int, error) {
 }
 
 // indexTerminator finds the first LF or NUL.
+//
+// The NUL is looked for only before the LF: searching the whole buffer for it
+// scanned every buffered byte once per frame, so a reader holding many short
+// lines paid for the size of its buffer on each of them (as in
+// go-syslog-server).
 func indexTerminator(b []byte) int {
 	lf := bytes.IndexByte(b, '\n')
-	nul := bytes.IndexByte(b, 0)
-	switch {
-	case lf < 0:
-		return nul
-	case nul < 0 || lf < nul:
-		return lf
+	if lf < 0 {
+		return bytes.IndexByte(b, 0)
 	}
-	return nul
+	if nul := bytes.IndexByte(b[:lf], 0); nul >= 0 {
+		return nul
+	}
+	return lf
 }
 
 // appendGrow appends p to b, growing the capacity by the pool classes (then

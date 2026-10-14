@@ -174,16 +174,17 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 		return nil, err
 	}
 
-	// ParseConfig("") yields the libpq defaults, which also means the libpq
-	// ENVIRONMENT (PGHOST, PGSSLMODE, PGPASSFILE, PGOPTIONS,
-	// PGTARGETSESSIONATTRS...). Every field the registry owns is overwritten
-	// below so the environment cannot shadow it; the fallbacks are dropped for
-	// the same reason -- otherwise a refused connection to the configured host
-	// would be retried against localhost --, the runtime parameters are rebuilt
-	// from nothing (PGOPTIONS would arrive as "options", PGAPPNAME as
-	// application_name), and ValidateConnect goes too
-	// (PGTARGETSESSIONATTRS=standby would refuse every primary).
-	pc, err := pgxpool.ParseConfig("")
+	// ParseConfig reads the libpq ENVIRONMENT (PGHOST, PGSSLMODE, PGSERVICE,
+	// PGCHANNELBINDING, PGCONNECT_TIMEOUT...), so it runs with every PG*
+	// hidden (SPEC §8.5.2, port of go-webhook-server, W 15): an invalid PGSSLMODE or a missing
+	// PGSERVICE failed the parse (exit 1), and the fields nothing below
+	// overwrites (channel binding, require_auth, sslnegotiation, the protocol
+	// versions) refused every connection with no SQLSTATE. Every field the
+	// registry owns is still overwritten below; the fallbacks are dropped --
+	// otherwise a refused connection to the configured host would be retried
+	// against localhost or in another sslmode --, the runtime parameters are
+	// rebuilt from nothing, and ValidateConnect goes too.
+	pc, err := parseWithoutLibpqEnv("sslmode=disable")
 	if err != nil {
 		return nil, fmt.Errorf("sink postgres: %w", err)
 	}
@@ -194,6 +195,7 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	cc.Password = cfg.Password
 	cc.Database = cfg.Database
 	cc.ConnectTimeout = cfg.ConnectTimeout
+	cc.DialFunc = dialPostgres
 	cc.Fallbacks = nil
 	cc.TLSConfig = nil
 	cc.ValidateConnect = nil
@@ -229,6 +231,47 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	p.probeCfg = probeCfg
 	p.args.New = func() any { return &pgArgs{} }
 	return p, nil
+}
+
+// libpqEnvMu serialises parseWithoutLibpqEnv: the environment is process-wide.
+var libpqEnvMu sync.Mutex
+
+// parseWithoutLibpqEnv is pgxpool.ParseConfig with every PG* environment
+// variable hidden for the duration of the parse and restored after it. The
+// parse is the only place pgx reads them, it runs once, at boot (NewPostgres),
+// and nothing else in this process reads PG* -- so the window is harmless,
+// and it is the only way to keep the ones a conninfo cannot neutralise
+// (PGSERVICE pulls in a whole service file) from reaching the pool. The
+// alternative, a conninfo naming every key with its default, breaks with the
+// first variable a pgx release adds. (From go-syslog-server.)
+func parseWithoutLibpqEnv(conninfo string) (*pgxpool.Config, error) {
+	libpqEnvMu.Lock()
+	defer libpqEnvMu.Unlock()
+	saved := map[string]string{}
+	for _, kv := range os.Environ() {
+		if k, v, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(k, "PG") {
+			saved[k] = v
+			os.Unsetenv(k)
+		}
+	}
+	defer func() {
+		for k, v := range saved {
+			os.Setenv(k, v)
+		}
+	}()
+	return pgxpool.ParseConfig(conninfo)
+}
+
+// dialPostgres is the pool's dialer, with no timeout of its own: the connect
+// deadline is ConnConfig.ConnectTimeout (sink.op_timeout), which pgconn
+// applies through the context. The DialFunc pgx builds for a connect_timeout
+// setting (PGCONNECT_TIMEOUT, makeConnectTimeoutDialFunc) carries that value
+// in its net.Dialer and cut every dial short of the configured deadline; the
+// hidden environment already keeps it out, and this keeps the dialer ours
+// whatever a later pgx reads (SPEC §8.5.2).
+func dialPostgres(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
 }
 
 // splitPostgresAddr accepts host:port, [v6]:port, or a unix socket directory

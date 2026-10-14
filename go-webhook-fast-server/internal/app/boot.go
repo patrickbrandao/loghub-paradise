@@ -12,6 +12,7 @@ import (
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-fast-server/internal/envelope"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-fast-server/internal/obs"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-fast-server/internal/ring"
+	"github.com/patrickbrandao/loghub-paradise/go-webhook-fast-server/internal/sink"
 )
 
 // reingest loads the emergency dumps a previous run left behind (SPEC §9.2).
@@ -105,7 +106,8 @@ func (a *App) reingest(ctx context.Context) int {
 			continue
 		}
 
-		if err := a.writeDirect(ctx, res.Items); err != nil {
+		refused, err := a.writeDirect(ctx, res.Items)
+		if err != nil {
 			if ctx.Err() != nil {
 				// SIGTERM during the boot: the file stays for the next one,
 				// and the exit is the interruption's, as in WaitReady
@@ -119,11 +121,15 @@ func (a *App) reingest(ctx context.Context) int {
 			return ExitSink
 		}
 		a.log.Info("emergency dump reingested",
-			"path", path, "items", len(res.Items), "truncated", res.Truncated)
+			"path", path, "items", len(res.Items)-refused, "truncated", res.Truncated,
+			"refused_by_destination", refused)
 
-		if res.Truncated {
+		// A record the destination refused for good stays in the file, which
+		// is quarantined like a truncated one: nothing is lost, and the next
+		// boot does not meet it again (SPEC §9.2).
+		if res.Truncated || refused > 0 {
 			dst, qerr := a.emg.Quarantine(path)
-			a.reportQuarantine(path, dst, qerr, res)
+			a.reportQuarantine(path, dst, qerr, res, refused)
 		} else {
 			a.reportRemoval(path, a.emg.Remove(path))
 		}
@@ -133,7 +139,8 @@ func (a *App) reingest(ctx context.Context) int {
 	return ExitOK
 }
 
-// reportQuarantine logs the outcome of Store.Quarantine for a truncated dump.
+// reportQuarantine logs the outcome of Store.Quarantine for a truncated dump,
+// or one with records the destination refused for good (refused).
 //
 // A non-empty dst means the file WAS renamed, whatever qerr says: the error is
 // then only the directory fsync that followed (emergency.ErrNotDurable), so
@@ -141,17 +148,24 @@ func (a *App) reingest(ctx context.Context) int {
 // case logged "cannot quarantine" with a path that no longer existed and
 // dropped the line with the discarded bytes (SPEC §9.2; port of the
 // syslog/RELP family, 2026-10-13).
-func (a *App) reportQuarantine(path, dst string, qerr error, res *emergency.ReadResult) {
+func (a *App) reportQuarantine(path, dst string, qerr error, res *emergency.ReadResult, refused int) {
 	if dst == "" {
-		a.log.Error("cannot quarantine a truncated dump", "path", path, "error", qerr)
+		a.log.Error("cannot quarantine a damaged dump", "path", path, "error", qerr,
+			"refused_by_destination", refused)
 		return
 	}
 	if qerr != nil {
-		a.log.Warn("the truncated dump was quarantined but the directory fsync failed; the new "+
+		a.log.Warn("the damaged dump was quarantined but the directory fsync failed; the new "+
 			"name may not survive a power loss", "path", dst, "error", qerr)
 	}
-	a.log.Warn("the dump was truncated; its unreadable tail was quarantined",
-		"path", dst, "discarded_bytes", res.TruncatedBytes)
+	if res.Truncated {
+		a.log.Warn("the dump was truncated; its unreadable tail was quarantined",
+			"path", dst, "discarded_bytes", res.TruncatedBytes)
+	}
+	if refused > 0 {
+		a.log.Error("the destination refused records of the dump for good; they stay in the "+
+			"quarantined file (SPEC §9.2)", "path", dst, "refused_by_destination", refused)
+	}
 }
 
 // reportRemoval logs the outcome of Store.Remove for a reingested dump. An
@@ -190,23 +204,95 @@ func (a *App) refreshEmergencyGauges() {
 
 // writeDirect sends items straight to the sink in batches, bypassing the ring.
 // Reingestion runs before the ring is serving, so routing through it would only
-// risk filling it with the backlog it is supposed to absorb.
-func (a *App) writeDirect(ctx context.Context, items []*envelope.Item) error {
-	batch := a.cfg.Sink.Batch
-	for i := 0; i < len(items); i += batch {
-		end := min(i+batch, len(items))
-		wctx, cancel := context.WithTimeout(ctx, a.cfg.Sink.OpTimeout)
-		err := a.sink.Write(wctx, items[i:end])
-		cancel()
+// risk filling it with the backlog it is supposed to absorb. A batch is what
+// the workers write (SPEC §8.1 step 2): at most sink.batch envelopes and
+// sink.batch_max_bytes of JLH, one envelope above the ceiling alone.
+//
+// A batch the destination refuses as logic -- a record that passed every check
+// of the reader and still is not something the destination stores -- is
+// retried one item at a time, and only the items refused again are left out,
+// counted in refused, and kept in the file, which the caller quarantines.
+// Returning the error instead made one such record stop every boot with exit
+// 3, with every other record of the file and every later file undelivered
+// (SPEC §9.2; port of go-webhook-pg-server, 2026-10-14).
+func (a *App) writeDirect(ctx context.Context, items []*envelope.Item) (refused int, err error) {
+	for rest := items; len(rest) > 0; {
+		n := min(a.cfg.Sink.Batch, sink.SplitByBytes(rest, a.cfg.Sink.BatchMaxBytes))
+		batch := rest[:n]
+		rest = rest[n:]
+		r, err := a.writeOrSingle(ctx, batch, func(it *envelope.Item, err error) {
+			a.log.Error("the destination refused a record of an emergency dump; it stays in the "+
+				"quarantined file", "id", it.ID, "error", err)
+		})
+		refused += r
 		if err != nil {
-			return err
+			return refused, err
 		}
-		a.metrics.EventsWrittenTotal.Add(uint64(end - i))
-		for _, it := range items[i:end] {
+		for _, it := range batch {
 			it.Release()
 		}
 	}
-	return nil
+	return refused, nil
+}
+
+// writeOrSingle writes one batch of the boot's direct writes. A logic refusal
+// of the batch is redone item by item: the items the destination takes are
+// written and counted, and each one it refuses again is reported to onRefused
+// and counted in refused -- the caller decides what a refusal costs. A logic
+// refusal that lists what was stored (Error.Delivered) is settled by that list
+// instead, without a second write. Any other error is returned at once, and
+// the caller keeps everything not yet settled.
+func (a *App) writeOrSingle(ctx context.Context, batch []*envelope.Item,
+	onRefused func(*envelope.Item, error)) (refused int, err error) {
+	write := func(b []*envelope.Item) error {
+		wctx, cancel := context.WithTimeout(ctx, a.cfg.Sink.OpTimeout)
+		defer cancel()
+		return a.sink.Write(wctx, b)
+	}
+	err = write(batch)
+	if err == nil {
+		a.metrics.EventsWrittenTotal.Add(uint64(len(batch)))
+		return 0, nil
+	}
+	if sink.ClassOf(err) != sink.ClassLogic {
+		return 0, err
+	}
+	// A refusal that lists what the destination stored (sink=nats, SPEC
+	// §8.1 step 5) is already the verdict per item: the stored ones are
+	// written, the rest refused, and nothing is sent again. Retrying item by
+	// item republished what the stream had kept -- duplicates only
+	// Nats-Msg-Id absorbs, and only inside sink.nats.duplicates (W §19.1 item
+	// 33; go-webhook-nats-server's writeDirect did it right).
+	if stored, ok := sink.DeliveredOf(err); ok {
+		took := make([]bool, len(batch))
+		for _, i := range stored {
+			if i >= 0 && i < len(batch) {
+				took[i] = true
+			}
+		}
+		for i, it := range batch {
+			if took[i] {
+				a.metrics.EventsWrittenTotal.Add(1)
+				continue
+			}
+			refused++
+			onRefused(it, err)
+		}
+		return refused, nil
+	}
+	for _, it := range batch {
+		one := []*envelope.Item{it}
+		switch err := write(one); {
+		case err == nil:
+			a.metrics.EventsWrittenTotal.Add(1)
+		case sink.ClassOf(err) == sink.ClassLogic:
+			refused++
+			onRefused(it, err)
+		default:
+			return refused, err
+		}
+	}
+	return refused, nil
 }
 
 // drainBacklog empties the ring.db backlog before the public listener opens
@@ -362,29 +448,53 @@ func (a *App) drainRing(ctx context.Context, r *ring.SQLiteRing) int {
 			a.log.Error("cannot read the ring backlog", "error", err)
 			return ExitSink
 		}
-		if len(items) == 0 {
-			continue
-		}
 
-		wctx, cancel := context.WithTimeout(ctx, a.cfg.Sink.OpTimeout)
-		err = a.sink.Write(wctx, items)
-		cancel()
-		if err != nil && ctx.Err() != nil {
-			// The rows stay in ring.db for the next boot (SPEC §9.2).
-			a.log.Info("interrupted while draining the backlog")
-			return ExitAborted
-		}
-		if err != nil {
-			a.log.Error("cannot deliver the backlog; the public listener stays closed",
-				"error", err, "pending", st.Items)
-			return ExitSink
-		}
-		a.metrics.EventsWrittenTotal.Add(uint64(len(items)))
-		_ = r.Commit(items)
-		for _, it := range items {
-			it.Release()
+		// In pieces under sink.batch_max_bytes, as the workers write (SPEC
+		// §8.1 step 2). Each piece is committed as soon as it is settled: a
+		// later piece that fails leaves only itself and the rest in ring.db.
+		for rest := items; len(rest) > 0; {
+			n := sink.SplitByBytes(rest, a.cfg.Sink.BatchMaxBytes)
+			piece := rest[:n]
+			rest = rest[n:]
+			if code := a.drainPiece(ctx, r, piece, st.Items); code != ExitOK {
+				return code
+			}
 		}
 	}
+}
+
+// drainPiece writes one piece of the ring.db backlog. A row the destination
+// refuses as logic is dropped and counted as sink_logic, with its uuid in an
+// ERROR, exactly as the workers do while serving (SPEC §8.1 step 5, §10.1
+// step 5): the same row was a counted loss in a running process and, at the
+// boot, an exit 3 at every restart with the public port closed (until
+// 2026-10-14). Commit comes before Release, as in the workers.
+func (a *App) drainPiece(ctx context.Context, r *ring.SQLiteRing, piece []*envelope.Item, pending int64) int {
+	refused, err := a.writeOrSingle(ctx, piece, func(it *envelope.Item, err error) {
+		a.log.Error("the destination refused a ring.db row permanently; it is lost",
+			"id", it.ID, "error", err)
+	})
+	if err != nil && ctx.Err() != nil {
+		// The rows stay in ring.db for the next boot (SPEC §9.2). Those this
+		// piece already wrote one by one come back too, which the destination
+		// absorbs by uuid where it can, as for any redelivery.
+		a.log.Info("interrupted while draining the backlog")
+		return ExitAborted
+	}
+	if err != nil {
+		a.log.Error("cannot deliver the backlog; the public listener stays closed",
+			"error", err, "pending", pending)
+		return ExitSink
+	}
+	if refused > 0 {
+		a.metrics.SinkErrorsTotal[obs.SinkErrLogic].Inc()
+		a.metrics.EventsDroppedTotal[obs.DropSinkLogic].Add(uint64(refused))
+	}
+	_ = r.Commit(piece)
+	for _, it := range piece {
+		it.Release()
+	}
+	return ExitOK
 }
 
 // dumpEmergency writes pending items to disk, or counts them lost (SPEC §9,

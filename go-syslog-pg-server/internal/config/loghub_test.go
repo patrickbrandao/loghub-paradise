@@ -382,14 +382,15 @@ func TestReloadSeesSecrets(t *testing.T) {
 		t.Fatalf("applied=%v ignored=%v", applied, ignored)
 	}
 	// Every [syslog] key, and everything outside [log], requires a restart
-	// (SPEC §16.3); the three [log] keys apply.
+	// (SPEC §16.3); the three [log] keys apply. sink.postgres.pool_size,
+	// derived from sink.workers in both, is not reported (2026-10-14).
 	fresh = mustLoad(t, []string{"--syslog.payload_raw=false", "--syslog.rfc3164_timezone=Asia/Tokyo",
 		"--log.level=debug", "--log.access", "--log.access_sample=0.5", "--sink.workers=6",
 		"--log.format=text"}, nil)
 	applied, ignored = Compare(boot, boot, fresh)
 	if !equalNames(applied, []string{"log.level", "log.access", "log.access_sample"}) ||
 		!equalNames(ignored, []string{"syslog.rfc3164_timezone", "syslog.payload_raw", "sink.postgres.password",
-			"sink.workers", "sink.postgres.pool_size", "log.format"}) {
+			"sink.workers", "log.format"}) {
 		t.Fatalf("applied=%v ignored=%v", applied, ignored)
 	}
 }

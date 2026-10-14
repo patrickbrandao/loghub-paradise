@@ -145,6 +145,8 @@ menos que você diga o contrário.
   a escrita direta; a descarga usa `sink.op_timeout`.
 - **Descarga:** uma rotina por instância. Lê até `sink.batch` (256) envelopes com
   teto de bytes por lote, faz um `Write` do lote e só remove depois do aceite.
+  *(Revisto em 2026-10-14 por decisão do usuário: o teto de bytes, que o porte
+  deixou de fora, existe agora como `sink.batch_max_bytes`; ver seção 4d.)*
   Backoff de 100 ms a 2 s, sempre com os mesmos bytes. `sink.workers` sai.
 - **Ring SQLite:** igual à v1 (group commit, `fsync` conforme
   `ring.sqlite.synchronous`). `stage=ring` significa `200` após o `COMMIT`, com
@@ -329,6 +331,7 @@ conhecida, o que mantém visíveis os erros de digitação que importam.
 Fica de fora, com o porquê: o TLS do `sink=nats` continua (este módulo tem TLS;
 o `TLSCertCB` que recusa é do N e do SN, que não têm), e a reingestão que refaz
 item a item uma recusa `logic` (`TESTING.md` §8 item 38) não estava na lista.
+*(Feita em 2026-10-14, seção 4d.)*
 
 ## 4b. Porte das correções da família syslog/RELP (2026-10-13)
 
@@ -396,7 +399,11 @@ plano da rodada. Padrões assumidos, contestáveis:
   com `tls=true` já era recusado aqui (item B5 do plano: nada a fazer).
 - **Fica de fora, por não se aplicar:** `sink.batch_max_bytes` (a família
   webhook não tem a chave; o teto de 1 GiB de um parâmetro do PostgreSQL já é
-  `WARN` de §8.5.4, limitado na prática por `ring.max_bytes`) e as regras de
+  `WARN` de §8.5.4, limitado na prática por `ring.max_bytes`) *(revisto em
+  2026-10-14 por decisão do usuário: a premissa não valia -- com
+  `ring=sqlite` o `ring.max_bytes` não limitava nada antes da reserva, e mesmo
+  limitado, 512 MiB num lote não cabem em `sink.op_timeout`; a chave existe,
+  ver seção 4d)* e as regras de
   URL PostgreSQL da `LOGHUB_EB_URL` (`sslmode=`/`host=` vazios, usuário e banco
   obrigatórios, fragmento): este servidor não tem `LOGHUB_EB_URL` nem outro
   leitor de URL ou DSN PostgreSQL/MySQL na configuração — `sink.postgres` e
@@ -467,6 +474,133 @@ nova do usuário. Contestáveis, como tudo neste arquivo:
   que `1048` e `23502` passam a fatais); o `Deliver` com `logic` antes do `ctx`
   do RP (os workers daqui já tratavam a classe antes do contexto; ficou um teste
   de guarda); o prazo próprio da validação (já existia, `validationContext`).
+
+## 4c. Pendências da superfície HTTP (2026-10-14)
+
+Os itens 1 a 7 da pendência "Superfície HTTP e conexões" da SPEC §19.1 do
+`go-webhook-server`, todos presentes também aqui. Seis eram correção (a regra
+está na seção normativa da SPEC); um era decisão de produto:
+
+- **`max_conns_per_ip` conta o endereço exato** (SPEC §13.5). **Contestável:**
+  o usuário não decidiu para a família webhook; a decisão segue o precedente
+  da família syslog/RELP (`go-relplog-server`, decisão 16; `go-syslog-server`,
+  "Decisões portadas do `go-relplog-server`"). Um /128 no IPv6, IPv4 mapeado =
+  IPv4. Contar por prefixo IPv6 foi recusado: um /64 pode ser uma LAN inteira
+  de emissores, e os emissores de webhook (provedores SaaS) saem de *pools* de
+  endereços IPv6 vizinhos, então uma cota por prefixo recusaria entregas
+  legítimas com um fechamento de conexão. Contra um /64 hostil: `max_conns`, o
+  firewall e o rate-limit por prefixo (`ratelimit.v6_mask`). Alternativa
+  registrada, se o usuário quiser fechar o contorno por configuração: uma chave
+  aditiva `server.max_conns_v6_prefix` (padrão 128, o comportamento atual),
+  nunca o `ratelimit.v6_mask` (/48 é largo demais para contar conexões). Vale
+  igual para o `go-webhook-server`, que não tem `DECISOES.md` e cita esta.
+  Teste: `TestPerIPLimitCountsTheExactAddress`.
+- **Saída de um listener parado** (SPEC §10.3, §10.5), padrão assumido: o
+  listener retenta todo erro do `accept` salvo o próprio fechamento e nunca
+  desiste (como o laço da família syslog), então não há código de saída novo;
+  um `Serve` que ainda assim termine com erro passa pelo shutdown gracioso e
+  sai com `1` se ele foi completo (o código de antes), ou com o que o
+  shutdown der (`3`, `130`).
+
+## 4d. Ring, lote e recusa no boot (2026-10-14)
+
+Rodada dos itens 8, 9, 10, 11 e 20 da SPEC §19.1 do `go-webhook-server`, e do
+achado da triagem sobre os lotes retidos, feita em W e portada para cá igual
+(o `internal/` dos dois é o mesmo). As regras estão na SPEC (§7.2, §7.4, §8.1,
+§8.5.4, §9.2, §10.1, §12.2, §12.4, §13.5); aqui fica o que foi decisão.
+
+- **O ring de memória cobra o buffer retido** (decisão do usuário,
+  2026-10-14). `ring.max_bytes` e `whs_ring_bytes`, com `ring=memory`, passam a
+  medir `cap(Env)` mais um custo fixo por item (`ring.ItemOverhead` = 256
+  bytes: a `struct`, o `uuid` em texto, o canal de confirmação e a vaga no
+  canal do ring), e o valor cobrado fica gravado no item (`Item.Charged`) para
+  o `Commit` e o `Drain` descontarem o mesmo. O usuário escolheu, das três
+  variantes da triagem, **só cobrar**: sem copiar o JLH para a classe justa
+  (uma cópia por requisição, e as classes espaçadas 4× não tiram o fator) e
+  **sem mudar os padrões** de `ring.max_bytes`. Consequência aceita: com
+  eventos pequenos o teto de bytes manda antes do de itens (512 MiB / ~16 KiB
+  ≈ 32 000 eventos) e uma instância perto do teto vê `429` antes.
+  `Item.Size()` continua `len(Env)`: o `ring=sqlite` (`nbytes`) e o
+  `sink=mysql` o usam como tamanho do dado.
+- **Os lotes retidos pelos workers contam no teto de itens** (achado da
+  triagem; porte de S/R, sem decisão nova). O teto era o tamanho do canal, e
+  um lote retirado por `Dequeue` saía do canal sem sair da conta: até
+  `workers × batch` além de `capacity_items`.
+- **`ring=sqlite` reserva no `Enqueue`** e **o worker sobrevive a erro de
+  leitura** (portes de S/R, sem decisão nova; ajustes: o teste usa
+  `CommitMaxDelay` de 500 ms para ser determinístico, e confere a recontagem
+  fechando e reabrindo o ring, porque aqui não há `Recount`).
+- **`sink.batch_max_bytes`** (decisão do usuário, 2026-10-14). Padrão 16 MiB,
+  teto 256 MiB (exit 1 acima), mínimo 1 byte: 1 é coerente com a regra (cada
+  evento vai sozinho), e 0 leria como "sem teto", que é o que a chave acaba. A
+  forma é a do SP/RP: o lote fecha quando a soma dos JLH passaria do teto, e um
+  envelope maior que o teto vai sozinho. Diferença deliberada do SP: o corte é
+  no worker, **depois** do `Dequeue`, e não no ring -- o ring de memória não
+  devolve item à cabeça do canal, e uma regra só serve aos dois rings; o
+  `Dequeue` continua lendo até `sink.batch` itens. Vale também para a
+  reingestão do dump e o dreno do `ring.db` no boot (mesma função,
+  `sink.SplitByBytes`). `config.WorstBatchBytes` passa a
+  `max(min(envelope × batch, ring.max_bytes, batch_max_bytes),
+  min(envelope, ring.max_bytes))`: o `WARN` do PostgreSQL só dispara com um
+  envelope acima de 1 GiB, e a exigência de memória do ClickHouse com os
+  padrões cai de ~4,1 GiB para 128 MiB + 8 × 16 MiB = 256 MiB. Revistas por
+  isso as entradas da seção 2 ("Descarga") e da 4b ("Fica de fora").
+  Os compose de `docker/` repassam `WHS_SINK_BATCH_MAX_BYTES` (padrão
+  `16MiB`) ao lado de `WHS_SINK_BATCH`, acrescentado na integração.
+- **CONTESTÁVEL -- recusa `logic` no boot** (porte do `go-webhook-pg-server`;
+  direção da SPEC §19.1 item 20 de W e do item 5 daqui; sem pergunta nova ao
+  usuário). Na reingestão do dump, um lote recusado como `logic` é refeito item
+  a item; o recusado de novo fica no arquivo, que vai para `.corrupt`, e o boot
+  segue -- nada se perde. No dreno do `ring.db`, a linha recusada como `logic`
+  é **descartada e contada** em `whs_events_dropped_total{reason="sink_logic"}`,
+  como os workers fazem em execução. É aqui que está o ponto contestável: os
+  dois caminhos tratam a mesma recusa de formas diferentes (o dump guarda o
+  registro; o `ring.db` o perde), porque o dump tem um lugar natural para o
+  registro ficar (o arquivo em quarentena) e o `ring.db` não -- deixar a linha
+  na `jlh_ring` a traria de volta a cada boot, e uma tabela de quarentena no
+  `ring.db` seria um contrato novo. A alternativa seria mover a linha para um
+  dump `.corrupt`; fica registrada para o usuário decidir. A porta do dump
+  passa a exigir UTF-8 válido e só os escapes que o serializador escreve
+  (`onlyOurEscapes` do P, inalterada), e recusa também U+2028/U+2029 crus, que
+  o serializador sempre escapa (o P não confere isso: a portar).
+
+## 4e. Revisão independente da família webhook (2026-10-14)
+
+Correções da revisão independente da família webhook (`tasks/review-web-*.md`),
+com teste e mutação; as decisões do coordenador da rodada foram seguidas, e o
+que segue é o que ficou a escolher no caminho (padrões assumidos,
+contestáveis). A linha de cada item está na §19.1 do `go-webhook-server`.
+
+- **Primeiro sinal no shutdown por erro do `Serve`** (W 31): tolerado como no
+  FATAL; o dreno e o `pre_stop_delay` continuam os de um `SIGTERM`
+  (`tolerateFirst` é um parâmetro à parte de `fatal`).
+- **`read_timeout = 0`** (W 32): continua aceito; nesse caso o handler não limpa
+  o prazo de escrita e o `write_timeout` volta a limitar o upload. A
+  alternativa, exigir `read_timeout > 0`, foi descartada para não recusar uma
+  configuração que já subia.
+- **Piso de `ring.max_bytes`** (W 35): `PooledCap(MaxEventBytes) +
+  ItemOverhead`, exit 1 (não `WARN`), como o piso dos cortes RELP. Com `ring=sqlite` não há piso (fora da decisão; `TESTING.md` §8).
+- **`admin.bind`** (W 40): a porta 0 também é recusada (o mesmo sorteio da
+  porta vazia); os testes que usavam `:0` passaram a uma porta fixa que não
+  chegam a abrir.
+- **Byte de controle num valor de texto** (W 41): recusado abaixo de `0x20`
+  salvo o tab, e o `0x7f`; o tab fica porque o INI o lê e o dump o relê entre
+  aspas. A mensagem dá o byte e o *offset*, nunca o valor.
+- **Só documentados**: o `Expect: 100-continue` com corpo enviado sem esperar
+  (§4.3), o `ItemOverhead` sem a cópia do `held` (§7.2) e o recusado no
+  `.corrupt` sem *gauge* (§9.2).
+- **Sonda do `sink=sqlite`** (W 36, W 37): limite `sink.op_timeout +
+  sink.health_timeout` no relógio monotônico; o heartbeat é escrita (falha →
+  "último falhou", sucesso → "bom", erro do próprio prazo da sonda → nada); a
+  recusa `logic` segue contando como `Write` com erro (intencional, §8.3.5).
+- **Redis** (W 38, W 42): `Dialer.Timeout = sink.op_timeout` (vale para as
+  reconexões); com as duas leituras da política recusadas a sonda deixa de
+  pedi-las até o processo reiniciar; Redis Cluster confere um nó por checagem e
+  um proxy com tipo inesperado no `INFO` vira retry (documentados).
+- **Só documentados também**: a linha do `ring.db` com `Scan` sempre falho trava
+  o dreno (§7.4), o dreno do boot sai com 3 num erro transitório (§10.1 passo
+  5), o *keep-alive* do `dialPostgres` e o ambiente `PG*` escondido do processo
+  no parse (§8.5.2).
 
 ## 5. Ordem de entrega
 

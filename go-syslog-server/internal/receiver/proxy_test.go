@@ -625,6 +625,16 @@ func TestProxyOptionalBufferedLinesSurviveClose(t *testing.T) {
 			if ok {
 				t.Errorf("required: a connection without a header survived the shutdown")
 			}
+			// Closed, but not blamed on the balancer (SPEC §4.6): without the
+			// "|| required" half of the rule this counted absent and
+			// reason="proxy" on every deploy (port of the SP/SN check,
+			// 2026-10-14).
+			if n := h.m.ProxyHeadersTotal[obs.ProxyAbsent].Load(); n != 0 {
+				t.Errorf("required: proxy_headers_total{absent} = %d after a shutdown", n)
+			}
+			if n := h.m.MessagesDroppedTotal[obs.DropProxy].Load(); n != 0 {
+				t.Errorf("required: messages_dropped_total{proxy} = %d after a shutdown", n)
+			}
 			continue
 		}
 		if !ok {
@@ -642,5 +652,63 @@ func TestProxyOptionalBufferedLinesSurviveClose(t *testing.T) {
 		if strings.Join(got, ",") != "<13>hello,<13>world" {
 			t.Fatalf("optional: got %q", got)
 		}
+	}
+}
+
+// TestProxyRequiredValidHeaderBufferedLinesSurviveClose: in required mode,
+// a balancer that sent a VALID header and the first lines in the same segment
+// before the Close is not a connection waiting for its header. Header and
+// lines are already in the reader, the TCP window took them, and closing
+// there lost them uncounted (independent review of 2026-10-14, A1; SPEC §4.6).
+func TestProxyRequiredValidHeaderBufferedLinesSurviveClose(t *testing.T) {
+	h := newHarness(t, 10, "debug", nil)
+	cidrs, _ := ParseCIDRList("127.0.0.1/32")
+	tr, err := NewTCP(context.Background(), TCPConfig{StreamConfig: StreamConfig{Addr: "127.0.0.1:0",
+		Proxy: ProxyConfig{Mode: ProxyRequired, Trusted: cidrs, HeaderTimeout: time.Hour}}}, h.in, h.m, logger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	cl, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	c, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const payload = "PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n<13>a\n"
+	if _, err := cl.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReaderSize(c, proxyReadBuffer)
+	for br.Buffered() < len(payload) {
+		_, _ = br.Peek(br.Buffered() + 1)
+	}
+	// The Close lands before readProxy looks at the header.
+	tr.closing.Store(true)
+	pip, pport := addrPortOf(c.RemoteAddr())
+	a := connAddrs{peer: netip.AddrPortFrom(pip, pport)}
+	a.src = a.peer
+	if !tr.readProxy(c, br, &a) {
+		t.Fatalf("required: a valid header and a line already read off the socket (%d bytes in the reader) were dropped uncounted", br.Buffered())
+	}
+	if !a.proxied || a.src.String() != "1.2.3.4:1" {
+		t.Fatalf("header not applied: %+v", a)
+	}
+	fr := NewFramer(br, FramingAuto, 64<<10)
+	m, _, _, err := fr.Next()
+	if err != nil || string(m) != "<13>a" {
+		t.Fatalf("line after the header: %q, %v", m, err)
+	}
+	if n := h.m.MessagesDroppedTotal[obs.DropProxy].Load(); n != 0 {
+		t.Errorf("messages_dropped_total{proxy} = %d", n)
 	}
 }

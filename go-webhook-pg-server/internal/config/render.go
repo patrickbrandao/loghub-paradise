@@ -104,14 +104,28 @@ func (l *Loaded) DumpINI(w io.Writer) error {
 				// Commented: read back, the value is derived again (from
 				// sink.workers, from ring.data_dir) instead of fixed.
 				fmt.Fprintln(w, "# derived (commented: it is derived again when this file is read)")
-				fmt.Fprintf(w, "# %-28s = %s\n", p.Key, redact(name, formatValue(p.Kind, p.Ptr)))
+				fmt.Fprintf(w, "# %-28s = %s\n", p.Key, quoteINI(redact(name, formatValue(p.Kind, p.Ptr))))
 				continue
 			}
-			fmt.Fprintf(w, "%-30s = %s\n", p.Key, redact(name, formatValue(p.Kind, p.Ptr)))
+			fmt.Fprintf(w, "%-30s = %s\n", p.Key, quoteINI(redact(name, formatValue(p.Kind, p.Ptr))))
 		}
 		fmt.Fprintln(w)
 	}
 	return nil
+}
+
+// quoteINI wraps a value whose surrounding whitespace or quotes the INI reader
+// would otherwise strip (SPEC §13.2; port of go-webhook-server, W 26;
+// from go-webhook-nats-server).
+// unquote removes exactly one layer, so the original comes back unchanged.
+func quoteINI(v string) string {
+	if v != strings.TrimSpace(v) {
+		return `"` + v + `"`
+	}
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		return `"` + v + `"`
+	}
+	return v
 }
 
 // Effective returns the flat name/value map used by the boot log line. Secrets

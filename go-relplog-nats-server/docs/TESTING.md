@@ -275,26 +275,18 @@ estão em SPEC §22.1; aqui ficam os do que os testes provam.
 
 ### 8.1 Pendências conhecidas
 
-1. **Teto de bytes do ring pequeno demais** (SPEC §22.1 item 1): aceito pela
-   validação, nenhuma mensagem cabe. Herdado do R e do SN.
-2. **Um dump publicado entre a última conferência do abandono e o `link`**
-   (SPEC §22.1 item 2): contado como perdido e reingerido. A janela é forçada
-   por `TestAbortAfterTheLastAbandonCheckCountsNothingMore` (o aborto logo
-   depois da última conferência): o dump não conta mais nada depois dele.
-3. **Discagens falhas da reconexão em `ERROR`** (SPEC §22.1 item 3): ruído, não
-   perda.
-4. **`dumpEmergency` devolve um `bool` que ninguém lê** em produção (os testes
+Nenhuma desde a rodada de 2026-10-14 (§9.3): os itens 1–3 e 6 desta lista
+eram as pendências SPEC §22.1, hoje regra (SPEC §22.1 diz onde). Ficam as duas
+arestas de forma, sem efeito:
+
+1. **`dumpEmergency` devolve um `bool` que ninguém lê** em produção (os testes
    leem); o comentário ainda diz "reports whether they were saved". Mantido
    para a forma ficar igual à do SN.
-5. **`validator.setIn` e `validator.notes`** no `config` são resíduo do R (o
+2. **`validator.setIn` e `validator.notes`** no `config` são resíduo do R (o
    rebaixamento de `sink.workers` dos destinos SQL): preenchidos, mas sem
-   efeito nenhum.
-   Mantidos para o diff com o R ficar pequeno; inofensivos.
-6. **As arestas do código comum que a revisão do RP achou e deixou** (SPEC
-   §22.1 itens 4 a 9: derivada relatada no `SIGHUP`, `listen.tcp` e
-   `admin.bind` na mesma porta, contadores sem *padding*, aborto no
-   `pre_stop_delay`, rótulo `server_closed` com `idle_timeout` menor, `kind`
-   `fatal` com o boot cancelado): valem aqui, sem teste que as fixe.
+   efeito nenhum. Mantidos para o diff com o R ficar pequeno; inofensivos. (A
+   nota `derived` de `emergency.dir`, que o `SIGHUP` usa desde 2026-10-14,
+   SPEC §16.3, vem do `Load`, não do validador.)
 
 ### 8.2 O que os testes ainda não provam
 
@@ -306,9 +298,14 @@ estão em SPEC §22.1; aqui ficam os do que os testes provam.
 3. **`WithPublishAsyncMaxPending`**: a folga de 2× (SPEC §10.7) não tem teste
    próprio; tirar o `WithPublishAsyncMaxPending` inteiro continua sobrevivendo à
    suíte (o padrão do `nats.go` é 4000, acima do que os testes publicam).
-4. **Com várias URLs**, o veredito do boot (`fatal` ou `network`) pode depender
-   da ordem em que o cliente tenta os servidores; o `LastError` reflete só a
-   última tentativa (herdado do SN).
+4. **Com várias URLs**, o `LastError` reflete só a última tentativa (herdado do
+   SN). Desde 2026-10-14 a recusa de TLS de um nó do *pool* nunca é veredito
+   (SPEC §10.7, `soleServer`), então a ordem só muda o **motivo** que o erro
+   `network` nomeia, provado com dois servidores falsos
+   (`TestNATSOneTLSServerOfAPoolIsNoVerdict`,
+   `TestNATSBootTLSRefusalOfAPoolIsNetwork`). O *pool* anunciado por um
+   cluster (`connect_urls`) não tem teste próprio aqui: o `nc.Servers()` é o
+   mesmo, e o R/F o provam com `nats-server` em cluster.
 5. **O ramo `ErrMaxBytesExceeded`** da classificação é inalcançável (só existe
    em consumidores *pull*).
 6. **Uma corrida teórica entre `Health` e `Close`** pode deixar uma conexão sem
@@ -328,6 +325,37 @@ estão em SPEC §22.1; aqui ficam os do que os testes provam.
    `stopSignals` é vazio, e o mutante que inverte a ordem sobrevive (M24 da
    revisão do RP, código comum). `binary_test.go` cobre os sinais fora da
    janela de `run()`, não essa.
+10. **A disputa de linha de cache dos contadores da recepção** sob
+    `SO_REUSEPORT` (a antiga pendência SPEC §22.1 item 6, registrada em
+    2026-10-14) não foi medida. Os contadores não têm *padding*, mas o mesmo
+    contador (`messages_total{transport="tcp"}`) é incrementado por **todos**
+    os listeners: a disputa principal é *true sharing* da mesma palavra, que
+    *padding* não remove. O `BenchmarkRELPSession` com vários listeners é o
+    lugar de medir.
+11. **`TestNATSOversizedMessageIsRefusedAlone` pula** contra o `nats-server` da
+    infraestrutura comum (`tasks/infra`, porta 24222), que tem `max_payload`
+    de 8 MiB: o teste precisa de um servidor abaixo de 4 MiB (o de §6 tem).
+12. **`TestNATSReconnectToATLSOnlyServerIsAVerdict/jetstream`** leva ora 0,6 s,
+    ora os 20 s do prazo do contexto: um `Health` que pega a conexão ainda
+    `CONNECTED` logo depois do `drop` espera o `StreamInfo` que o servidor
+    falso nunca responde. Passa sempre; igual com o `nats.go` de antes de
+    2026-10-14 (conferido: 0,61/20/20/20 s).
+13. **A soltura do buffer do leitor RELP vale só entre frames** (A5 e D4 do S,
+    2026-10-14; SPEC §5.2): um frame grande seguido de alguns bytes do próximo
+    segura o buffer até o idle. Não corrigido (medido no S) e sem teste que
+    fixe o número.
+14. **`sameStreamSocket` com nome de serviço** (revisão de 2026-10-14) é
+    provado com `http` (a tabela embutida do Go) e com um nome inexistente; um
+    nome que só o `/etc/services` conhece depende do arquivo da máquina ou da
+    imagem.
+15. **A transação segurada desde antes do primeiro `Accept`** (A2 do RELP,
+    2026-10-14) é provada com um ring falso cujo `Enqueue` espera o teste e
+    devolve `ErrFull`, e o idle vence pelo relógio (200 ms contra 700 ms de
+    espera); sem teste com o `sqlite`/`redis`/`none` de verdade.
+16. **NATS: *pool* só de servidores que recusam e uma URL com vários IPs** (D2
+    do syslog, D3 do RELP, 2026-10-14; SPEC §10.7): registrados como limite,
+    sem teste; o primeiro precisaria de dois `nats-server` com TLS recusado, o
+    segundo de um nome com vários IPs.
 
 ---
 
@@ -440,6 +468,41 @@ corrida).
 | E1 do S | `closing` com PROXY `optional` | **não aplicado**, por instrução: no RELP as linhas no buffer nunca tiveram `200`, e o `librelp` as retransmite | — |
 | A2-minor do S | Comentário de ordem reversa com fechamento paralelo; log do aborto com o ring Redis | **não se aplica**: o comentário diz "AT ONCE", como o código; não há Redis | — |
 
+### 9.3 Rodada das pendências conhecidas (2026-10-14)
+
+Entrada: `tasks/triage-RP-RN.md` da raiz. Ordem por item: SPEC, teste que
+falhava no código de então, correção, e mutação (só a correção revertida, o
+teste falha, restaurada). Os testes novos ficam em `known_issues_test.go` de
+cada pacote; os do código comum são os mesmos do RP. Registro passo a passo
+em `tasks/progress-RP-RN.md` da raiz.
+
+| Item (SPEC §22.1) | Regra | Testes (falhavam antes) | Mutação |
+|---|---|---|---|
+| 7, aborto lê o ring aberto | §13.4 | `TestAbortClosesTheRingBeforeCounting` (`app`); `TestEnqueueSeesACloseThatRacedTheReservation` (`ring`, gancho `afterReserve`) | sem `ring.Close()` no `abortLoss` e sem a reconferência: os dois falham |
+| 1, `ring.max_bytes` sem lugar | §13.2, §15.1 (a direção do RP: classe de `max_message_bytes` + 256 B) | `TestRingMaxBytesFitsTheLargestMessage`, `TestRingMinBytesIsWhatTheRingCharges` | piso de volta a 1: falha |
+| 5, `admin.bind` = `listen.tcp` | §13.2, §14 | `TestAdminBindCollidesWithListen` | sem a checagem: falha |
+| 3, discagem da reconexão em `ERROR` | §10.7 | `TestNATSReconnectDialFailureIsNotLogged` (`level=ERROR msg="nats async error" error="dial tcp: connection refused"`) | `asyncError` fora do `if` (a forma antiga): falha |
+| 10 (novo), veredito de TLS sem olhar o *pool* | §10.7 | `TestNATSOneTLSServerOfAPoolIsNoVerdict` (dois servidores falsos, o bom derrubado e religado: `natsFake.stop`/`restart`), `TestNATSBootTLSRefusalOfAPoolIsNetwork` | sem `soleServer` no `onReconnectErr`, sem `soleServer` no `noteLastError`, sem o ramo do *pool* no `connect`, `Health` sem nomear o TLS: cada um falha |
+| 8, rótulo do idle | §5.4, §13.2 | `TestIdleCloseWithAHeldTransactionIsBackpressure`, `TestIdleBelowBackpressureWarns`; controle `TestIdleCloseWithNothingHeldCountsNothing` | rótulo sempre `server_closed`, `held` que nunca sobe, `WARN` desligado: cada um falha |
+| 4, derivada no `SIGHUP` | §16.3 | `TestReloadDoesNotReportDerivedKeys` | filtro desligado: falha; `\|\|` no lugar de `&&`: falham os controles |
+| 2, 6, 9 | §13.4 e DECISOES nº 15, §8.2 item 10, §14.1 | sem código novo | — |
+
+### 9.4 Revisão independente de 2026-10-14 (S, SP, SN, R, RP, RN)
+
+Entrada: `tasks/review-syslog.md` e `tasks/review-relp.md`; progresso em
+`tasks/progress-review-fixes-syslog-relp.md`. **Ordem:** SPEC, teste que falha
+no código de antes, correção. **Mutação:** cada correção revertida sozinha,
+com o teste da linha falhando e a correção restaurada depois.
+
+| Item | Falha antes / com o mutante | Teste |
+|---|---|---|
+| `sameStreamSocket` por valor (§13.2; D1 do syslog, D4 do RELP) | 7 casos, p.ex. `sameStreamSocket("[::0]:9102", "127.0.0.1:9102") = false, want true`, `("127.0.0.1:0514", "127.0.0.1:514")`, `("127.0.0.1:http", "127.0.0.1:80")`; mutantes (curinga por grafia; porta comparada como texto): mortos | `TestSameStreamSocketReadsValuesNotSpellings` |
+| Transação segurada desde antes do primeiro `Accept` (§5.4; A2 do RELP) | "idle during a slow first Accept: backpressure = 0, server_closed = 1; want 1 and 0"; mutante (o `held` de volta para depois do primeiro `Accept`): a mesma | `TestIdleDuringASlowFirstAcceptIsBackpressure` |
+
+Registrados sem código: comentário do `Memory.Enqueue` (D1); URL única com vários IPs e *pool* só de servidores que exigem TLS (D3; D2 do syslog; §10.7); soltura do buffer do leitor entre frames (A5/D4 do S; §5.2); sobrecontagem pelo recuo de bytes (D3 do syslog; §13.4). Aqui o `Accept` do ring em memória é instantâneo: o A2 entra para o código comum não divergir do R.
+
+Rodadas: `tasks/run2.sh go-relplog-nats-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh`), logs em `tasks/logs/go-relplog-nats-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*; e o pacote `sink` com `RELPLOG_TEST_NATS_URL=nats://127.0.0.1:24226`: **ok**. Fuzz: nenhum, por instrução da rodada.
+
 ---
 
 ## 10. Resultado da rodada final (2026-10-13, depois do porte de §9.1)
@@ -471,3 +534,20 @@ Apple M2, macOS, Go 1.27.1, quatro `nats-server` 2.14.6 em processos próprios
 | Fuzz | `FuzzFrame` 60 s, sem falha (1,63 milhão de execuções); o único alvo cujo código mudou (`relpframe.go`; `nats.go` não tem alvo) |
 | Mutação | cada correção revertida sozinha: o teste da linha falha (ver acima) |
 | Não rodou | fuzz de 10 min; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |
+
+### Depois da rodada das pendências conhecidas de §9.3 (2026-10-14)
+
+Os quatro `nats-server` da infraestrutura comum (`tasks/infra/env.sh`: 24222
+JetStream, 24223 sem JetStream, 24224 permissões, 24225 `tls {}`) e o rsyslog
+8.2410 com `librelp` 1.11.
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `source tasks/infra/env.sh; go test -race -count=1 -timeout 1200s ./...` | **verde duas vezes seguidas** (74 s e 66 s), sem falha |
+| Testes | **450** de primeiro nível passaram e **1** pulou (`TestNATSOversizedMessageIsRefusedAlone`, §8.2 item 11: o servidor da infraestrutura comum tem `max_payload` de 8 MiB); **334** subtestes passaram, **1** pulado (`TestGoldenVectors/arquivo-sem-pri`, D5); 0 falhas. Eram 438 de primeiro nível: os 13 novos são os de §9.3 |
+| Por pacote (primeiro nível / subtestes, com os pulados) | `app` 74/81, `config` 74/0, `control` 9/0, `convert` 15/71, `emergency` 28/45, `ident` 2/0, `item` 5/0, `jlh` 4/0, `jlhcheck` 4/0, `obs` 10/0, `receiver` 103/33, `ring` 15/0, `sink` 108/105 |
+| Emissores reais | `TestEmittersRELPInClear` (14,9 s e 15,1 s), `TestEmittersRELPBackpressureRetransmits` (6,4 s e 7,7 s), `TestEmittersRELPSurvivesARestart` (4,8 s e 4,5 s), verdes nas duas rodadas |
+| Mutação | cada correção revertida sozinha: o teste da linha falha (§9.3) |
+| Não rodou | fuzz (por instrução; nenhum alvo de fuzz mudou); carga ponta a ponta; `docker compose` (o `docker/` não mudou) |
+

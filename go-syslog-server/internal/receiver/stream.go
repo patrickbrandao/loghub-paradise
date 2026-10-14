@@ -353,7 +353,7 @@ func (s *Stream) readProxy(c net.Conn, br *bufio.Reader, a *connAddrs) bool {
 
 	armDeadline(c, px.headerTimeout(), &s.closing)
 	hdr, found, err := ReadProxyHeader(br)
-	if s.closing.Load() && (err != nil || px.Mode == ProxyRequired) {
+	if s.closing.Load() && (err != nil || (!found && px.Mode == ProxyRequired)) {
 		// The shutdown expired the deadline of a connection still waiting for
 		// its header (or halfway through one). That is a deploy, not the
 		// balancer's fault: nothing is counted and nothing is logged, as the
@@ -367,6 +367,11 @@ func (s *Stream) readProxy(c net.Conn, br *bufio.Reader, a *connAddrs) bool {
 		// up to 4 KiB of them uncounted on every Close (independent review of
 		// the port, 2026-10-13); in RELP nothing is confirmed before the
 		// header, here the TCP window already took them.
+		//
+		// And only without a header in required mode: a VALID header the
+		// balancer sent in the same segment as the first lines is not a wait.
+		// Header and lines are already in the reader, and closing here lost
+		// them uncounted (independent review of 2026-10-14, A1).
 		return false
 	}
 	switch {

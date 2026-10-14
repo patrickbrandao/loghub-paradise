@@ -15,7 +15,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-server/internal/item"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-server/internal/rediscli"
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-server/internal/ring"
 )
 
 // Defaults and ceilings that only apply to the relational destinations
@@ -180,6 +182,9 @@ func validate(c *Config, setIn map[string]bool) ([]string, map[string]string, er
 	if err := v.memoryRingItems(); err != nil {
 		return nil, nil, err
 	}
+	if err := v.ringBytesFloor(); err != nil {
+		return nil, nil, err
+	}
 	v.outsideDataDir()
 	v.exposure()
 	v.natsMode()
@@ -259,6 +264,21 @@ func validateListeners(c *Config) error {
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
 			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
 		}
+		// Refused here, not at boot step 12 after the admin port served the
+		// whole boot -- and on macOS/BSD not even there: SO_REUSEADDR lets
+		// 127.0.0.1:P and *:P coexist, and the admin port silently took
+		// localhost's connections (SPEC §13.2, §14). Only the stream
+		// listeners: UDP is another protocol, listen.unix a path.
+		for _, e := range []struct{ name, addr string }{
+			{"listen.tcp", c.Listen.TCP},
+			{"listen.tls", c.Listen.TLS},
+		} {
+			if e.addr != "" && sameStreamSocket(e.addr, c.Admin.Bind) {
+				return fmt.Errorf("admin.bind (%q) and %s (%q) are, or may resolve to, the same "+
+					"TCP address: the admin port and a syslog listener cannot share one stream "+
+					"socket (to share a port, use two distinct IP literals)", c.Admin.Bind, e.name, e.addr)
+			}
+		}
 	}
 	if c.Listen.UnixMode == 0 && c.Listen.Unix != "" {
 		return fmt.Errorf("listen.unix_mode: 0 makes the socket unwritable by anyone, " +
@@ -272,10 +292,31 @@ func validateListeners(c *Config) error {
 func sameStreamSocket(a, b string) bool {
 	ha, pa, errA := net.SplitHostPort(a)
 	hb, pb, errB := net.SplitHostPort(b)
-	if errA != nil || errB != nil || pa != pb || pa == "0" {
+	if errA != nil || errB != nil {
 		return false
 	}
-	wild := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
+	// Values, not spellings (independent review of 2026-10-14, SPEC §13.2):
+	// the port is the number net.Listen would bind, read the way it reads it
+	// -- "0514" is 514, a service name is its number -- and a port that is
+	// neither fails at bind anyway, so it is refused here with both keys
+	// named. Compared as text, "0514" and "514" passed as different ports.
+	na, errA := net.LookupPort("tcp", pa)
+	nb, errB := net.LookupPort("tcp", pb)
+	if errA != nil || errB != nil {
+		return true
+	}
+	if na != nb || na == 0 {
+		return false
+	}
+	// Any unspecified literal is the wildcard ("::0", "0:0::0"), not only
+	// the three usual spellings.
+	wild := func(h string) bool {
+		if h == "" {
+			return true
+		}
+		ip, err := netip.ParseAddr(h)
+		return err == nil && ip.Unmap().IsUnspecified()
+	}
 	if wild(ha) || wild(hb) {
 		return true
 	}
@@ -838,6 +879,36 @@ func (v *validator) memoryRingItems() error {
 		c.Ring.CapacityItems, maxRingItems)
 }
 
+// ringBytesFloor refuses a ring.max_bytes below what one message of
+// syslog.max_message_bytes costs the EFFECTIVE ring, in that ring's measure
+// (SPEC §9.2, §13.2, §15.1): below it that message could never be queued, even
+// in an empty ring -- a TCP connection stalls behind it until the backpressure
+// timeout every time, and UDP drops it as ring_full with nothing queued. The
+// floor of the smallest class is not enough: a 4 KiB ring takes the short
+// lines and refuses any 3 KiB one for ever. Runs after ringSinkCombinations,
+// which may degrade ring=redis to memory, and after validateSyslog has bounded
+// max_message_bytes.
+func (v *validator) ringBytesFloor() error {
+	c := v.c
+	var floor int64
+	switch c.Ring.Mode {
+	case RingModeMemory:
+		floor = ringMinBytes(c.Syslog.MaxMessageBytes)
+	case RingModeSQLite, RingModeRedis:
+		// They count len(raw), what they store, so the truncated message
+		// itself is what one of them costs.
+		floor = c.Syslog.MaxMessageBytes
+	default:
+		return nil // ring=none does not use the key
+	}
+	if c.Ring.MaxBytes >= floor {
+		return nil
+	}
+	return fmt.Errorf("ring.max_bytes (%s) is below what one message of syslog.max_message_bytes "+
+		"(%s) costs the %s ring, %s: that message could never be queued, even in an empty ring",
+		FormatBytes(c.Ring.MaxBytes), FormatBytes(c.Syslog.MaxMessageBytes), c.Ring.Mode, FormatBytes(floor))
+}
+
 // exposure is the "ratelimit.enabled=false with a listener off loopback" row.
 func (v *validator) exposure() {
 	c := v.c
@@ -1020,4 +1091,12 @@ func unixPathMax() int {
 		return 107
 	}
 	return 103
+}
+
+// ringMinBytes is what one n-byte message costs the memory ring (SPEC §9.2):
+// the capacity of the pooled buffer the receiver copies it into, plus the
+// per-item overhead. It is the ring's own heldBytes, computed before the copy
+// exists.
+func ringMinBytes(n int64) int64 {
+	return int64(item.PooledCap(int(n))) + ring.ItemOverhead
 }

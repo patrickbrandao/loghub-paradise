@@ -256,21 +256,7 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 			}
 			log.Warn("nats disconnected", "error", err)
 		}),
-		nats.ReconnectErrHandler(func(nc *nats.Conn, err error) {
-			// nats.go calls this only for a reconnection whose TCP dial
-			// failed -- and for a wss:// server, whose TLS is part of the
-			// dial; a nats:// TLS refusal comes later, in the handshake, and
-			// is caught by noteLastError from Health. Only a verdict is
-			// logged: every failed dial of a long outage as an ERROR would
-			// repeat what /readyz and syslog_sink_up already say
-			// (go-relplog-nats-server SPEC §22 item 3, not ported). A TLS
-			// refusal is a verdict only with no other server to go to
-			// (tlsVerdict).
-			if n.tlsVerdict(nc, err) {
-				n.setVerdict(err)
-				n.asyncError(err)
-			}
-		}),
+		nats.ReconnectErrHandler(n.onReconnectErr),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			m.SinkNATSReconnectsTotal.Inc()
 			log.Warn("nats reconnected", "url", connectedURL(nc))
@@ -369,6 +355,22 @@ func (n *NATS) noteLastError(nc *nats.Conn) {
 	// independent review, 2026-10-13; SPEC §10.7).
 	if deniesTheDataPath(last) || n.tlsVerdict(nc, last) {
 		n.setVerdict(last)
+	}
+}
+
+// onReconnectErr is the client's ReconnectErrCB. nats.go calls it only for a
+// reconnection whose TCP dial failed -- and for a wss:// server, whose TLS is
+// part of the dial; a nats:// TLS refusal comes later, in the handshake, and
+// is caught by noteLastError from Health. Only a verdict is logged (SPEC
+// §10.7): every failed dial of a long outage as an ERROR, one every 30 s,
+// would repeat what the disconnection WARN, /readyz and syslog_sink_up
+// already say (go-relplog-nats-server SPEC §22.1 item 3, fixed there
+// 2026-10-14; TestNATSReconnectDialFailureIsNotLogged). A TLS refusal is a
+// verdict only with no other server to go to (tlsVerdict).
+func (n *NATS) onReconnectErr(nc *nats.Conn, err error) {
+	if n.tlsVerdict(nc, err) {
+		n.setVerdict(err)
+		n.asyncError(err)
 	}
 }
 

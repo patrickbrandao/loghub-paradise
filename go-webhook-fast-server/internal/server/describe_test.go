@@ -484,7 +484,7 @@ func TestFingerprintsKeepTheirCommas(t *testing.T) {
 		t.Errorf("fp4 = %q, want %q", sec.FP4, ja4)
 	}
 	if sec.FP3 == "0" || sec.FP2 == "p" {
-		t.Skip("BUG: describe.go reads X-TLS-JA3 and X-HTTP2-Fingerprint with lastElem, which keeps " +
+		t.Fatal("regressão de §3.2: describe.go reads X-TLS-JA3 and X-HTTP2-Fingerprint with lastElem, which keeps " +
 			"only the text after the last comma: fp3 = " + strconv.Quote(sec.FP3) + ", fp2 = " + strconv.Quote(sec.FP2))
 	}
 	if sec.FP3 != ja3 || sec.FP2 != h2 {
@@ -514,7 +514,7 @@ func TestFallbackHostPortDoesNotReachTheURL(t *testing.T) {
 		t.Fatalf("host = %q, want the dst fallback", e.Payload.Host)
 	}
 	if e.Payload.URL == "http://198.51.100.1:9443/hook" && e.Payload.Network.L4.DPort == 9443 {
-		t.Skip("BUG: describe.go derives dport from the port of an X-Forwarded-Host that is then " +
+		t.Fatal("regressão de §3.2: describe.go derives dport from the port of an X-Forwarded-Host that is then " +
 			"refused by plainHost, so the refused host's port reaches the url as dport")
 	}
 	if e.Payload.URL != "http://198.51.100.1/hook" || e.Payload.Network.L4.DPort != 80 {
@@ -632,7 +632,7 @@ func TestDescribeOnARealSocket(t *testing.T) {
 	t.Run("OPTIONS *", func(t *testing.T) {
 		resp, body, _ := rawExchange(t, addr, "OPTIONS * HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
 		if resp.StatusCode == http.StatusOK && body == "" && resp.Header.Get("X-LogHub-UUID") == "" {
-			t.Skip("BUG: net/http answers OPTIONS * itself (200, empty) before the handler: " +
+			t.Fatal("regressão de §4.2: net/http answers OPTIONS * itself (200, empty) before the handler: " +
 				"newHTTPServer does not set DisableGeneralOptionsHandler, so SPEC §4.2's 400 never happens")
 		}
 		if resp.StatusCode != http.StatusBadRequest || resp.Header.Get("X-LogHub-UUID") != "" ||

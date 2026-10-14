@@ -408,6 +408,10 @@ func parseISO3164(b []byte, loc *time.Location, warn *Warnings) (tsValue, ts3164
 					j++
 				}
 				if om, okm := num(b, j, 2); okm {
+					// No range check: +25:00 and +05:75 are applied as
+					// they came, as the skill's reference converter does
+					// (decided on 2026-10-14 as in go-syslog-server: SPEC
+					// §6.5.1, TestRFC3164ISOOffsetIsNotRangeChecked).
 					off = int64(oh*3600 + om*60)
 					if b[i] == '-' {
 						off = -off

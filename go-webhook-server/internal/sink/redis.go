@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/redis/rueidis"
 
@@ -38,6 +40,10 @@ type RedisConfig struct {
 	ReadBufferEachConn  int64
 	WriteBufferEachConn int64
 	ClientName          string
+	// DialTimeout bounds each dial and handshake of the client, at boot and
+	// on every reconnection: sink.op_timeout (SPEC §10.1 step 3). 0 keeps
+	// rueidis's own 5s.
+	DialTimeout time.Duration
 }
 
 // Redis writes each event as one XADD with one field (SPEC §3.3):
@@ -53,7 +59,22 @@ type Redis struct {
 	client   rueidis.Client
 	log      *slog.Logger
 	m        *obs.Metrics
+	// policyWarned: the WARN of an unreadable maxmemory-policy is logged once
+	// per process; at every sink.health_interval it would flood the log.
+	policyWarned atomic.Bool
+	// policyRead is which reading of the policy works, learned by the first
+	// check that needed more than INFO: policyByInfo, policyByConfig (INFO
+	// did not answer it, CONFIG GET did) or policyNone (both refused, the
+	// WARN given). The probe pipelines that one command only, so it stays
+	// one round trip (SPEC §8.2.5, W §19.1 item 42).
+	policyRead atomic.Int32
 }
+
+const (
+	policyByInfo int32 = iota
+	policyByConfig
+	policyNone
+)
 
 // NewRedis connects and verifies the connection with one PING.
 func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger, m *obs.Metrics) (*Redis, error) {
@@ -67,6 +88,9 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger, m *obs.Met
 		// Disabling it also drops the RESP3 requirement, so an older Redis or a
 		// proxy in front of one still works.
 		DisableCache: true,
+	}
+	if cfg.DialTimeout > 0 {
+		opt.Dialer.Timeout = cfg.DialTimeout
 	}
 	if cfg.RingScaleEachConn > 0 {
 		opt.RingScaleEachConn = cfg.RingScaleEachConn
@@ -98,7 +122,7 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger, m *obs.Met
 		}
 	}
 
-	client, err := rueidis.NewClient(opt)
+	client, err := newRedisClient(ctx, opt)
 	if err != nil {
 		// rueidis dials AND authenticates inside NewClient, so a bad password
 		// or a missing ACL comes back here as a Redis error reply rather than
@@ -116,6 +140,35 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger, m *obs.Met
 		return nil, err
 	}
 	return r, nil
+}
+
+// newRedisClient is rueidis.NewClient within ctx. NewClient takes no context:
+// it dials and handshakes (HELLO, AUTH, CLIENT SETINFO) under the Dialer's
+// timeout, so an address that accepts TCP and never speaks held a boot attempt
+// past sink.boot_timeout (SPEC §10.1 step 3, W §19.1 item 38). It runs in a
+// goroutine; when ctx ends first, the attempt is a network failure, retried
+// by the boot loop, and the client that arrives late is closed.
+func newRedisClient(ctx context.Context, opt rueidis.ClientOption) (rueidis.Client, error) {
+	type result struct {
+		c   rueidis.Client
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, err := rueidis.NewClient(opt)
+		ch <- result{c, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.c, r.err
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.c != nil {
+				r.c.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
 }
 
 func buildTLS(cfg RedisConfig) (*tls.Config, error) {
@@ -221,13 +274,24 @@ func (r *Redis) buildXAdd(stream string, it *envelope.Item) rueidis.Completed {
 // on a full server, NOPERM on an insufficient ACL. Nothing is written and
 // nothing is created (SPEC §8.2.4).
 func (r *Redis) Health(ctx context.Context) error {
+	// INFO memory rides in the same pipeline as the probe: the eviction check
+	// (checkEviction) then costs no round trip of its own, and the probe's
+	// latency, which sink.health_timeout bounds, stays one round trip.
 	cmds := rueidis.Commands{
 		r.client.B().Xlen().Key(r.stream.own).Build(),
 		r.client.B().Xadd().Key(r.probeKey).Nomkstream().Id("*").
 			FieldValue().FieldValue("p", "1").Build(),
 	}
+	mode := r.policyRead.Load()
+	switch mode {
+	case policyByInfo:
+		cmds = append(cmds, r.client.B().Info().Section("memory").Build())
+	case policyByConfig:
+		cmds = append(cmds, r.client.B().ConfigGet().Parameter("maxmemory-policy").Build())
+	}
 	ops := [2]string{"xlen", "writeprobe"}
-	for i, resp := range r.client.DoMulti(ctx, cmds...) {
+	resps := r.client.DoMulti(ctx, cmds...)
+	for i, resp := range resps[:2] {
 		err := resp.Error()
 		// A nil reply is the expected answer from the probe: the key is absent,
 		// so nothing was appended. rueidis reports it as an error value, which
@@ -239,7 +303,191 @@ func (r *Redis) Health(ctx context.Context) error {
 			return classifyRedis(ops[i], err, "")
 		}
 	}
+	switch mode {
+	case policyNone:
+		return nil
+	case policyByConfig:
+		kv, cerr := resps[2].AsStrMap()
+		policy, err := evictionFromConfig(kv, cerr, nil)
+		if errors.Is(err, ErrPolicyUnknown) {
+			// The ACL changed under us: WARN (once) and learn again from
+			// INFO at the next check.
+			r.policyRead.Store(policyByInfo)
+		}
+		return r.judgePolicy(policy, err)
+	}
+	info, ierr := resps[2].ToString()
+	return r.checkEviction(ctx, info, ierr)
+}
+
+// checkEviction refuses a server whose maxmemory-policy is allkeys-* (SPEC
+// §8.2.5, W pendência 12), at every check: the boot's and each one after it,
+// since CONFIG SET changes the policy of a live server. Under such a policy a
+// full Redis never answers the OOM that is fatal here: it evicts keys, and a
+// stream is one key, so every event already answered 200 goes at once while
+// this sink stays UP. The write probe cannot see it: under allkeys-* an XADD
+// at maxmemory succeeds, by evicting.
+//
+// It runs after the probe, so a Redis that is not up yet stays a network
+// failure retried by WaitReady, and only a server that answers is judged. An
+// unreadable policy (an ACL without INFO and CONFIG) is a WARN with the
+// premise, once, and the check passes.
+func (r *Redis) checkEviction(ctx context.Context, info string, ierr error) error {
+	policy, src, err := evictionFromInfo(ctx, r.client, info, ierr)
+	switch {
+	case src == policyByConfig:
+		r.policyRead.Store(policyByConfig)
+	case errors.Is(err, ErrPolicyUnknown):
+		r.policyRead.Store(policyNone)
+	}
+	return r.judgePolicy(policy, err)
+}
+
+// judgePolicy turns a reading of the policy into the probe's answer: fatal
+// for allkeys-*, a WARN once when it could not be read.
+func (r *Redis) judgePolicy(policy string, err error) error {
+	switch {
+	case errors.Is(err, ErrPolicyUnknown):
+		if !r.policyWarned.Swap(true) {
+			r.log.Warn("sink redis: cannot read maxmemory-policy; it must be noeviction (or volatile-*: the "+
+				"streams never have a TTL), or a full Redis evicts whole streams of delivered events",
+				"error", err)
+		}
+		return nil
+	case err != nil:
+		return classifyEviction(err)
+	}
+	r.log.Debug("sink redis: maxmemory-policy checked", "policy", policy)
 	return nil
+}
+
+// ErrEvictionPolicy marks a Redis whose maxmemory-policy may evict keys that
+// have no TTL (allkeys-lru, allkeys-lfu, allkeys-random). It is fatal: exit 3
+// at boot, FATAL after it (SPEC §8.2.5). A warning would be read after the
+// data is gone.
+var ErrEvictionPolicy = errors.New("redis: maxmemory-policy evicts keys without a TTL")
+
+// ErrPolicyUnknown means the policy could not be read: the ACL forbids both
+// INFO and CONFIG GET, or a proxy in front of Redis does not implement them.
+// Refusing it would lock out every deployment whose ACL is least-privilege.
+var ErrPolicyUnknown = errors.New("redis: maxmemory-policy could not be read")
+
+// evictsUnexpiredKeys reports whether a maxmemory-policy may evict a key that
+// has no TTL. noeviction refuses writes with OOM instead; the volatile-*
+// policies only evict keys WITH a TTL, and this sink never sets one, so to it
+// a volatile-* server at maxmemory behaves like noeviction. Matching the
+// prefix rather than three names keeps a future allkeys-* policy refused.
+func evictsUnexpiredKeys(policy string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(policy)), "allkeys-")
+}
+
+// evictionVerdict is the policy rule of checkRedisEviction.
+func evictionVerdict(policy string) error {
+	if evictsUnexpiredKeys(policy) {
+		return fmt.Errorf("%w: maxmemory-policy is %s, under which a full Redis deletes the stream "+
+			"instead of answering OOM; set noeviction (or a volatile-* policy: these keys never "+
+			"have a TTL)", ErrEvictionPolicy, policy)
+	}
+	return nil
+}
+
+// policyFromInfo extracts maxmemory_policy from the text of INFO memory, or
+// returns false when the line is absent (a proxy, a fork of Redis).
+func policyFromInfo(info string) (string, bool) {
+	for _, line := range strings.Split(info, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), "maxmemory_policy:"); ok {
+			return strings.TrimSpace(v), true
+		}
+	}
+	return "", false
+}
+
+// checkRedisEviction reads the server's maxmemory-policy (ported from
+// go-syslog-server's rediscli.CheckEviction). It returns the policy read and:
+//
+//	nil                         the policy keeps the keys: noeviction, volatile-*
+//	an ErrEvictionPolicy error  allkeys-*: fatal (classifyEviction)
+//	an ErrPolicyUnknown error   unreadable: the caller WARNs and carries on
+//	any other error             the connection, or a transient reply: retry
+//
+// INFO memory comes first because it is what a managed Redis (which often
+// renames or blocks CONFIG) still answers, and because the ACL category of
+// INFO is narrower than that of CONFIG (@admin); CONFIG GET is the fallback
+// for a server whose INFO is filtered. Any other error REPLY to both is
+// "unreadable", not "retry": NOPERM or "unknown command" does not change by
+// waiting, and retrying it would hold the boot until sink.boot_timeout over a
+// check that is a precaution. With Sentinel the client's node is the primary,
+// the one that holds the streams.
+func checkRedisEviction(ctx context.Context, c rueidis.Client) (string, error) {
+	info, ierr := c.Do(ctx, c.B().Info().Section("memory").Build()).ToString()
+	policy, _, err := evictionFromInfo(ctx, c, info, ierr)
+	return policy, err
+}
+
+// evictionFromInfo is checkRedisEviction from an INFO memory reply already in
+// hand (the probe pipelines it): CONFIG GET is asked only when INFO did not
+// answer the policy.
+func evictionFromInfo(ctx context.Context, c rueidis.Client, info string, ierr error) (string, int32, error) {
+	if ierr == nil {
+		if policy, ok := policyFromInfo(info); ok {
+			return policy, policyByInfo, evictionVerdict(policy)
+		}
+	} else if !redisReplyRefused(ierr) {
+		return "", policyByInfo, ierr
+	}
+	kv, cerr := c.Do(ctx, c.B().ConfigGet().Parameter("maxmemory-policy").Build()).AsStrMap()
+	policy, err := evictionFromConfig(kv, cerr, ierr)
+	if errors.Is(err, ErrPolicyUnknown) || (cerr != nil && !redisReplyRefused(cerr)) {
+		return policy, policyByInfo, err
+	}
+	return policy, policyByConfig, err
+}
+
+// evictionFromConfig reads the policy from a CONFIG GET reply; ierr is the
+// INFO error that sent the probe here, if any, for the message.
+func evictionFromConfig(kv map[string]string, cerr, ierr error) (string, error) {
+	if cerr == nil {
+		if policy, ok := kv["maxmemory-policy"]; ok {
+			return policy, evictionVerdict(policy)
+		}
+	} else if !redisReplyRefused(cerr) {
+		return "", cerr
+	}
+	reason := "INFO memory has no maxmemory_policy line"
+	if ierr != nil {
+		reason = ierr.Error()
+	}
+	if cerr != nil {
+		reason += "; CONFIG GET: " + cerr.Error()
+	}
+	return "", fmt.Errorf("%w (%s)", ErrPolicyUnknown, reason)
+}
+
+// classifyEviction maps an error of checkRedisEviction onto a class: the
+// verdict is fatal, the rest is classified like any reply of the probe.
+func classifyEviction(err error) error {
+	if errors.Is(err, ErrEvictionPolicy) {
+		return &Error{Class: ClassFatal, Op: "maxmemory-policy", Err: err}
+	}
+	return classifyRedis("maxmemory-policy", err, "")
+}
+
+// redisReplyRefused reports whether err is an error REPLY that waiting cannot
+// change (NOPERM, unknown command), as opposed to a transport failure or one
+// of the transient replies of SPEC §8.2.4, which the caller retries.
+func redisReplyRefused(err error) bool {
+	rerr, ok := rueidis.IsRedisErr(err)
+	return ok && !transientRedisReply(strings.ToUpper(rerr.Error()))
+}
+
+// transientRedisReply: alive but temporarily unable (SPEC §8.2.4).
+func transientRedisReply(upper string) bool {
+	for _, p := range []string{"LOADING", "BUSY", "MASTERDOWN", "READONLY", "CLUSTERDOWN", "TRYAGAIN"} {
+		if strings.HasPrefix(upper, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Redis) Close() error {
@@ -274,12 +522,7 @@ func classifyRedisReply(msg string) Class {
 		// 200 in a process whose PING says it is healthy (SPEC §8.2.4).
 		return ClassFatal
 
-	case strings.HasPrefix(upper, "LOADING"),
-		strings.HasPrefix(upper, "BUSY"),
-		strings.HasPrefix(upper, "MASTERDOWN"),
-		strings.HasPrefix(upper, "READONLY"),
-		strings.HasPrefix(upper, "CLUSTERDOWN"),
-		strings.HasPrefix(upper, "TRYAGAIN"):
+	case transientRedisReply(upper):
 		// Alive but temporarily unable: a replica mid-failover, a loading
 		// dataset. Retrying is exactly right.
 		return ClassNetwork

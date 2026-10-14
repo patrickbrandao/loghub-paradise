@@ -173,9 +173,13 @@ func (a *App) writeDirect(ctx context.Context, items []*envelope.Item) (refused 
 		}
 	}
 
-	size := a.cfg.Sink.Batch
-	for i := 0; i < len(items); i += size {
-		batch := items[i:min(i+size, len(items))]
+	// Batches of sink.batch items and at most sink.batch_max_bytes of JLH,
+	// an envelope above the ceiling alone: the workers' rule (SPEC §8.1 step
+	// 2, §9.2), so a dump is written in the same pieces the ring would be.
+	for rest := items; len(rest) > 0; {
+		n := min(a.cfg.Sink.Batch, sink.SplitByBytes(rest, a.cfg.Sink.BatchMaxBytes))
+		batch := rest[:n]
+		rest = rest[n:]
 		err := write(batch)
 		if err == nil {
 			delivered(batch)

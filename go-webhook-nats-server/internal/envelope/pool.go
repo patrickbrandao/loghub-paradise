@@ -68,6 +68,24 @@ func GetBody(n int64) (buf []byte, class int) {
 	return (*p)[:0], class
 }
 
+// PooledCap is the capacity GetBody gives a buffer of n bytes: its class, or
+// n itself above the largest class. It is what the memory ring charges for an
+// n-byte envelope before the envelope exists (SPEC §7.2), which the
+// validation compares with ring.max_bytes for the largest one.
+func PooledCap(n int64) int64 {
+	switch classFor(n) {
+	case 0:
+		return classSmall
+	case 1:
+		return classMedium
+	case 2:
+		return classLarge
+	case 3:
+		return classHuge
+	}
+	return n
+}
+
 // PutBody returns a pooled buffer. class must be the value GetBody returned.
 // Passing -1 is a no-op, so callers need no special case for large bodies.
 func PutBody(buf []byte, class int) {
@@ -129,6 +147,14 @@ type Item struct {
 	// RowID is the ring=sqlite row this item came from, or 0. It lets Commit
 	// delete exactly the delivered rows without a side table keyed by item.
 	RowID int64
+
+	// Charged is what the memory ring counted for this item against
+	// ring.max_bytes when it accepted it -- the buffer it retains plus a fixed
+	// per-item cost, not len(Env) (SPEC §7.2) -- recorded so that Commit and
+	// Drain give back exactly that, whatever happened to Env in between. Only
+	// the memory ring writes it; Size stays len(Env), the size of the DATA,
+	// which ring=sqlite stores in nbytes and sink=mysql splits by.
+	Charged int64
 }
 
 // Size is the item's contribution to the ring's byte accounting.

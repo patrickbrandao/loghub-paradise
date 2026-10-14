@@ -63,10 +63,12 @@ type Ring interface {
 	Dequeue(ctx context.Context, n int) ([]*envelope.Item, error)
 
 	// Commit is called after the sink confirmed the batch, or refused it as
-	// logic, and BEFORE the caller releases the buffers: the ring drops its own
-	// record of the items by it.Size(), which is len(Env), and Release empties
-	// Env. Releasing the buffers -- exactly once -- is the caller's job (SPEC
-	// §8.1, §12.3).
+	// logic, and BEFORE the caller releases the buffers: the memory ring
+	// subtracts the Charged it recorded at Enqueue (SPEC §7.2), so either
+	// order would do for it; this one is the rule because it serves every
+	// ring (the fast's ring=sqlite drops its record by len(Env), which
+	// Release empties). Releasing the buffers -- exactly once -- is the
+	// caller's job (SPEC §8.1, §12.3).
 	Commit(items []*envelope.Item) error
 
 	// Drain returns everything still pending and empties the ring. It is used

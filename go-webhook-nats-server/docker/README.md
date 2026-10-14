@@ -224,7 +224,9 @@ O servidor **publica** cada envelope em `loghub.<space>.webhook` (`docs/SPEC.md`
 - **Autenticação**, contra um NATS de fora: usuário e senha
   (`WHS_SINK_NATS_USERNAME`/`PASSWORD`), token (`WHS_SINK_NATS_TOKEN`) ou um
   `.creds` montado em `/etc/webhook` (`WHS_SINK_NATS_CREDENTIALS`), e só uma
-  delas.
+  delas. O serviço é `read_only` e só tem `/data`: descomente o volume
+  `./certs:/etc/webhook:ro` do `compose.memory-nats.yml` e ponha o `.creds` em
+  `./certs`, ou o caminho apontado não existe e o boot falha.
 
 Para olhar o que chegou:
 

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -132,12 +133,29 @@ func parseList(s string) []string {
 // setValue parses raw according to kind and stores it through ptr. ptr must be
 // the pointer type matching kind; a mismatch is a programming error in the
 // registry and panics rather than failing at runtime for the user.
+// noControlByte refuses a text value with a control byte: below 0x20 but the
+// tab, or DEL. The INI cannot carry one -- the dump split the value over two
+// lines, read back as an error or as an injected key or section -- and an
+// environment variable or a flag is where one comes from (SPEC §13.2, W 41).
+// The byte is named, never the value: the caller names the key.
+func noControlByte(raw string) error {
+	for i := 0; i < len(raw); i++ {
+		if c := raw[i]; (c < 0x20 && c != '\t') || c == 0x7f {
+			return fmt.Errorf("contains a control byte (0x%02x) at offset %d; a configuration value cannot carry one", c, i)
+		}
+	}
+	return nil
+}
+
 func setValue(kind Kind, ptr any, raw string) error {
 	switch kind {
 	case KString:
 		p, ok := ptr.(*string)
 		if !ok {
 			panic("config: KString bound to non-*string")
+		}
+		if err := noControlByte(raw); err != nil {
+			return err
 		}
 		*p = raw
 
@@ -183,6 +201,14 @@ func setValue(kind Kind, ptr any, raw string) error {
 		if err != nil {
 			return fmt.Errorf("invalid number %q", raw)
 		}
+		// ParseFloat accepts NaN and ±Inf, and NaN passes every range check
+		// (every comparison with it is false): ring.high_water=NaN never
+		// reported saturation, log.access_sample=NaN turned the access log off
+		// (SPEC §13.5; port of go-webhook-server, W 24; the parser of the
+		// syslog family).
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("invalid number %q: must be finite", raw)
+		}
 		*p = v
 
 	case KDuration:
@@ -214,6 +240,9 @@ func setValue(kind Kind, ptr any, raw string) error {
 		p, ok := ptr.(*[]string)
 		if !ok {
 			panic("config: KList bound to non-*[]string")
+		}
+		if err := noControlByte(raw); err != nil {
+			return err
 		}
 		*p = parseList(raw)
 

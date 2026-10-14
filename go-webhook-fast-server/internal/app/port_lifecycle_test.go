@@ -496,7 +496,7 @@ func TestSignalBeforeTheBindExits130(t *testing.T) {
 func TestCancelledAdminBindIsAnAbortNotAConfigError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	args := []string{"--admin.bind=localhost:0", "--server.bind=127.0.0.1:0",
+	args := []string{"--admin.bind=localhost:9101", "--server.bind=127.0.0.1:0",
 		"--ring.data_dir=" + t.TempDir(), "--ring.mode=memory", "--sink.type=none",
 		"--log.level=error"}
 	if code := RunContext(ctx, args, testID); code != ExitAborted {
@@ -561,7 +561,7 @@ func TestQuarantineWithoutDurabilityIsStillReported(t *testing.T) {
 	a := &App{log: obs.NewLogger(&log, "text", "info")}
 	notDurable := fmt.Errorf("%w: fsync of directory d: input/output error", emergency.ErrNotDurable)
 	a.reportQuarantine("d/emg-x.bin", "d/emg-x.bin.corrupt", notDurable,
-		&emergency.ReadResult{Truncated: true, TruncatedBytes: 7})
+		&emergency.ReadResult{Truncated: true, TruncatedBytes: 7}, 0)
 	out := log.String()
 	if strings.Contains(out, "cannot quarantine") || !strings.Contains(out, "directory fsync failed") ||
 		!strings.Contains(out, "unreadable tail was quarantined") || !strings.Contains(out, "emg-x.bin.corrupt") {

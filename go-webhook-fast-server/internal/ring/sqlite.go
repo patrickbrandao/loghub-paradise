@@ -74,6 +74,13 @@ type SQLiteRing struct {
 	items atomic.Int64
 	bytes atomic.Int64
 
+	// resItems and resBytes are the reservations of items on their way to the
+	// next group commit: Enqueue claims them before handing an item to the
+	// writer, so the ceilings see what is about to be committed and not only
+	// what already was (SPEC §7.4).
+	resItems atomic.Int64
+	resBytes atomic.Int64
+
 	// cursor is the highest rowid_ handed to a worker. Reads resume strictly
 	// after it, which is what guarantees a row is served at most once.
 	//
@@ -360,17 +367,21 @@ func tableNames(db *sql.DB) ([]string, error) {
 	return names, rows.Err()
 }
 
-// Enqueue hands the item to the writer and waits for its group COMMIT.
+// Enqueue reserves room, hands the item to the writer and waits for its group
+// COMMIT.
+//
+// The reservation is what makes the ceilings hold (SPEC §7.4). Compared
+// against counters that only grow after the COMMIT, a whole group -- up to
+// 2 x commit_batch waiting for the writer, plus the group being built --
+// passed the check together, and with large bodies ring.db went past
+// ring.max_bytes by gigabytes (until 2026-10-14; port of go-syslog-server).
 func (r *SQLiteRing) Enqueue(ctx context.Context, it *envelope.Item) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
 
 	size := it.Size()
-	if r.cfg.CapacityBytes > 0 && r.bytes.Load()+size > r.cfg.CapacityBytes {
-		return ErrFull
-	}
-	if r.cfg.CapacityItems > 0 && r.items.Load() >= int64(r.cfg.CapacityItems) {
+	if !r.reserve(size) {
 		return ErrFull
 	}
 
@@ -380,6 +391,7 @@ func (r *SQLiteRing) Enqueue(ctx context.Context, it *envelope.Item) error {
 	default:
 		// The writer is behind. Refusing here rather than blocking keeps
 		// backpressure visible as 429 instead of as growing latency.
+		r.unreserve(1, size)
 		return ErrFull
 	}
 
@@ -401,9 +413,35 @@ func (r *SQLiteRing) Enqueue(ctx context.Context, it *envelope.Item) error {
 		case err := <-done:
 			return err
 		default:
+			// Never picked up: the writer will not commit it, so the
+			// reservation goes back.
+			r.unreserve(1, size)
 			return ErrClosed
 		}
 	}
+}
+
+// reserve claims room for one item against both ceilings, or refuses. Each Add
+// returns a total that includes every concurrent reservation, so two handlers
+// can never both take the last slot.
+func (r *SQLiteRing) reserve(size int64) bool {
+	n := r.resItems.Add(1)
+	if r.cfg.CapacityItems > 0 && r.items.Load()+n > int64(r.cfg.CapacityItems) {
+		r.resItems.Add(-1)
+		return false
+	}
+	b := r.resBytes.Add(size)
+	if r.cfg.CapacityBytes > 0 && r.bytes.Load()+b > r.cfg.CapacityBytes {
+		r.resItems.Add(-1)
+		r.resBytes.Add(-size)
+		return false
+	}
+	return true
+}
+
+func (r *SQLiteRing) unreserve(n, b int64) {
+	r.resItems.Add(-n)
+	r.resBytes.Add(-b)
 }
 
 // writerLoop owns the write connection. It accumulates items and commits either
@@ -480,8 +518,17 @@ func (r *SQLiteRing) writerLoop() {
 func (r *SQLiteRing) commitBatch(batch []*envelope.Item) {
 	ctx := context.Background()
 
+	// What the batch reserved in Enqueue, read before anything can release a
+	// buffer: Size is len(Env), and Release empties Env.
+	var n, b int64
+	for _, it := range batch {
+		n++
+		b += it.Size()
+	}
+
 	tx, err := r.writeDB.BeginTx(ctx, nil)
 	if err != nil {
+		r.unreserve(n, b)
 		r.ackAll(batch, fmt.Errorf("ring sqlite: begin: %w", err))
 		return
 	}
@@ -492,6 +539,7 @@ func (r *SQLiteRing) commitBatch(batch []*envelope.Item) {
 		res, err := stmt.ExecContext(ctx, it.ID, it.Env, it.Size())
 		if err != nil {
 			_ = tx.Rollback()
+			r.unreserve(n, b)
 			r.ackAll(batch, fmt.Errorf("ring sqlite: insert: %w", err))
 			return
 		}
@@ -501,18 +549,20 @@ func (r *SQLiteRing) commitBatch(batch []*envelope.Item) {
 	// This is where the fsync happens with synchronous=FULL, and it is the
 	// reason a handler's 200 is bound to the disk in this mode.
 	if err := tx.Commit(); err != nil {
+		r.unreserve(n, b)
 		r.ackAll(batch, fmt.Errorf("ring sqlite: commit: %w", err))
 		return
 	}
 
-	var n, b int64
 	for i, it := range batch {
 		it.RowID = ids[i]
-		n++
-		b += it.Size()
 	}
+	// Committed first, reservation released second: the sum the ceilings see
+	// may briefly count the batch twice -- refusing a little early -- but can
+	// never count it zero times and admit past the ceiling.
 	r.items.Add(n)
 	r.bytes.Add(b)
+	r.unreserve(n, b)
 
 	// The row is the event now: the workers read it back from ring.db into
 	// items of their own, and the handler only needs its id and the body
@@ -541,11 +591,15 @@ func (r *SQLiteRing) Dequeue(ctx context.Context, n int) ([]*envelope.Item, erro
 	}
 	for {
 		items, err := r.selectRows(ctx, n)
+		if len(items) > 0 {
+			// A read that failed part way serves what it read: those rows are
+			// already behind the cursor, and dropping them here stranded them
+			// until the next boot (SPEC §7.4). The failing row was not passed,
+			// so the next call meets it again.
+			return items, nil
+		}
 		if err != nil {
 			return nil, err
-		}
-		if len(items) > 0 {
-			return items, nil
 		}
 		// Nothing available: wait briefly rather than spin. The commit delay is
 		// the natural cadence, since that is how fast new rows can appear.
@@ -583,6 +637,8 @@ func (r *SQLiteRing) selectRows(ctx context.Context, n int) ([]*envelope.Item, e
 			env   []byte
 		)
 		if err := rows.Scan(&rowID, &id, &env); err != nil {
+			// The cursor has not moved past this row: Dequeue serves the
+			// items already built, and the row is met again next time.
 			return out, fmt.Errorf("ring sqlite: scan: %w", err)
 		}
 		if rowID > r.cursor {
@@ -652,10 +708,12 @@ func (r *SQLiteRing) deleteRows(ids []int64) {
 // emergency dump (SPEC §9).
 func (r *SQLiteRing) Drain() []*envelope.Item { return nil }
 
+// Stats counts committed rows plus the reservations on their way to the next
+// group commit: what the ceilings are checked against (SPEC §7.4).
 func (r *SQLiteRing) Stats() Stats {
 	return Stats{
-		Items:    r.items.Load(),
-		Bytes:    r.bytes.Load(),
+		Items:    r.items.Load() + r.resItems.Load(),
+		Bytes:    r.bytes.Load() + r.resBytes.Load(),
 		CapItems: int64(r.cfg.CapacityItems),
 		CapBytes: r.cfg.CapacityBytes,
 	}

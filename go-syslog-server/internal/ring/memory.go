@@ -32,6 +32,12 @@ type Memory struct {
 	closed atomic.Bool
 }
 
+// afterReserve, nil outside tests, runs in Enqueue right after the item slot
+// is reserved: the point where a Close racing the Enqueue must still be seen
+// (TestEnqueueSeesACloseThatRacedTheReservation; the pattern of
+// emergency's var link = os.Link).
+var afterReserve func()
+
 // ItemOverhead is what one queued item holds besides its raw buffer, on
 // 64-bit:
 //
@@ -108,6 +114,22 @@ func (r *Memory) Enqueue(ctx context.Context, it *item.Item) error {
 	if r.items.Add(1) > r.capItems {
 		r.items.Add(-1)
 		return ErrFull
+	}
+	if afterReserve != nil {
+		afterReserve()
+	}
+	// The closed check above can be stale by now: an abort closes the ring
+	// and then reads Stats (SPEC §13.4). Re-checked after the reservation,
+	// either this Add is visible to that read (counted) or the Close is
+	// visible here and the item is refused as the shutdown it is -- never an
+	// accept the abort's os.Exit loses uncounted. Sequentially consistent
+	// atomics guarantee at least one of the two; both can happen in one race
+	// (the abort counts the reservation and the Enqueue still refuses it), a
+	// transient overcount SPEC §13.4 records, never a loss. The cost on the
+	// hot path is one Load.
+	if r.closed.Load() {
+		r.items.Add(-1)
+		return ErrClosed
 	}
 	size := heldBytes(it)
 	if r.capBytes > 0 {

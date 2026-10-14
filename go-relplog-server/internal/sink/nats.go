@@ -256,20 +256,7 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 			}
 			log.Warn("nats disconnected", "error", err)
 		}),
-		nats.ReconnectErrHandler(func(nc *nats.Conn, err error) {
-			// nats.go calls this only for a reconnection whose TCP dial
-			// failed; a TLS refusal comes later, in the handshake, and is
-			// caught by noteLastError from Health. Kept for a client version
-			// that reports it here. Only a verdict is logged: every failed
-			// dial of a long outage as an ERROR would repeat what /readyz and
-			// relplog_sink_up already say (go-relplog-nats-server SPEC §22
-			// item 3, not ported). The verdict only with no other server to
-			// go to (soleServer).
-			if isTLSRefusal(err) && soleServer(nc) {
-				n.setVerdict(err)
-				n.asyncError(err)
-			}
-		}),
+		nats.ReconnectErrHandler(n.onReconnectErr),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			m.SinkNATSReconnectsTotal.Inc()
 			log.Warn("nats reconnected", "url", connectedURL(nc))
@@ -377,6 +364,21 @@ func (n *NATS) noteLastError(nc *nats.Conn) {
 	// the fuses, if the pool never recovers, says why.
 	if deniesTheDataPath(last) || (isTLSRefusal(last) && soleServer(nc)) {
 		n.setVerdict(last)
+	}
+}
+
+// onReconnectErr is the ReconnectErrCB (SPEC §10.7). nats.go calls it only for
+// a reconnection whose TCP dial failed; a TLS refusal comes later, in the
+// handshake, and is caught by noteLastError from Health. Kept for a client
+// version that reports it here. Only a verdict is logged: every failed dial of
+// a long outage as an ERROR would repeat what the disconnection WARN, /readyz
+// and relplog_sink_up already say (the rule go-relplog-nats-server took from
+// here, 2026-10-14). The verdict only with no other server to go to
+// (soleServer). Nothing outside the if.
+func (n *NATS) onReconnectErr(nc *nats.Conn, err error) {
+	if isTLSRefusal(err) && soleServer(nc) {
+		n.setVerdict(err)
+		n.asyncError(err)
 	}
 }
 

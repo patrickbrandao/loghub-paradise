@@ -78,3 +78,14 @@ func CopyRaw(b []byte) ([]byte, int) {
 	buf, class := GetRaw(len(b))
 	return append(buf, b...), class
 }
+
+// PooledCap is the capacity GetRaw(n) will hand out: the class size for a
+// pooled length, n itself above the largest class. It lets the configuration
+// compute what one message of syslog.max_message_bytes costs the memory ring
+// (SPEC §9.2, §13.2) before any buffer exists.
+func PooledCap(n int) int {
+	if c := classFor(n); c >= 0 {
+		return classSizes[c]
+	}
+	return n
+}

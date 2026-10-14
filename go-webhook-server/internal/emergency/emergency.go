@@ -8,6 +8,7 @@ package emergency
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-server/internal/envelope"
 )
@@ -338,13 +340,10 @@ func (s *Store) Read(path string) (*ReadResult, error) {
 			res.TruncatedBytes = size - consumed
 			return res, nil
 		}
-		// A record whose JLH is not the shape this server writes is damage,
-		// not an event: everything from here on is treated as truncated.
-		// ParseHead checks the header and only scans the payload's braces, so
-		// json.Valid reads the whole of it -- free at boot, and the one thing
-		// that tells "{]" or "{,,,}" from an object a destination can store.
-		h, _, herr := envelope.ParseHead(env)
-		if herr != nil || !json.Valid(env) {
+		// A record whose JLH is not what this server writes is damage, not an
+		// event: everything from here on is treated as truncated (checkLine).
+		h, herr := checkLine(env)
+		if herr != nil {
 			res.Truncated = true
 			res.TruncatedBytes = size - consumed
 			return res, nil
@@ -355,6 +354,104 @@ func (s *Store) Read(path string) (*ReadResult, error) {
 		// class and reingestion is a boot-time path where allocation is free.
 		res.Items = append(res.Items, envelope.NewItem(h.UUID.String(), env, -1))
 	}
+}
+
+// errNotOurs is a record that is not an envelope this server could have
+// written.
+var errNotOurs = errors.New("emergency: not an envelope of this server")
+
+// rawLS and rawPS are U+2028 and U+2029 in UTF-8. The serializer always
+// escapes them (SPEC §12.1), so a raw one did not come from it.
+var rawLS, rawPS = []byte("\u2028"), []byte("\u2029")
+
+// checkLine holds one record to "an envelope this server writes" (SPEC §9.2),
+// which is stricter than "a JSON object with the right header" (port of
+// go-webhook-pg-server, 2026-10-14):
+//
+//   - ParseHead checks the header and only scans the payload's braces, so
+//     json.Valid reads the whole of it: "{]" or "{,,,}" is not a document.
+//   - json.Valid checks neither UTF-8 nor escapes. A raw invalid byte or an
+//     escaped lone surrogate ("\ud800") is valid to it and refused by jsonb
+//     (22021, 22P02) -- class 22, logic -- and by MySQL, and one such record,
+//     from bit rot or a hand edit, made every boot exit 3 before the public
+//     port opened (until 2026-10-14). The serializer writes UTF-8 only, and
+//     only two kinds of \u escape: \u00XX for control bytes and \u2028/
+//     (SPEC §12.1); anything else did not come from it -- and neither does a
+//     raw U+2028 or U+2029, which it always escapes.
+func checkLine(env []byte) (envelope.Head, error) {
+	h, _, err := envelope.ParseHead(env)
+	if err != nil {
+		return h, err
+	}
+	if !utf8.Valid(env) || !json.Valid(env) || !onlyOurEscapes(env) ||
+		bytes.Contains(env, rawLS) || bytes.Contains(env, rawPS) {
+		return h, errNotOurs
+	}
+	return h, nil
+}
+
+// onlyOurEscapes reports whether every escape in env is one the serializer
+// writes (envelope.appendEscape and the U+2028/U+2029 case, SPEC §9.2): \"
+// \\ \n \r \t, \u00XX in lowercase hex for a control byte with no short
+// form, and \u2028/\u2029 -- nothing else. \/ \b \f, the \u of a printable
+// character and uppercase hex are valid JSON this server never writes, so a
+// record carrying one is not ours (W §19.1 item 34; until 2026-10-14 any
+// two-character escape and any \u00XX passed, against §9.2). A backslash
+// always starts an escape in valid JSON, so the pairs are walked in order and
+// "\\u0000" (an escaped backslash, then text) is not mistaken for one. It is
+// go-webhook-nats-server's check (emergency/shape.go).
+func onlyOurEscapes(env []byte) bool {
+	for i := 0; i < len(env); i++ {
+		if env[i] != '\\' {
+			continue
+		}
+		if i+1 >= len(env) {
+			return false
+		}
+		switch env[i+1] {
+		case '"', '\\', 'n', 'r', 't':
+			i++
+			continue
+		case 'u':
+		default:
+			return false // \/ \b \f: valid JSON, never written
+		}
+		if i+6 > len(env) || !ourUnicodeEscape(env[i+2:i+6]) {
+			return false
+		}
+		i += 5
+	}
+	return true
+}
+
+// ourUnicodeEscape is the four hex digits of a \u escape the serializer writes:
+// lowercase hex, a control byte without a short form, or a JavaScript line
+// terminator.
+func ourUnicodeEscape(q []byte) bool {
+	if string(q) == "2028" || string(q) == "2029" {
+		return true
+	}
+	if q[0] != '0' || q[1] != '0' || (q[2] != '0' && q[2] != '1') {
+		return false
+	}
+	lo := lowerHex(q[3])
+	if lo < 0 {
+		return false
+	}
+	v := int(q[2]-'0')<<4 | lo
+	return v != '\n' && v != '\r' && v != '\t'
+}
+
+// lowerHex is the value of a lowercase hex digit, or -1: the serializer's
+// hexDigits are lowercase, so 'A'-'F' is not ours.
+func lowerHex(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	}
+	return -1
 }
 
 // parseHeader reads "<len>\n". Two lengths is the v1 format: legacy. Two

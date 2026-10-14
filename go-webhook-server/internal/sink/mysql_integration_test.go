@@ -356,7 +356,7 @@ func TestMySQLRefusesAnEnvelopeItDidNotWrite(t *testing.T) {
 		t.Fatalf("chunked Write = %v (class %s), want logic", err, ClassOf(err))
 	}
 	if n := f.count(f.table); n != 0 {
-		t.Skipf("BUG (mysql.go Write/writeChunk): %d rows of a batch refused as logic were inserted; "+
+		t.Fatalf("regressão de §8.6.3 (mysql.go Write/writeChunk): %d rows of a batch refused as logic were inserted; "+
 			"the earlier chunks are sent before a later chunk maps its items. The worker counts the "+
 			"whole batch as dropped (whs_events_dropped_total{reason=sink_logic}) while those events "+
 			"sit in the table. Map every item before the first chunk is sent.", n)

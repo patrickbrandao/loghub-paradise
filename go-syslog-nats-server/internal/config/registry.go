@@ -173,7 +173,7 @@ func Registry(c *Config) []*Param {
 		{Sec: "ring", Key: "capacity_items", Kind: KInt, Def: "65536", Ptr: &c.Ring.CapacityItems,
 			Desc: "item ceiling of the memory ring, 1..16777216; with 200-byte messages this is the one that binds"},
 		{Sec: "ring", Key: "max_bytes", Kind: KBytes, Def: "512MiB", Ptr: &c.Ring.MaxBytes,
-			Desc: "byte ceiling, counting raw lines only; the JLH is the worker's memory, not the ring's"},
+			Desc: "byte ceiling, counting each item's raw buffer capacity plus 256 bytes; the JLH is the worker's memory, not the ring's. At least one message of syslog.max_message_bytes (its pool class + 256 bytes)"},
 		{Sec: "ring", Key: "high_water", Kind: KFloat, Def: "0.80", Ptr: &c.Ring.HighWater,
 			Desc: "occupancy fraction, of either ceiling, above which /readyz fails"},
 

@@ -52,7 +52,10 @@ services:
       # aponte WHS_SINK_NATS_CREDENTIALS para ele; ligue WHS_SINK_NATS_TLS.
       WHS_SINK_NATS_USERNAME: ${WHS_SINK_NATS_USERNAME:-}
       WHS_SINK_NATS_PASSWORD: ${WHS_SINK_NATS_PASSWORD:-}
+      WHS_SINK_NATS_TOKEN: ${WHS_SINK_NATS_TOKEN:-}
+      WHS_SINK_NATS_CREDENTIALS: ${WHS_SINK_NATS_CREDENTIALS:-}
       WHS_SINK_NATS_TLS: ${WHS_SINK_NATS_TLS:-false}
+      WHS_SINK_NATS_TLS_CA: ${WHS_SINK_NATS_TLS_CA:-}
       # Nao ha' dreno em background neste modo: workers/batch ficam sem efeito
       # sobre o caminho da requisicao.
       WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
@@ -93,7 +96,7 @@ services:
   # um NATS de producao esse papel e' de quem administra o servidor -- o
   # webhook nunca cria nem altera um stream (docs/SPEC.md 8.7.5).
   nats-init:
-    image: ${WHS_NATS_BOX_IMAGE:-natsio/nats-box:latest}
+    image: ${WHS_NATS_BOX_IMAGE:-natsio/nats-box:0.20.0}
     container_name: whs-none-nats-init
     depends_on:
       nats:

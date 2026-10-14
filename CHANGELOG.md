@@ -16,6 +16,85 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-10-14 — Todos: fechamento das "Pendências conhecidas"
+
+Pedido: fechar as pendências das SPECs, começando pelo W, sem fuzz. Triagem por
+sete leitores em paralelo; escrita em grupos de módulos disjuntos (W/F em três
+worktrees, integrados por diff); cada item com SPEC, teste que falhava antes e
+mutação; revisão independente por área (cinco revisores) e uma segunda rodada
+de correções. Nenhuma pendência ficou aberta em W, F, P, N, S, SP, SN, R, RP e
+RN: cada uma está corrigida com teste ou decidida como contestável na DECISOES.
+
+**Decisões do usuário** (as quatro opções recomendadas): o ring de memória
+cobra `cap(Env)` + `ItemOverhead` (W/F/P/N); `sink.batch_max_bytes` (16 MiB,
+teto 256 MiB) nos workers, na reingestão e no dreno do `ring.db`, revendo as
+DECISOES que o recusavam; a sonda do `sink=sqlite` com a escritora ocupada
+conta UP se o último `Write` foi bom (e, da revisão, só até `op_timeout +
+health_timeout` de lote em curso, no relógio monotônico); portar tudo também
+para R e S, que não listavam os mesmos defeitos.
+
+**Decididas por precedente, contestáveis:** `max_conns_per_ip` conta o endereço
+exato (/128), como o R (decisão 16) — W/F/P/N, SP/SN; offset da RFC 3164 não
+conferido (SP/SN); recusa `logic` no boot refeita item a item, o dump vai a
+`.corrupt` e a linha do `ring.db` é descartada e contada (W/F, do P); piso de
+`ring.max_bytes` pelo que cada ring cobra (memória: classe do pool + custo
+fixo; sqlite/redis: o maior evento/mensagem) em toda a família.
+
+**Webhook (W 1–43; F/P/N onde o código existe):**
+- HTTP: o corpo não é mais pré-alocado pelo `Content-Length` declarado (64 KiB
+  e cresce); a checagem rápida do passo 9 vê bytes; o dreno de recusa não
+  convida corpo (`Expect`) nem derruba conexão h2; `write_timeout` conta da
+  resposta; erro não temporário no `accept` é retentado e um `Serve` com erro
+  passa pelo shutdown gracioso (que tolera o primeiro sinal, como o FATAL);
+  rate-limit conta buckets sob a trava do shard.
+- Ring e lote: reserva antes do `COMMIT` no `ring=sqlite`; lotes retidos no
+  teto de itens; worker sobrevive a erro transitório do `Dequeue`; escrita
+  direta do boot respeita a entrega parcial do NATS; porta do dump só aceita o
+  que o serializador escreve (UTF-8, escapes exatos, sem U+2028/9 crus).
+- Destinos e config: `maxmemory-policy` `allkeys-*` do Redis é fatal (lida no
+  mesmo pipeline da sonda, que fica em uma ida e volta); `tls_ca` sem `tls` no
+  Redis, `NaN`/`±Inf`, `admin.bind` sem porta numérica e byte de controle em
+  valor de texto são exit 1; ambiente `PG*` escondido no parse; um prazo só de
+  `boot_timeout` com Redis (o `NewClient` também); `--dump-config` com aspas;
+  compose repassam CA/credenciais/`BATCH_MAX_BYTES`, `nats-box:0.20.0`; os
+  `t.Skip("BUG")` viraram `t.Fatalf`.
+
+**Syslog e RELP (S, SP, SN, R, RP, RN):** shutdown deixou de contar falha do
+PROXY; leitor de 4 KiB e buffer de frame solto (64 KiB → ~6 KiB por conexão
+ociosa); o aborto fecha o ring antes de contar e o `Enqueue` reconfere;
+`admin.bind` colidindo com `listen.*` é exit 1; `SIGHUP` não relata chave
+derivada; rótulo `backpressure` no idle com transação segurada e `WARN` de
+configuração; NATS só dá veredito de reconexão com servidor único e não loga a
+discagem como ERROR; `kind=network` não conta o cancelamento (S, R).
+Da revisão: `required` com cabeçalho PROXY válido perdia as linhas já lidas no
+shutdown; `ring=none` sem a reconferência do fechamento (S, R); a sonda do
+sqlite usava relógio de parede, não voltava a OK depois de um heartbeat bom e
+marcava falha quando o próprio prazo cortava o heartbeat; `sameStreamSocket`
+comparava grafia (`[::0]`, `0514`, `http`); `held` subia depois do primeiro
+`Accept`. Recusado com motivo: soltar o buffer do frame dentro da espera
+(custo 10× em frames de 24 KiB), registrado nas SPECs.
+
+**Fora do escopo:** o `go-syslog-standard-server` teve as 20 pendências
+listadas (todas ainda no código; o S resolve 17) e nada corrigido, como pedido.
+
+**Lições:**
+- Duas suítes do mesmo código no mesmo banco se pisam: W e F rodando juntos
+  viram "4 rows, want 2" no MySQL; e suítes NATS de módulos diferentes colidem
+  em subjects. Banco próprio por módulo (`whs_<mod>`) e NATS um módulo por vez.
+- PostgreSQL com 100 conexões não aguenta cinco suítes em paralelo (`53300`):
+  as rodadas usaram um segundo servidor com 600.
+- Uma checagem nova dentro da sonda dobra a latência dela: sob carga o sink foi
+  a DOWN. Pôr o comando no mesmo pipeline.
+- A ferramenta de edição converte `\u2028` em caractere cru: em Go usar
+  `"\xe2\x80\xa8"` e conferir com contagem de bytes contra o HEAD.
+- A revisão independente achou 19 defeitos reais (e 2 testes que não provavam
+  nada) no código já "verde", inclusive na regra nova da sonda do sqlite
+  (escritora presa contava UP para sempre): uma regra que relaxa um sinal de
+  saúde precisa de prazo.
+- Um teste que libera o servidor no mesmo instante de uma tentativa do backoff
+  (`TestRedisBootHasOneDeadline`, 1,5 s) cai às vezes mesmo com a máquina
+  quieta: o evento do teste fica longe das fronteiras do que ele mede.
+
 ## 2026-10-13 — Todos: revisão do porte do S e porte final para R, cortes e webhooks
 
 Pedido: terminar tudo com as opções recomendadas (autorizado), testar e publicar.

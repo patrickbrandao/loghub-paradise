@@ -259,7 +259,10 @@ avisa e o deixa intocado, para ser reingerido pelo fast.
 5. **`WHS_SINK_POSTGRES_PASSWORD`.** O padrão `webhook` serve ao ambiente de
    desenvolvimento e a mais nada. Em produção, defina no `.env`; e contra um
    banco fora do compose, ligue `WHS_SINK_POSTGRES_TLS` e monte a CA em
-   `/etc/webhook` (somente leitura) apontando `WHS_SINK_POSTGRES_TLS_CA` para ela.
+   `/etc/webhook` (somente leitura) apontando `WHS_SINK_POSTGRES_TLS_CA` para ela
+   — o volume `./certs:/etc/webhook:ro` já está comentado no
+   `compose.memory-postgres.yml`, e o compose repassa a variável (vazia por
+   padrão); sem o volume, o serviço `read_only` não tem a CA e o boot falha.
 
 ---
 

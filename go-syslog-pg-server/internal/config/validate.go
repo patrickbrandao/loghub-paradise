@@ -10,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-pg-server/internal/item"
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-pg-server/internal/ring"
 )
 
 // dbWarnWorkers is the sink.workers value above which the boot warns
@@ -166,12 +169,68 @@ func validateListeners(c *Config) error {
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
 			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
 		}
+		// Refused here, not when the transport opens after the admin port
+		// served the whole boot -- and on macOS/BSD not even there:
+		// SO_REUSEADDR lets 127.0.0.1:P and *:P coexist, and the admin port
+		// silently took localhost's TCP connections (SPEC §13.2, §14). UDP is
+		// another protocol, listen.unix a path.
+		if c.Listen.TCP != "" && sameStreamSocket(c.Listen.TCP, c.Admin.Bind) {
+			return fmt.Errorf("admin.bind (%q) and listen.tcp (%q) are, or may resolve to, the same "+
+				"TCP address: the admin port and the syslog listener cannot share one stream "+
+				"socket (to share a port, use two distinct IP literals)", c.Admin.Bind, c.Listen.TCP)
+		}
 	}
 	if c.Listen.UnixMode == 0 && c.Listen.Unix != "" {
 		return fmt.Errorf("listen.unix_mode: 0 makes the socket unwritable by anyone, " +
 			"which silently disables the transport")
 	}
 	return nil
+}
+
+// sameStreamSocket reports whether two host:port binds would collide; the
+// function of go-syslog-server, where it also compares listen.tcp and
+// listen.tls. Port 0 asks the kernel for a free port and never collides.
+func sameStreamSocket(a, b string) bool {
+	ha, pa, errA := net.SplitHostPort(a)
+	hb, pb, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	// Values, not spellings (independent review of 2026-10-14, SPEC §13.2):
+	// the port is the number net.Listen would bind, read the way it reads it
+	// -- "0514" is 514, a service name is its number -- and a port that is
+	// neither fails at bind anyway, so it is refused here with both keys
+	// named. Compared as text, "0514" and "514" passed as different ports.
+	na, errA := net.LookupPort("tcp", pa)
+	nb, errB := net.LookupPort("tcp", pb)
+	if errA != nil || errB != nil {
+		return true
+	}
+	if na != nb || na == 0 {
+		return false
+	}
+	// Any unspecified literal is the wildcard ("::0", "0:0::0"), not only
+	// the three usual spellings.
+	wild := func(h string) bool {
+		if h == "" {
+			return true
+		}
+		ip, err := netip.ParseAddr(h)
+		return err == nil && ip.Unmap().IsUnspecified()
+	}
+	if wild(ha) || wild(hb) {
+		return true
+	}
+	ia, errA := netip.ParseAddr(ha)
+	ib, errB := netip.ParseAddr(hb)
+	if errA == nil && errB == nil {
+		return ia.Unmap() == ib.Unmap()
+	}
+	// A host NAME on the same port may resolve to the other address
+	// ("localhost" and "127.0.0.1"), and resolving here would make the
+	// validation depend on DNS. Same port with a name on either side is a
+	// collision; IP literals are how two stream sockets share a port.
+	return true
 }
 
 // validateProxy holds the [proxy] row of SPEC §13.2.
@@ -214,12 +273,31 @@ func validateSyslog(c *Config) error {
 	return nil
 }
 
+// ringMinBytes is what one n-byte message costs the memory ring (SPEC §9.2):
+// the capacity of the pooled buffer the receiver copies it into
+// (item.CopyRawBox, the class of the truncated length), plus the per-item
+// overhead. It is the ring's own heldBytes, computed before the copy exists,
+// as ring.Memory.FullFor computes it.
+func ringMinBytes(n int64) int64 {
+	return int64(item.PooledCap(int(n))) + ring.ItemOverhead
+}
+
 func validateRanges(c *Config) error {
 	if c.Ring.CapacityItems < 1 || c.Ring.CapacityItems > maxRingItems {
 		return fmt.Errorf("ring.capacity_items: %d is outside 1..%d", c.Ring.CapacityItems, maxRingItems)
 	}
-	if c.Ring.MaxBytes < 1 {
-		return fmt.Errorf("ring.max_bytes: must be positive")
+	// One message of the largest size the truncation keeps must fit an empty
+	// ring. Below it that message could never be queued: a TCP connection
+	// stalls behind it until tcp.backpressure_timeout every time, and UDP
+	// drops it as ring_full with nothing queued. The floor of the smallest
+	// class is not enough: a 4 KiB ring takes the short lines and refuses any
+	// 3 KiB one for ever (SPEC §13.2, §15.1). validateSyslog has already
+	// bounded max_message_bytes.
+	if floor := ringMinBytes(c.Syslog.MaxMessageBytes); c.Ring.MaxBytes < floor {
+		return fmt.Errorf("ring.max_bytes (%s) is below what one message of syslog.max_message_bytes "+
+			"(%s) costs the ring, %s (its pool class plus %d bytes): that message could never be "+
+			"queued, even in an empty ring",
+			FormatBytes(c.Ring.MaxBytes), FormatBytes(c.Syslog.MaxMessageBytes), FormatBytes(floor), ring.ItemOverhead)
 	}
 	if c.Ring.HighWater <= 0 || c.Ring.HighWater > 1 {
 		return fmt.Errorf("ring.high_water: %g is outside (0, 1]", c.Ring.HighWater)

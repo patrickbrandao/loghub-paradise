@@ -784,6 +784,14 @@ func (a *App) abortLoss() {
 	if a.ring == nil {
 		return
 	}
+	// Close BEFORE counting (SPEC §13.4): the transports are still open (a
+	// SIGQUIT in normal operation, or a second signal in pre_stop_delay), and
+	// an Enqueue after the read would answer 200 for a message the os.Exit
+	// loses uncounted. Closed, the ring refuses it with ErrClosed, which the
+	// receiver treats as shutdown: no answer, librelp retransmits. Nothing is
+	// left to honour after an abort, so stopping intake here changes no
+	// pre_stop_delay semantics.
+	_ = a.ring.Close()
 	st := a.ring.Stats()
 	if st.Items == 0 {
 		return

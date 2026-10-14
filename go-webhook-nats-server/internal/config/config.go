@@ -66,6 +66,7 @@ type Sink struct {
 	Type            string // compatibility selector: nats only (SPEC §0)
 	Workers         int
 	Batch           int
+	BatchMaxBytes   int64 // JLH bytes per write: a batch goes out in pieces under it (SPEC §8.1)
 	BatchMaxDelay   time.Duration
 	OpTimeout       time.Duration
 	HealthInterval  time.Duration

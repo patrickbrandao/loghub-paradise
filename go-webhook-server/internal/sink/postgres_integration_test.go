@@ -614,7 +614,7 @@ func TestPostgresHealthValidatesTheRole(t *testing.T) {
 			return // written: consistent
 		}
 		if strings.Contains(err.Error(), "sqlstate=42501") {
-			t.Skipf("BUG (postgres.go validate, privilege check): the boot check accepts a role with INSERT "+
+			t.Fatalf("regressão de §8.5.5 (postgres.go validate, privilege check): the boot check accepts a role with INSERT "+
 				"only, and the first batch fails with %v -- ON CONFLICT (uuid) needs SELECT on uuid. "+
 				"Validate has_column_privilege(..., 'uuid', 'SELECT') too, and document "+
 				"GRANT INSERT, SELECT (uuid) in SPEC §3.6/§8.5.5 and docker/postgres/inbox.sql.", err)

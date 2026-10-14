@@ -238,14 +238,17 @@ func (h *Health) WaitReady(ctx context.Context, timeout time.Duration, backoffMi
 			return lastErr
 		}
 
+		// Never past the budget: the whole backoff (up to 5s) used to run
+		// and then one more check, after the deadline (W §19.1 item 39).
+		sleep := min(backoff, time.Until(deadline))
 		h.log.Warn("sink not reachable yet, retrying",
 			"sink", h.sink.Type(), "attempt", attempt, "error", err,
-			"retry_in", backoff.String())
+			"retry_in", sleep.String())
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(sleep):
 		}
 		if backoff = backoff * 2; backoff > backoffMax {
 			backoff = backoffMax

@@ -66,13 +66,19 @@ services:
       # 0 deriva sink.workers + 1: uma conexao por worker e uma de folga (o health tem a sua, fora do pool).
       WHS_SINK_POSTGRES_POOL_SIZE: ${WHS_SINK_POSTGRES_POOL_SIZE:-0}
       # Rede interna do compose: sem TLS. Contra um banco gerenciado, ligue
-      # WHS_SINK_POSTGRES_TLS e monte a CA em /etc/webhook (somente leitura).
+      # WHS_SINK_POSTGRES_TLS e, com uma CA privada, aponte
+      # WHS_SINK_POSTGRES_TLS_CA para ela dentro de /etc/webhook, montado
+      # somente leitura (o volume comentado abaixo). Vazio = sem CA propria
+      # (a do sistema); uma CA sem TLS e' exit 1 (SPEC 8.5.11, 13.6).
       WHS_SINK_POSTGRES_TLS: ${WHS_SINK_POSTGRES_TLS:-false}
+      WHS_SINK_POSTGRES_TLS_CA: ${WHS_SINK_POSTGRES_TLS_CA:-}
 
       # Cada worker e' uma conexao no servidor; some as instancias antes de
       # subir isto.
       WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-4}
       WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      # Teto de JLH por escrita: o lote vai em pedacos (SPEC 8.1).
+      WHS_SINK_BATCH_MAX_BYTES: ${WHS_SINK_BATCH_MAX_BYTES:-16MiB}
       WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
       WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
 
@@ -81,8 +87,11 @@ services:
       - "127.0.0.1:${WHS_ADMIN_PORT:-9201}:9101"
 
     # /data so' para os dumps de emergencia -- e aqui eles sao esperados.
+    # O servico e' read_only: a CA de WHS_SINK_POSTGRES_TLS_CA so' existe se
+    # ./certs for montado em /etc/webhook (somente leitura). Descomente.
     volumes:
       - whp-data:/data
+      # - ./certs:/etc/webhook:ro
 
   postgres:
     # 18 fixado: a DDL da fila usa uuid_extract_version (PostgreSQL 18), e a

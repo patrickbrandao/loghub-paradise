@@ -275,8 +275,8 @@ ao voltar da suspensão inicial, SPEC §19), `/readyz` dá 200, o `SIGHUP` respo
 ## 8. Lacunas conhecidas
 
 Registradas por honestidade, não por esquecimento. Os defeitos e arestas do
-código atual, com cenário e motivo, estão em SPEC §22.1 (dez em 2026-10-13,
-depois da revisão independente); aqui fica o que os testes não provam.
+código atual ficam em SPEC §22.1 (dez em 2026-10-13; nenhuma aberta desde a
+rodada de 2026-10-14, §9.5); aqui fica o que os testes não provam.
 
 1. **Fuzz de 10 min por alvo ainda não rodou.** As rodadas foram de 60 s.
 2. **Os critérios de carga nunca foram medidos** ponta a ponta com o rsyslog: há
@@ -307,6 +307,30 @@ depois da revisão independente); aqui fica o que os testes não provam.
     anterior e pede aspas. A cauda de um segredo partido pelo shell que tenha a
     forma de uma chave de seção conhecida (`--sink.postgres.abc`) ainda é
     nomeada: escondê-la esconderia os erros de digitação.
+11. **A disputa de linha de cache dos contadores da recepção** sob
+    `SO_REUSEPORT` (a antiga pendência SPEC §22.1 item 5, registrada em
+    2026-10-14) não foi medida. Os contadores (`obs.Counter`, um
+    `atomic.Uint64`) não têm *padding*, mas o mesmo contador
+    (`messages_total{transport="tcp"}`) é incrementado por **todos** os
+    listeners: a disputa principal é *true sharing* da mesma palavra, que
+    *padding* não remove. Resolver de verdade seria um contador por listener
+    somado no *scrape*, otimização sem evidência. O `BenchmarkRELPSession` com
+    vários listeners é o lugar de medir.
+12. **O fechamento por idle com transação segurada** (SPEC §5.4) é provado no
+    receptor com o ring cheio (`TestIdleCloseWithAHeldTransactionIsBackpressure`);
+    com o sink DOWN o caminho é o mesmo laço de `decide`, sem teste próprio.
+13. **A soltura do buffer do leitor RELP vale só entre frames** (A5 e D4 do S,
+    2026-10-14; SPEC §5.2): um frame grande seguido de alguns bytes do próximo
+    segura o buffer até o idle. Não corrigido (medido no S) e sem teste que
+    fixe o número.
+14. **`sameStreamSocket` com nome de serviço** (revisão de 2026-10-14) é
+    provado com `http` (a tabela embutida do Go) e com um nome inexistente; um
+    nome que só o `/etc/services` conhece depende do arquivo da máquina ou da
+    imagem.
+15. **A transação segurada desde antes do primeiro `Accept`** (A2 do RELP,
+    2026-10-14) é provada com um ring falso cujo `Enqueue` espera o teste e
+    devolve `ErrFull`, e o idle vence pelo relógio (200 ms contra 700 ms de
+    espera); sem teste com o `sqlite`/`redis`/`none` de verdade.
 
 ---
 
@@ -436,6 +460,38 @@ por mutação**, cada correção revertida sozinha: o teste da linha falha
 | E1 do S | `closing` com PROXY `optional` | **não aplicado**, por instrução: no RELP as linhas no buffer nunca tiveram `200`, e o `librelp` as retransmite | — |
 | A2-minor do S | Comentário de ordem reversa com fechamento paralelo; log do aborto com o ring Redis | **não se aplica**: o comentário diz "AT ONCE", como o código; não há Redis | — |
 
+### 9.5 Rodada das pendências conhecidas (2026-10-14)
+
+Entrada: `tasks/triage-RP-RN.md` da raiz. Ordem por item: SPEC, teste que
+falhava no código de então, correção, e mutação (só a correção revertida, o
+teste falha, restaurada). Os testes novos ficam em `known_issues_test.go` de
+cada pacote. Registro passo a passo em `tasks/progress-RP-RN.md` da raiz.
+
+| Item (SPEC §22.1) | Regra | Testes (falhavam antes) | Mutação |
+|---|---|---|---|
+| 6, aborto lê o ring aberto | §13.4 | `TestAbortClosesTheRingBeforeCounting` (`app`: o `Enqueue` depois do aborto dava `nil`, um `200` sem contagem); `TestEnqueueSeesACloseThatRacedTheReservation` (`ring`, gancho `afterReserve` entre `items.Add(1)` e a reconferência) | sem `ring.Close()` no `abortLoss` e sem a reconferência: os dois falham |
+| 4, `ring.max_bytes` sem lugar | §13.2, §15.1 | `TestRingMaxBytesFitsTheLargestMessage` (65 791 aceito); `TestRingMinBytesIsWhatTheRingCharges` (fixa o piso no `FullFor` do ring vazio) | piso de volta a 1: falha |
+| 2, `admin.bind` = `listen.tcp` | §13.2, §14 | `TestAdminBindCollidesWithListen` (literal, curinga, `[::]`, nome, IPv4 mapeado; controles: literais distintos, admin desligado, porta 0) | sem a checagem: falha |
+| 7, rótulo do idle | §5.4, §13.2 | `TestIdleCloseWithAHeldTransactionIsBackpressure` (`backpressure = 0, server_closed = 1`); `TestIdleBelowBackpressureWarns`; controle `TestIdleCloseWithNothingHeldCountsNothing` | rótulo sempre `server_closed`, `held` que nunca sobe, `WARN` desligado: cada um falha |
+| 1, derivada no `SIGHUP` | §16.3 | `TestReloadDoesNotReportDerivedKeys`, `TestReloadDoesNotReportTheDerivedPoolSize`; `TestReloadSeesSecrets` ajustado (esperava o `pool_size` derivado na lista) | filtro desligado: falham; `\|\|` no lugar de `&&`: falham os controles explícito↔derivado |
+| 3, 5, 8, 9, 10 | §12.2, TESTING §8 item 11, §19, §13.4, §14.1 | sem código novo (a remoção falha já tinha `TestQuarantineAndRemovalReportTheirOutcome`) | — |
+
+### 9.6 Revisão independente de 2026-10-14 (S, SP, SN, R, RP, RN)
+
+Entrada: `tasks/review-syslog.md` e `tasks/review-relp.md`; progresso em
+`tasks/progress-review-fixes-syslog-relp.md`. **Ordem:** SPEC, teste que falha
+no código de antes, correção. **Mutação:** cada correção revertida sozinha,
+com o teste da linha falhando e a correção restaurada depois.
+
+| Item | Falha antes / com o mutante | Teste |
+|---|---|---|
+| `sameStreamSocket` por valor (§13.2; D1 do syslog, D4 do RELP) | 7 casos, p.ex. `sameStreamSocket("[::0]:9102", "127.0.0.1:9102") = false, want true`, `("127.0.0.1:0514", "127.0.0.1:514")`, `("127.0.0.1:http", "127.0.0.1:80")`; mutantes (curinga por grafia; porta comparada como texto): mortos | `TestSameStreamSocketReadsValuesNotSpellings` |
+| Transação segurada desde antes do primeiro `Accept` (§5.4; A2 do RELP) | "idle during a slow first Accept: backpressure = 0, server_closed = 1; want 1 and 0"; mutante (o `held` de volta para depois do primeiro `Accept`): a mesma | `TestIdleDuringASlowFirstAcceptIsBackpressure` |
+
+Registrados sem código: comentário do `Memory.Enqueue` (D1); soltura do buffer do leitor entre frames (A5/D4 do S; §5.2); sobrecontagem pelo recuo de bytes (D3 do syslog; §13.4). Aqui o `Accept` do ring em memória é instantâneo: o A2 entra para o código comum não divergir do R.
+
+Rodadas: `tasks/run2.sh go-relplog-pg-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh` e banco próprio `whs_rp`), logs em `tasks/logs/go-relplog-pg-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*. Fuzz: nenhum, por instrução da rodada.
+
 ---
 
 ## 10. Resultado da rodada final (2026-10-13)
@@ -472,3 +528,19 @@ rsyslog 8.2410 com `librelp` 1.11 (Alpine 3.22).
 | Fuzz | `FuzzFrame` 60 s, sem falha (1,66 milhão de execuções); o único alvo cujo código mudou (`relpframe.go`) |
 | Mutação | cada correção revertida sozinha: o teste da linha falha (ver acima) |
 | Não rodou | fuzz de 10 min; carga ponta a ponta; `docker compose` (o `docker/` não mudou) |
+
+### Depois da rodada das pendências conhecidas de §9.5 (2026-10-14)
+
+PostgreSQL 18 e os quatro `nats-server` da infraestrutura comum
+(`tasks/infra/env.sh`: PG em 25432), o rsyslog 8.2410 com `librelp` 1.11.
+
+| Item | Resultado |
+|---|---|
+| `gofmt -l .`, `go vet ./...` | limpos |
+| `source tasks/infra/env.sh; go test -race -count=1 -timeout 1200s ./...` | **verde duas vezes seguidas** (92 s e 89 s), sem *flake* |
+| Testes | **418** de primeiro nível e **286** subtestes passaram, **1** pulado (`TestGoldenVectors/arquivo-sem-pri`, D5), 0 falhas (407 e 286 antes: os 11 novos são os de §9.5) |
+| Por pacote (primeiro nível / subtestes, com o pulado) | `app` 71/65, `config` 69/0, `convert` 15/71, `emergency` 28/45, `ident` 2/0, `item` 5/0, `jlh` 4/0, `jlhcheck` 4/0, `obs` 9/0, `receiver` 103/33, `ring` 15/0, `sink` 93/73 |
+| Emissores reais | `TestEmittersRELPInClear` (14,8 s e 17,0 s), `TestEmittersRELPBackpressureRetransmits` (7,2 s e 8,3 s), `TestEmittersRELPSurvivesARestart` (5,7 s e 5,6 s), verdes nas duas rodadas |
+| Mutação | cada correção revertida sozinha: o teste da linha falha (§9.5) |
+| Não rodou | fuzz (nenhum alvo de fuzz mudou: `relp.go`, `ring`, `config` e `app` não têm alvo; por instrução, nenhum fuzz nesta rodada); carga ponta a ponta; `docker compose` (o `docker/` não mudou) |
+

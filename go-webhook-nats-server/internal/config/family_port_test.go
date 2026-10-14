@@ -258,9 +258,12 @@ func TestFamilyPortConfigCeilings(t *testing.T) {
 // a percent-encoded host are refused saying what is wrong, and no message
 // quotes the URL.
 func TestFamilyPortEBURL(t *testing.T) {
-	for _, v := range []string{"   ", "\t", " \n "} {
+	for _, v := range []string{"   ", "\t"} {
 		famFail(t, nil, map[string]string{"LOGHUB_EB_URL": v}, "only blanks")
 	}
+	// A newline is refused earlier, as any control byte in a text value
+	// (SPEC §13.2, W 41).
+	famFail(t, nil, map[string]string{"LOGHUB_EB_URL": " \n "}, "control byte")
 	for _, tc := range []struct{ url, want string }{
 		{"nats://tok/en@h:4222", "%2F"},
 		{"nats://app:39182#Zsecret9@nats-1:4222", "%2F"},
