@@ -20,9 +20,9 @@ import (
 // so no bind fails: the server opened, /readyz said 200 and the shutdown that
 // followed exited 0. TestSignalBeforeTheBindExits130 is the host-name case.
 func TestSignalBeforeALiteralBindExits130(t *testing.T) {
-	base := func(dir string) []string { return baseArgs(t, dir) }
+	base := func(t *testing.T, dir string) []string { return baseArgs(t, dir) }
 	id := testID
-	dump := func(dir string) { dumpOf(t, dir, crashItems(3, "pre-bind")) }
+	dump := func(t *testing.T, dir string) { dumpOf(t, dir, crashItems(3, "pre-bind")) }
 	for _, tc := range []struct {
 		name string
 		args func([]string) []string
@@ -35,10 +35,10 @@ func TestSignalBeforeALiteralBindExits130(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			dump(dir)
+			dump(t, dir)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			code := runContext(ctx, tc.args(base(dir)), id, func(a *App) {
+			code := runContext(ctx, tc.args(base(t, dir)), id, func(a *App) {
 				a.abort = make(chan os.Signal, 1)
 				a.wrapSink = func(s sink.Sink) sink.Sink { return cancelAfterWrite{Sink: s, cancel: cancel} }
 			})
