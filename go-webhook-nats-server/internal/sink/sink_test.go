@@ -590,10 +590,13 @@ func TestWorkersTaintABatchAfterATimedOutAttempt(t *testing.T) {
 		BackoffMin: time.Millisecond, BackoffMax: 5 * time.Millisecond,
 	}, quietLog(), m)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	w.Start(ctx)
-
+	// Enqueued before the worker starts, so the stalled first write carries
+	// all four. Started first, the worker could take item 0 alone, stall on
+	// it, and then deliver items 1-3 in an attempt that never timed out:
+	// those are pooled, rightly, and the test read their Env while Release
+	// was clearing it -- a DATA RACE about 1 run in 70 under -race, or an
+	// "item 3 was pooled" failure (integration of the syslog/RELP port,
+	// 2026-10-13). The ownership rule held; the test raced its own setup.
 	items := mkBatch(4)
 	for _, it := range items {
 		if err := r.Enqueue(context.Background(), it); err != nil {
@@ -601,8 +604,15 @@ func TestWorkersTaintABatchAfterATimedOutAttempt(t *testing.T) {
 		}
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+
 	if !eventually(t, 3*time.Second, func() bool { return m.EventsWrittenTotal.Load() == 4 }) {
 		t.Fatalf("delivered %d of 4 after the stall", m.EventsWrittenTotal.Load())
+	}
+	if n := ss.stalled.Load(); n != 4 {
+		t.Fatalf("the stalled write carried %d of the 4 items; the rest were never at risk", n)
 	}
 	if !eventually(t, time.Second, func() bool {
 		for _, it := range items {
@@ -631,11 +641,13 @@ func TestWorkersTaintABatchAfterATimedOutAttempt(t *testing.T) {
 // stallOnceSink blocks the first write until its context expires -- the shape
 // of a destination that stopped answering -- and accepts everything after.
 type stallOnceSink struct {
-	writes atomic.Int64
+	writes  atomic.Int64
+	stalled atomic.Int64 // items in the write that stalled
 }
 
 func (s *stallOnceSink) Write(ctx context.Context, items []*envelope.Item) error {
 	if s.writes.Add(1) == 1 {
+		s.stalled.Store(int64(len(items)))
 		<-ctx.Done()
 		return networkErr("xadd", ctx.Err())
 	}

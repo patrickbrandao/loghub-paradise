@@ -913,8 +913,15 @@ func TestPostgresPoolSizeWarnings(t *testing.T) {
 	if l.Config.SinkPG.PoolSize != 2 {
 		t.Errorf("explicit pool_size = %d, want 2 kept", l.Config.SinkPG.PoolSize)
 	}
-	if !hasWarning(l.Warnings, "below sink.workers+1") {
+	if !hasWarning(l.Warnings, "pool_size=2 is below sink.workers=4") {
 		t.Errorf("warnings = %v, want the small-pool warning", l.Warnings)
+	}
+
+	// SPEC §8.5.3: the health check has its own connection, outside the
+	// pool, so a pool of exactly sink.workers is legitimate.
+	l = load(t, Options{Args: []string{"--sink.type=postgres", "--sink.postgres.pool_size=4"}})
+	if hasWarning(l.Warnings, "pool_size=4 is below") {
+		t.Errorf("pool_size = sink.workers must not warn: %v", l.Warnings)
 	}
 
 	// ring=none: the writers are the handlers, bounded by max_inflight.
@@ -1199,8 +1206,9 @@ func TestNATSURLsAreCheckedWithoutEcho(t *testing.T) {
 		{"slash in the password", "nats://bob:" + secret + "/x@h:4222", nil, "not a valid URL"},
 		{"hash in the password", "nats://bob:" + secret + "#x@h:4222", nil, "not a valid URL"},
 		{"bad escape in the password", "nats://bob:" + secret + "%zz@h:4222", nil, "percent-escape"},
-		{"a password that parses as a port and a path", "nats://bob:1234/" + secret + "@h:4222", nil, "path"},
-		{"a token that parses as a host and a path", "nats://" + secret + "/x@h:4222", nil, "path"},
+		// An '@' after the '/' names the escape to use (natsurl.go).
+		{"a password that parses as a port and a path", "nats://bob:1234/" + secret + "@h:4222", nil, "%2F"},
+		{"a token that parses as a host and a path", "nats://" + secret + "/x@h:4222", nil, "%2F"},
 		{"query", "nats://h:4222/?" + secret, nil, "query"},
 		{"no host", "nats://:4222", nil, "no host"},
 		{"userinfo and username", "nats://bob:" + secret + "@h:4222", []string{"--sink.nats.username=u"}, "keep one"},
@@ -1360,12 +1368,15 @@ func TestParserErrorsDoNotEchoValues(t *testing.T) {
 		want string
 	}{
 		{[]string{"--sink.workers", "-1"}, "must be at least 1"},
-		{[]string{"--sink.nats.stream", "-h"}, "the next argument is the flag --h"},
+		{[]string{"--sink.nats.stream", "--help"}, "the next argument is the flag --help"},
 		{[]string{"--sink.nats.password=", "--server.http2", "extra"}, `"extra"`},
 		{[]string{"--sink.nats.password=", "hunter2"}, "right after the '='"},
 		{[]string{"--sink.nats.password", "=", "hunter2"}, "right after the '='"},
 		{[]string{"--sink.nats.password=foo", "hunter2"}, "goes in quotes"},
-		{[]string{"--sink.workers=4", "--typo.key=1"}, `"typo.key"`},
+		// After a value, a flag outside every section may be the tail of that
+		// value (knownSectionOf); a typo inside one is still named.
+		{[]string{"--sink.workers=4", "--typo.key=1"}, "unexpected argument after --sink.workers"},
+		{[]string{"--sink.workers=4", "--sink.wrkers=1"}, `"sink.wrkers"`},
 		{[]string{"--sink.nats.password", "--sink.workers=4"}, "the flag --sink.workers"},
 	} {
 		if _, err := Load(Options{Args: c.args, LookupEnv: envMap(nil)}); err == nil ||

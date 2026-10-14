@@ -158,7 +158,6 @@ func TestNATSURLSchemes(t *testing.T) {
 		{"n:4222", "without a scheme"},
 		{"127.0.0.1:4222", "without a scheme"},
 		{"nats://a:4222,tls://b:4222", `"tls://"`},
-		{"nats://a:4222,b:4222", "without a scheme"},
 		{"http://n:8222", `"http://"`},
 	} {
 		err := mustFail(t, []string{"--sink.nats.urls=" + tc.urls}, nil, "sink.nats.urls")
@@ -169,6 +168,16 @@ func TestNATSURLSchemes(t *testing.T) {
 		}
 		// The environment is the same parameter and the same refusal.
 		mustFail(t, nil, map[string]string{"WHS_SINK_NATS_URLS": tc.urls}, "sink.nats.urls")
+	}
+	// A piece of the list with no scheme after the first: a bare host:port,
+	// or the tail of a password an unescaped ',' split. The message says both
+	// (go-syslog-nats-server, porte da família syslog/RELP, 2026-10-13).
+	for _, u := range []string{"nats://a:4222,b:4222", "nats://u:12,cret@h:4222"} {
+		err := mustFail(t, []string{"--sink.nats.urls=" + u}, nil, "no scheme")
+		if !strings.Contains(err.Error(), "nats://") || !strings.Contains(err.Error(), "','") ||
+			strings.Contains(err.Error(), "cret") {
+			t.Errorf("%s: err = %v, want nats:// and the ',' named, and nothing of the URL", u, err)
+		}
 	}
 	// The refusal names the scheme, never the URL: it may carry a password.
 	for _, u := range []string{"tls://u:hunter2@n:4222", "ws://hunter2@n:80", "u:hunter2@n:4222",
@@ -358,8 +367,9 @@ func TestEBURLUnsupportedOrMalformed(t *testing.T) {
 			t.Errorf("%q: err = %v", u, err)
 		}
 	}
-	// Empty means "not set": nothing is filled.
-	for _, v := range []string{"", "   "} {
+	// Empty means "not set": nothing is filled. Only blanks is no URL and
+	// no "unset" either: refused (TestFamilyPortEBURL).
+	for _, v := range []string{""} {
 		l := mustLoad(t, nil, map[string]string{"LOGHUB_EB_URL": v})
 		if !reflect.DeepEqual(l.Config.SinkNATS.URLs, []string{"nats://127.0.0.1:4222"}) ||
 			l.Source["sink.nats.urls"] != FromDefault {
@@ -518,13 +528,23 @@ func TestConfigReviewFindings(t *testing.T) {
 		}
 	}
 	// A password that parses as a port and a path: no credentials at all,
-	// dialled until boot_timeout. Refused like LOGHUB_EB_URL refuses it.
+	// dialled until boot_timeout. Refused like LOGHUB_EB_URL refuses it; the
+	// '@' after the '/', '?' or '#' names the escape to use (porte da família
+	// syslog/RELP, 2026-10-13).
 	for _, u := range []string{"nats://user:1234/5678@n1:4222", "nats://user:1234#5678@n1:4222",
 		"nats://user:1234?5678@n1:4222"} {
-		err := mustFail(t, []string{"--sink.nats.urls=" + u}, nil, "path, a query or a fragment")
+		err := mustFail(t, []string{"--sink.nats.urls=" + u}, nil, "%2F, %3F, %23")
 		if strings.Contains(err.Error(), "5678") {
 			t.Errorf("%q: err = %v", u, err)
 		}
+	}
+	// Without the '@', the path, query or fragment rule.
+	for _, u := range []string{"nats://n1:4222/x", "nats://n1:4222?x=1", "nats://n1:4222#f"} {
+		mustFail(t, []string{"--sink.nats.urls=" + u}, nil, "path, a query or a fragment")
+	}
+	// A percent-escape in the host is about the host, not the password.
+	if err := mustFail(t, []string{"--sink.nats.urls=nats://bob:pw@n%31:4222"}, nil, "percent-encoded host"); strings.Contains(err.Error(), "pw") {
+		t.Errorf("the password is echoed: %v", err)
 	}
 	mustLoad(t, []string{"--sink.nats.urls=nats://user:1234%2F5678@n1:4222/"}, nil) // control
 
@@ -587,14 +607,17 @@ func TestConfigReviewFindings(t *testing.T) {
 		t.Errorf("separated values: workers=%d stream=%q", l.Config.Sink.Workers, l.Config.SinkNATS.Stream)
 	}
 	mustFail(t, []string{"--sink.workers", "-1"}, nil, "must be at least 1")
-	mustFail(t, []string{"--sink.nats.stream", "-h"}, nil, "the next argument is the flag --h")
+	mustFail(t, []string{"--sink.nats.stream", "--help"}, nil, "the next argument is the flag --help")
 	mustFail(t, []string{"--sink.nats.password=", "--server.http2", "extra"}, nil, `"extra"`)
 	// Each says what went wrong: the space after the '=', or a value with a
 	// space left unquoted.
 	mustFail(t, []string{"--sink.nats.password=", "hunter2"}, nil, "right after the '='")
 	mustFail(t, []string{"--sink.nats.password", "=", "hunter2"}, nil, "right after the '='")
 	mustFail(t, []string{"--sink.nats.password=foo", "hunter2"}, nil, "goes in quotes")
-	mustFail(t, []string{"--sink.workers=4", "--typo.key=1"}, nil, `"typo.key"`)
+	// After a value, a flag outside every section may be the tail of that
+	// value (knownSectionOf); a typo inside one is still named.
+	mustFail(t, []string{"--sink.workers=4", "--typo.key=1"}, nil, "unexpected argument after --sink.workers")
+	mustFail(t, []string{"--sink.workers=4", "--sink.wrkers=1"}, nil, `"sink.wrkers"`)
 	mustFail(t, []string{"--sink.nats.password", "--sink.workers=4"}, nil, "the flag --sink.workers")
 
 	// An explicit EMPTY owned key does not compete with LOGHUB_EB_URL: it is

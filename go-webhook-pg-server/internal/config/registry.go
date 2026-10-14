@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -199,9 +201,109 @@ func newIndex(params []*Param) *index {
 func (ix *index) lookup(name string) (*Param, error) {
 	p, ok := ix.byName[name]
 	if !ok {
+		// Named only when it has the shape of a name. What reaches here from
+		// an INI key or a flag is everything before the first '=', and a
+		// ':' typed for the '=' ("password: hunter2 = x",
+		// "--sink.x.password:hunter2") puts the value inside it; the error
+		// goes to stderr (SPEC §13.2; ported from the syslog/RELP family,
+		// 2026-10-13).
+		if !paramNameRE.MatchString(name) {
+			return nil, fmt.Errorf("unknown parameter (the name holds characters no parameter " +
+				"name has, so it is not shown; a value goes after an '=')")
+		}
+		if ix.extendsAName(name) {
+			// "--sink.x.passwordhunter2": the '=' was forgotten and the value
+			// glued to the name, with or without a separator ("-hunter2",
+			// "_hunter2", ".hunter2"). Quoted, the error would print the
+			// secret (go-relplog-pg-server's review, ported 2026-10-13).
+			return nil, fmt.Errorf("unknown parameter (it starts with the name of a parameter " +
+				"and goes on, so it is not shown: the '=' between the name and the value may be missing)")
+		}
 		return nil, fmt.Errorf("unknown parameter %q", name)
 	}
 	return p, nil
+}
+
+// extendsAName reports whether name is a parameter name of the registry with
+// something glued after it.
+func (ix *index) extendsAName(name string) bool {
+	for n := range ix.byName {
+		if len(name) > len(n) && strings.HasPrefix(name, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownSectionOf reports whether name, read as "<section>.<key>", names a
+// section this server knows: "sink.wrkers" and "log.levl" do, "hunter2" and
+// "x" do not (SPEC §13.2).
+func (ix *index) knownSectionOf(name string) bool {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 {
+		return false
+	}
+	return ix.knownSection(name[:i])
+}
+
+func (ix *index) knownSection(sec string) bool {
+	if retiredSections[sec] {
+		return true
+	}
+	for _, p := range ix.byName {
+		if p.Sec == sec {
+			return true
+		}
+	}
+	return false
+}
+
+// iniKeyRE is what an INI key of this server looks like. It is narrower than
+// paramNameRE on purpose: an unknown INI key is named only when it has this
+// shape, because the INI is where a secret wraps onto a second line
+// ("password = eyJhbGciOiJI" then "UzI1NiJ9abcDEF==") and the continuation
+// reads as a key.
+var iniKeyRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// lookupINI is lookup for an INI entry. An unknown key is named only when its
+// section is one this server knows, its key has the shape of a key, and the
+// line before it was not a secret: a key right after a password or a token is
+// most likely the rest of that value on the next line ("password = abc" then
+// "ffd3a9c1b2=") -- the error goes to stderr and, where there is a SIGHUP, to
+// the server log (SPEC §13.2; go-relplog-nats-server's review, ported
+// 2026-10-13).
+func (ix *index) lookupINI(e iniEntry, afterSecret bool) (*Param, error) {
+	if p, ok := ix.byName[e.Name]; ok {
+		return p, nil
+	}
+	switch {
+	case afterSecret:
+		return nil, errors.New("unknown parameter right after a secret value; it is not shown, " +
+			"in case it is the rest of that value: a value must fit on one line")
+	case !iniKeyRE.MatchString(e.Key) || !ix.knownSection(e.Sec):
+		return nil, errors.New("unknown parameter (not shown: its section or its key is not one " +
+			"a parameter has; a value goes after an '=' on the same line)")
+	}
+	return ix.lookup(e.Name)
+}
+
+// paramNameRE is what a parameter name, known or not, can look like: the
+// dotted lowercase words of the registry, with room for a typo in case or a
+// dash. Anything else is not printed.
+var paramNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+
+// retiredSections are the sections of go-webhook-fast-server this server does
+// not have (SPEC §0). They count as known for knownSectionOf and lookupINI: a
+// configuration carried over from go-webhook-fast-server is exactly where such
+// a key comes from, and the error must name it instead of blaming the value
+// before it, as for any other unknown parameter.
+var retiredSections = map[string]bool{
+	"ring.sqlite":     true,
+	"sink.clickhouse": true,
+	"sink.mysql":      true,
+	"sink.nats":       true,
+	"sink.redis":      true,
+	"sink.sqlite":     true,
 }
 
 // sections returns section names in registry order, which is the order used by

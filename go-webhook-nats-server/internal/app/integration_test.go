@@ -1149,8 +1149,8 @@ func TestNATSConfigCarriesTheDeadlinesAndCeilings(t *testing.T) {
 		t.Errorf("ConnectTimeout %s OpTimeout %s, want sink.op_timeout (7s) for both",
 			nc.ConnectTimeout, nc.OpTimeout)
 	}
-	if nc.MaxPending != 150 {
-		t.Errorf("MaxPending = %d, want sink.workers × sink.batch = 150", nc.MaxPending)
+	if nc.MaxPending != 300 {
+		t.Errorf("MaxPending = %d, want 2 × sink.workers × sink.batch = 300 (SPEC §8.7.2)", nc.MaxPending)
 	}
 	if nc.MaxEventBytes != config.MaxEventBytes(loaded.Config) || nc.MaxEventBytes == 0 {
 		t.Errorf("MaxEventBytes = %d, want %d", nc.MaxEventBytes, config.MaxEventBytes(loaded.Config))

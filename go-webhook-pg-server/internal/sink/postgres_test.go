@@ -59,19 +59,23 @@ func TestClassifySQLState(t *testing.T) {
 		{"42804", ClassFatal}, // datatype_mismatch
 		{"57P04", ClassFatal}, // database_dropped
 		{"XX001", ClassFatal}, // data_corrupted
+		// The sink never sends NULL: a not_null_violation after the boot is
+		// the table (a required column added, a DEFAULT dropped, a trigger).
+		{"23502", ClassFatal},
+		// feature_not_supported: ON CONFLICT on a table with an INSERT or
+		// UPDATE rule, refused at boot; one created later fails every batch.
+		{"0A000", ClassFatal},
 
 		// The destination is alive and refused THIS data.
 		{"22021", ClassLogic}, // character_not_in_repertoire
 		{"22001", ClassLogic}, // string_data_right_truncation
 		{"22003", ClassLogic}, // numeric_value_out_of_range: a narrowed sid column
 		{"22P05", ClassLogic}, // untranslatable_character: the NUL jsonbSafe exists for
-		{"23502", ClassLogic}, // not_null_violation
 		{"23514", ClassLogic}, // check_violation: a CHECK of the inbox
 		{"23505", ClassLogic}, // unique_violation on some OTHER index
 		{"54000", ClassLogic}, // program_limit_exceeded
 
 		// Unknown is retried, not dropped.
-		{"0A000", ClassNetwork},
 		{"P0001", ClassNetwork},
 		{"", ClassNetwork},
 		{"1", ClassNetwork},
@@ -119,9 +123,9 @@ func TestClassifyPostgresUnwrapsPgError(t *testing.T) {
 		t.Error("the classified error must still unwrap to the PgError")
 	}
 
-	logic := classifyPostgres("insert", &pgconn.PgError{Code: "23502"})
+	logic := classifyPostgres("insert", &pgconn.PgError{Code: "23514", ConstraintName: "inbox_level_check"})
 	if ClassOf(logic) != ClassLogic {
-		t.Errorf("23502 = %s, want logic", ClassOf(logic))
+		t.Errorf("23514 with a constraint name = %s, want logic", ClassOf(logic))
 	}
 }
 

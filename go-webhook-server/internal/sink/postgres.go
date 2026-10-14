@@ -73,6 +73,21 @@ type Postgres struct {
 	validated atomic.Bool
 	closed    atomic.Bool
 	lastWaits atomic.Int64
+
+	// probe is the health check's own connection, OUTSIDE the pool (SPEC
+	// §8.5.8), dialled on the first check and again after any failure;
+	// probeCfg is the pool's connection configuration, copied before the pool
+	// took it. With the check inside the pool, writers that held every
+	// connection -- slow, not failing -- left it waiting for one past
+	// sink.health_timeout: DOWN, then FATAL and exit 3 with nothing wrong
+	// with the database. pool_size >= sink.workers + 1 kept a connection for
+	// it with a ring, but with ring=none the writers are the handlers, up to
+	// ring.max_inflight, and no pool size the configuration can demand keeps
+	// one free (independent review of go-relplog-pg-server and of the port to
+	// go-syslog-server, 2026-10-13). probeMu serialises the checks on it.
+	probeMu  sync.Mutex
+	probe    *pgx.Conn
+	probeCfg *pgx.ConnConfig
 }
 
 // pgIdent mirrors the config rule; it is checked again here so a caller that
@@ -196,6 +211,7 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	}
 	pc.MaxConns = int32(cfg.PoolSize)
 	pc.MinConns = 0
+	probeCfg := cc.Copy()
 
 	pool, err := pgxpool.NewWithConfig(context.Background(), pc)
 	if err != nil {
@@ -210,6 +226,7 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 		insert:  fmt.Sprintf(pgInsert, pgx.Identifier(strings.Split(cfg.Table, ".")).Sanitize()),
 		regname: cfg.Table,
 	}
+	p.probeCfg = probeCfg
 	p.args.New = func() any { return &pgArgs{} }
 	return p, nil
 }
@@ -406,7 +423,7 @@ func (p *Postgres) Health(ctx context.Context) error {
 		return ErrClosed
 	}
 	var inRecovery bool
-	if err := p.pool.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil {
+	if err := p.probeScan(ctx, "SELECT pg_is_in_recovery()", &inRecovery); err != nil {
 		return classifyPostgres("health", err)
 	}
 	p.observePool()
@@ -424,6 +441,51 @@ func (p *Postgres) Health(ctx context.Context) error {
 		p.log.Info("queue table validated", "table", p.cfg.Table)
 	}
 	return nil
+}
+
+// probeScan runs one query of the health check on its own connection (see
+// Postgres.probe) and scans the row into dest. A connection that fails is
+// dropped, so the next check dials afresh; one that was reused and failed is
+// retried once on a fresh dial, inside the same deadline, because a
+// connection idle for a whole sink.health_interval may simply have died under
+// it (a proxy's idle timeout, a server restart) and the pool used to hide
+// that by pinging before reuse. A failure on a fresh connection is the
+// answer.
+func (p *Postgres) probeScan(ctx context.Context, sql string, dest ...any) error {
+	p.probeMu.Lock()
+	defer p.probeMu.Unlock()
+	for {
+		if p.closed.Load() {
+			return ErrClosed
+		}
+		fresh := false
+		if p.probe == nil {
+			c, err := pgx.ConnectConfig(ctx, p.probeCfg)
+			if err != nil {
+				return err
+			}
+			p.probe, fresh = c, true
+		}
+		err := p.probe.QueryRow(ctx, sql).Scan(dest...)
+		if err == nil {
+			return nil
+		}
+		p.dropProbe()
+		if fresh || ctx.Err() != nil {
+			return err
+		}
+	}
+}
+
+// dropProbe closes the health check's connection; the caller holds probeMu.
+func (p *Postgres) dropProbe() {
+	if p.probe == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_ = p.probe.Close(ctx)
+	cancel()
+	p.probe = nil
 }
 
 // validate is the boot contract of SPEC §8.5.5. Everything it refuses is
@@ -606,6 +668,25 @@ func (p *Postgres) validate(ctx context.Context) error {
 				"(docs/SPEC.md §8.5.5)", p.regname, extra))
 	}
 
+	// No INSERT or UPDATE rule. PostgreSQL refuses "INSERT ... ON CONFLICT"
+	// on a table with one (0A000, feature_not_supported): every batch would
+	// fail with the sink UP and /readyz green (go-relplog-pg-server's
+	// independent review, 2026-10-13). A rule ON DELETE or ON SELECT (a
+	// view's) does not touch the INSERT and is left alone.
+	var rules string
+	if err := p.pool.QueryRow(ctx, `
+		SELECT COALESCE((SELECT string_agg(quote_ident(rulename), ', ' ORDER BY rulename)
+		                   FROM pg_catalog.pg_rewrite
+		                  WHERE ev_class = to_regclass($1) AND ev_type IN ('2', '3')), '')`,
+		p.regname).Scan(&rules); err != nil {
+		return classifyPostgres("validate", err)
+	}
+	if rules != "" {
+		return fatalErr("validate", fmt.Errorf(
+			"table %s has an INSERT or UPDATE rule (%s); INSERT ... ON CONFLICT cannot run on such a "+
+				"table (0A000): drop the rule, or use a trigger (docs/SPEC.md §8.5.5)", p.regname, rules))
+	}
+
 	// INSERT, and SELECT on uuid: ON CONFLICT (uuid) reads the arbiter
 	// column, and a role with INSERT alone fails the first batch with 42501.
 	var canInsert, canSelectUUID bool
@@ -645,13 +726,17 @@ func (p *Postgres) observePool() {
 	}
 }
 
-// Close releases the pool. It waits for connections a worker still holds,
-// which is fine: the workers are stopped before the sink is closed.
+// Close releases the pool and the health check's connection. It waits for
+// connections a worker still holds, which is fine: the workers are stopped
+// before the sink is closed.
 func (p *Postgres) Close() error {
 	if p.closed.Swap(true) {
 		return nil
 	}
 	p.pool.Close()
+	p.probeMu.Lock()
+	p.dropProbe()
+	p.probeMu.Unlock()
 	return nil
 }
 
@@ -688,6 +773,21 @@ func classifyPostgres(op string, err error) error {
 func classifySQLState(code string) Class {
 	switch code {
 	case "25006": // read_only_sql_transaction: promoted replica, or configured so
+		return ClassFatal
+	case "0A000":
+		// feature_not_supported: what INSERT ... ON CONFLICT gets from a table
+		// with an INSERT or UPDATE rule, refused at boot by validate. A rule
+		// created after the boot fails every batch the same way; as network
+		// it was retried forever with the sink UP (go-relplog-pg-server's
+		// independent review, 2026-10-13).
+		return ClassFatal
+	case "23502":
+		// not_null_violation is class 23 but never THIS data: the sink fills
+		// all ten columns of the contract and none of its values is NULL, so a
+		// 23502 after the boot comes from the TABLE -- a required column added,
+		// a DEFAULT dropped, a trigger writing NULL. As logic it would drop
+		// every batch, one every few milliseconds, with the sink UP (SPEC
+		// §8.5.7; go-syslog-pg-server, 2026-10-13).
 		return ClassFatal
 	case "53100", "53200", "53400": // disk full, out of memory, config limit
 		return ClassFatal

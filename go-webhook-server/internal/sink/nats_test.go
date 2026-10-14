@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +59,12 @@ func TestClassifyNATS(t *testing.T) {
 		{"connect: user authentication expired", errors.New("nats: User Authentication Expired"), ClassFatal},
 		{"connect: user authentication revoked", errors.New("nats: User Authentication Revoked"), ClassFatal},
 		{"connect: account authentication expired", errors.New("nats: Account Authentication Expired"), ClassFatal},
+		// A TLS that can never succeed: sink.nats.tls against a server
+		// without TLS, a certificate that does not verify. A handshake cut
+		// short is network (SPEC §8.7.9).
+		{"tls wanted", nats.ErrSecureConnWanted, ClassFatal},
+		{"tls verification", fmt.Errorf("%w: %w", nats.ErrTLS, &tls.CertificateVerificationError{Err: errors.New("x509: unknown authority")}), ClassFatal},
+		{"tls handshake reset", fmt.Errorf("%w: connection reset by peer", nats.ErrTLS), ClassNetwork},
 		{"closed", nats.ErrConnectionClosed, ClassFatal},
 		{"stream not found", jetstream.ErrStreamNotFound, ClassFatal},
 		{"jetstream not enabled", jetstream.ErrJetStreamNotEnabled, ClassFatal},
@@ -66,11 +73,29 @@ func TestClassifyNATS(t *testing.T) {
 		{"api sealed", api(400, jsErrStreamSealed), ClassFatal},
 		{"api insufficient resources", api(503, jsErrInsufficientResources), ClassFatal},
 		{"api store failed", api(503, jsErrStreamStoreFailed), ClassFatal},
+		// A full discard=new stream, or one closing, is 10077 too, with the
+		// store's own words: transient (porte da família syslog/RELP,
+		// 2026-10-13). "store is closed" is nats-server 2.14.6's text
+		// (server/store.go, ErrStoreClosed); "store closed" an older one.
+		{"10077 max msgs", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages exceeded"}, ClassNetwork},
+		{"10077 max bytes", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum bytes exceeded"}, ClassNetwork},
+		{"10077 max per subject", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "maximum messages per subject exceeded"}, ClassNetwork},
+		{"10077 store is closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store is closed"}, ClassNetwork},
+		{"10077 store closed", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "store closed"}, ClassNetwork},
+		{"10077 record too large", &jetstream.APIError{Code: 503, ErrorCode: jsErrStreamStoreFailed, Description: "message too large"}, ClassFatal},
 		{"api stream not found by code", api(404, jetstream.JSErrCodeStreamNotFound), ClassFatal},
 		{"api stream not found 10059", api(404, jsErrStreamNotFound), ClassFatal},
 		{"api jetstream off 10076", api(503, jsErrJetStreamNotEnabled), ClassFatal},
 		{"api jetstream off for account 10039", api(503, jsErrJetStreamNotEnabledFA), ClassFatal},
 		{"api unknown 4xx", api(400, 10999), ClassFatal},
+		// Transient though 4xx: 10158 (409) is a Nats-Msg-Id still in a Raft
+		// proposal, 10167 (429) a full ingest queue, and any 429 is
+		// backpressure; another 409 stays fatal.
+		{"api duplicate in process 10158", api(409, jsErrDuplicateInProcess), ClassNetwork},
+		{"api too many requests 10167", api(429, jsErrStreamTooManyRequests), ClassNetwork},
+		{"api unknown 429", api(429, 10210), ClassNetwork},
+		{"api unknown 409", api(409, 10999), ClassFatal},
+		{"wrapped api 10158", fmt.Errorf("ack: %w", api(409, jsErrDuplicateInProcess)), ClassNetwork},
 
 		{"max payload", nats.ErrMaxPayload, ClassLogic},
 		{"max bytes", jetstream.ErrMaxBytesExceeded, ClassLogic},

@@ -308,15 +308,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Close severs everything immediately, for the second-signal abort path.
+// Close severs everything immediately, for the second-signal abort path and
+// for a boot interrupted right after Listen. The listeners are closed too: an
+// http.Server only knows the ones Serve was handed, and a boot interrupted
+// before Serve left them open (SPEC §10.5).
 func (s *Server) Close() error {
 	s.mu.Lock()
-	srvs := s.srvs
+	srvs, lns := s.srvs, s.listeners
 	s.mu.Unlock()
 
 	var errs []error
 	for _, srv := range srvs {
 		errs = append(errs, srv.Close())
+	}
+	for _, ln := range lns {
+		_ = ln.Close() // a second Close of a served one only says it is closed
 	}
 	return errors.Join(errs...)
 }

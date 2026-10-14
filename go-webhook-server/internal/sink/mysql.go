@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -52,6 +53,14 @@ type MySQL struct {
 	log *slog.Logger
 	m   *obs.Metrics
 
+	// probe is the health check's own pool of ONE connection, from the same
+	// connector, outside db (SPEC §8.6.7): the reason is Postgres.probe's --
+	// writers holding every pooled connection starved a check that waited
+	// for one, DOWN and then FATAL with a healthy server, and with ring=none
+	// no pool_size keeps one free. database/sql redials it after a broken
+	// connection on its own.
+	probe *sql.DB
+
 	// quoted is the table as every statement names it: `db`.`t`.
 	quoted string
 	// schema and name are what information_schema is asked about.
@@ -88,7 +97,44 @@ const (
 	mysqlDefaultPacket = 16 << 20
 
 	mysqlColumns = 10
+
+	// mysqlMaxNameChars is the longest database name MySQL accepts: 64
+	// CHARACTERS, not bytes (ClickHouse takes the same ceiling here).
+	mysqlMaxNameChars = 64
 )
+
+// checkQuotedName refuses a database name that cannot travel between
+// backticks as is: sink.mysql.database and sink.clickhouse.database are
+// spliced into every INSERT as `name`, and the table name is checked against
+// injection precisely so that this text is the only SQL nobody wrote by hand.
+// A backtick closes the quote (`a`b` is a syntax error at best, SQL at worst);
+// a backslash is an escape to ClickHouse inside backticks and changes the name
+// it reads; a control byte has no business in a name and would reach the logs
+// raw. More than 64 characters is longer than either server accepts, so
+// refusing it here only says so at exit 1 instead of as a server error on the
+// first check. The limit counts characters, not bytes: a legitimate name of 64
+// accented letters is 128 bytes (go-syslog-server review, 2026-10-13). Other
+// characters (a dash, a dot, UTF-8) are legal inside backticks and stay
+// accepted. Config checks the same rule (SPEC §8.6.3); this is the copy for a
+// caller that bypasses it (W pendência of 2026-10-11, ported from the
+// syslog/RELP family, 2026-10-13).
+func checkQuotedName(what, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s is empty", what)
+	}
+	if n := utf8.RuneCountInString(name); n > mysqlMaxNameChars {
+		return fmt.Errorf("%s %q has %d characters; the limit is %d", what, name, n, mysqlMaxNameChars)
+	}
+	for i := 0; i < len(name); i++ {
+		switch c := name[i]; {
+		case c == '`' || c == '\\':
+			return fmt.Errorf("%s %q has %q, which cannot appear between the backticks of the INSERT", what, name, c)
+		case c < 0x20 || c == 0x7f:
+			return fmt.Errorf("%s %q has the control byte 0x%02x", what, name, c)
+		}
+	}
+	return nil
+}
 
 // mysqlIdent mirrors the config rule; it is checked again here so a caller
 // that bypasses config cannot inject SQL through the table name.
@@ -292,8 +338,8 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	if !mysqlIdent.MatchString(cfg.Table) {
 		return nil, fmt.Errorf("sink mysql: table %q is not a plain identifier", cfg.Table)
 	}
-	if cfg.Database == "" {
-		return nil, errors.New("sink mysql: database is empty")
+	if err := checkQuotedName("sink mysql: database", cfg.Database); err != nil {
+		return nil, err
 	}
 
 	mc := mysql.NewConfig()
@@ -330,10 +376,16 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	//
 	// time_zone is UTC so the CURRENT_TIMESTAMP(6) default of received_at is
 	// UTC like event_at, which the driver sends in UTC (mc.Loc).
-	mc.Params = map[string]string{
-		"sql_mode":  "'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'",
-		"time_zone": "'+00:00'",
-	}
+	//
+	// autocommit is pinned for the same reason the mode is: it is the server's
+	// to default, and this sink depends on it. With autocommit=0 in my.cnf or
+	// init_connect, every single-chunk INSERT opens an implicit transaction
+	// nobody commits: Write returns success, the 200 goes out, and the rows
+	// vanish when the connection closes -- a silent loss of everything
+	// confirmed (SPEC §8.6.1). The driver sends these as SET after the
+	// handshake, so they win over init_connect, which the server runs before.
+	// The boot validation reads it back.
+	mc.Params = mysqlSessionParams()
 	mc.Loc = time.UTC
 	if cfg.AppName != "" {
 		mc.ConnectionAttributes = "program_name:" + cfg.AppName
@@ -359,6 +411,9 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	db.SetMaxIdleConns(cfg.PoolSize)
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(0)
+	probe := sql.OpenDB(connector)
+	probe.SetMaxOpenConns(1)
+	probe.SetMaxIdleConns(1)
 
 	schema, name := cfg.Database, cfg.Table
 	if i := strings.IndexByte(cfg.Table, '.'); i >= 0 {
@@ -367,6 +422,7 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	p := &MySQL{
 		cfg:    cfg,
 		db:     db,
+		probe:  probe,
 		log:    log,
 		m:      m,
 		quoted: "`" + schema + "`.`" + name + "`",
@@ -378,6 +434,16 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 }
 
 func (p *MySQL) Type() string { return "mysql" }
+
+// mysqlSessionParams is what every connection SETs after the handshake (see
+// NewMySQL for why each one is there).
+func mysqlSessionParams() map[string]string {
+	return map[string]string{
+		"sql_mode":   "'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'",
+		"time_zone":  "'+00:00'",
+		"autocommit": "1",
+	}
+}
 
 // mysqlLogger adapts the driver's Print-style logger to slog.
 type mysqlLogger struct{ log *slog.Logger }
@@ -607,7 +673,7 @@ func (p *MySQL) Health(ctx context.Context) error {
 		return ErrClosed
 	}
 	var readOnly int64
-	if err := p.db.QueryRowContext(ctx, "SELECT @@read_only").Scan(&readOnly); err != nil {
+	if err := p.probe.QueryRowContext(ctx, "SELECT @@read_only").Scan(&readOnly); err != nil {
 		return classifyMySQL("health", err)
 	}
 	p.observePool()
@@ -712,6 +778,19 @@ func (p *MySQL) validate(ctx context.Context) error {
 					"duplicate without an error; make it non-unique (docs/SPEC.md §8.6.4)",
 				p.cfg.Table, k.name, k.describe()))
 		}
+	}
+
+	// autocommit, read back from a pooled connection: the session parameter
+	// set it, and a server or proxy that ignored the SET would turn every
+	// Write into a transaction nobody commits (see NewMySQL).
+	var autocommit int64
+	if err := p.db.QueryRowContext(ctx, "SELECT @@session.autocommit").Scan(&autocommit); err != nil {
+		return classifyMySQL("validate", err)
+	}
+	if autocommit != 1 {
+		return fatalErr("validate", errors.New(
+			"the session has autocommit=0 although this sink sets it to 1; every INSERT would stay in "+
+				"a transaction nobody commits, and its rows would vanish with the connection"))
 	}
 
 	var maxPacket int64
@@ -858,13 +937,14 @@ func (p *MySQL) observePool() {
 	}
 }
 
-// Close releases the pool. It waits for connections a worker still holds,
-// which is fine: the workers are stopped before the sink is closed.
+// Close releases the pool and the health check's connection. It waits for
+// connections a worker still holds, which is fine: the workers are stopped
+// before the sink is closed.
 func (p *MySQL) Close() error {
 	if p.closed.Swap(true) {
 		return nil
 	}
-	return p.db.Close()
+	return errors.Join(p.db.Close(), p.probe.Close())
 }
 
 // classifyMySQL maps a driver error onto the class the state machine acts on.
@@ -938,10 +1018,17 @@ func mysqlNumberClass(n uint16) (Class, bool) {
 		return ClassFatal, true
 	case 1054, 1146, 1364: // unknown column, no such table, field has no default
 		return ClassFatal, true
+	// 1048 (column cannot be null) is 1364's twin and PostgreSQL's 23502: the
+	// sink fills all ten columns and none of its values is NULL, so after the
+	// boot probe it comes from the TABLE -- a trigger writing NULL, a column
+	// changed under it. As logic it dropped every batch with the sink UP
+	// (go-syslog-server review, 2026-10-13).
+	case 1048:
+		return ClassFatal, true
 	// 1062 cannot come from the INSERT: ON DUPLICATE KEY absorbs a collision
 	// on ANY unique key, which is why an extra one is refused at boot
 	// (SPEC §8.6.4) instead of surfacing here. Listed for what it would be.
-	case 1048, 1062, 1153, 1264, 1366, 1406, 1690: // NULL refused, duplicate entry, packet too large, out of range, bad string, data too long
+	case 1062, 1153, 1264, 1366, 1406, 1690: // duplicate entry, packet too large, out of range, bad string, data too long
 		return ClassLogic, true
 	case 3819, 3140, 3144: // CHECK violated, invalid JSON text, JSON from a binary string
 		return ClassLogic, true
@@ -949,7 +1036,15 @@ func mysqlNumberClass(n uint16) (Class, bool) {
 		1158, 1159, 1160, 1161, // net read/write errors and timeouts
 		1205, 1213, // lock wait timeout, deadlock
 		1317, 3024, // query interrupted, max_execution_time
-		2006, 2013: // server has gone away, lost connection
+		2006, 2013, // server has gone away, lost connection
+		// Server limits that clear on their own, and that report SQLSTATE
+		// 42000: the "42 is fatal" fallback would end the process -- a dump
+		// and exit 3, maybe on the whole fleet at once, freeing nothing --
+		// when a rolling deploy briefly overlaps the connection budget
+		// (go-relplog-server review, 2026-10-11; SPEC §8.6.6).
+		1203, // max_user_connections (global) reached
+		1226, // a per-user resource limit: MAX_USER_CONNECTIONS, *_PER_HOUR
+		1461: // max_prepared_stmt_count reached (the binary protocol prepares on every Exec)
 		return ClassNetwork, true
 	}
 	return ClassNetwork, false

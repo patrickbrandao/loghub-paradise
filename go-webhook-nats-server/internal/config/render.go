@@ -21,6 +21,10 @@ func redact(p *Param, value string) string {
 	return value
 }
 
+// isSecret reports whether p's value is masked in the dump: a line of the INI
+// right after one is not quoted in an error either (lookupINI).
+func isSecret(p *Param) bool { return p.Redact != RedactNone }
+
 // Usage writes --help. It is generated from the registry, so a parameter cannot
 // exist without being documented, and the documented default is by construction
 // the one the code uses.
@@ -114,6 +118,13 @@ func (l *Loaded) DumpINI(w io.Writer) error {
 			}
 			if src := l.Source[name]; src != FromDefault {
 				fmt.Fprintf(w, "# from %s\n", src)
+			}
+			if l.derived[name] {
+				// Commented: read back, the value is derived again (from
+				// sink.workers, from ring.data_dir) instead of fixed.
+				fmt.Fprintln(w, "# derived (commented: it is derived again when this file is read)")
+				fmt.Fprintf(w, "# %-28s = %s\n", p.Key, quoteINI(redact(p, formatValue(p.Kind, p.Ptr))))
+				continue
 			}
 			fmt.Fprintf(w, "%-30s = %s\n", p.Key, quoteINI(redact(p, formatValue(p.Kind, p.Ptr))))
 		}

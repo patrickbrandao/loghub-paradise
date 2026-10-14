@@ -163,7 +163,19 @@ func TestPostgresValidationHasItsOwnDeadline(t *testing.T) {
 		cfg.ConnectTimeout = 30 * time.Second
 		cfg.ValidateTimeout = 30 * time.Second
 		p := f.sink(cfg)
-		return p.Health, p.pool.Ping
+		// warm also opens, on its first call, the health check's own
+		// connection (SPEC §8.5.8): dialled through the delay, its handshake
+		// alone took most of the check deadline. Later calls are the one
+		// round trip the deadline is measured by.
+		probed := false
+		return p.Health, func(ctx context.Context) error {
+			if err := p.pool.Ping(ctx); err != nil || probed {
+				return err
+			}
+			probed = true
+			var one int
+			return p.probeScan(ctx, "SELECT 1", &one)
+		}
 	})
 }
 
@@ -176,7 +188,14 @@ func TestMySQLValidationHasItsOwnDeadline(t *testing.T) {
 		cfg.PoolSize = 1
 		cfg.ConnectTimeout = 30 * time.Second
 		p := f.sink(cfg)
-		return p.Health, p.db.PingContext
+		probed := false // see TestPostgresValidationHasItsOwnDeadline
+		return p.Health, func(ctx context.Context) error {
+			if err := p.db.PingContext(ctx); err != nil || probed {
+				return err
+			}
+			probed = true
+			return p.probe.PingContext(ctx) // the health check's own (SPEC §8.6.7)
+		}
 	})
 }
 
@@ -189,7 +208,14 @@ func TestClickHouseValidationHasItsOwnDeadline(t *testing.T) {
 		cfg.PoolSize = 1
 		cfg.ConnectTimeout = 30 * time.Second
 		c := f.sink(cfg)
-		return c.Health, c.conn.Ping
+		probed := false // see TestPostgresValidationHasItsOwnDeadline
+		return c.Health, func(ctx context.Context) error {
+			if err := c.conn.Ping(ctx); err != nil || probed {
+				return err
+			}
+			probed = true
+			return c.probe.Ping(ctx) // the health check's own (SPEC §8.8.8)
+		}
 	})
 }
 

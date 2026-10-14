@@ -319,6 +319,16 @@ sem `WHS_TEST_NATS_NOJS_URL` esses casos pulam. Em 2026-10-11 a suíte rodou
 contra servidores com `max_payload: 8MB`; o 1 MiB padrão também serve (a suíte
 da app baixa os tetos de corpo e cabeçalho, e a do sink lê o `max_payload`).
 
+Desde o porte da família syslog/RELP (2026-10-13), quatro variáveis a mais,
+cada uma pulando os seus casos sem ela (`review_port_nats_test.go`):
+`WHS_TEST_NATS_PERM_URL` (JetStream com os usuários `admin`, `nopub` — publish
+negado em `loghub.*.webhook` — e `noinbox` — subscribe negado em `_INBOX.>`; a
+configuração está no comentário de `natsPermSetup`), `WHS_TEST_NATS_TLS_URL`
+com `WHS_TEST_NATS_TLS_CA` (um listener com `tls {}` e o PEM do seu
+certificado autoassinado, CN/SAN `127.0.0.1`) e `WHS_TEST_NATS_SERVER` (o
+binário do `nats-server`, para os servidores que o próprio teste sobe, derruba
+e sobe de novo na mesma porta — com outro certificado, em cluster).
+
 Cada teste usa um Workspace e um stream próprios. Prova: subject
 `loghub.<space>.webhook.request` expandido por envelope; headers
 `Nats-Msg-Id = <uuid>.0`, `X-LogHub-*`, `Content-Type`, e nenhum `Whs-*`;
@@ -656,11 +666,12 @@ Registradas por honestidade, não por esquecimento:
     `network` (falha de handshake) e esperam `sink.boot_timeout` em vez de sair
     com 3 na hora.
 
-36. **O aborto no meio de um dump** (SPEC §10.3) não tem teste determinístico:
-    a janela entre o recolhimento e o fim da escrita do dump é de
-    milissegundos, e nada no caminho a segura. A contagem única (`atRisk`,
-    `collected`) está provada nas pontas — aborto antes do recolhimento, dump
-    que falha, emergência desligada — e no resto, por leitura.
+36. ~~**O aborto no meio de um dump** (SPEC §10.3) não tem teste determinístico~~
+    — **fechada em 2026-10-13** (§9, "Porte das correções da família
+    syslog/RELP"): os ganchos `beforeCollect`, `beforeDump` e `inAbort`
+    seguram o shutdown em cada janela, e a contagem única é provada em cada uma
+    (`TestAbortDuringTheDumpCountsItOnceAndLeavesNoDump` e os testes unitários
+    do livro-caixa do aborto).
 
 37. **`sink=redis` num *pipe* travado ignora o cancelamento.** Achado em
     2026-10-11 ao provar o prazo único das fases 3 e 4: com o Redis atrás de
@@ -691,9 +702,12 @@ Registradas por honestidade, não por esquecimento:
     "Achados anteriores ao porte"): o `SIGHUP` durante o dump, o dump parado
     quando a vida seguinte troca o ring, os gauges de emergência e o `WARN` do
     `ring=sqlite`. Seguem abertos:
-    - um segundo sinal no meio do dump conta os eventos como perda e o dump
+    - ~~um segundo sinal no meio do dump conta os eventos como perda e o dump
       ainda pode ser ligado ao nome final antes do `os.Exit` (reingerido
-      depois: perda contada a mais);
+      depois: perda contada a mais)~~ — corrigido em 2026-10-13: o dump que o
+      aborto contou desiste (`emergency.Store.SetAbandon`); só o que publica
+      entre a última conferência e o aborto fica contado e guardado (§9,
+      "Porte das correções da família syslog/RELP");
     - com `sink=redis`, o boot pode levar até 2× `sink.boot_timeout` (o
       `buildSink` tem o seu e o `WaitReady` começa outro);
     - em NFS, um `link` que deu certo no servidor e voltou erro faz o dump
@@ -707,11 +721,14 @@ Registradas por honestidade, não por esquecimento:
       duplicatas reais com `sink=redis`~~ — corrigido em 2026-10-11 na rodada
       do item 42 (§9), onde o dreno de um `ring.db` mantido o fazia aparecer
       em metade dos boots com uma CPU.
-41. **Uma brecha deixada no parser de flags** (SPEC §13.2, como no N): a cauda
+41. ~~**Uma brecha deixada no parser de flags** (SPEC §13.2, como no N): a cauda
     de um valor que o shell partiu num espaço, quando começa com traço e vem
     depois de um valor não vazio (`--sink.nats.password=a -b`), sai como
     parâmetro desconhecido, com o nome. Escondê-la esconderia todo erro de
-    digitação de uma flag depois de outra.
+    digitação de uma flag depois de outra.~~ — **fechada em
+    2026-10-13** (porte da família syslog/RELP, `knownSectionOf`): depois de um
+    valor, só se nomeia uma flag desconhecida dentro de uma seção deste
+    servidor; `TestFamilyPortTailAfterAValueIsNotNamed`.
 42. ~~Um backlog do `ring.db` fica parado quando a vida seguinte sobe com
     `ring=memory` ou `ring=none`, e com `ring=sqlite` + `sink=none` o dreno do
     boot entrega ao descarte as linhas de uma vida com destino~~ — **fechada em
@@ -987,3 +1004,130 @@ mesmo `ring.data_dir`) e o comentário de `removeLeftRing`, que dizia que os
 destinos absorvem uma reentrega pelo `uuid` — falso com `sink=redis`, e agora
 moot: os `DELETE` chegam ao disco antes do `Close`.
 
+### Porte das correções da família syslog/RELP (2026-10-13)
+
+**A (ciclo de vida, dump, shutdown, boot).** Cada item com SPEC primeiro, o
+teste abaixo e a correção revertida numa cópia do módulo (mutação): 28 de 28
+mutantes mortos. O mesmo no `go-webhook-fast-server`.
+
+| Item | Teste |
+|---|---|
+| `fsync` do diretório no `Remove`, na quarentena e no `.legacy`; `ErrNotDurable` (inclusive na abertura do diretório) vira `WARN`, não o "cannot remove" falso; a escrita do dump continua melhor esforço (SPEC §9.1, §9.2) | `TestRemoveSyncsTheDirectory`, `TestRemoveWithAnUnopenableDirectoryIsNotDurable`, `TestRenameAsideWithAFailedDirectoryFsyncHappened`, `TestWriteKeepsTheDumpWhenTheDirectoryFsyncFails`, `TestReingestedDumpRemovedWithoutDurabilityIsAWarning`, `TestQuarantineWithoutDurabilityIsStillReported` |
+| Posse única da perda do aborto (`lossMu`, `enterDumpPhase`, `oweDump`, `settleDump`), no lugar do par `atRisk`/`collected`: o aborto entre o `Drain` e o registro do recolhimento contava a menos (2 de 5) (SPEC §10.3; fecha §8 item 36) | `TestAbortBetweenTheDrainAndTheDumpCountsEverything`, `TestAbortAfterASavedDumpCountsNothing`, `TestAbortAndDisabledDumpCountOnce`, `TestAbortAndFailedDumpCountOnce`, `TestAbortDuringTheDrainIsCountedOnce`, `TestAbortBeforeTheDumpPhaseKeepsItClosed` |
+| O dump que o aborto contou desiste (`Store.SetAbandon`), e o que publica depois da última conferência não é contado de novo (fecha o primeiro ponto do §8 item 40) | `TestWriteGivesUpWhenAbandoned` (antes do primeiro registro, a cada 1024, antes do `link`), `TestDumpAfterTheAbortIsAbandoned`, `TestAbortAfterTheLastAbandonCheckCountsNothingMore`, `TestAbortDuringTheDumpCountsItOnceAndLeavesNoDump` (ponta a ponta: `beforeDump` segura o dump até o aborto contar) |
+| X2: o dump toma o contador sob `lossMu`, nos dois ramos (com dump e `emergency.enabled=false`) | `TestDumpThatSawTheAbortLeavesTheCountToIt` (`inAbort`: o dump roda com a trava do aborto na mão) |
+| A4: `ring=sqlite`, sink que não aceita nada, segundo sinal na fase 4: `abort=0`, as linhas no `ring.db` e entregues no boot seguinte | `TestAbortWithTheSQLiteRingLosesNothing` |
+| `SIGQUIT` nunca tolerado, e o primeiro `SIGTERM`/`SIGINT` do shutdown por FATAL tolerado (já valia; agora com teste de unidade em `shutdownWith`) | `TestFatalShutdownToleratesTheFirstSignal` |
+| O canal do aborto registrado antes de o contexto soltar `SIGTERM`/`SIGINT` (um segundo sinal no meio saía 143 sem contar) | sem teste: a janela é de instruções, entre o `signal.Stop` do contexto e o `signal.Notify`; provado por leitura |
+| Um sink FATAL durante o dreno do `SIGTERM` encerra a espera e sai 3 em qualquer ring (SPEC §10.3; fecha SPEC §19.1 item 21, já registrado, na mesma rodada por ser da fase 4) | `TestFatalDuringTheDrainEndsTheWaitAndExits3` (`memory`: o dump sai na hora; `sqlite`: 3, não 0) |
+| X1: `bind` cancelado por sinal = 130, na porta admin e na pública, com nome de host (o *lookup* cancelado saía 1) e com IP literal (abria, `/readyz` 200, saía 0); o `Server.Close` fecha também os listeners que o `Serve` nunca recebeu | `TestSignalBeforeTheBindExits130` (`127.0.0.1:0` e `localhost:0`, a porta solta depois), `TestCancelledAdminBindIsAnAbortNotAConfigError` |
+
+Não se aplicam (com o porquê no `docs/DECISOES.md` §4b do fast; o W não tem
+DECISOES): o `quitNow` (sem observador de `SIGQUIT` fora do
+shutdown), o prazo da reingestão sem progresso (sem retentativa nem prazo
+único), o fechamento em paralelo (o `Server.Shutdown` já fecha os listeners
+juntos). O `withLifetime` e o `validationContext` com `sink.op_timeout` já
+estavam aqui, com `TestHealthChecksCarryTheirLifetime`.
+
+**B (configuração, `internal/config/`).** Testes em
+`internal/config/family_port_test.go`; cada um falhou contra o código de antes
+(conferido no módulo intocado) e cada correção revertida sozinha derruba ao
+menos um (40 mutantes, 40 mortos).
+
+| Item | Teste |
+|---|---|
+| Cauda depois de um valor nomeada só dentro de uma seção conhecida (`knownSectionOf`; fecha §8 item 41) | `TestFamilyPortTailAfterAValueIsNotNamed`; controles de `TestParserErrorsDoNotEchoValues` ajustados (`--typo.key` depois de um valor culpa a flag anterior; `--sink.wrkers` é nomeada) |
+| `-h`/`-v` depois de uma flag que espera valor não é nomeado como *switch* | `TestFamilyPortShortDashValueIsNotNamedAsAFlag` |
+| Valor colado ao nome, `:` no lugar do `=`, na flag e no INI; chave antes de seção | `TestFamilyPortGluedValueIsNotPrinted` |
+| Continuação de segredo numa linha do INI (senha, token, URL com credencial) | `TestFamilyPortINISecretContinuationIsNotPrinted` |
+| *Switches* com valor; `--config=` vazio; BOM na linha 1 | `TestFamilyPortSwitchesTakeNoValue`, `TestFamilyPortEmptyConfigFlagIsRefused`, `TestFamilyPortINIByteOrderMarkIsIgnored` |
+| Derivados (`ring.sqlite.path`, `sink.sqlite.path`, `emergency.dir`, `pool_size`) comentados no `--dump-config` | `TestFamilyPortDumpCommentsDerivedValues` (relido com outro `data_dir` e outros `workers`, deriva de novo) |
+| Tetos, sem recusar config legítima (ClickHouse `batch=100000`; `ring=sqlite` com 50 milhões de itens e `max_bytes=16GiB`; `ring=none`) | `TestFamilyPortConfigCeilings` |
+| `sink.postgres.addr` um servidor só; `sink.redis.addrs` `host:porta` | `TestFamilyPortPostgresAddrNamesOneServer`, `TestFamilyPortRedisAddrsAreHostPort` |
+
+Não se aplica (SPEC §10.1; `DECISOES.md` 4b do fast): `sink.batch_max_bytes` (a chave
+não existe aqui), as regras de URL PostgreSQL da `LOGHUB_EB_URL` (não há
+`LOGHUB_EB_URL` nem outro leitor de URL/DSN SQL), a `,` no host de uma URL
+Redis (não há URL Redis; a vírgula é o separador de `sink.redis.addrs`), e o
+socket PostgreSQL com `tls=true`, que já era recusado.
+
+**C (sink NATS).** Os achados do `go-relplog-server`, do
+`go-relplog-nats-server` e do `go-syslog-server` no sink NATS, conferidos um a
+um contra este módulo (SPEC §8.7). Cada teste falhou antes da correção, e cada
+correção foi revertida sozinha numa cópia (mutação): 23 mutantes, todos mortos
+— 17 do sink, 6 da configuração e da app. Não se aplicam aqui, por não haver
+`mode=core` neste servidor (só JetStream): a negação mascarada pelo `-ERR` do
+beacon, o *flush* que atravessa uma reconexão e o aviso de outro `space` em
+`core` (o `cover` do JetStream já recusa o subject descoberto).
+
+| Achado | Consequência sem a correção | Teste |
+|---|---|---|
+| `10077` de stream `discard: new` cheio ("maximum messages exceeded", texto real do `nats-server` 2.14.6) ou fechando ("store is closed", o `ErrStoreClosed` de `server/store.go`) era fatal; a família casava só "store closed", que o servidor não manda | Dump e `exit 3` por contrapressão ou por um reinício do NATS, e a parte já gravada do lote duplicada na reingestão | `TestNATSFullDiscardNewStreamIsNetwork` (servidor real), `TestClassifyNATS` |
+| `10158`, `10167` e todo 429 caíam na regra do 4xx desconhecido (SPEC §19.1 item 19) | FATAL em todas as instâncias de um stream em cluster degradado ou num pico | `TestClassifyNATS` |
+| `retention: interest` aceito; `max_msgs_per_subject` sem aviso (SPEC §19.1 item 18) | `PubAck` sem gravar: o `200` de `ring=none` e a liberação do ring como perda silenciosa | `TestNATSValidateRetentionAndPerSubjectCap`, `TestNATSInterestStreamIsRefused` (servidor real: o `PubAck` vem e nada fica) |
+| A publicação negada e o `_INBOX` negado só viravam FATAL na checagem **seguinte**: a ida e volta que esbarrava na negação expirava como `network` | Um lote retentado e o sink UP até a próxima checagem; no boot, o `_INBOX` negado só no `Health` seguinte | `TestNATSPermissionDeniedIsFatal` (servidor real com permissões: `nopub` pelo prazo da confirmação e pelo do worker, `noinbox`, `admin` de controle) |
+| Um certificado que não verifica e `sink.nats.tls` contra um servidor sem TLS eram `network` | O boot esperava o `sink.boot_timeout` inteiro para sair com a mensagem da rede; depois do boot, o sink DOWN até os fusíveis — ou para sempre, sem eles | `TestNATSBootTLSRefusalIsFatal` (o listener `tls {}` compartilhado; controles com a CA e com `tls_insecure`), `TestNATSReconnectToAnUntrustedTLSServerIsAVerdict` (servidor próprio que volta exigindo TLS com certificado não confiável; controle com um confiável), `TestClassifyNATS` |
+| A regra do *pool* (C1 da revisão do `go-syslog-server`): a recusa de TLS de um nó só vale como veredito sem outro servidor no *pool* | Sem ela, o nó não confiável de um *pool* — nas URLs ou anunciado pelo cluster — virava FATAL, dump e `exit 3` enquanto o confiável voltava; no boot, um *pool* com o confiável fora saía na hora | `TestNATSOneUntrustedServerOfAPoolIsNoVerdict` (`urls` e `announced`, com servidores próprios: nenhum FATAL, o TLS nomeado como motivo, de volta UP), `TestNATSBootTLSRefusalOfAPoolIsNetwork` |
+| `MaxPending` sem folga e sem teto em `ring.max_inflight` (C3) | Retentativa rápida de um lote contaminado parada na janela cheia (`ErrTooManyStalledMsgs`); um `max_inflight` grande dava a volta e caía em 4096 em silêncio | `TestNATSMaxPendingHasTwiceTheInFlight` (app), `TestRingMaxInflightHasACeiling` (config) |
+| `sink.nats.urls` aceitava qualquer esquema, recusava o caminho de um `ws://`, e o `@` depois de `/` só dizia "path" | Um esquema que o `nats.go` não disca falhava só na conexão, até o `sink.boot_timeout`; um *endpoint* websocket legítimo recusado | `TestNATSURLsFollowTheFamilyRules`, `TestNATSURLsAreCheckedWithoutEcho` (o texto esperado do `@` depois de `/` passou a ser o `%2F`) |
+
+O `ReconnectErrHandler` novo (veredito de TLS se um dia o `nats.go` o relatar
+ali) não tem teste: o cliente atual só o chama na discagem TCP, como no
+`go-syslog-server`.
+
+**D (destinos SQL e o dreno).** Cada correção tem o teste abaixo, contra
+PostgreSQL 18, MySQL 8.4 e ClickHouse 25.8 reais, e foi revertida numa cópia
+(mutação, os mesmos mutantes do `go-webhook-fast-server`, cujo código é o
+mesmo): 46 de 46 mutantes morreram (7 PostgreSQL, 24 MySQL/ClickHouse/dreno,
+2 da montagem, 13 da configuração). `23502` e `0A000` fatais, `RULE` de
+`INSERT`/`UPDATE` recusada no boot: `TestClassifySQLState`,
+`TestPostgresNotNullViolationIsFatal`, `TestPostgresRulesAreRefusedAtBoot`. O
+check de saúde com conexão própria: `TestPostgresHealthHasItsOwnConnection`,
+`TestMySQLHealthHasItsOwnConnection`, `TestClickHouseHealthHasItsOwnConnection`
+(`pool = escritores` em 1 e 3, escritores presos num lock ou numa *materialized
+view* que dorme), e a reconexão: `TestPostgresHealthRedialsADeadConnection`.
+MySQL: `1048` fatal (`TestClassifyMySQLNumber`,
+`TestMySQLNotNullAfterBootIsFatal`, um *trigger* que anula), `1203`/`1226`/
+`1461` como `network` (`TestClassifyMySQLNumber`,
+`TestMySQLUserConnectionLimitIsNetwork`, com um usuário próprio de
+`MAX_USER_CONNECTIONS 1`), `autocommit` (`TestMySQLSessionPinsAutocommit`,
+`TestMySQLAutocommitIsReadBackAtBoot`, sem `SET GLOBAL`). Nome do banco por
+caracteres: `TestSQLDatabaseNameBetweenBackticks`,
+`TestDatabaseNamesBetweenBackticks`. A conta de memória do ClickHouse por
+escritores: `TestClickHouseMemoryCountsTheWritersNotThePool`,
+`TestClickHouseUserMemoryLimitCountsTheWriters`, `TestSinkWritersFollowTheRing`,
+`TestClickHouseBootCountsTheWorkersNotThePool` (a montagem passa os
+escritores). A regra do pool: `TestSQLPoolOfExactlyTheWorkersIsLegitimate`,
+`TestPostgresPoolSizeWarnings`. O dreno já tratava a recusa `logic` antes do
+contexto; `TestWorkersLogicRefusalDuringShutdownIsLoggedAndCounted` a guarda
+(o mutante que olha o contexto primeiro morre). E o *flake* de
+`TestPostgresWrongPasswordIsFatal` (`53300` antes de conferir a senha, com as
+vagas do servidor esgotadas por outras suítes): o teste repete enquanto essa é
+a resposta, como no RP. A conexão própria do check mudou um teste antigo: o
+aquecimento de `TestPostgresValidationHasItsOwnDeadline` (e dos irmãos MySQL
+e ClickHouse) abre também a conexão do check, ou o *handshake* dela, pelo
+*proxy* que atrasa cada pedaço, consumia o prazo da checagem (1 falha em 8
+rodadas antes; 45 de 45 depois).
+
+Os padrões assumidos desta parte (contestáveis) estão na SPEC: o check com
+conexão própria em vez da recusa de `pool_size < sink.workers + 1` do RP, a
+derivação mantida e o `WARN` só abaixo de `sink.workers` (§8.5.3, §8.5.8), a
+reconexão única do check (§8.5.8), o `autocommit` (§8.6.1) e o nome do banco
+por caracteres (§8.6.3). **Não se aplica:** a sonda MySQL com `unix`/`src_ip
+NULL` do R (as dez colunas são sempre preenchidas, nenhuma vem `NULL`); o
+`Deliver` com `logic` antes do `ctx` do RP (já era assim; ficou o teste de
+guarda); o prazo próprio da validação (já existia).
+
+**Integração (as quatro áreas fundidas).** O `TestWorkersTaintABatchAfterATimedOutAttempt`
+falhou duas vezes durante a rodada (`DATA RACE` entre o `Release` de
+`sink/workers.go` e a leitura de `it.Env` no teste; 1× no W, 1× no N), com o
+`workers.go` e o teste iguais ao `base`. Não era defeito de posse: o teste
+iniciava o worker **antes** de enfileirar os quatro itens, e o worker podia
+pegar só os primeiros, estourar o prazo neles (marcados, nunca voltam ao pool)
+e entregar os demais numa tentativa que não estourou — esses voltam ao pool,
+como manda a SPEC §12.3, e o teste lia o `Env` que o `Release` zerava (com
+`-race -count=200`, 3 falhas; com a guarda nova, 6 de 300 diziam "the stalled
+write carried 1|2|3 of the 4 items"). Correção no teste: enfileirar antes do
+`Start` (como o `TestWorkersMarkFatal`) e conferir que a escrita parada levou
+os quatro (`stallOnceSink.stalled`); `-race -count=500` verde. O
+`go-syslog-standard-server` tem o mesmo teste com a mesma ordem.

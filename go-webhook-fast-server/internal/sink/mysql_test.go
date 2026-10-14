@@ -42,6 +42,11 @@ func TestClassifyMySQLNumber(t *testing.T) {
 		{2006, "", ClassNetwork},      // server has gone away
 		{2013, "", ClassNetwork},      // lost connection during query
 		{3024, "HY000", ClassNetwork}, // max_execution_time exceeded
+		// Server limits that clear on their own, all SQLSTATE 42000: the
+		// fallback would make them fatal (go-relplog-server review).
+		{1203, "42000", ClassNetwork}, // max_user_connections reached
+		{1226, "42000", ClassNetwork}, // a per-user resource limit
+		{1461, "42000", ClassNetwork}, // max_prepared_stmt_count reached
 
 		// Waiting never fixes it: end the process.
 		{1290, "HY000", ClassFatal}, // --read-only: the deliberate hard choice
@@ -59,9 +64,10 @@ func TestClassifyMySQLNumber(t *testing.T) {
 		{1054, "42S22", ClassFatal}, // unknown column
 		{1146, "42S02", ClassFatal}, // table does not exist
 		{1364, "HY000", ClassFatal}, // field has no default value
+		// The sink never sends NULL: 1048 after the boot probe is the table.
+		{1048, "23000", ClassFatal}, // column cannot be null
 
 		// The destination is alive and refused THIS data.
-		{1048, "23000", ClassLogic}, // column cannot be null
 		{1062, "23000", ClassLogic}, // duplicate entry: unreachable under ON DUPLICATE KEY
 		{1153, "08S01", ClassLogic}, // packet bigger than max_allowed_packet: the number wins over 08
 		{1264, "22003", ClassLogic}, // out of range
@@ -136,8 +142,8 @@ func TestClassifyMySQLUnwrapsDriverError(t *testing.T) {
 	if !errors.As(err, &me) {
 		t.Error("the classified error must still unwrap to the MySQLError")
 	}
-	if got := ClassOf(classifyMySQL("insert", &mysql.MySQLError{Number: 1048})); got != ClassLogic {
-		t.Errorf("1048 = %s, want logic", got)
+	if got := ClassOf(classifyMySQL("insert", &mysql.MySQLError{Number: 1406})); got != ClassLogic {
+		t.Errorf("1406 = %s, want logic", got)
 	}
 	if got := ClassOf(classifyMySQL("insert", &mysql.MySQLError{Number: 1213})); got != ClassNetwork {
 		t.Errorf("1213 = %s, want network", got)

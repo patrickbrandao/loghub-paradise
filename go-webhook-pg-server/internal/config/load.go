@@ -45,6 +45,10 @@ type Loaded struct {
 	File     string // config file actually read, empty if none
 	Meta     Meta
 	Warnings []string
+
+	// derived are the keys whose value Load derived from another one (the
+	// empty default of derivedParams); the dump prints them commented.
+	derived map[string]bool
 }
 
 // ErrExitEarly is returned when --help or --version was requested; the caller
@@ -104,11 +108,15 @@ func Load(opts Options) (*Loaded, error) {
 		if err != nil {
 			return nil, err
 		}
+		// afterSecret: the line before was a secret, so an unknown key here
+		// may be the rest of it wrapped onto this line (lookupINI).
+		afterSecret := false
 		for _, e := range entries {
-			p, err := ix.lookup(e.Name)
+			p, err := ix.lookupINI(e, afterSecret)
 			if err != nil {
 				return nil, fmt.Errorf("%s line %d: %w", file, e.Line, err)
 			}
+			afterSecret = isSecret(p)
 			if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
 				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, p.Name(), err)
 			}
@@ -138,6 +146,14 @@ func Load(opts Options) (*Loaded, error) {
 		l.Source[p.Name()] = FromFlag
 	}
 
+	// What is still empty or zero here is derived below, by derive or by
+	// Validate (a pool from sink.workers).
+	unset := map[string]bool{}
+	for _, name := range derivedParams {
+		if v := formatValue(ix.byName[name].Kind, ix.byName[name].Ptr); v == "" || v == "0" {
+			unset[name] = true
+		}
+	}
 	if err := derive(cfg, opts); err != nil {
 		return nil, err
 	}
@@ -146,7 +162,23 @@ func Load(opts Options) (*Loaded, error) {
 		return nil, err
 	}
 	l.Warnings = warns
+	l.derived = make(map[string]bool, len(unset))
+	for name := range unset {
+		if v := formatValue(ix.byName[name].Kind, ix.byName[name].Ptr); v != "" && v != "0" {
+			l.derived[name] = true
+		}
+	}
 	return l, nil
+}
+
+// derivedParams are the keys whose empty or zero value derives another one
+// (SPEC §13.5). The dump prints a derived value commented: written as a key,
+// it would be explicit when the dump is read back, and a pool_size would stop
+// following sink.workers, a path stop following ring.data_dir -- out of the
+// one writable mount (SPEC §13.6; go-relplog-pg-server's review, ported
+// 2026-10-13).
+var derivedParams = []string{
+	"emergency.dir", "sink.postgres.pool_size",
 }
 
 // derive fills the values whose default depends on another value and therefore

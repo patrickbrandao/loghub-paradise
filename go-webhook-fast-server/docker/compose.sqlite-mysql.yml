@@ -55,7 +55,7 @@ services:
       WHS_SINK_MYSQL_PASSWORD: ${WHS_SINK_MYSQL_PASSWORD:-webhook}
       WHS_SINK_MYSQL_DATABASE: ${WHS_SINK_MYSQL_DATABASE:-webhook}
       WHS_SINK_MYSQL_TABLE: ${WHS_SINK_MYSQL_TABLE:-inbox}
-      # 0 deriva sink.workers + 1: uma conexao por worker e uma para o health.
+      # 0 deriva sink.workers + 1: uma conexao por worker e uma de folga (o health tem a sua, fora do pool).
       WHS_SINK_MYSQL_POOL_SIZE: ${WHS_SINK_MYSQL_POOL_SIZE:-0}
       # Rede interna do compose: sem TLS. Contra um banco gerenciado, ligue
       # WHS_SINK_MYSQL_TLS e monte a CA em /etc/webhook (somente leitura).

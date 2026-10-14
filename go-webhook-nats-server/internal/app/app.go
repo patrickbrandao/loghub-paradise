@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -161,7 +162,15 @@ type App struct {
 	workers *sink.Workers
 	srv     *server.Server
 	admin   *server.Admin
-	emg     *emergency.Store
+
+	// emg reads the dumps of a previous life at every boot, emergency.enabled
+	// or not; dumps says whether this life writes them (SPEC §9.2). The store
+	// used to exist only with the key on, and a next life with it off left a
+	// dump stranded with no log (SPEC §19.1 item 8 of go-webhook-pg-server,
+	// §18.1 item 4 of go-webhook-nats-server; the rule of
+	// go-webhook-fast-server, ported 2026-10-13).
+	emg   *emergency.Store
+	dumps bool
 
 	// abort replaces the OS signal channel that shutdown watches for a second
 	// interrupt. It is nil in the binary, which registers the real signals; the
@@ -183,15 +192,39 @@ type App struct {
 	// binary.
 	wrapRing func(*ring.Memory) ring.Ring
 
-	// atRisk is how many accepted events the shutdown has collected out of
-	// the ring and the workers and not yet saved or counted: the dump in
-	// progress. collected says the collection happened, after which the
-	// ring's own count no longer means anything. Whoever Swaps atRisk to zero
-	// first -- the abort, or the graceful path once the dump is settled --
-	// does the counting, so the same events are never lost twice
-	// (independent review, 2026-10-07).
-	atRisk    atomic.Int64
-	collected atomic.Bool
+	// lossMu orders the abort against the moments the shutdown hands the
+	// loss counter around (enterDumpPhase, oweDump, settleDump): one side
+	// counts each event, never both (SPEC §10.3). aborted is set by abortLoss
+	// under it, and is what tells an emergency dump still being written to
+	// give up (emergency.Store.SetAbandon): a dump counted lost must not come
+	// back at the next boot. The form is the final one of the syslog/RELP
+	// family (go-relplog-nats-server's independent review, 2026-10-13),
+	// ported 2026-10-13; it replaces the atRisk/collected pair, which left
+	// two windows -- an abort between the Drain and the collected flag read
+	// the ring without the drained events, and one during the dump counted
+	// events that the link could still publish.
+	lossMu  sync.Mutex
+	aborted atomic.Bool
+
+	// dumping is the number of accepted events the shutdown is collecting or
+	// dumping, for abortLoss; 0 otherwise. Drain takes the items out of the
+	// ring's accounting BEFORE the dump, so an abort that lands while the
+	// file is written would read the ring as (nearly) empty and count a
+	// fraction of a loss that is in fact the whole dump.
+	dumping atomic.Int64
+	// dumpPhase is set when the shutdown starts collecting the leftovers of
+	// the ring: from then on abortLoss counts dumping, never the ring's count.
+	dumpPhase atomic.Bool
+
+	// beforeDump, when a test sets it, runs right before the emergency dump
+	// is written; beforeCollect, right after the dump phase started and
+	// before the leftovers are collected (Workers.Pending, Drain); inAbort,
+	// inside abortLoss in the dump phase, right after aborted is set and
+	// before the counter is taken, with lossMu held. The tests land an abort,
+	// or the dump's own count (settleDump), there. nil in the binary.
+	beforeDump    func()
+	beforeCollect func()
+	inAbort       func()
 }
 
 func (a *App) run(ctx context.Context, stopSignals func()) int {
@@ -223,6 +256,14 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	a.admin = server.NewAdmin(a.metrics, a.cfg.Ring.HighWater)
 	if a.cfg.Admin.Enabled {
 		if err := a.admin.Listen(ctx, a.cfg.Admin.Bind); err != nil {
+			if ctx.Err() != nil {
+				// The signal context, not the address: a host name's lookup
+				// fails with "operation was canceled". An interrupted boot is
+				// 130, not the exit 1 of a bad address (SPEC §10.5; port of
+				// the syslog/RELP family, 2026-10-13).
+				a.log.Info("interrupted while opening the admin listener")
+				return ExitAborted
+			}
 			a.log.Error("cannot bind the admin listener", "addr", a.cfg.Admin.Bind, "error", err)
 			return ExitConfig
 		}
@@ -322,8 +363,23 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 
 	// Step 6: the public listener opens last.
 	if err := a.srv.Listen(ctx); err != nil {
+		if ctx.Err() != nil {
+			// See the admin listener: a signal, not a bad address.
+			a.log.Info("interrupted while opening the public listener")
+			return ExitAborted
+		}
 		a.log.Error("cannot bind the public listener", "addr", a.cfg.Server.Bind, "error", err)
 		return ExitConfig
+	}
+	// A literal IP binds without ever looking at ctx, so a signal between the
+	// reingestion and here used to reach this point with the bind done: the
+	// server opened, answered /readyz 200 and left with 0 through the graceful
+	// path instead of 130 (SPEC §10.5; port of the syslog/RELP family,
+	// 2026-10-13). Nothing was accepted yet: the listeners just close.
+	if ctx.Err() != nil {
+		_ = a.srv.Close()
+		a.log.Info("interrupted while opening the public listener")
+		return ExitAborted
 	}
 	a.log.Info("public listener open",
 		"addr", a.srv.Addr(), "listeners", a.cfg.Server.Listeners,
@@ -345,13 +401,32 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 
 	case <-a.health.Fatal():
 		a.log.Error("sink became permanently unusable", "error", a.health.FatalErr())
-		return a.shutdown(stopWorkers, true)
+		abort, stopAbort := a.watchAbort()
+		defer stopAbort()
+		return a.shutdown(stopWorkers, true, abort)
 
 	case <-ctx.Done():
-		stopSignals() // restore default handling so a second signal is not swallowed
+		// The abort watcher is registered BEFORE the signal context lets go
+		// of SIGTERM/SIGINT: in between, a second signal got Go's default
+		// action and killed the process with 143, the loss counted nowhere
+		// (port of the syslog/RELP family, 2026-10-13).
+		abort, stopAbort := a.watchAbort()
+		defer stopAbort()
+		stopSignals() // a second signal now reaches abort, not the context
 		a.log.Info("shutdown requested")
-		return a.shutdown(stopWorkers, false)
+		return a.shutdown(stopWorkers, false, abort)
 	}
+}
+
+// watchAbort is the channel shutdown watches for a second signal: the test's
+// when set, otherwise SIGTERM, SIGINT and SIGQUIT from the OS, until stop.
+func (a *App) watchAbort() (abort <-chan os.Signal, stop func()) {
+	if a.abort != nil {
+		return a.abort, func() {}
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
+	return ch, func() { signal.Stop(ch) }
 }
 
 // buildSink constructs the destination. Nothing connects here: the
@@ -393,12 +468,21 @@ func (a *App) natsConfig() sink.NATSConfig {
 		ClientName:     a.clientName(),
 		ConnectTimeout: a.cfg.Sink.OpTimeout,
 		OpTimeout:      a.cfg.Sink.OpTimeout,
-		// Everything the workers can have in the air at once (SPEC §8.7.2);
-		// the boot reingestion runs before they start.
-		MaxPending:    a.cfg.Sink.Workers * a.cfg.Sink.Batch,
-		MaxEventBytes: config.MaxEventBytes(a.cfg),
+		MaxPending:     maxPending(a.cfg),
+		MaxEventBytes:  config.MaxEventBytes(a.cfg),
 	}
 }
+
+// maxPending is the client's PublishAsyncMaxPending (SPEC §8.7.2): every
+// publish this process can have in flight at once -- the drain workers'
+// batches (the boot reingestion runs before they start) -- doubled: the
+// futures of a tainted batch keep counting until their own async timeout,
+// which starts at the publish, a little after the worker's deadline, and a
+// quick retry would stall on a full window and fail with
+// ErrTooManyStalledMsgs (go-relplog-nats-server's independent review,
+// 2026-10-13; porte da família syslog/RELP). The ceilings of sink.workers and
+// sink.batch keep it an int (config/validate.go).
+func maxPending(c *config.Config) int { return 2 * c.Sink.Workers * c.Sink.Batch }
 
 // clientName names this instance's connection to the destination (SPEC §3.5,
 // §8.7.1): the NATS client name, visible in the server's connz.
@@ -430,11 +514,13 @@ func (a *App) build() int {
 		a.ring = a.wrapRing(mem)
 	}
 
-	// The emergency dump belongs to the ring (SPEC §9). One line of a dump
-	// is at most the largest envelope this configuration can produce.
-	if a.cfg.Emergency.Enabled {
-		a.emg = emergency.NewStore(a.cfg.Emergency.Dir, a.id.From, config.MaxEventBytes(a.cfg))
-	}
+	// Writing a dump belongs to the ring and to emergency.enabled; reading
+	// one belongs to every boot: the dump is a previous life's (SPEC §9.2).
+	// One line of a dump is at most the largest envelope this configuration
+	// can produce. NewStore touches no disk.
+	a.emg = emergency.NewStore(a.cfg.Emergency.Dir, a.id.From, config.MaxEventBytes(a.cfg))
+	a.emg.SetAbandon(a.aborted.Load)
+	a.dumps = a.cfg.Emergency.Enabled
 
 	a.workers = sink.NewWorkers(a.ring, a.sink, a.health, sink.WorkerConfig{
 		Workers:    a.cfg.Sink.Workers,
@@ -479,55 +565,119 @@ func (a *App) build() int {
 
 // shutdown runs the five phases of SPEC §10.3. A second signal skips straight
 // to the exit, accepting the loss.
-func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool) int {
-	abort := a.abort
-	if abort == nil {
-		abort = make(chan os.Signal, 1)
-		signal.Notify(abort, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
-		defer signal.Stop(abort)
-	}
+//
+// A FATAL shutdown starts with no signal at all, so the FIRST SIGTERM or
+// SIGINT that arrives during it -- the orchestrator's ordinary one, while the
+// dump is being written -- is not the second signal of SPEC §10.3: it is
+// logged and the shutdown goes on; the next one aborts (independent review,
+// 2026-10-07). SIGQUIT is never tolerated: it means "now", in every phase.
+func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool, abort <-chan os.Signal) int {
+	return a.shutdownWith(func(abortCtx context.Context) int {
+		return a.gracefulShutdown(abortCtx, stopWorkers, fatal)
+	}, fatal, abort)
+}
 
-	// aborted stops the graceful path when the abort wins: in the binary
-	// os.Exit makes that moot, but in the tests the instance would otherwise
-	// keep draining and dumping into a directory the test has removed.
-	abortCtx, aborted := context.WithCancel(context.Background())
-	defer aborted()
+// shutdownWith is shutdown around any graceful procedure, so the signal rules
+// can be tested without a whole server. The procedure is handed abortCtx,
+// cancelled when the abort wins: in the binary os.Exit makes that moot, but in
+// the tests the instance would otherwise keep draining and dumping into a
+// directory the test has removed.
+func (a *App) shutdownWith(graceful func(abortCtx context.Context) int, fatal bool, abort <-chan os.Signal) int {
+	abortCtx, stopGraceful := context.WithCancel(context.Background())
+	defer stopGraceful()
 
 	done := make(chan int, 1)
-	go func() { done <- a.gracefulShutdown(abortCtx, stopWorkers, fatal) }()
+	go func() { done <- graceful(abortCtx) }()
 
-	signals := 0
+	tolerate := fatal
 	for {
 		select {
 		case code := <-done:
 			return code
 		case sig := <-abort:
-			signals++
-			// SPEC §10.3: the SECOND signal aborts. A shutdown started by a
-			// signal has had its first one; a FATAL shutdown has not, and the
-			// orchestrator's ordinary SIGTERM arriving while the dump is being
-			// written must not throw the dump away (independent review,
-			// 2026-10-07). SIGQUIT always aborts.
-			if fatal && signals == 1 && sig != syscall.SIGQUIT {
+			if tolerate && sig != syscall.SIGQUIT {
+				tolerate = false
 				a.log.Warn("signal during the emergency shutdown; it goes on -- a second one aborts "+
 					"and accepts the loss", "signal", sig.String())
 				continue
 			}
-			aborted()
+			stopGraceful()
 			a.log.Warn("second signal during shutdown; exiting immediately and accepting the loss",
 				"signal", sig.String())
-			_ = a.srv.Close()
-			lost := a.atRisk.Swap(0)
-			if !a.collected.Load() {
-				lost = a.ring.Stats().Items
+			if a.srv != nil {
+				_ = a.srv.Close()
 			}
-			if lost > 0 {
-				a.metrics.EventsDroppedTotal[obs.DropAbort].Add(uint64(lost))
-				a.log.Error("events lost to the abort", "count", lost)
-			}
+			a.abortLoss()
 			return ExitAborted
 		}
 	}
+}
+
+// abortLoss accounts for what an abort leaves behind: everything still queued
+// (reason="abort", SPEC §10.3).
+//
+// From the moment the shutdown starts collecting the leftovers (dumpPhase),
+// the ring's count is no longer the measure: the held batches are still
+// counted there although they are going to the dump, and the drained ones no
+// longer are. The counter is the only measure then, and it is taken with Swap
+// so that exactly one side -- this abort, or dumpEmergency counting a failed
+// or disabled dump -- counts the same events. Under lossMu, and only once:
+// aborted, set here, closes the dump phase (enterDumpPhase, oweDump) and makes
+// a dump still being written give up (emergency.Store.SetAbandon).
+func (a *App) abortLoss() {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	if a.aborted.Swap(true) {
+		return // counted already: one abort, one count
+	}
+	if a.dumpPhase.Load() {
+		if a.inAbort != nil {
+			a.inAbort()
+		}
+		if n := a.dumping.Swap(0); n > 0 {
+			a.metrics.EventsDroppedTotal[obs.DropAbort].Add(uint64(n))
+			a.log.Error("events lost to the abort: the shutdown was collecting or dumping them",
+				"count", n)
+		}
+		return
+	}
+	if a.ring == nil {
+		return
+	}
+	if n := a.ring.Stats().Items; n > 0 {
+		a.metrics.EventsDroppedTotal[obs.DropAbort].Add(uint64(n))
+		a.log.Error("events lost to the abort", "count", n)
+	}
+}
+
+// enterDumpPhase hands the loss counter from the ring's own count to dumping:
+// from here an abort counts dumping, not the ring (SPEC §10.3). Under lossMu,
+// so an abort lands wholly before (it counted the ring; false is returned) or
+// wholly after (it takes dumping).
+func (a *App) enterDumpPhase() bool {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	if a.aborted.Load() {
+		return false
+	}
+	a.dumping.Store(a.ring.Stats().Items)
+	a.dumpPhase.Store(true)
+	return true
+}
+
+// oweDump sets the counter to exactly what goes to the dump, unless an abort
+// already took it: then the events were counted, the process is exiting, and
+// putting the number back would let a failed or disabled dump count them a
+// second time (go-relplog-nats-server's independent review, 2026-10-13: 10
+// counted lost for 5).
+func (a *App) oweDump(n int) bool {
+	a.lossMu.Lock()
+	defer a.lossMu.Unlock()
+	if a.aborted.Load() {
+		return false
+	}
+	a.dumping.Store(int64(n))
+	return true
 }
 
 func (a *App) gracefulShutdown(abortCtx context.Context, stopWorkers context.CancelFunc, fatal bool) int {
@@ -571,11 +721,13 @@ func (a *App) gracefulShutdown(abortCtx context.Context, stopWorkers context.Can
 	// without that collection they would be lost despite having been answered
 	// 200.
 	code := ExitOK
-	if fatal {
-		code = ExitSink
-	}
 	if !fatal {
 		a.waitDrained(abortCtx, time.Until(deadline))
+	}
+	// The sink may also have gone FATAL DURING the drain: the exit is 3 (SPEC
+	// §10.2, §10.5; port of the syslog/RELP family, 2026-10-13).
+	if fatal || a.health.State() == sink.StateFatal {
+		code = ExitSink
 	}
 	if abortCtx.Err() != nil {
 		return ExitAborted // the abort has already counted what was left
@@ -583,6 +735,18 @@ func (a *App) gracefulShutdown(abortCtx context.Context, stopWorkers context.Can
 
 	stopWorkers()
 	a.workers.Wait()
+
+	// From here an abort loses whatever the ring still counts -- queued items
+	// and the batches the workers hold, one population there until a Commit
+	// -- until the dump is safe. Set BEFORE the collection: the Drain takes
+	// the items out of the ring's count, and in between nobody counted them
+	// (SPEC §10.3).
+	if !a.enterDumpPhase() {
+		return ExitAborted // the abort counted the ring; the process is exiting
+	}
+	if a.beforeCollect != nil {
+		a.beforeCollect()
+	}
 
 	leftover := a.workers.Pending()
 	if len(leftover) > 0 {
@@ -597,27 +761,19 @@ func (a *App) gracefulShutdown(abortCtx context.Context, stopWorkers context.Can
 		s.Seal()
 	}
 	leftover = append(leftover, a.ring.Drain()...)
-	a.atRisk.Store(int64(len(leftover)))
-	a.collected.Store(true)
 
 	if len(leftover) > 0 {
 		a.log.Error("events still pending after the drain", "count", len(leftover))
-		if a.emg == nil {
-			// emergency.enabled=false: the loss is the abort's (SPEC §9.3). A
-			// dump that FAILED is counted by dumpEmergency as
-			// emergency_failed, and the same events are not lost twice
-			// (SPEC §11.1).
-			a.log.Error("emergency.enabled=false; these events are lost", "count", len(leftover))
-			if n := a.atRisk.Swap(0); n > 0 {
-				a.metrics.EventsDroppedTotal[obs.DropAbort].Add(uint64(n))
-			}
-		} else {
-			lost := a.dumpEmergency(leftover)
-			if a.atRisk.Swap(0) > 0 && lost > 0 {
-				a.metrics.EventsDroppedTotal[obs.DropEmergencyFailed].Add(uint64(lost))
-			}
+		// From here until the dump is safe on disk (or counted lost), an abort
+		// loses exactly leftover (see abortLoss); dumpEmergency takes the
+		// counter back, and counts a disabled or failed dump itself.
+		if !a.oweDump(len(leftover)) {
+			return ExitAborted
 		}
+		a.dumpEmergency(leftover)
 		code = ExitSink
+	} else if !a.oweDump(0) {
+		return ExitAborted
 	}
 
 	// Phase 5.
@@ -626,7 +782,9 @@ func (a *App) gracefulShutdown(abortCtx context.Context, stopWorkers context.Can
 	return code
 }
 
-// waitDrained blocks until the ring is empty or the deadline passes.
+// waitDrained blocks until the ring is empty, the sink goes FATAL (nothing
+// will drain any more; waiting out drain_timeout would only delay the dump,
+// perhaps past the orchestrator's SIGKILL), or the deadline passes.
 //
 // Polling is adequate here and nowhere else: this runs once, during shutdown,
 // and the alternative -- a completion signal threaded through the Ring
@@ -637,6 +795,11 @@ func (a *App) waitDrained(abortCtx context.Context, timeout time.Duration) {
 	for time.Now().Before(deadline) {
 		st := a.ring.Stats()
 		if st.Items == 0 || abortCtx.Err() != nil {
+			return
+		}
+		if a.health.State() == sink.StateFatal {
+			a.log.Error("the sink went FATAL during the drain; nothing more will drain",
+				"error", a.health.FatalErr())
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

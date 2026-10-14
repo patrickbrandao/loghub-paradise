@@ -233,7 +233,7 @@ cada um com SPEC, teste e mutação. Todos contestáveis.
   e no SN, a portar): agora só se nomeia uma flag que este servidor conhece, e
   nada depois de um valor é citado. Fica, decidida, a brecha da cauda com traço
   depois de um valor não vazio (`--x=a -b`): escondê-la esconderia os erros de
-  digitação (TESTING §8 item 20).
+  digitação (TESTING §8 item 20). Fechada em 2026-10-13 (abaixo).
 - **O teste do `Seal` age dentro do `Drain`** (`App.wrapRing`, nulo no
   binário), não depois dele: um gancho depois do `Drain` não distinguia um
   `Seal` antes do `Drain` de um entre os dois (achado da revisão; o teste do P
@@ -248,6 +248,76 @@ cada um com SPEC, teste e mutação. Todos contestáveis.
   vieram também.
 
 ---
+
+## 3a. Porte das correções da família syslog/RELP (2026-10-13)
+
+Uma subseção por área da rodada; o que veio igual dos irmãos está na SPEC.
+
+### Ciclo de vida e dump
+
+Padrões assumidos nesta rodada (contestáveis); o que veio igual do S, do SN e
+do RN está na SPEC (§9, §9.2, §10.3, §10.5), na mesma forma do fast:
+
+- **O `fsync` do diretório decide a remoção e a quarentena, não o dump.** O SN
+  recusa o dump cujo diretório não sincroniza; aqui ele continua melhor esforço
+  (§9.1, decisão do porte de 2026-10-11). Na remoção e na quarentena a falha
+  vem depois do `unlink`/`rename` e vira `WARN` (`emergency.ErrNotDurable`).
+- **Com `emergency.enabled = false` a perda continua sendo `abort`** (§9.3),
+  não `emergency_failed` como no SN; o envelope deixado fora do dump pela
+  defesa do enquadramento passa a ser contado pelo próprio dump.
+- **A leitura dos dumps em todo boot** (a regra do fast, pendência registrada
+  na SPEC) entrou nesta rodada por ser do mesmo caminho: com a chave
+  desligada, um `emergency.dir` que não se lista é `ERROR` e o boot segue.
+- **Não se aplica o `quitNow` do SN:** `SIGQUIT` fora do shutdown é a ação
+  padrão do Go (§10.3); o canal do aborto, que inclui `SIGQUIT`, passa a ser
+  registrado antes de o contexto soltar `SIGTERM`/`SIGINT`.
+- **Não se aplica o prazo da reingestão "sem progresso"** do SN: a reingestão
+  daqui não espera nem retenta — cada lote tem o seu `sink.op_timeout` e uma
+  recusa de rede ou fatal sai com 3 (§9.2). A leitura é do arquivo inteiro, não
+  em fluxo, então não há "pedaço" para o *gauge* mostrar: ele é do arquivo, e
+  recontado do disco no fim.
+- **Fechamento em paralelo:** já era (`Server.Shutdown`).
+
+### Configuração
+
+As regras de configuração do `go-relplog-server` e dos cortes dele, já no
+`go-syslog-nats-server` (SPEC §13.2, tabela de §10.1, §8.7.11). Padrões
+assumidos, contestáveis:
+
+- **Tetos:** `ring.capacity_items` 16 Mi; `sink.batch` 1 Mi, o da família
+  webhook (o SN tem 65 536; com `workers` ≤ 256, `workers × batch` ainda cabe
+  num `int` de 32 bits); `sink.workers` **256**, o do SN (todo worker publica
+  na uma conexão NATS); `server.listeners` 256.
+- **As seções do fast que este servidor não tem contam como conhecidas**
+  (`retiredSections`) para a regra da cauda, como no P.
+- **`LOGHUB_EB_URL` só com brancos é exit 1**, não mais "não definida" (a
+  regra do SN e do RP); vazia continua "não definida". **`#` ou `?` vazio**
+  numa URL NATS também é recusado: a URL não tem nenhum dos dois. As mensagens
+  do `@` depois de `/`, `?` ou `#` e do host codificado são as do SN, no
+  `parseURL` — que também serve o `sink.nats.urls`.
+- **Já estava feito:** fragmento, caminho e consulta recusados; chave própria
+  vazia sem conflito. **Não se aplica:** `sink.batch_max_bytes`, `pool_size`,
+  `ring.max_inflight` (não existem) e as regras de URL PostgreSQL.
+
+### Sink NATS
+
+O sink do `go-syslog-nats-server` depois do porte de 2026-10-13
+(e o texto "store is closed" da revisão do `go-syslog-server`), conferido aqui
+item a item. Padrões assumidos, contestáveis:
+
+- **`retention: interest` é recusado** (fatal na validação de toda checagem),
+  como decidiu o `go-syslog-server` em 2026-10-11 e o SN adotou; SPEC §18.1
+  item 7 deixava a escolha (recusar, avisar ou conferir os consumidores) em
+  aberto. O `PubAck` é o que deixa o ring esquecer uma mensagem, e um stream
+  que descarta no aceite o esvazia. `max_msgs_per_subject > 0` só dá `WARN`.
+- **A regra do *pool* do `go-syslog-server` (C1) não vem para cá.** Lá, com
+  TLS, a recusa de TLS de um nó de um *pool* virou `network` (outro nó pode
+  servir, e um certificado mal posto num nó é erro de operação passageiro).
+  Aqui a SPEC §8.7.6 já decidia o contrário, e fica: um nó que **exige** TLS é
+  um cluster migrando para TLS, que deixou de ser destino deste servidor, e o
+  primeiro nó assim que a reconexão sortear é o veredito — agora lido do
+  `LastError`, como no SN e no RN. A contestar junto com o SN e o RN, que têm a
+  mesma regra.
 
 ## 4. Riscos
 

@@ -255,6 +255,10 @@ WHS_TEST_NATS_URL=nats://127.0.0.1:14222 WHS_TEST_NATS_NOJS_URL=nats://127.0.0.1
   go test -race -timeout 600s ./internal/sink/ ./internal/app/
 ```
 
+Os casos de permissões, TLS e *pool* pedem ainda `WHS_TEST_NATS_PERM_URL`,
+`WHS_TEST_NATS_TLS_URL` com `WHS_TEST_NATS_TLS_CA` e `WHS_TEST_NATS_SERVER`
+(o binário, para os servidores que o teste sobe e derruba): `TESTING.md` §5.4.
+
 Destino ClickHouse — **os testes pulam sem um servidor**, protocolo nativo,
 25.8 ou mais novo, e o servidor não cria a tabela (a suíte cria as dela a
 partir de `docker/clickhouse/inbox.sql`; os subtestes de privilégio e memória
@@ -433,6 +437,13 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   e todo `Write` devolvem como fatal. O contrato do stream (`no_ack`, plano de
   controle, subjects, tamanhos) vale em toda checagem; não volte a guardar o
   `validate` atrás do `validated`, que só controla o log.
+- **O `nats.go` não relata uma recusa de TLS na reconexão pelo
+  `ReconnectErrCB`** (só a falha da discagem TCP): ela fica no `LastError`, com
+  a conexão em `RECONNECTING`, e é o `Health` que a lê (`noteLastError`). E o
+  `LastError` é o do último servidor **tentado**: num *pool* a recusa de um nó
+  não é veredito (`soleServer`, SPEC §8.7.9). O `10077` tem dois sentidos pela
+  descrição do *store* (`storeFailedIsTransient`): confira o texto no
+  `server/store.go` do `nats-server`, não na memória.
 - **`ring.Commit` antes do `Release`**, também na recusa `logic`: o ring
   desconta `len(Env)`, que o `Release` zera.
 - **O dump só está salvo no nome final** (temporário oculto e `link`; sem

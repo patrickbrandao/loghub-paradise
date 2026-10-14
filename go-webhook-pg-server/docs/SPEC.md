@@ -805,8 +805,19 @@ Por isso:
   destino, e o padrão já é o valor certo. Quem escreve o número manda, com
   `WARN` se passar de 16.
 - **`sink.postgres.pool_size`**, padrão `0` = `sink.workers + 1`: uma conexão por
-  worker mais uma para o `Health()`, que corre em paralelo aos workers e não
-  pode esperar por uma conexão sem estourar `sink.health_timeout`.
+  worker mais uma de folga. O `Health()` **não** usa o pool: tem uma conexão
+  própria, fora dele (§8.5.8), e a conta por instância é `pool_size + 1`. A
+  folga ficou porque o pool abre conexões sob demanda (ela não custa nada até
+  ser usada) e porque mudar a derivação mudaria o que toda configuração já
+  implantada deriva. Um `pool_size` explícito **igual** a `sink.workers` é
+  legítimo; **abaixo** dele os workers esperam conexão uns dos outros (vazão,
+  não correção), e o boot avisa com `WARN` (porte da família syslog/RELP, 2026-10-13: com a sonda dentro do
+  pool, `pool_size = sink.workers` e escritores lentos que seguravam todas as
+  conexões deixavam o `Health()` esperando além do `health_timeout` — DOWN e
+  depois FATAL, `exit 3`, com o banco sadio; o `go-relplog-pg-server` passou a
+  recusar `pool_size < sink.workers + 1`, aqui a sonda saiu do pool, como no
+  `go-webhook-fast-server`, onde com `ring=none` nenhum `pool_size` bastaria;
+  `docs/DECISOES.md`).
 - A ocupação do pool é exposta em métrica (§8.5.10).
 
 #### 8.5.4 Escrita
@@ -867,6 +878,7 @@ trezentos segundos.
 | Nenhuma coluna **extra** obrigatória (`NOT NULL` sem default, não identidade, não gerada); `received_at` passa pelo `DEFAULT now()` | `pg_attribute` | exit 3 — sem isso toda escrita seria `23502`, `logic`, um lote descartado a cada poucos ms com o sink UP |
 | Índice único exatamente sobre `(uuid)`, sem predicado nem expressão, imediato e válido | `pg_index` (`indimmediate`, `indisvalid`) | exit 3 — sem ele o `ON CONFLICT (uuid)` falha em **toda** escrita; um único sobre `(uuid, step)` não serve; um `DEFERRABLE` dá `55000` retentado para sempre |
 | Nenhum outro índice único nem constraint de exclusão além do árbitro (único, exatamente `(uuid)`, sem predicado nem expressão, imediato); índice ainda não `indisready` é ignorado, inválido mas pronto conta | `pg_index` (`indisunique`, `indisready`, `indimmediate`), `pg_constraint` (`contype = 'x'`) | exit 3 — o `ON CONFLICT (uuid)` absorve colisão só no árbitro: um evento novo que colide noutro índice único derruba o `INSERT` multilinha inteiro com `23505` (`23P01` na exclusão), classe 23, um lote descartado a cada colisão com o sink UP; um único `DEFERRABLE` sobre `uuid` ao lado da PK é pior — a inferência o escolhe e toda escrita falha com `55000`, retentada para sempre |
+| Nenhuma `RULE` de `INSERT` ou `UPDATE` na tabela (as de `DELETE` e `SELECT` passam) | `pg_rewrite` (`ev_type` `2`, `3`) | exit 3, nomeando as regras — o `INSERT ... ON CONFLICT` é recusado numa tabela com elas (`0A000`): todo lote falharia com o sink UP (porte da família syslog/RELP, 2026-10-13; revisão do `go-relplog-pg-server`) |
 | `INSERT` e `SELECT (uuid)` concedidos | `has_table_privilege`, `has_column_privilege` | exit 3 — o `ON CONFLICT (uuid)` lê a coluna árbitra: só com `INSERT` o primeiro lote falharia com `42501` (`GRANT INSERT, SELECT (uuid)`) |
 | Banco `UTF8` | `current_setting('server_encoding')` | exit 3 — um `LATIN1` guardaria o texto em dupla codificação, sem erro; a sessão fixa `client_encoding = UTF8` |
 | Tabela comum, não particionada | `pg_class.relkind` | exit 3 — uma linha sem partição seria `23514` em todo lote (e em tempo de execução um `23514` sem constraint nomeada é `fatal`) |
@@ -928,9 +940,11 @@ dispensa classificar por substring de mensagem. A tabela abaixo
 | `28000` `28P01` `3D000` `42501` | credencial, banco inexistente, sem permissão | `ErrFatal` | FATAL — não se resolve sozinho |
 | `42P01` `42703` `42P10` `42804` e o resto da classe `42` | tabela ou coluna sumiu, índice único ausente, contrato de esquema quebrado | `ErrFatal` | FATAL — `logic` descartaria um lote a cada 5 ms para sempre |
 | `57P04` | `database_dropped` | `ErrFatal` | FATAL |
+| **`23502`** | `not_null_violation`: o servidor nunca manda `NULL` nas dez colunas, então depois do boot ele é a **tabela** (coluna obrigatória acrescentada, `DEFAULT` de `received_at` retirado, *trigger* que anula) | `ErrFatal` | FATAL — dump e exit 3, e o boot seguinte já recusa a coluna extra obrigatória; como `logic` todo lote era descartado em `sink_logic` com o sink UP, para sempre (porte da família syslog/RELP, 2026-10-13; era a pendência 11 de §19.1). Um *trigger* que anula uma coluna só em certas linhas passa a derrubar o processo, e isso fica escrito |
+| **`0A000`** | `feature_not_supported`: o `ON CONFLICT` numa tabela com `RULE` de `INSERT`/`UPDATE` criada depois do boot (§8.5.5) | `ErrFatal` | FATAL — como desconhecido era retentado para sempre com o sink UP |
 | classe `XX` | corrupção interna | `ErrFatal` | FATAL |
 | classe `22` | dado recusado: codificação, tamanho | `ErrLogic` | log `ERROR`, lote descartado e contado em `sink_logic` (o cliente já recebeu `200`) |
-| classe `23` | `NOT NULL`, `CHECK`, unicidade em **outro** índice (que o boot recusa, §8.5.5) | `ErrLogic` | idem — `23505` sobre `uuid` é impossível com o `ON CONFLICT` |
+| classe `23` (salvo `23502`) | `CHECK`, unicidade em **outro** índice (que o boot recusa, §8.5.5) | `ErrLogic` | idem — `23505` sobre `uuid` é impossível com o `ON CONFLICT`; um `23514` sem constraint nomeada é a partição ausente, `ErrFatal` |
 | classe `54` | limite do programa: lote grande demais | `ErrLogic` | idem — é o caso que o aviso de §8.5.4 existe para evitar |
 | qualquer outro | desconhecido | `ErrNetwork` | retry: encher o ring é visível, descartar não |
 
@@ -958,6 +972,20 @@ esperar pelo check.
 O check também atualiza as métricas de ocupação do pool (§8.5.10). Fazê-lo em
 `Write()` custaria um lock do pool por escrita, no caminho quente; um valor com
 até um `health_interval` de atraso é o preço.
+
+**O check tem conexão própria, fora do pool** (porte da família syslog/RELP, 2026-10-13). Dentro do
+pool ele disputava conexão com os workers: `pool_size` escritas lentas — um
+lock, nada falhando — seguravam todas, o check esperava uma além do
+`sink.health_timeout` e o estado ia a DOWN e, passado o `fail_timeout`, a
+FATAL, com dump e `exit 3` e o banco sadio. A conexão do check (`pgx.Conn`, com
+a mesma configuração do pool) é aberta no primeiro check, fechada em qualquer
+falha e reaberta no seguinte; uma conexão reaproveitada que falha é refeita
+**uma vez** dentro do mesmo prazo, porque uma conexão parada um
+`health_interval` inteiro pode ter morrido sob um *proxy* ou um reinício do
+servidor (o pool escondia isso com o *ping* antes do reuso), e só a falha numa
+conexão nova é a resposta. A validação de §8.5.5 continua no pool: roda no
+boot, antes de qualquer worker. O código é o do `go-webhook-fast-server`, onde
+a regra também cobre o `ring=none`.
 
 #### 8.5.9 Retenção
 
@@ -1005,6 +1033,15 @@ Não existem neste servidor (§0).
 `shutdown.drain_timeout` estourado, com o ring (ou um lote retido por um worker,
 §10.4) não-vazio. Com `emergency.enabled = false` não há dump, e o que sobrou é
 perda contada (§9.3).
+
+**Escrever depende da chave; ler é de todo boot.** A reingestão (§9.2) e o
+informe dos temporários (§9.1) rodam com `emergency.enabled` ligado ou não: um
+dump é de uma vida anterior, não da configuração desta. Até 2026-10-13 o leitor
+só existia junto do escritor, e uma vida com a chave desligada deixava o dump
+parado no disco, sem uma linha de log, com `whs_emergency_files` em 0 e
+`/readyz` 200 — eventos respondidos com `200` que nunca chegavam à fila (§19.1
+item 8; a regra do `go-webhook-fast-server`, portada na rodada da família
+syslog/RELP).
 
 ### 9.1 Formato: JSON Lines
 
@@ -1116,6 +1153,31 @@ crash não é decisão dele. Reingerir o `.corrupt` de novo (renomeando-o de vol
 é seguro: as linhas já entregues são duplicatas que o `ON CONFLICT (uuid)`
 absorve (§3.6).
 
+**A remoção e a quarentena fazem `fsync` do diretório** (porte da família
+syslog/RELP, 2026-10-13). Sem ele, uma queda de energia logo depois da
+reingestão podia trazer o nome de volta, e o boot seguinte entregava o dump
+inteiro de novo — absorvido pelo `ON CONFLICT (uuid)` só enquanto a fila ainda
+guarda aqueles `uuid`. O `fsync` vem **depois** do `unlink` ou do `rename`,
+então a falha dele (inclusive a de **abrir** o diretório, num modo `0300`) não
+desfaz nada: o arquivo já saiu, ou já é `.corrupt`. O boot a registra num `WARN`
+que diz o que aconteceu e o risco de uma segunda entrega, em vez do `ERROR`
+"cannot remove" — falso, com o arquivo já removido — ou do "cannot quarantine"
+com um caminho que não existia mais, que ainda engolia o `ERROR` com as linhas
+puladas. Só a escrita do dump mantém o `fsync` do diretório como melhor esforço
+(§9.1).
+
+**Um `emergency.dir` que não se lista** encerra o boot com 1 só quando esta
+vida escreve dumps (`emergency.enabled = true`), porque o dump precisará dele;
+com a chave desligada vira um `ERROR` nomeando o diretório, e o boot segue sem
+reingerir (a regra do fast).
+
+**Os *gauges*** `whs_emergency_files` e `whs_emergency_events_pending` dizem o
+que está no disco (§11.1): durante a reingestão, `whs_emergency_files` é o
+número de dumps listados (todos esperam a reingestão), posto antes do estado de
+boot que a anuncia; no fim, os dois são recontados do diretório — um arquivo que
+não se lê conta como arquivo, sem eventos (até 2026-10-13 ele ficava fora,
+§19.1 item 12) — e o dump do shutdown soma o seu, sem reler o diretório.
+
 **Linha recusada pelo destino.** Se ainda assim o PostgreSQL recusar um lote da
 reingestão como `logic` (§8.5.7), o lote é refeito item a item: os aceitos são
 entregues, os recusados ficam no arquivo, contados num `ERROR` com o `uuid`, e o
@@ -1166,7 +1228,8 @@ dump dos demais bem-sucedido.
       IMEDIATO, sem esperar sink.boot_timeout, com o log "the sink
       refused this server permanently" (não "did not become reachable
       within sink.boot_timeout", que mandava o operador olhar a rede)
-4. se existem arquivos emg-*.jsonl: entrega direto ao sink (§9.2)
+4. se existem arquivos emg-*.jsonl: entrega direto ao sink (§9.2), com
+   emergency.enabled ligado ou não (§9)
    (um emg-*.bin do fast => WARN, intocado, §9.2; o temporário gêmeo de
    um dump é removido, o de um dump interrompido => WARN, intocado, §9.1)
 5. (retirado: o dreno do backlog do ring.db; o ring de memória nasce vazio)
@@ -1190,8 +1253,13 @@ já têm.
 | `ring.mode` ≠ `memory`, `sink.type` ≠ `postgres`, `ratelimit.enabled = true` | `exit 1`: recurso retirado (§0) |
 | Chave de recurso retirado (`[ring.sqlite]`, `ring.max_inflight`, `[sink.redis]`...) num INI ou numa flag | `exit 1`: chave desconhecida (§0); no ambiente, inerte |
 | Linha de INI sem `=` ou cabeçalho sem `]`; argumento sem `--` | `exit 1` com o número da linha ou o nome antes do `=`, nunca o valor (`password: x` é exatamente a linha que cai aqui) (§13.2) |
+| **Tetos** (porte da família syslog/RELP, 2026-10-13): `ring.capacity_items` > 16 777 216; `sink.batch` > 1 048 576; `sink.workers` > 1024; `sink.postgres.pool_size` > 4096; `server.listeners` > 256 | `exit 1`, nomeando a chave. Sem eles um erro de digitação de poucos dígitos derrubava o boot com pânico (`makechan` do ring de memória), alocava um gigabyte por `Dequeue` (`sink.batch`) ou dava a volta no `int32` do pool do pgx (`pool_size = 4294967300` virava 4) |
+| `sink.postgres.addr` que não é um servidor só — `host:porta` (porta 1–65535 escrita sem sinal nem zero à esquerda) ou diretório de socket (começa com `/`, com `:porta` opcional, sem vírgula nem branco); recusados `h1,h2:5432`, tab, `[h:5432]:5433`, `pg-1` sem porta | `exit 1` (§8.5.2): passava aqui e falhava no DNS ou no *dial*, erro `network` retentado até o `boot_timeout` (porte do `go-syslog-pg-server`/`go-relplog-pg-server`, 2026-10-13) |
+| `--help`, `--version` ou `--dump-config` com `=valor`; `--config=` vazio | `exit 1`, sem o valor (§13.2) |
+| Nome de parâmetro desconhecido sem forma de nome, ou que começa com o nome de um parâmetro e continua; chave desconhecida do INI fora de uma seção conhecida, sem forma de chave ou logo depois de um segredo; flag desconhecida fora das seções conhecidas logo depois de uma flag com valor | `exit 1`, nomeando só a linha ou a flag anterior, **nunca o conteúdo** (§13.2) |
 | Flag sem valor seguida de outra flag (`--sink.workers --sink.postgres.password=x`, um `$WORKERS` vazio num script); valor depois de um espaço (`--sink.postgres.password= x`, `--sink.postgres.password = x`, `--sink.postgres.password= -x`); valor que o shell partiu num espaço (`--sink.postgres.password=$P`, com espaço em `$P`); valor que começa com `--` na forma separada (`--sink.postgres.password --x`) | `exit 1`, nunca com o valor: um argumento que começa com `--` (ou `-` com o nome de um parâmetro ou de um *switch*) nunca é tomado como valor de outra flag, e só é nomeado se for uma flag deste servidor; o argumento depois de um valor vazio ou de um `=` sozinho não é citado, nem como nome de flag desconhecida; uma palavra solta depois de qualquer valor não é citada. Um valor que começa com `-` vai depois do `=` (§13.2; revisão do porte de volta ao N, 2026-10-11) |
 | `sink.workers` acima de 16 | Permitido, com `WARN` (§8.5.3) |
+| `sink.postgres.pool_size` explícito abaixo de `sink.workers` | Permitido, com `WARN`: os workers esperam conexão uns dos outros. Igual a `sink.workers` é legítimo: o check tem conexão própria (§8.5.3) |
 | `min(maior envelope × sink.batch, ring.max_bytes) > 1 GiB` | Permitido, com `WARN`: um lote pode exceder o teto de um parâmetro do protocolo (§8.5.4) |
 | `sink.postgres.tls_ca` sem `tls` | `exit 1` (§8.5.11) |
 | `sink.postgres.table` que não é identificador simples (`nome` ou `esquema.nome`, minúsculos) | `exit 1` |
@@ -1248,17 +1316,50 @@ fase 5  fecha o sink, exit 0
 
 **Segundo sinal** em qualquer fase → pula direto para a saída, aceitando a perda
 (contada em `whs_events_dropped_total{reason="abort"}`, inclusive o que já tinha
-sido recolhido para um dump ainda não ligado ao nome final), `exit 130`. No shutdown
-**por FATAL** nenhum sinal o iniciou: o primeiro que chega — o `SIGTERM` comum de
+sido recolhido para um dump ainda não ligado ao nome final, e uma vez só: o que
+o aborto conta o dump não conta de novo), `exit 130`. No shutdown **por FATAL**
+nenhum sinal o iniciou: o primeiro `SIGTERM` ou `SIGINT` que chega — o comum de
 um orquestrador — é o primeiro, registra um `WARN` e o dump continua; só um
 segundo aborta. No fast, esse primeiro sinal jogava o dump fora (revisão
-independente de 2026-10-07). Um dump interrompido assim fica no disco só como o
-temporário oculto (§9.1), que a reingestão não lê: os eventos dele são a perda
-que o aborto contou.
-**`SIGQUIT`** durante o shutdown aborta como o segundo sinal; fora dele vale a
-ação padrão do Go (despejo das goroutines e saída `2`), que é o que um operador
-quer ao mandá-lo para um processo travado. A frase do fast ("sempre aborta
-imediatamente") prometia mais do que o código fazia.
+independente de 2026-10-07).
+**`SIGQUIT`** durante o shutdown aborta como o segundo sinal e nunca é
+tolerado, nem como primeiro sinal do shutdown por FATAL; fora dele vale a ação
+padrão do Go (despejo das goroutines e saída `2`), que é o que um operador quer
+ao mandá-lo para um processo travado. A frase do fast ("sempre aborta
+imediatamente") prometia mais do que o código fazia. O observador do segundo
+sinal é registrado **antes** de o contexto do primeiro soltar
+`SIGTERM`/`SIGINT`: no meio, um segundo sinal recebia a ação padrão do Go e
+matava o processo com 143, sem contar nada (porte da família syslog/RELP,
+2026-10-13).
+
+**Um dono só para a perda do aborto** (forma final da família syslog/RELP,
+portada em 2026-10-13). Até ali, o aborto contava o ring até o recolhimento e,
+depois dele, um contador do que fora recolhido: um aborto entre o `Drain` (que
+já tira os itens da conta do ring) e o registro do recolhimento contava a
+menos, e um aborto no meio do dump contava os eventos enquanto a escrita
+seguia e podia ligar o arquivo ao nome final antes do `os.Exit` — o boot
+seguinte o reingeria, perda contada a mais. Agora:
+
+- antes de recolher as sobras (`Pending` dos workers e o `Drain`), o shutdown
+  passa a conta do ring para um contador próprio, sob a mesma trava do aborto:
+  o aborto cai inteiro antes (conta o ring, e o recolhimento nem começa) ou
+  inteiro depois (conta o contador);
+- o contador passa a ser exatamente o que vai para o dump, a menos que o aborto
+  já o tenha tomado; e o dump o toma de volta, também sob a trava, assim que o
+  resultado é conhecido e antes de contar qualquer coisa. Fora da trava, um dump
+  que via o aborto marcado antes de o aborto tomar o contador contava a perda
+  inteira como `emergency_failed`, e o aborto dizia que nada se perdera (X2 da
+  revisão do porte do `go-syslog-server`);
+- um dump que o aborto já contou **desiste**: a escrita confere a marca do
+  aborto antes da primeira linha, a cada 1024 e antes do `link`, e remove o
+  temporário em vez de publicar um arquivo que o boot seguinte reingeriria. Um
+  dump que publica entre a última conferência e o aborto fica contado **e**
+  guardado — contagem a mais, nunca perda —, e nada mais é contado. Um
+  temporário ainda pode sobrar quando o `os.Exit` corta a escrita entre duas
+  conferências (§9.1): os eventos dele são a perda que o aborto contou;
+- com `emergency.enabled = false`, a perda continua sendo do aborto (§9.3), e
+  conta uma vez, por quem tomar o contador; o envelope deixado fora pela defesa
+  do enquadramento (§9.1) é contado pelo próprio dump, em `emergency_failed`.
 
 `shutdown.pre_stop_delay` existe para Kubernetes: a remoção do endpoint no LB é
 assíncrona e o pod continua recebendo tráfego **depois** do `SIGTERM`. Sem a
@@ -1266,7 +1367,11 @@ espera, o emissor recebe conexão recusada — um erro de rede, não um `503`
 retentável. Valor sugerido em K8s: 5–10s.
 
 Se o `drain_timeout` estourar com itens ainda no ring, executa §9 e sai com
-código 3. **Um prazo, não dois** (correção do `go-webhook-nats-server`, portada
+código 3. Um sink que vira **FATAL durante a fase 4** encerra a espera na hora,
+com um `ERROR` — nada mais escoa, e esperar o resto do prazo só adiaria o dump,
+talvez para depois do `SIGKILL` do orquestrador —, e a saída é 3 sempre que a
+saúde termina FATAL, mesmo com o ring vazio (§10.2, §10.5; até 2026-10-13,
+§19.1 item 10). **Um prazo, não dois** (correção do `go-webhook-nats-server`, portada
 em 2026-10-11): cada fase tinha o seu, e um upload lento (que segura a fase 3
 até o prazo) seguido de um sink DOWN (que segura a fase 4) só começava o dump
 em duas vezes o `drain_timeout` — além de um `stop_grace_period` dimensionado
@@ -1313,7 +1418,7 @@ loop de CPU girando os mesmos itens.
 | `1` | Erro de configuração ou falha de inicialização não relacionada ao sink |
 | `3` | Sink indisponível (FATAL, `boot_timeout`, ou `drain_timeout` estourado) |
 | `100`–`114` | Identidade: o `go-loghub-ident` sai sozinho (`DATADIR` inválido ou sem escrita, `AGENT_UUID` que não é UUIDv7, `HOSTNAME` fora da RFC 1123, `WORKSPACE` com `_`...). A tabela completa está na skill `go-loghub-ident` §8 |
-| `130` | Abortado por segundo sinal |
+| `130` | Abortado por segundo sinal, ou boot interrompido por sinal: na espera do sink, na reingestão e no `bind` da porta admin ou da pública. Um nome de host no `bind` falha com "operation was canceled" e saía com 1, como um endereço errado; um IP literal nem olha o sinal, e o boot abria a porta, respondia `/readyz` 200 e saía com 0 pelo caminho gracioso. Agora o boot confere o sinal depois do último `bind` e antes de servir (porte da família syslog/RELP, 2026-10-13) |
 
 ---
 
@@ -1757,11 +1862,53 @@ parâmetro desconhecido; e a cauda de um valor que o shell partiu num espaço
 (`--sink.postgres.password=$P`, com espaço em `$P`) saía como argumento solto.
 Agora só se nomeia uma flag que este servidor conhece, nada depois de um valor
 vazio é citado, e uma palavra solta depois de qualquer valor também não. Um
-valor que começa com `-` vai depois do `=`. Fica uma brecha, de propósito: a
-cauda partida que começa com traço depois de um valor **não** vazio
-(`--sink.postgres.password=a -b`) sai como parâmetro desconhecido, porque
-escondê-la esconderia todo erro de digitação de uma flag
-(`--sink.workers=4 --tipo.errado=1`).
+valor que começa com `-` vai depois do `=`. A cauda partida que começa com traço
+depois de um valor **não** vazio (`--sink.postgres.password=a -b`) era uma
+brecha deixada de propósito, para não esconder o erro de digitação de uma flag
+depois de outra; a regra abaixo a fecha (2026-10-13).
+
+**Porte da família syslog/RELP (2026-10-13)** — as regras de configuração que
+a revisão do `go-relplog-server`, do `go-relplog-pg-server` e do
+`go-relplog-nats-server` firmou, e que o `go-syslog-pg-server` e o
+`go-syslog-nats-server` já seguem:
+
+- **A cauda depois de um valor é nomeada só dentro de uma seção conhecida.**
+  Depois de uma flag com valor, uma flag desconhecida pode ser a cauda desse
+  valor que o shell partiu num espaço (`--sink.postgres.password=abc -hunter2`,
+  `... abc --x=y`): ela só é nomeada quando o nome, lido como
+  `<seção>.<chave>`, cai numa seção deste servidor **ou numa das seções do
+  `go-webhook-fast-server` que este não tem** (`[ring.sqlite]`, `[sink.redis]`...:
+  uma configuração trazida do fast é exatamente de onde ela vem, e o erro a
+  nomeia); senão o erro culpa a flag anterior ("a value with a space goes in
+  quotes"), sem citar nada. Sem valor antes, toda flag desconhecida continua
+  nomeada. Era a brecha acima, fechada sem esconder os erros de digitação que
+  importam (`--sink.wrkers=1` depois de `--sink.workers=4` aparece).
+- **Um `-h` ou `-v` depois de uma flag que espera valor** só é nomeado como o
+  *switch* quando escrito com dois traços: `--sink.postgres.password -h` é também como
+  fica uma senha de dois caracteres que começa com traço.
+- **Valor colado ao nome.** Um nome desconhecido que começa com o nome de um
+  parâmetro e continua (`--sink.postgres.passwordhunter2`, com ou sem `-`, `_`, `.` no
+  meio; o `=` esquecido) não é citado, nem o que tem caracteres que nenhum nome
+  tem (`--sink.postgres.password:hunter2`). O mesmo vale para a chave do INI
+  (`password: hunter2 = x`) e para a chave antes de qualquer seção.
+- **Continuação de segredo no INI.** Uma chave desconhecida do INI só é
+  nomeada quando a seção é conhecida (como acima), a chave tem forma de chave
+  (`[a-z0-9_]{1,64}`) **e** a linha anterior não era um segredo (senha):
+  `password = eyJhbGciOiJI` seguido de `UzI1NiJ9abcDEF==` é um valor que quebrou
+  de linha, e o resto dele virava o nome de uma chave desconhecida no stderr.
+  Um erro de digitação (`[sink.postgres]` `tabel = x`) continua nomeado, com a linha.
+- ***Switches* não levam valor.** `--help`, `-h`, `--version`, `-v` e
+  `--dump-config` com `=valor` são exit 1, sem o valor: `--dump-config=false`
+  despejava a configuração e saía com 0, o contrário do que diz.
+- **`--config=` vazio é exit 1**, em vez de cair no `WHS_CONFIG` (ou no padrão),
+  que é o contrário do que a flag diz.
+- **BOM UTF-8 na linha 1 do INI** é ignorado: alguns editores o escrevem, e a
+  linha virava "expected 'key = value'" sem nada visível que explicasse.
+- **Valores derivados saem comentados no `--dump-config`**: `emergency.dir` (derivado de `ring.data_dir`) e `sink.postgres.pool_size` (derivado de `sink.workers`), quando é o servidor quem os deriva, aparecem como
+  `# chave = valor` sob "`# derived`". Escritos como chave, o dump relido os
+  fixava: o pool deixava de seguir `sink.workers`, e o diretório de emergência
+  deixava de seguir `ring.data_dir` — para fora da única área gravável
+  (§13.6). Um valor explícito continua chave.
 
 ### 13.3 Recarga por `SIGHUP` — retirada
 
@@ -2323,9 +2470,10 @@ do código atual.
 ### 19.1 Pendências conhecidas
 
 Problemas reais, conferidos contra o código atual e ainda não corrigidos. Cada
-item diz o problema, a consequência e a direção da correção. Corrigido um, ele
-sai daqui e a regra vai para a seção que ele cita, spec primeiro; os pacotes
-são os do fast, então a correção se porta nos dois sentidos (§14.2).
+item diz o problema, a consequência e a direção da correção. Corrigido um, a
+regra vai para a seção que ele cita, spec primeiro, e ele fica numa linha só,
+com o número (que o `docs/TESTING.md` e os comentários do código citam); os
+pacotes são os do fast, então a correção se porta nos dois sentidos (§14.2).
 
 1. **O ring conta `len(Env)`, não o buffer que o item segura** (§7.2, §12.2,
    §12.4). O JLH vive no buffer inteiro da classe do pool, escolhida por uma
@@ -2379,13 +2527,9 @@ são os do fast, então a correção se porta nos dois sentidos (§14.2).
    Direção: nada é alocado pelo que o par promete, só pelo que chegou — o
    declarado pré-dimensiona até um teto pequeno (64 KiB), e o buffer cresce só
    quando está cheio de bytes recebidos, sem passar do declarado.
-8. **`emergency.enabled = false` também desliga a reingestão** (§9.2, §10.1
-   passo 4). O `Store` só existe com a chave ligada, e sem ele a reingestão
-   retorna em silêncio: os dumps de um boot anterior ficam no disco sem log,
-   com `whs_emergency_files` em 0 e `/readyz` 200 — eventos respondidos com
-   `200` que nunca chegam à fila, contra o "todo arquivo" de §9.2. Direção: a
-   reingestão e os gauges sempre leem `emergency.dir`, com um `Store` próprio;
-   a chave decide só a escrita.
+8. *Corrigido no porte da família syslog/RELP (2026-10-13):* a reingestão e os
+   *gauges* leem `emergency.dir` em todo boot, com a chave `emergency.enabled`
+   decidindo só a escrita; a regra está em §9 e §9.2.
 9. **O dreno de recusa ignora HTTP/2 e `Expect: 100-continue`** (§4.3). O dreno
    de `reject_drain_bytes` e o `Connection: close` foram pensados para o
    HTTP/1.1: em h2c o `Connection: close` vira `GOAWAY` da conexão inteira,
@@ -2395,25 +2539,11 @@ são os do fast, então a correção se porta nos dois sentidos (§14.2).
    Direção: drenar só em HTTP/1.x sem `Expect` pendente, e nunca pôr
    `Connection: close` em HTTP/2 (o `net/http` já encerra o fluxo com
    `RST_STREAM(NO_ERROR)`).
-10. **O dreno do `SIGTERM` não vê o FATAL** (§10.2, §10.3). Se o sink vira
-    FATAL durante a fase 4 de um shutdown por sinal, o `waitDrained` espera o
-    ring esvaziar até o fim do `drain_timeout`, e só então o dump começa —
-    talvez depois do `SIGKILL` do orquestrador, que leva o ring; e, se o FATAL
-    veio dos fusíveis com o ring já vazio, o processo sai com 0, embora §10.2
-    mande 3. Direção: o `waitDrained` retorna com a saúde em FATAL, e o código
-    de saída é 3 sempre que ela terminar FATAL.
-11. **`23502` em execução é `logic`** (§8.5.5, §8.5.7). O servidor nunca manda
-    NULL nas dez colunas, então um `not_null_violation` depois do boot é recusa
-    da **tabela** (uma coluna `NOT NULL` acrescentada, o `DEFAULT` de
-    `received_at` retirado, um trigger): como classe `23`, todo lote é
-    descartado em `sink_logic` com o sink UP, para sempre — o laço que §8.5.5
-    evita no boot e que fez da classe `42` fatal. Direção: `23502` fatal (dump
-    e exit 3; o boot seguinte já recusa a coluna extra obrigatória), com a
-    tabela de §8.5.7 e o `TestClassifySQLState` mudando juntos; um trigger que
-    anula uma coluna só em certas linhas passa a derrubar o processo, e isso
-    fica escrito.
-12. **`whs_emergency_files` não conta um dump ilegível** (§9.2, §11.1). O
-    `Count` que reconta os gauges no boot pula o arquivo cujo `Read` falha (sem
-    permissão de leitura, por exemplo): ele fica no disco e fora do gauge, e o
-    alerta por `whs_emergency_files > 0` não dispara. Direção: contar os
-    arquivos pelo `List`, legíveis ou não, e somar eventos só dos legíveis.
+10. *Corrigido no porte da família syslog/RELP (2026-10-13):* um FATAL durante
+    o dreno do `SIGTERM` encerra a espera e o processo sai com 3; a regra está
+    em §10.3.
+11. *Corrigido no porte da família syslog/RELP (2026-10-13):* `23502` em
+    execução é fatal; a regra está em §8.5.7.
+12. *Corrigido no porte da família syslog/RELP (2026-10-13):*
+    `whs_emergency_files` conta todo arquivo listado, legível ou não, e os
+    eventos só dos legíveis; a regra está em §9.2.

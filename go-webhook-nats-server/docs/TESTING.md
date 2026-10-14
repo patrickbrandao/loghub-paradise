@@ -172,6 +172,15 @@ O `max_payload` de 8 MB não é exigido: a suíte da app baixa os tetos de corpo
 cabeçalho para caber no 1 MiB padrão, e a do sink lê o `max_payload` do
 servidor.
 
+Desde o porte da família syslog/RELP (2026-10-13), três variáveis a mais, cada
+uma pulando os seus casos sem ela (`internal/sink/review_port_nats_test.go`):
+`WHS_TEST_NATS_PERM_URL` (JetStream com os usuários `admin`, `nopub` — publish
+negado em `loghub.*.webhook` —, `noinbox` — subscribe negado em `_INBOX.>` — e
+`nobeacon` — publish negado em `*.beacon`; a configuração está no comentário de
+`natsPermSetup`), `WHS_TEST_NATS_TLS_URL` (um listener com `tls {}`, que este
+servidor deve recusar) e `WHS_TEST_NATS_SERVER` (o binário do `nats-server`,
+para o nó em texto claro que o teste derruba no meio de um *pool*).
+
 O que prova:
 
 - **sink** (`internal/sink/nats_integration_test.go`): o JLH no stream byte a
@@ -302,18 +311,23 @@ aqui; os defeitos que o código ainda tem estão em SPEC §18.1.
     afins) são provadas pela tabela de classificação, com o texto que o
     `nats.go` v1.53.1 devolve; um servidor com JWT expirado não foi montado (um
     real responde "Authorization Violation", que já era fatal).
-18. **A janela da contabilidade do aborto** entre o `ring.Drain()` e o
+18. ~~**A janela da contabilidade do aborto**~~ — **fechada em 2026-10-13** (§9,
+    "Porte das correções da família syslog/RELP": o contador passa de mão sob
+    uma trava antes do recolhimento). O registro de então: entre o `ring.Drain()` e o
     `atRisk.Store` (herdada do P): um segundo sinal exatamente ali conta a
     menos. A atualização das métricas de emergência deixou de reler o diretório
     no caminho do dump, o que encurtou a janela; não foi fechada.
 19. **Mutante equivalente conhecido**: dar à fase 3 do shutdown o seu próprio
     `drain_timeout` não muda nada, porque o prazo único é calculado no mesmo
     instante; o teste do prazo único mata a mutação da fase 4.
-20. **Uma brecha deixada no parser de flags** (SPEC §13.2): a cauda de um valor
+20. ~~**Uma brecha deixada no parser de flags** (SPEC §13.2): a cauda de um valor
     que o shell partiu num espaço, quando começa com traço e vem depois de um
     valor não vazio (`--sink.nats.password=a -b`), sai como parâmetro
     desconhecido, com o nome. Escondê-la esconderia todo erro de digitação de
-    uma flag depois de outra.
+    uma flag depois de outra.~~ — **fechada em
+    2026-10-13** (porte da família syslog/RELP, `knownSectionOf`): depois de um
+    valor, só se nomeia uma flag desconhecida dentro de uma seção deste
+    servidor; `TestFamilyPortTailAfterAValueIsNotNamed`.
 
 ## 9. Histórico: bugs que os testes encontraram
 
@@ -412,3 +426,102 @@ E um achado da última passada de mutação, depois da revisão: o
 `TestMemorySealIsABarrierForEnqueue` herdado do P (300 rodadas) matava o
 `Enqueue` sem trava só em 11 de 20 execuções sem `-race` (20 de 20 com ele). Com
 3000 rodadas, 20 de 20 sem `-race`, em ~1 s.
+
+### Porte das correções da família syslog/RELP (2026-10-13)
+
+**A (ciclo de vida, dump, shutdown, boot).** Cada item com SPEC primeiro, o
+teste abaixo e a correção revertida numa cópia do módulo (mutação): 32 de 32
+mutantes mortos. Os testes são os do `go-webhook-fast-server`
+(`port_lifecycle_test.go`, `durable_test.go`), adaptados ao dump JSON Lines e
+ao destino falso (`memSink`); o código comum é igual entre o P e o N.
+
+| Item | Teste |
+|---|---|
+| `fsync` do diretório no `Remove` e na quarentena; `ErrNotDurable` (inclusive na abertura do diretório) vira `WARN`, não o "cannot remove" falso; a escrita do dump continua melhor esforço (SPEC §9.1, §9.2) | `TestRemoveSyncsTheDirectory`, `TestRemoveWithAnUnopenableDirectoryIsNotDurable`, `TestQuarantineWithAFailedDirectoryFsyncIsQuarantined`, `TestWriteKeepsTheDumpWhenTheDirectoryFsyncFails`, `TestReingestedDumpRemovedWithoutDurabilityIsAWarning`, `TestQuarantineWithoutDurabilityIsStillReported` |
+| Posse única da perda do aborto (`lossMu`, `enterDumpPhase`, `oweDump`, `settleDump`), no lugar do par `atRisk`/`collected`: o aborto entre o `Drain` e o registro do recolhimento contava a menos (2 de 5) (SPEC §10.3; fecha §8 item 18) | `TestAbortBetweenTheDrainAndTheDumpCountsEverything`, `TestAbortAfterASavedDumpCountsNothing`, `TestAbortAndDisabledDumpCountOnce`, `TestAbortAndFailedDumpCountOnce`, `TestAbortDuringTheDrainIsCountedOnce`, `TestAbortBeforeTheDumpPhaseKeepsItClosed`, `TestNewlineEnvelopeLeftOutOfTheDumpIsCountedOnce` (o envelope com `0x0A`, agora contado pelo dump) |
+| O dump que o aborto contou desiste (`Store.SetAbandon`), e o que publica depois da última conferência não é contado de novo | `TestWriteGivesUpWhenAbandoned` (antes da primeira linha, a cada 1024, antes do `link`), `TestDumpAfterTheAbortIsAbandoned`, `TestAbortAfterTheLastAbandonCheckCountsNothingMore`, `TestAbortDuringTheDumpCountsItOnceAndLeavesNoDump` (ponta a ponta: `beforeDump` segura o dump até o aborto contar) |
+| X2: o dump toma o contador sob `lossMu`, nos dois ramos (com dump e `emergency.enabled=false`) | `TestDumpThatSawTheAbortLeavesTheCountToIt` (`inAbort`: o dump roda com a trava do aborto na mão) |
+| `SIGQUIT` nunca tolerado, e o primeiro `SIGTERM`/`SIGINT` do shutdown por FATAL tolerado (já valia; agora com teste de unidade em `shutdownWith`) | `TestFatalShutdownToleratesTheFirstSignal` |
+| O canal do aborto registrado antes de o contexto soltar `SIGTERM`/`SIGINT` (um segundo sinal no meio saía 143 sem contar) | sem teste: a janela é de instruções, entre o `signal.Stop` do contexto e o `signal.Notify`; provado por leitura |
+| X1: `bind` cancelado por sinal = 130, na porta admin e na pública, com nome de host e com IP literal; o `Server.Close` fecha também os listeners que o `Serve` nunca recebeu | `TestSignalBeforeTheBindExits130` (`127.0.0.1:0` e `localhost:0`, a porta solta depois), `TestCancelledAdminBindIsAnAbortNotAConfigError` |
+| Um sink FATAL durante o dreno do `SIGTERM` encerra a espera, e a saída é 3 sempre que a saúde termina FATAL (SPEC §10.3; fecha SPEC §18.1 item 6, já registrado) | `TestFatalDuringTheDrainEndsTheWaitAndExits3` (prazo de 10 min; o dump sai na hora), `TestFatalDuringThePreStopDelayExits3` (ring vazio: saía 0) |
+| Leitura dos dumps em todo boot, com `emergency.enabled` desligado também, e o diretório que não se lista só para uma vida que escreve dumps (fecha SPEC §18.1 item 4) | `TestDumpsAreReingestedWithEmergencyDisabled`, `TestUnlistableEmergencyDirStopsOnlyALifeThatDumps` |
+| *Gauges* de emergência do arquivo inteiro e do disco: `whs_emergency_files` posto no início da reingestão, o `Count` contando o arquivo ilegível, falha da recontagem com `WARN` (fecha SPEC §18.1 item 5) | `TestEmergencyFilesGaugeDuringReingestion`, `TestCountKeepsAnUnreadableFile`, `TestEmergencyGaugesCountAnUnreadableDump` (o `WARN` sem teste: só log) |
+| `withLifetime` e `validationContext` (SP2/RP): não se aplicam — o sink NATS valida o stream dentro da checagem, sobre o `StreamInfo` que acabou de buscar, e nenhuma validação passa do `health_timeout` (como no SN); só o comentário do RN entrou no `health.go` | — |
+
+Não se aplicam (DECISOES, "Porte das correções da família syslog/RELP"): o
+`quitNow` (sem observador de `SIGQUIT` fora do shutdown), o prazo da
+reingestão sem progresso (sem retentativa nem prazo único; a leitura é do
+arquivo inteiro, sem "pedaço"), o fechamento em paralelo (o `Server.Shutdown`
+já fecha os listeners juntos) e o A4 do plano (não há `ring=sqlite`).
+
+**B (configuração, `internal/config/`).** Testes em
+`internal/config/family_port_test.go`; cada um falhou contra o código de antes
+(conferido no módulo intocado; `TestFamilyPortRetiredKeyAfterAValueIsNamed` é
+guarda da regra nova) e cada correção revertida sozinha derruba ao menos um
+(32 mutantes, 31 mortos; o que sobra é equivalente aqui: tratar `0` como "não
+derivado" não muda nada sem um derivado inteiro).
+
+| Item | Teste |
+|---|---|
+| Cauda depois de um valor nomeada só dentro de uma seção conhecida (`knownSectionOf`; fecha §8 item 20), contando as seções do fast que este servidor não tem (`retiredSections`) | `TestFamilyPortTailAfterAValueIsNotNamed`, `TestFamilyPortRetiredKeyAfterAValueIsNamed`; controles de `TestConfigReviewFindings` ajustados |
+| `-h`/`-v` depois de uma flag que espera valor não é nomeado como *switch* | `TestFamilyPortShortDashValueIsNotNamedAsAFlag` |
+| Valor colado ao nome, `:` no lugar do `=`, na flag e no INI; chave antes de seção | `TestFamilyPortGluedValueIsNotPrinted` |
+| Continuação de segredo numa linha do INI (senha, token, URL com credencial) | `TestFamilyPortINISecretContinuationIsNotPrinted` |
+| *Switches* com valor; `--config=` vazio; BOM na linha 1 | `TestFamilyPortSwitchesTakeNoValue`, `TestFamilyPortEmptyConfigFlagIsRefused`, `TestFamilyPortINIByteOrderMarkIsIgnored` |
+| `emergency.dir` derivado comentado no `--dump-config` | `TestFamilyPortDumpCommentsDerivedValues` |
+| Tetos (`capacity_items`, `batch`, `workers` ≤ 256, `listeners`) | `TestFamilyPortConfigCeilings` |
+| `LOGHUB_EB_URL`: só brancos recusada; `@` depois de `/`, `?` ou `#` com a dica do escape; host codificado; `#` ou `?` vazio; nada da URL no erro | `TestFamilyPortEBURL`; `TestEBURLUnsupportedOrMalformed` e `TestConfigReviewFindings` ajustados (só brancos não é mais "não definida"; a mensagem do `@` mudou) |
+
+Já estava feito: fragmento e caminho/consulta recusados (`TestEBURLUnsupportedOrMalformed`),
+chave própria vazia que não conflita (`TestConfigReviewFindings`). Não se
+aplica: `sink.batch_max_bytes`, `pool_size`, `ring.max_inflight` (não existem)
+e as regras de URL PostgreSQL (a `LOGHUB_EB_URL` daqui é só `nats://`).
+
+**C (sink NATS).** O sink do `go-syslog-nats-server` depois do porte de
+2026-10-13 (commit `fb92edd`, que o trouxe do `go-relplog-nats-server`),
+conferido item a item contra este módulo, mais o texto "store is closed" da
+revisão do `go-syslog-server` (X3) e as URLs NATS do SN. O servidor falso
+(`natsFake`) e os seus auxiliares vieram com os testes. Cada teste falhou no
+código de antes, e cada correção foi revertida sozinha numa cópia (mutação):
+24 mutantes, todos mortos — 20 do sink, 4 da configuração e da app. A regra do
+*pool* do `go-syslog-server` (C1) **não** veio: SPEC §8.7.6 já decidia que um
+nó que exige TLS é veredito, e um teste agora guarda essa decisão
+(`docs/DECISOES.md` §3).
+
+| Achado | Consequência sem a correção | Teste |
+|---|---|---|
+| `10077` de stream `discard: new` cheio ("maximum messages exceeded", texto real do `nats-server` 2.14.6) ou fechando ("store is closed", o `ErrStoreClosed` de `server/store.go`; a família casava só "store closed") era fatal | Dump e exit 3 por contrapressão ou por um reinício do NATS, e a parte gravada do lote duplicada na reingestão | `TestNATSFullDiscardNewStreamIsNetwork` (servidor real), `TestClassifyNATS` |
+| `10158`, `10167` e todo 429 caíam na regra do 4xx desconhecido (SPEC §18.1 item 8) | FATAL em toda instância de um stream em cluster degradado ou num pico | `TestClassifyNATS` |
+| `retention: interest` aceito; `max_msgs_per_subject` sem aviso (SPEC §18.1 item 7) | `PubAck` sem gravar: o item fora do ring e perdido sem log | `TestNATSValidateRetentionAndPerSubjectCap`, `TestNATSInterestStreamIsRefused` (servidor real) |
+| A assinatura negada em `_INBOX.` não era veredito (SPEC §18.1 item 9); e a publicação negada só virava FATAL na checagem **seguinte** | O boot esperava o `sink.boot_timeout` culpando a rede; um lote retentado com o sink UP | `TestNATSVerdictIsReturnedByHealthAndWrite`, `TestNATSJetStreamDeniedPublishIsFatalAfterTheTimeout` (o `ErrorHandler` atrasado: só a leitura do `LastError` dá o veredito), `TestNATSPermissionDeniedIsFatal` (servidor real com permissões: `nopub` em `jetstream` pelos dois prazos e em `core`, `noinbox`, `nobeacon` de controle), `TestNATSPermissionViolationOnTheDataPathIsFatal` |
+| O servidor que passa a exigir TLS depois do boot: o `nats.go` só o relata pelo `LastError`, nunca pelo `ReconnectErrCB` | `connection is RECONNECTING`, `network`, até os fusíveis — ou para sempre | `TestNATSReconnectToATLSOnlyServerIsAVerdict` (os dois modos), `TestNATSATLSServerOfAPoolIsAVerdict` (nó em texto claro derrubado, o outro com `tls {}`: a decisão de SPEC §8.7.6) |
+| *Flush* `core` que atravessa uma reconexão; *flush* cortado por uma queda; negação do beacon mascarando a do caminho de dados | Um lote confirmado sem o servidor tê-lo recebido; FATAL, dump e exit 3 por um soluço; um lote negado confirmado | `TestNATSCoreFlushAcrossAReconnectionIsNotConfirmed`, `TestNATSCoreFlushCutByAReconnectionIsNetwork`, `TestNATSCoreMaskedDenialIsNotConfirmed`, `TestMaskedDenial`, `TestNATSCoreHealthReadsTheDenialItsFlushFollows` |
+| `MaxPending` sem folga | Retentativa rápida de um lote contaminado parada na janela cheia (`ErrTooManyStalledMsgs`) | `TestMaxPendingHasTwiceTheWorkersBatches`, `TestNATSConfigCarriesTheDeadlinesAndCeilings` (app; este fixava a fórmula antiga) |
+| URLs NATS do SN: `@` depois de `/`, `?` ou `#` só dizia "path"; um pedaço da lista sem esquema não dizia que uma `,` parte a lista; o *escape* no host culpava a senha | O operador procurando o erro no lugar errado | `TestConfigReviewFindings`, `TestNATSURLSchemes` |
+
+Não se aplicam: o teto de `ring.max_inflight` (C3) — este servidor não tem
+`ring=none` nem a chave; o aviso de um dump de outro `space` em `core` (SPEC
+§21.1 item 8 do SN), que este módulo já tinha por subject.
+
+**D (o dreno).** O `Deliver` do `go-relplog-pg-server` olhava o contexto antes
+da classe da resposta, e um `SIGTERM` durante uma recusa `logic` a contava sem
+o `ERROR` com os uuids. Os workers daqui (o `sink/workers.go` comum a P, F e W)
+já tratavam a classe primeiro: não se aplica, e ficou a guarda
+`TestWorkersLogicRefusalDuringShutdownIsLoggedAndCounted` (2 de 2 mutantes
+mortos: o contexto conferido antes da classe, e o `ERROR` rebaixado). Os itens
+SQL da rodada não se aplicam: este módulo não tem destino SQL.
+
+**Integração (as quatro áreas fundidas).** O `TestWorkersTaintABatchAfterATimedOutAttempt`
+falhou duas vezes durante a rodada (`DATA RACE` entre o `Release` de
+`sink/workers.go` e a leitura de `it.Env` no teste; 1× no W, 1× no N), com o
+`workers.go` e o teste iguais ao `base`. Não era defeito de posse: o teste
+iniciava o worker **antes** de enfileirar os quatro itens, e o worker podia
+pegar só os primeiros, estourar o prazo neles (marcados, nunca voltam ao pool)
+e entregar os demais numa tentativa que não estourou — esses voltam ao pool,
+como manda a SPEC §12.3, e o teste lia o `Env` que o `Release` zerava (com
+`-race -count=200`, 3 falhas; com a guarda nova, 6 de 300 diziam "the stalled
+write carried 1|2|3 of the 4 items"). Correção no teste: enfileirar antes do
+`Start` (como o `TestWorkersMarkFatal`) e conferir que a escrita parada levou
+os quatro (`stallOnceSink.stalled`); `-race -count=500` verde. O
+`go-syslog-standard-server` tem o mesmo teste com a mesma ordem.
