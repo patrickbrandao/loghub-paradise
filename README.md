@@ -18,12 +18,13 @@ esses servidores.
 ## Sumário
 
 1. [Os aplicativos](#1-os-aplicativos)
-2. [Visão geral do ecossistema](#2-visão-geral-do-ecossistema)
-3. [Ring e sink: o modelo](#3-ring-e-sink-o-modelo)
-4. [Topologias de ring e sink](#4-topologias-de-ring-e-sink)
-5. [Como implementar cada sistema](#5-como-implementar-cada-sistema)
-6. [Guia de exemplos](#6-guia-de-exemplos)
-7. [Versões e releases](#7-versões-e-releases)
+2. [Como ler os diagramas](#2-como-ler-os-diagramas)
+3. [As técnicas, uma por diagrama](#3-as-técnicas-uma-por-diagrama)
+4. [Os servidores e suas combinações](#4-os-servidores-e-suas-combinações)
+5. [Os injetores, um diagrama por caso](#5-os-injetores-um-diagrama-por-caso)
+6. [Como implementar cada sistema](#6-como-implementar-cada-sistema)
+7. [Guia de exemplos](#7-guia-de-exemplos)
+8. [Versões e releases](#8-versões-e-releases)
 
 ---
 
@@ -69,292 +70,2190 @@ desenvolvimento e ainda não faz parte do repositório.
 
 ---
 
-## 2. Visão geral do ecossistema
+## 2. Como ler os diagramas
+
+Cada diagrama mostra **um caso só**, da esquerda para a direita:
 
 ```mermaid
 flowchart LR
-    subgraph Emissores
-        WH["Provedores de webhook<br/>(HTTP)"]
-        SL["Dispositivos e daemons<br/>(syslog UDP/TCP/TLS/unix)"]
-        RS["rsyslog omrelp<br/>(RELP)"]
-    end
-
-    subgraph Injetores["Injetores (teste e carga)"]
-        SI["go-syslog-injector"]
-        RI["go-relplog-injector"]
-    end
-
-    subgraph BridgeIN["Bridge-IN (step = 0)"]
-        W["go-webhook-server<br/>go-webhook-fast-server"]
-        WC["go-webhook-pg-server<br/>go-webhook-nats-server"]
-        S["go-syslog-server"]
-        SC["go-syslog-pg-server<br/>go-syslog-nats-server"]
-        R["go-relplog-server"]
-        RC["go-relplog-pg-server<br/>go-relplog-nats-server"]
-    end
-
-    subgraph Destinos
-        NATS[("NATS JetStream<br/>loghub.{space}.{type}")]
-        PG[("PostgreSQL<br/>loghub.inbox")]
-        RD[("Redis Streams")]
-        MY[("MySQL inbox")]
-        CH[("ClickHouse inbox")]
-        SQ[("SQLite events.db")]
-    end
-
-    WH --> W & WC
-    SL --> S & SC
-    RS --> R & RC
-    SI -.-> S & SC
-    RI -.-> R & RC
-
-    W --> NATS & PG & RD & MY & CH & SQ
-    S --> NATS & PG & RD & MY & CH & SQ
-    R --> NATS & PG & RD & MY & CH & SQ
-    WC --> PG & NATS
-    SC --> PG & NATS
-    RC --> PG & NATS
+    A["Quem envia"] --> B["Servidor"]
+    B --> R["Ring<br/>(onde o evento espera)"]
+    R --> D[("Destino<br/>(onde o evento fica)")]
+    B -.->|"confirmação"| A
 ```
 
-Todo servidor:
+- **Retângulo:** um programa ou um passo.
+- **Cilindro:** um lugar onde o evento fica gravado (banco, fila, arquivo).
+- **Seta cheia:** o caminho do evento.
+- **Seta tracejada:** a resposta que volta para quem enviou.
 
-- gera um envelope **JLH** com `uuid` UUIDv7 e o horário `event` saídos da
-  **mesma** amostra de relógio;
-- tem uma identidade (`AGENT_UUID`, `WORKSPACE`...) resolvida pelo
-  `go-loghub-ident` e guardada em `DATADIR`;
-- expõe `/healthz`, `/readyz` e `/metrics` (Prometheus) numa porta admin
-  ligada ao loopback;
-- escreve tudo o que grava sob `DATADIR` (`/data` no contêiner): identidade,
-  `ring.db`, `events.db` e `emergency/`;
-- nunca cria tabela nem stream no destino. Só valida no boot e sai com código
-  `3` se o esquema estiver errado.
+Os nomes **ring** e **sink** aparecem em todo o README:
+
+- **Ring** é a sala de espera: o evento fica ali entre ser aceito e ser entregue.
+- **Sink** é o destino final: o banco ou a fila onde o evento fica guardado.
+
+## 3. As técnicas, uma por diagrama
+
+Cada técnica usada pelos servidores, explicada sozinha.
+
+### 3.1 O que todo servidor faz
+
+Recebe o evento, transforma num envelope JLH do LogHub, guarda no ring e entrega ao destino.
+
+```mermaid
+flowchart LR
+    A["Evento chega"] --> B["Vira envelope JLH<br/>(com uuid e horário)"]
+    B --> C["Espera no ring"]
+    C --> D["Vai para o destino"]
+```
+
+### 3.2 Ring memory: espera na RAM
+
+É o ring mais rápido. O evento é confirmado assim que entra na memória.
+
+```mermaid
+flowchart LR
+    A["Evento"] --> R["Ring memory<br/>(RAM)"]
+    R --> W["Workers"]
+    W --> D[("Destino")]
+```
+
+Se o processo morrer de repente, o que estava na RAM se perde. No desligamento normal, o dump de emergência (3.6) salva o que não deu tempo de entregar.
+
+### 3.3 Ring sqlite: espera no disco
+
+O evento só é confirmado depois de gravado no arquivo `ring.db`, com `fsync`. Nada se perde numa queda.
+
+```mermaid
+flowchart LR
+    A["Evento"] --> R[("Ring sqlite<br/>ring.db")]
+    R --> W["Workers"]
+    W --> D[("Destino")]
+```
+
+Depois que o destino confirma, a linha sai do `ring.db`:
+
+```mermaid
+flowchart LR
+    D[("Destino")] -->|"confirmou"| W["Workers"]
+    W -->|"apaga a linha"| R[("ring.db")]
+```
+
+### 3.4 Ring redis: espera compartilhada entre réplicas
+
+Só nos servidores de syslog e RELP completos (`go-syslog-server`, `go-relplog-server`). Várias réplicas gravam no mesmo stream Redis.
+
+```mermaid
+flowchart LR
+    A["Réplica A"] -->|"grava"| R[("Redis do ring")]
+    B["Réplica B"] -->|"grava"| R
+```
+
+Qualquer réplica pode entregar o que outra recebeu. Se a réplica A cair, a B termina o trabalho:
+
+```mermaid
+flowchart LR
+    R[("Redis do ring")] -->|"pega o evento da A"| B["Réplica B"]
+    B --> D[("Destino")]
+```
+
+Todas as réplicas precisam da mesma configuração `[syslog]`, do mesmo `WORKSPACE` e da mesma versão.
+
+### 3.5 Ring none: sem espera
+
+Não há ring. O servidor grava direto no destino e só responde depois disso. Se o destino falhar, quem enviou fica sabendo (no HTTP, recebe um `5xx` e reenvia).
+
+```mermaid
+flowchart LR
+    A["Evento"] --> B["Servidor"]
+    B -->|"escrita direta"| D[("Destino")]
+    B -.->|"resposta só depois do destino"| A
+```
+
+### 3.6 Dump de emergência
+
+Com ring memory, no desligamento (`SIGTERM`) o servidor tenta entregar tudo. O que não couber no prazo vai para um arquivo em `emergency/`.
+
+```mermaid
+flowchart LR
+    R["Ring memory"] -->|"prazo estourou"| E[("emergency/<br/>dump")]
+```
+
+No próximo boot, o servidor lê o dump e entrega ao destino:
+
+```mermaid
+flowchart LR
+    E[("emergency/<br/>dump")] -->|"boot"| B["Servidor"]
+    B --> D[("Destino")]
+```
+
+Nos cortes (`*-pg-server`, `*-nats-server`) o dump é em JSON Lines (`.jsonl`).
+
+### 3.7 Workers e lotes
+
+Os workers tiram eventos do ring em lotes e mandam cada lote ao destino de uma vez.
+
+```mermaid
+flowchart LR
+    R["Ring"] -->|"lote de eventos"| W["Worker"]
+    W -->|"um envio"| D[("Destino")]
+```
+
+Se o destino falhar, o worker segura o lote e tenta de novo. O evento só sai do ring depois da confirmação.
+
+### 3.8 HTTP: a resposta 200
+
+Nos servidores de webhook, o `200 OK` só sai depois da garantia da combinação ring × sink. O cabeçalho `X-LogHub-UUID` traz o identificador do evento.
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] -->|"POST"| B["Servidor webhook"]
+    B --> R["Ring"]
+    B -.->|"200 OK<br/>X-LogHub-UUID"| A
+```
+
+### 3.9 HTTP: ring cheio responde 429
+
+Se o ring encher, o servidor recusa com `429` e `Retry-After`. Nunca responde `200` para depois descartar.
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] -->|"POST"| B["Servidor webhook"]
+    B -->|"ring cheio"| X["Recusa"]
+    X -.->|"429 + Retry-After"| A
+```
+
+### 3.10 HTTP: IP de origem atrás de proxy
+
+Só um proxy listado em `proxy.trusted` pode informar o IP real do cliente pelo `X-Forwarded-For`.
+
+```mermaid
+flowchart LR
+    A["Cliente<br/>203.0.113.7"] --> P["Proxy confiável"]
+    P -->|"X-Forwarded-For: 203.0.113.7"| B["Servidor webhook"]
+    B --> E["IP gravado:<br/>203.0.113.7"]
+```
+
+Um cliente que manda o cabeçalho direto é ignorado; vale o IP da conexão:
+
+```mermaid
+flowchart LR
+    A["Cliente<br/>198.51.100.5"] -->|"X-Forwarded-For: 1.2.3.4"| B["Servidor webhook"]
+    B --> E["IP gravado:<br/>198.51.100.5"]
+```
+
+### 3.11 Syslog TCP e TLS: o servidor para de ler
+
+Syslog por TCP não tem resposta. Com o ring cheio, o servidor simplesmente para de ler a conexão, e a janela TCP faz o emissor esperar.
+
+```mermaid
+flowchart LR
+    A["Emissor TCP"] -->|"mensagens"| B["Servidor syslog"]
+    B -->|"ring cheio"| X["Para de ler"]
+    X -.->|"janela TCP fecha<br/>emissor espera"| A
+```
+
+### 3.12 Syslog UDP: descarte contado
+
+UDP não tem confirmação nem como segurar o emissor. Com o ring cheio, a mensagem é descartada e contada na métrica `syslog_messages_dropped_total`.
+
+```mermaid
+flowchart LR
+    A["Emissor UDP"] -->|"datagrama"| B["Servidor syslog"]
+    B -->|"ring cheio"| X["Descarta e conta"]
+```
+
+### 3.13 Syslog: cru no ring, conversão na saída
+
+No syslog, o ring guarda a mensagem crua. A conversão para JLH acontece no worker, na hora de entregar.
+
+```mermaid
+flowchart LR
+    A["Mensagem syslog"] --> R["Ring<br/>(mensagem crua)"]
+    R --> W["Worker converte<br/>para JLH"]
+    W --> D[("Destino")]
+```
+
+Nos webhooks é o contrário: o JLH é escrito uma vez, na chegada, e o ring guarda o envelope pronto:
+
+```mermaid
+flowchart LR
+    A["Requisição HTTP"] --> H["Handler escreve<br/>o JLH"]
+    H --> R["Ring<br/>(JLH pronto)"]
+    R --> D[("Destino")]
+```
+
+### 3.14 PROXY protocol
+
+Um balanceador na frente do servidor syslog ou RELP pode anunciar a origem real com o cabeçalho PROXY v1 ou v2.
+
+```mermaid
+flowchart LR
+    A["Emissor<br/>198.51.100.9"] --> L["Balanceador"]
+    L -->|"PROXY v2<br/>origem 198.51.100.9"| B["Servidor"]
+```
+
+### 3.15 RELP: uma confirmação por mensagem
+
+No RELP cada mensagem tem um número de transação. O servidor responde `200 OK` para aquele número só depois que a mensagem está no ring.
+
+```mermaid
+flowchart LR
+    A["rsyslog"] -->|"txnr 7: mensagem"| B["Servidor RELP"]
+    B --> R["Ring"]
+    B -.->|"txnr 7: 200 OK"| A
+```
+
+### 3.16 RELP: servidor ocupado
+
+Com o ring cheio ou o destino fora, o servidor segura a transação. Passado `relp.backpressure_timeout` (30 s), fecha a sessão sem responder.
+
+```mermaid
+flowchart LR
+    A["rsyslog"] -->|"mensagem"| B["Servidor RELP"]
+    B -->|"30 s sem espaço"| X["Fecha a sessão<br/>sem responder"]
+```
+
+O rsyslog reconecta e reenvia o que ficou sem resposta. Nada se perde:
+
+```mermaid
+flowchart LR
+    A["rsyslog"] -->|"reconecta e reenvia"| B["Servidor RELP"]
+    B -.->|"200 OK"| A
+```
+
+### 3.17 NATS: publicação confirmada
+
+Com `sink=nats` em modo JetStream, cada publicação recebe um `PubAck`. O `uuid` do evento vai como `Nats-Msg-Id`, e o stream descarta repetições.
+
+```mermaid
+flowchart LR
+    W["Worker"] -->|"publica<br/>Nats-Msg-Id = uuid"| J[("JetStream")]
+    J -.->|"PubAck"| W
+```
+
+### 3.18 NATS: heartbeat beacon
+
+Os servidores com NATS anunciam que estão vivos em `loghub._ctl.beacon`.
+
+```mermaid
+flowchart LR
+    B["Servidor"] -->|"a cada intervalo"| C[("loghub._ctl.beacon")]
+```
+
+### 3.19 Ring redis com sink redis: não pode
+
+Nos servidores de syslog e RELP, pedir ring redis com destino redis faz o servidor usar ring memory e avisar no log. Um ring no mesmo Redis do destino não protegeria nada.
+
+```mermaid
+flowchart LR
+    C["ring=redis<br/>sink=redis"] -->|"no boot"| M["vira ring=memory<br/>+ aviso"]
+```
+
+### 3.20 O servidor nunca cria o esquema
+
+Tabelas e streams são criados por você antes. O servidor só confere no boot e, se algo estiver errado, sai com código `3`.
+
+```mermaid
+flowchart LR
+    B["Servidor sobe"] --> V{"Tabela ou stream<br/>está certo?"}
+    V -->|"sim"| OK["Começa a receber"]
+    V -->|"não"| X["Sai com código 3"]
+```
+
+### 3.21 Sink nats: NATS JetStream
+
+Um barramento de mensagens. Outros programas assinam o subject e recebem os eventos.
+
+```mermaid
+flowchart LR
+    W["Worker"] --> D[("NATS JetStream<br/>loghub.{space}.{type}")]
+```
+
+### 3.22 Sink redis: Redis Streams
+
+Uma fila no Redis (`XADD`). Padrão da família webhook.
+
+```mermaid
+flowchart LR
+    W["Worker"] --> D[("Redis Streams")]
+```
+
+### 3.23 Sink sqlite: SQLite
+
+Um arquivo local, só para acrescentar. Bom para um nó único sem infraestrutura.
+
+```mermaid
+flowchart LR
+    W["Worker"] --> D[("SQLite<br/>events.db")]
+```
+
+### 3.24 Sink postgres: PostgreSQL
+
+A fila `loghub.inbox` do LogHub. Várias instâncias podem gravar na mesma tabela.
+
+```mermaid
+flowchart LR
+    W["Worker"] --> D[("PostgreSQL<br/>loghub.inbox")]
+```
+
+### 3.25 Sink mysql: MySQL
+
+Uma tabela `inbox` igual à do PostgreSQL.
+
+```mermaid
+flowchart LR
+    W["Worker"] --> D[("MySQL<br/>tabela inbox")]
+```
+
+### 3.26 Sink clickhouse: ClickHouse
+
+Um banco analítico para consultar o histórico.
+
+```mermaid
+flowchart LR
+    W["Worker"] --> D[("ClickHouse<br/>inbox ou inbox_syslog")]
+```
+
+### 3.27 Sink none: none
+
+Não grava nada. Serve só para medir desempenho; o servidor avisa no boot.
+
+```mermaid
+flowchart LR
+    W["Worker"] --> D["Descarte"]
+```
+
+## 4. Os servidores e suas combinações
+
+Cada servidor tem a sua seção. Primeiro, um diagrama do servidor sozinho; depois, um diagrama para cada combinação de ring e sink que ele aceita. A combinação padrão está marcada com ★.
+
+### 4.1 go-webhook-server
+
+Recebe webhooks por HTTP/1.1 e h2c, em qualquer caminho e método, e grava cada requisição como um evento JLH `type=webhook.request`.
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+Rings: `memory`, `sqlite`, `none`. Sinks: `redis`, `sqlite`, `postgres`, `mysql`, `nats`, `clickhouse`, `none`.
+
+#### go-webhook-server: ring memory → sink Redis ★
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("Redis Streams<br/>loghub.{space}.webhook.request")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-server: ring memory → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-server: ring memory → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-server: ring memory → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-server: ring memory → sink NATS
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.webhook.request")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-server: ring memory → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("ClickHouse<br/>tabela inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-server: ring memory → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-webhook-server: ring sqlite → sink Redis
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("Redis Streams<br/>loghub.{space}.webhook.request")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring sqlite → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** `ring.db` e `events.db` precisam ser arquivos diferentes, de preferência em discos diferentes.
+
+#### go-webhook-server: ring sqlite → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring sqlite → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring sqlite → sink NATS
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.webhook.request")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring sqlite → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("ClickHouse<br/>tabela inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring sqlite → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-webhook-server: ring none → sink Redis
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B -->|"escrita direta"| D[("Redis Streams<br/>loghub.{space}.webhook.request")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** depois do XADD confirmado pelo Redis.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring none → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B -->|"escrita direta"| D[("SQLite<br/>events.db")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** depois do COMMIT no events.db.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring none → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B -->|"escrita direta"| D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo PostgreSQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring none → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B -->|"escrita direta"| D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo MySQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring none → sink NATS
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B -->|"escrita direta"| D[("NATS JetStream<br/>loghub.{space}.webhook.request")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** depois do PubAck do JetStream.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-server: ring none → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B -->|"escrita direta"| D[("ClickHouse<br/>tabela inbox")]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT respondido pelo ClickHouse.
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** cada requisição vira uma parte no ClickHouse; use só com `async_insert` no perfil do usuário.
+
+#### go-webhook-server: ring none → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-server"]
+    B -->|"escrita direta"| D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK"| A
+```
+
+- **Confirmação ao emissor:** na hora, e o evento é descartado.
+- **Perda se o servidor cair de repente:** tudo.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+### 4.2 go-webhook-fast-server
+
+Igual ao `go-webhook-server`, mas grava `type=webhook` (`mode=fast`) e a resposta diz em que estágio o evento estava (`stage`).
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+Rings: `memory`, `sqlite`, `none`. Sinks: `redis`, `sqlite`, `postgres`, `mysql`, `nats`, `clickhouse`, `none`.
+
+#### go-webhook-fast-server: ring memory → sink Redis ★
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("Redis Streams<br/>loghub.{space}.webhook")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-fast-server: ring memory → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-fast-server: ring memory → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-fast-server: ring memory → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-fast-server: ring memory → sink NATS
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.webhook")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-fast-server: ring memory → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("ClickHouse<br/>tabela inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-webhook-fast-server: ring memory → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-webhook-fast-server: ring sqlite → sink Redis
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("Redis Streams<br/>loghub.{space}.webhook")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring sqlite → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** `ring.db` e `events.db` precisam ser arquivos diferentes, de preferência em discos diferentes.
+
+#### go-webhook-fast-server: ring sqlite → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring sqlite → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring sqlite → sink NATS
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.webhook")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring sqlite → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("ClickHouse<br/>tabela inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring sqlite → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-webhook-fast-server: ring none → sink Redis
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B -->|"escrita direta"| D[("Redis Streams<br/>loghub.{space}.webhook")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** depois do XADD confirmado pelo Redis.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring none → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B -->|"escrita direta"| D[("SQLite<br/>events.db")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** depois do COMMIT no events.db.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring none → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B -->|"escrita direta"| D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo PostgreSQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring none → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B -->|"escrita direta"| D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo MySQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring none → sink NATS
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B -->|"escrita direta"| D[("NATS JetStream<br/>loghub.{space}.webhook")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** depois do PubAck do JetStream.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-webhook-fast-server: ring none → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B -->|"escrita direta"| D[("ClickHouse<br/>tabela inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT respondido pelo ClickHouse.
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** cada requisição vira uma parte no ClickHouse; use só com `async_insert` no perfil do usuário.
+
+#### go-webhook-fast-server: ring none → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-fast-server"]
+    B -->|"escrita direta"| D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** na hora, e o evento é descartado.
+- **Perda se o servidor cair de repente:** tudo.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+### 4.3 go-webhook-pg-server
+
+Corte do fast com uma única combinação: ring na RAM e a fila `loghub.inbox` do PostgreSQL.
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-pg-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-webhook-pg-server: ring memory → sink PostgreSQL ★
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-pg-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+### 4.4 go-webhook-nats-server
+
+Corte do fast com uma única combinação: ring na RAM e o NATS JetStream.
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-nats-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-webhook-nats-server: ring memory → sink NATS ★
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] --> B["go-webhook-nats-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.webhook")]
+    B -.->|"200 OK + stage"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+### 4.5 go-syslog-server
+
+Recebe syslog por UDP, TCP, TLS e socket unix e grava cada mensagem como um evento JLH `type=syslog`.
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+Rings: `memory`, `sqlite`, `redis`, `none`. Sinks: `nats`, `redis`, `sqlite`, `postgres`, `mysql`, `clickhouse`, `none`. A combinação ring `redis` com sink `redis` não existe (3.19).
+
+#### go-syslog-server: ring memory → sink NATS ★
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring memory → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("Redis Streams<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring memory → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring memory → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring memory → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring memory → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring memory → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring sqlite → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring sqlite → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("Redis Streams<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring sqlite → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** `ring.db` e `events.db` precisam ser arquivos diferentes, de preferência em discos diferentes.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring sqlite → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring sqlite → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring sqlite → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring sqlite → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring redis → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring redis → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring redis → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring redis → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring redis → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring redis → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring none → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B -->|"escrita direta"| D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do PubAck do JetStream.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring none → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B -->|"escrita direta"| D[("Redis Streams<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do XADD confirmado pelo Redis.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring none → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B -->|"escrita direta"| D[("SQLite<br/>events.db")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do COMMIT no events.db.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring none → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B -->|"escrita direta"| D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo PostgreSQL.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring none → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B -->|"escrita direta"| D[("MySQL<br/>tabela inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo MySQL.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring none → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B -->|"escrita direta"| D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT respondido pelo ClickHouse.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+#### go-syslog-server: ring none → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix"] --> B["go-syslog-server"]
+    B -->|"escrita direta"| D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** na hora, e o evento é descartado.
+- **Perda se o servidor cair de repente:** tudo.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+### 4.6 go-syslog-pg-server
+
+Corte do `go-syslog-server`, sem TLS, com uma única combinação: ring na RAM e a fila `loghub.inbox` do PostgreSQL.
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, unix"] --> B["go-syslog-pg-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-syslog-pg-server: ring memory → sink PostgreSQL ★
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, unix"] --> B["go-syslog-pg-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+### 4.7 go-syslog-nats-server
+
+Corte do `go-syslog-server`, sem TLS, com uma única combinação: ring na RAM e o NATS JetStream.
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, unix"] --> B["go-syslog-nats-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-syslog-nats-server: ring memory → sink NATS ★
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, unix"] --> B["go-syslog-nats-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** só TCP e TLS seguram o emissor; UDP não tem confirmação.
+
+### 4.8 go-relplog-server
+
+Recebe syslog por RELP (o `omrelp` do rsyslog), em claro ou TLS, e confirma cada mensagem. Grava eventos JLH `type=syslog` com `x-transport: relp`.
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+Rings: `memory`, `sqlite`, `redis`, `none`. Sinks: `nats`, `redis`, `sqlite`, `postgres`, `mysql`, `clickhouse`, `none`. A combinação ring `redis` com sink `redis` não existe (3.19).
+
+#### go-relplog-server: ring memory → sink NATS ★
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-relplog-server: ring memory → sink Redis
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("Redis Streams<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-relplog-server: ring memory → sink SQLite
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-relplog-server: ring memory → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-relplog-server: ring memory → sink MySQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-relplog-server: ring memory → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-relplog-server: ring memory → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-relplog-server: ring sqlite → sink NATS
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring sqlite → sink Redis
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("Redis Streams<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring sqlite → sink SQLite
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** `ring.db` e `events.db` precisam ser arquivos diferentes, de preferência em discos diferentes.
+
+#### go-relplog-server: ring sqlite → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring sqlite → sink MySQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring sqlite → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring sqlite → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-relplog-server: ring redis → sink NATS
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+
+#### go-relplog-server: ring redis → sink SQLite
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+
+#### go-relplog-server: ring redis → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+
+#### go-relplog-server: ring redis → sink MySQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+
+#### go-relplog-server: ring redis → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+
+#### go-relplog-server: ring redis → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-relplog-server: ring none → sink NATS
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B -->|"escrita direta"| D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** depois do PubAck do JetStream.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring none → sink Redis
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B -->|"escrita direta"| D[("Redis Streams<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** depois do XADD confirmado pelo Redis.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring none → sink SQLite
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B -->|"escrita direta"| D[("SQLite<br/>events.db")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** depois do COMMIT no events.db.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring none → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B -->|"escrita direta"| D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo PostgreSQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring none → sink MySQL
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B -->|"escrita direta"| D[("MySQL<br/>tabela inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo MySQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring none → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B -->|"escrita direta"| D[("ClickHouse<br/>tabela inbox_syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT respondido pelo ClickHouse.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-relplog-server: ring none → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-server"]
+    B -->|"escrita direta"| D["Descarte<br/>(só benchmark)"]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** na hora, e o evento é descartado.
+- **Perda se o servidor cair de repente:** tudo.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+### 4.9 go-relplog-pg-server
+
+Corte do `go-relplog-server`, sem TLS, com uma única combinação: ring na RAM e a fila `loghub.inbox` do PostgreSQL.
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-pg-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-relplog-pg-server: ring memory → sink PostgreSQL ★
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-pg-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+### 4.10 go-relplog-nats-server
+
+Corte do `go-relplog-server`, sem TLS, com uma única combinação: ring na RAM e o NATS JetStream.
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-nats-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-relplog-nats-server: ring memory → sink NATS ★
+
+```mermaid
+flowchart LR
+    A["rsyslog<br/>omrelp"] --> B["go-relplog-nats-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.syslog")]
+    B -.->|"200 OK por mensagem"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+### 4.11 go-syslog-standard-server
+
+O servidor syslog antigo, anterior ao LogHub, mantido como referência de código. Não gera envelope JLH.
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+Rings: `memory`, `sqlite`, `none`. Sinks: `redis`, `sqlite`, `postgres`, `mysql`, `nats`, `none`.
+
+#### go-syslog-standard-server: ring memory → sink Redis ★
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("Redis Streams<br/>syslog:in")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-syslog-standard-server: ring memory → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-syslog-standard-server: ring memory → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>tabela events")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-syslog-standard-server: ring memory → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("MySQL<br/>tabela events")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-syslog-standard-server: ring memory → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>stream SYSLOG")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+
+#### go-syslog-standard-server: ring memory → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-syslog-standard-server: ring sqlite → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("Redis Streams<br/>syslog:in")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring sqlite → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** `ring.db` e `events.db` precisam ser arquivos diferentes, de preferência em discos diferentes.
+
+#### go-syslog-standard-server: ring sqlite → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("PostgreSQL<br/>tabela events")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring sqlite → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("MySQL<br/>tabela events")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring sqlite → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("NATS JetStream<br/>stream SYSLOG")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring sqlite → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+#### go-syslog-standard-server: ring none → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B -->|"escrita direta"| D[("Redis Streams<br/>syslog:in")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do XADD confirmado pelo Redis.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring none → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B -->|"escrita direta"| D[("SQLite<br/>events.db")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do COMMIT no events.db.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring none → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B -->|"escrita direta"| D[("PostgreSQL<br/>tabela events")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo PostgreSQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring none → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B -->|"escrita direta"| D[("MySQL<br/>tabela events")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo MySQL.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring none → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B -->|"escrita direta"| D[("NATS JetStream<br/>stream SYSLOG")]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** depois do PubAck do JetStream.
+- **Perda se o servidor cair de repente:** nada.
+
+#### go-syslog-standard-server: ring none → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor syslog<br/>UDP, TCP, TLS, unix, RELP"] --> B["go-syslog-standard-server"]
+    B -->|"escrita direta"| D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito"| A
+```
+
+- **Confirmação ao emissor:** na hora, e o evento é descartado.
+- **Perda se o servidor cair de repente:** tudo.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+
+## 5. Os injetores, um diagrama por caso
+
+Os injetores mandam mensagens para os servidores, para teste e para medir carga.
+
+### 5.1 go-syslog-injector por UDP
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"UDP"| S["Servidor syslog"]
+```
+
+Não há resposta. O relatório conta o que foi enviado; compare com as métricas do servidor.
+
+### 5.2 go-syslog-injector por TCP
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"TCP<br/>octet-counting ou LF"| S["Servidor syslog"]
+```
+
+### 5.3 go-syslog-injector por TLS
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"TLS<br/>mTLS opcional"| S["Servidor syslog"]
+```
+
+### 5.4 go-syslog-injector por socket unix
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"datagrama unix<br/>/dev/log"| S["Servidor syslog"]
+```
+
+### 5.5 go-syslog-injector com PROXY protocol
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"PROXY v1 ou v2<br/>+ syslog"| S["Servidor syslog"]
+```
+
+Simula um balanceador na frente do servidor (3.14).
+
+### 5.6 go-relplog-injector por RELP
+
+```mermaid
+flowchart LR
+    I["go-relplog-injector"] -->|"mensagem"| S["Servidor RELP"]
+    S -.->|"200 OK"| I
+```
+
+Cada mensagem espera a sua confirmação. Até `--window` mensagens podem esperar ao mesmo tempo.
+
+### 5.7 go-relplog-injector: retransmissão
+
+```mermaid
+flowchart LR
+    I["go-relplog-injector"] -->|"reconecta e reenvia<br/>o que ficou sem resposta"| S["Servidor RELP"]
+```
+
+Se a sessão cair, o injetor reenvia até `--retries` vezes, como o rsyslog.
+
+### 5.8 Conteúdo: gerador com seq
+
+```mermaid
+flowchart LR
+    G["Gerador<br/>seq=1, 2, 3..."] --> I["Injetor"]
+    I --> S["Servidor"]
+```
+
+Um número faltando no destino é uma perda; um número repetido é uma retransmissão.
+
+### 5.9 Conteúdo: modelo com marcadores
+
+```mermaid
+flowchart LR
+    M["Modelo<br/>login user={rand:6}"] --> I["Injetor"]
+    I --> S["Servidor"]
+```
+
+### 5.10 Conteúdo: arquivo ou stdin
+
+```mermaid
+flowchart LR
+    F[("arquivo.txt<br/>uma mensagem por linha")] --> I["Injetor"]
+    I --> S["Servidor"]
+```
+
+### 5.11 Conteúdo: captura do tcpdump
+
+```mermaid
+flowchart LR
+    P["Produção"] -->|"tcpdump -w"| C[("prod.pcap")]
+```
+
+No laboratório, o injetor tira as mensagens da captura e as manda de novo:
+
+```mermaid
+flowchart LR
+    C[("prod.pcap")] --> I["Injetor"]
+    I -->|"mesmo ritmo<br/>ou o mais rápido"| S["Servidor"]
+```
+
+### 5.12 O relatório
+
+```mermaid
+flowchart LR
+    I["Injetor"] --> R["Relatório<br/>texto ou JSON"]
+    I --> X["Código de saída<br/>0, 1, 2, 3 ou 130"]
+```
 
 ---
 
-## 3. Ring e sink: o modelo
+## 6. Como implementar cada sistema
 
-Ring e sink são **dois eixos independentes**. Nenhuma implementação de ring
-consulta o tipo do sink, e vice-versa.
-
-- **Ring** é onde o evento espera entre ser aceito e ser entregue.
-- **Sink** é o destino final.
-
-```mermaid
-flowchart LR
-    IN["Recepção<br/>HTTP / syslog / RELP"] -->|"aceita"| RING["RING<br/>memory | sqlite | redis | none"]
-    RING -->|"workers de dreno<br/>conversão + lote"| SINK["SINK<br/>nats | redis | sqlite | postgres | mysql | clickhouse | none"]
-    RING -.->|"FATAL ou SIGTERM<br/>que estoura o dreno"| EM["emergency/<br/>dump"]
-    EM -.->|"próximo boot<br/>reingestão"| SINK
-    SINK -->|"confirmação"| RING
-```
-
-### Os rings
-
-| Ring | Onde mora | O que a confirmação ao emissor significa | Perda em queda abrupta |
-|---|---|---|---|
-| `memory` | RAM do processo, com teto de itens e bytes | aceito na RAM | o backlog, mitigado pelo dump de emergência |
-| `sqlite` | `ring.db` local, com `fsync` | gravado em disco | nada |
-| `redis` (só syslog/RELP) | stream Redis **compartilhado** entre réplicas (`XAUTOCLAIM`) | gravado no Redis do ring | o que o Redis do ring perder |
-| `none` | não há fila: a escrita no destino é síncrona | confirmado pelo destino | nada (a falha volta ao emissor) |
-
-### Os sinks
-
-| Sink | Destino | Observação |
-|---|---|---|
-| `nats` | NATS JetStream (`PubAck`); `core` opcional nos servidores syslog/RELP e no N | subject `loghub.{space}.{type}`; o JLH vai em `Data`; dedup por `Nats-Msg-Id` |
-| `redis` | Redis Streams (`XADD`) | padrão da família webhook |
-| `sqlite` | `events.db` local, append-only | nó único, sem infraestrutura |
-| `postgres` | fila `loghub.inbox` (PostgreSQL 18) | DDL literal em `docker/postgres/inbox.sql` |
-| `mysql` | tabela `inbox` que espelha a `loghub.inbox` | `docker/mysql/` |
-| `clickhouse` | `ReplacingMergeTree` (`inbox` nos webhooks, `inbox_syslog` no syslog) | protocolo nativo, ClickHouse 25.8+ |
-| `none` | descarte | **benchmark**: o boot avisa que não é para produção |
-
-### O que "confirmar" significa em cada protocolo
-
-| Protocolo | Confirmação | Ring cheio |
-|---|---|---|
-| HTTP (webhooks) | `200` com `X-LogHub-UUID`, só depois da garantia da combinação | `429` com `Retry-After` |
-| syslog TCP/TLS | o servidor continua lendo | para de ler; a janela TCP segura o emissor |
-| syslog unix datagram | não existe | descarte, mas o kernel já segurou o emissor |
-| syslog UDP | não existe | **descarte contado** em métrica |
-| RELP | `200 OK` por mensagem, só depois do ring | a transação é segurada; passado `relp.backpressure_timeout` a sessão fecha sem resposta e o rsyslog retransmite |
-
----
-
-## 4. Topologias de ring e sink
-
-### 4.1 Família webhook (`go-webhook-server`, `go-webhook-fast-server`)
-
-São 21 combinações, de 3 rings × 7 sinks, e todas são válidas. Há um compose
-para cada uma em `docker/compose.<ring>-<sink>.yml`.
-
-**ring = memory** (padrão: `memory → redis`)
-
-```mermaid
-flowchart LR
-    C["Cliente HTTP"] -->|"POST /qualquer/caminho"| H["Handler<br/>JLH escrito uma vez"]
-    H --> M["ring memory<br/>(RAM, teto itens/bytes)"]
-    H -.->|"ring cheio"| E429["429 + Retry-After"]
-    M -->|"200 + X-LogHub-UUID<br/>(aceito na RAM)"| C
-    M --> WK["workers<br/>lotes até sink.batch_max_bytes"]
-    WK --> RD[("redis ★")]
-    WK --> SQ[("sqlite<br/>events.db")]
-    WK --> PG[("postgres<br/>loghub.inbox")]
-    WK --> MY[("mysql<br/>inbox")]
-    WK --> NA[("nats<br/>JetStream")]
-    WK --> CH[("clickhouse<br/>inbox")]
-    WK --> NO["none<br/>(descarte)"]
-    M -.->|"FATAL / SIGTERM"| DUMP["emergency/ dump"]
-```
-
-**ring = sqlite** (fila durável em disco)
-
-```mermaid
-flowchart LR
-    C["Cliente HTTP"] --> H["Handler"]
-    H --> R[("ring.db<br/>fsync")]
-    R -->|"200 = gravado com fsync"| C
-    R --> WK["workers"]
-    WK --> RD[("redis")] & SQ[("sqlite events.db<br/>(outro arquivo)")] & PG[("postgres")] & MY[("mysql")] & NA[("nats")] & CH[("clickhouse")] & NO["none"]
-    WK -->|"confirmado: DELETE"| R
-```
-
-Com `sqlite → sqlite`, `ring.db` e `events.db` têm de ser arquivos diferentes;
-o boot recusa o mesmo caminho. A combinação só compensa com os dois em discos
-físicos diferentes.
-
-**ring = none** (síncrono: o cliente sabe de cada falha)
-
-```mermaid
-flowchart LR
-    C["Cliente HTTP"] --> H["Handler"]
-    H -->|"escrita síncrona"| D{"sink"}
-    D --> RD[("redis: XADD")] & SQ[("sqlite: COMMIT")] & PG[("postgres: INSERT")] & MY[("mysql: INSERT")] & NA[("nats: PubAck")] & CH[("clickhouse: INSERT")] & NO["none"]
-    D -->|"200 só após confirmação<br/>falha = 5xx, cliente reenvia"| C
-```
-
-| Ring \ Sink | redis | sqlite | postgres | mysql | nats | clickhouse | none |
-|---|---|---|---|---|---|---|---|
-| **memory** | ★ padrão | nó único | banco compartilhado | banco compartilhado | barramento | analítico | benchmark |
-| **sqlite** | sem perda, destino remoto | dois fsyncs | fila local + banco | fila local + banco | fila local + barramento | fila local + analítico | benchmark |
-| **none** | cliente sabe da falha | cliente sabe da falha | cliente sabe da falha | cliente sabe da falha | cliente sabe da falha | só com `async_insert` | benchmark puro de HTTP |
-
-### 4.2 Família syslog e RELP (`go-syslog-server`, `go-relplog-server`)
-
-São 4 rings × 7 sinks. A única combinação recusada é `redis → redis`, que vira
-`memory` com `WARN`: o ring não protegeria nada que o destino já não perca
-junto. Os composes cobrem 23 combinações: os 21 de `memory`/`sqlite`/`none`
-mais `redis-nats` e `redis-postgres`.
-
-No ring o item é guardado **cru** (cabeçalho mais mensagem). A conversão para
-JLH roda no dreno, e o JLH é função pura de cabeçalho, cru e config. Por isso
-um retry reenvia os mesmos bytes, e réplicas que dividem um ring Redis
-precisam da mesma config `[syslog]`.
-
-**ring = memory** (padrão: `memory → nats`)
-
-```mermaid
-flowchart LR
-    subgraph Recepção
-        U["UDP 1514"] & T["TCP 1514"] & TL["TLS 6514"] & UX["unix /dev/log"] & RL["RELP 20514 / TLS"]
-    end
-    Recepção -->|"moldura, PRI, filtro,<br/>rate-limit, uuid"| M["ring memory<br/>(cabeçalho + cru)"]
-    M -->|"RELP: 200 OK por mensagem<br/>TCP: continua lendo"| Recepção
-    M --> WK["workers<br/>conversão syslog → JLH"]
-    WK --> NA[("nats ★<br/>loghub.{space}.syslog")]
-    WK --> RD[("redis")]
-    WK --> SQ[("sqlite events.db")]
-    WK --> PG[("postgres<br/>loghub.inbox")]
-    WK --> MY[("mysql")]
-    WK --> CH[("clickhouse<br/>inbox_syslog")]
-    WK --> NO["none"]
-    M -.->|"FATAL / SIGTERM"| DUMP["emergency/ dump"]
-```
-
-**ring = sqlite**
-
-```mermaid
-flowchart LR
-    IN["UDP / TCP / TLS / unix / RELP"] --> R[("ring.db<br/>fsync")]
-    R -->|"confirmação após fsync"| IN
-    R --> WK["workers"]
-    WK --> NA[("nats")] & RD[("redis")] & SQ[("sqlite")] & PG[("postgres")] & MY[("mysql")] & CH[("clickhouse")] & NO["none"]
-```
-
-**ring = redis** (compartilhado entre réplicas)
-
-```mermaid
-flowchart LR
-    LB["Emissores<br/>(balanceados)"] --> A["réplica A"] & B["réplica B"] & C["réplica C"]
-    A & B & C -->|"XADD"| RR[("Redis do ring<br/>stream compartilhado")]
-    RR -->|"XREADGROUP / XAUTOCLAIM<br/>qualquer réplica drena<br/>o que outra recebeu"| A & B & C
-    A & B & C --> D{"sink"}
-    D --> NA[("nats")] & PG[("postgres")] & SQ[("sqlite")] & MY[("mysql")] & CH[("clickhouse")] & NO["none"]
-    D -.->|"sink = redis: recusado,<br/>vira ring memory + WARN"| X["redis"]
-```
-
-**ring = none**
-
-```mermaid
-flowchart LR
-    IN["TCP / TLS / RELP<br/>(UDP e unix também)"] -->|"conversão na recepção"| D{"sink síncrono"}
-    D --> NA[("nats: PubAck")] & RD[("redis")] & SQ[("sqlite")] & PG[("postgres")] & MY[("mysql")] & CH[("clickhouse")] & NO["none"]
-    D -->|"RELP: 200 OK após o destino<br/>recusa definitiva = 500"| IN
-```
-
-| Ring \ Sink | nats | redis | sqlite | postgres | mysql | clickhouse | none |
-|---|---|---|---|---|---|---|---|
-| **memory** | ★ padrão | sim | sim | sim | sim | sim | benchmark |
-| **sqlite** | sim | sim | sim | sim | sim | sim | benchmark |
-| **redis** | sim (compose) | **não** (vira memory) | sim | sim (compose) | sim | sim | benchmark |
-| **none** | sim | sim | sim | sim | sim | sim | benchmark |
-
-### 4.3 Cortes PostgreSQL (`go-webhook-pg-server`, `go-syslog-pg-server`, `go-relplog-pg-server`)
-
-```mermaid
-flowchart LR
-    IN["HTTP :8080<br/>ou syslog UDP/TCP/unix :1514<br/>ou RELP :20514"] --> M["ring memory"]
-    M -->|"confirmação"| IN
-    M --> WK["workers"]
-    WK -->|"INSERT ... ON CONFLICT (uuid)"| PG[("PostgreSQL 18<br/>loghub.inbox")]
-    PG --> CONS["consumidores da fila<br/>(webhook-worker, etc.)"]
-    M -.->|"FATAL / SIGTERM"| J["emergency/*.jsonl<br/>(JSON Lines)"]
-    J -.->|"boot"| WK
-```
-
-### 4.4 Cortes NATS (`go-webhook-nats-server`, `go-syslog-nats-server`, `go-relplog-nats-server`)
-
-```mermaid
-flowchart LR
-    IN["HTTP :8080<br/>ou syslog UDP/TCP/unix :1514<br/>ou RELP :20514"] --> M["ring memory"]
-    M -->|"confirmação"| IN
-    M --> WK["workers"]
-    WK -->|"publish + PubAck<br/>Nats-Msg-Id = uuid"| JS[("JetStream<br/>LOGHUB_WEBHOOK / LOGHUB_SYSLOG")]
-    WK -.->|"sink.nats.mode = core"| CORE["NATS core<br/>(sem confirmação)"]
-    BEA["beacon"] -->|"heartbeat"| CTL["loghub._ctl.beacon"]
-    JS --> SUB["consumidores<br/>loghub.{space}.webhook / .syslog"]
-    M -.->|"FATAL / SIGTERM"| J["emergency/*.jsonl"]
-```
-
-### 4.5 Injetores no laboratório
-
-```mermaid
-flowchart LR
-    CAP["tcpdump -w prod.pcap<br/>(produção)"] --> F["prod.pcap / pcapng"]
-    F --> SI["go-syslog-injector<br/>--pcap"]
-    GEN["gerador seq= / modelo / arquivo"] --> SI & RI["go-relplog-injector"]
-    F --> RI
-    SI -->|"UDP / TCP / TLS / unix<br/>PROXY v1/v2"| S["go-syslog-server<br/>ou corte"]
-    RI -->|"RELP TCP / TLS<br/>janela + retransmissão"| R["go-relplog-server<br/>ou corte"]
-    S & R --> MET["/metrics do servidor<br/>(conferir contadores)"]
-    SI & RI --> REP["relatório texto/JSON<br/>+ código de saída"]
-```
-
----
-
-## 5. Como implementar cada sistema
-
-### 5.1 Requisitos comuns
+### 6.1 Requisitos comuns
 
 - **Go 1.25+**, só para compilar. Os binários não têm dependência de sistema.
 - **Docker com Compose**, para as stacks de exemplo.
@@ -377,7 +2276,7 @@ go install github.com/patrickbrandao/loghub-paradise/go-syslog-server/cmd/go-sys
 
 Também há binários prontos em cada [release](https://github.com/patrickbrandao/loghub-paradise/releases), com `SHA256SUMS`.
 
-### 5.2 Configuração (vale para todos os servidores)
+### 6.2 Configuração (vale para todos os servidores)
 
 ```
 defaults  <  arquivo INI (--config)  <  ambiente  <  linha de comando
@@ -413,7 +2312,7 @@ kill -HUP <pid>                     # recarrega as chaves recarregáveis (filtro
 No macOS o `HOSTNAME` não pode ter `_`, ou o `go-loghub-ident` sai com um
 código entre 100 e 114. Use, por exemplo, `HOSTNAME=dev-mac`.
 
-### 5.3 Preparar o destino (o servidor nunca cria esquema)
+### 6.3 Preparar o destino (o servidor nunca cria esquema)
 
 | Sink | O que criar antes | Arquivo de referência |
 |---|---|---|
@@ -432,12 +2331,12 @@ psql "$DSN" -f go-syslog-server/docker/postgres/inbox.sql
 Se o esquema estiver errado (coluna, índice, permissão, `max_payload`), o boot
 sai com código `3`, em vez de descartar eventos depois.
 
-### 5.4 go-webhook-server e go-webhook-fast-server
+### 6.4 go-webhook-server e go-webhook-fast-server
 
-1. Escolha a combinação na [tabela 4.1](#41-família-webhook-go-webhook-server-go-webhook-fast-server).
+1. Escolha a combinação na seção [4.1](#41-go-webhook-server) (ou [4.2](#42-go-webhook-fast-server) para o fast).
    Escolha o **fast** quando o consumidor espera `type=webhook` e a resposta
    `{uuid, mode:"fast", status:"accepted", stage}`.
-2. Prepare o destino ([5.3](#53-preparar-o-destino-o-servidor-nunca-cria-esquema)).
+2. Prepare o destino ([6.3](#63-preparar-o-destino-o-servidor-nunca-cria-esquema)).
 3. Configure os proxies confiáveis (`proxy.trusted`) antes de expor à
    internet. Sem isso, `X-Forwarded-For` é ignorado e o IP de origem é o do
    peer TCP.
@@ -460,7 +2359,7 @@ HOSTNAME=dev-mac ./go-webhook-server --ring.mode=memory --sink.type=sqlite \
 Cada compose usa portas próprias, para que várias combinações rodem lado a
 lado. A tabela está em `go-webhook-server/docker/README.md`.
 
-### 5.5 go-webhook-pg-server e go-webhook-nats-server
+### 6.5 go-webhook-pg-server e go-webhook-nats-server
 
 O ring e o destino são fixos. Configure só a conexão:
 
@@ -477,9 +2376,9 @@ WHS_SINK_NATS_URLS=nats://nats:4222 DATADIR=/data ./go-webhook-nats-server
 Stacks prontas: `docker compose up -d --build` em `go-webhook-pg-server/docker`
 e em `go-webhook-nats-server/docker`.
 
-### 5.6 go-syslog-server
+### 6.6 go-syslog-server
 
-1. Escolha a combinação na [tabela 4.2](#42-família-syslog-e-relp-go-syslog-server-go-relplog-server).
+1. Escolha a combinação na seção [4.5](#45-go-syslog-server).
    A padrão é `memory → nats`.
 2. Ligue os transportes de que precisa:
 
@@ -511,7 +2410,7 @@ DATADIR=/tmp/sls-data AGENT_NAME=go-syslog-server HOSTNAME=dev-mac \
   --listen.tcp=127.0.0.1:1514 --admin.bind=127.0.0.1:9102
 ```
 
-### 5.7 go-syslog-pg-server e go-syslog-nats-server
+### 6.7 go-syslog-pg-server e go-syslog-nats-server
 
 ```bash
 SYSLOG_SINK_POSTGRES_ADDR=db:5432 SYSLOG_SINK_POSTGRES_PASSWORD=*** DATADIR=/data ./go-syslog-pg-server
@@ -521,11 +2420,11 @@ SYSLOG_SINK_NATS_URLS=nats://nats:4222 DATADIR=/data ./go-syslog-nats-server
 Recebem UDP, TCP e unix, sem TLS. O `go-syslog-nats-server` também emite o
 heartbeat em `loghub._ctl.beacon`. Há uma stack pronta em `docker/` de cada um.
 
-### 5.8 go-relplog-server
+### 6.8 go-relplog-server
 
 1. Instale o `rsyslog-relp` nos emissores e configure o `omrelp` para o
-   servidor (exemplo em [6.3](#63-go-relplog-server-e-cortes-relp)).
-2. Escolha ring e destino como na família syslog. O RELP só confirma cada
+   servidor (exemplo em [7.3](#73-go-relplog-server-e-cortes-relp)).
+2. Escolha ring e destino na seção [4.8](#48-go-relplog-server). O RELP só confirma cada
    mensagem (`200 OK`) depois do ring.
 3. Para TLS, defina `listen.tls` e os certificados (`docker/conf/tls`). O mTLS
    é opcional.
@@ -543,7 +2442,7 @@ mkdir -p /tmp/rls-data
 DATADIR=/tmp/rls-data ./go-relplog-server --sink.type=sqlite --listen.tcp=127.0.0.1:20514
 ```
 
-### 5.9 go-relplog-pg-server e go-relplog-nats-server
+### 6.9 go-relplog-pg-server e go-relplog-nats-server
 
 ```bash
 RELPLOG_SINK_POSTGRES_ADDR=db:5432 RELPLOG_SINK_POSTGRES_PASSWORD=*** DATADIR=/data ./go-relplog-pg-server
@@ -553,7 +2452,7 @@ RELPLOG_SINK_NATS_URLS=nats://nats:4222 DATADIR=/data ./go-relplog-nats-server
 O `docker compose up -d --build` de cada um sobe o servidor, o destino e um
 emissor rsyslog.
 
-### 5.10 Injetores
+### 6.10 Injetores
 
 ```bash
 cd go-syslog-injector  && go build -o go-syslog-injector  ./cmd/go-syslog-injector
@@ -564,7 +2463,7 @@ Não precisam de configuração nem de identidade: tudo vem das flags (`--help`)
 Também há imagem em `docker/Dockerfile` de cada um. Para conferir a entrega,
 compare o relatório do injetor com os contadores do `/metrics` do servidor.
 
-### 5.11 Operação em produção
+### 6.11 Operação em produção
 
 - **Saúde.** Use `/readyz` como readiness (reflete a saúde do destino e o
   enchimento do ring) e `/healthz` como liveness. As métricas ficam em
@@ -582,9 +2481,9 @@ compare o relatório do injetor com os contadores do `/metrics` do servidor.
 
 ---
 
-## 6. Guia de exemplos
+## 7. Guia de exemplos
 
-### 6.1 Família webhook
+### 7.1 Família webhook
 
 Enviar um evento:
 
@@ -641,7 +2540,7 @@ Uma carga simples sem ferramenta própria, com o `ab`:
 ab -n 100000 -c 64 -p body.json -T application/json http://127.0.0.1:8080/carga
 ```
 
-### 6.2 go-syslog-server e cortes syslog
+### 7.2 go-syslog-server e cortes syslog
 
 Com ferramentas do sistema:
 
@@ -711,7 +2610,7 @@ só sem TLS. Para conferir a entrega:
 curl -s http://127.0.0.1:9102/metrics | grep -E '^syslog_(messages|events)_'
 ```
 
-### 6.3 go-relplog-server e cortes RELP
+### 7.3 go-relplog-server e cortes RELP
 
 No rsyslog (pacote `rsyslog-relp`):
 
@@ -757,7 +2656,7 @@ Ver o resultado:
 curl -s http://127.0.0.1:9103/metrics | grep -E '^relplog_(relp_responses|messages_accepted|events_written|relp_unanswered)_total'
 ```
 
-### 6.4 go-syslog-standard-server
+### 7.4 go-syslog-standard-server
 
 É a referência antiga, sem envelope LogHub. O uso é igual ao do syslog,
 inclusive com RELP:
@@ -767,7 +2666,7 @@ cd go-syslog-standard-server/docker && docker compose up -d --build   # memory -
 printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514
 ```
 
-### 6.5 Receitas de teste de carga
+### 7.5 Receitas de teste de carga
 
 | Objetivo | Receita |
 |---|---|
@@ -780,7 +2679,7 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514
 
 ---
 
-## 7. Versões e releases
+## 8. Versões e releases
 
 - **Tags por módulo:** `<módulo>/vX.Y.Z`, por exemplo
   `go-syslog-server/v1.2.0`.
