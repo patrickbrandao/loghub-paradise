@@ -1,0 +1,25 @@
+{
+  "host": {
+    "hostname": "example.org",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 1,
+    "name": "alert"
+  },
+  "timestamp": "2013-11-21T17:11:02.3072Z",
+  "short-message": "A short message that helps you identify what is going on",
+  "full-message": "Backtrace here\n\nmore stuff",
+  "fields": {
+    "user_id": 9001,
+    "some_info": "foo",
+    "some_env_var": "bar"
+  },
+  "size": 292
+}

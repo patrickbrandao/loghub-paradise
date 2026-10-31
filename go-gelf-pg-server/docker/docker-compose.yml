@@ -1,0 +1,108 @@
+# go-gelf-pg-server: ring na RAM -> PostgreSQL (fila loghub.inbox).
+#
+#   cd docker && docker compose up -d --build
+#
+# A unica combinacao (SPEC §2.1). Sobe o servidor e um PostgreSQL 18 com a fila
+# criada a partir de postgres/inbox.sql. O emissor de demonstracao (fluent-bit,
+# UDP chunked+gzip e TCP) fica em compose.demo.yml, no perfil "demo":
+#
+#   docker compose -f docker-compose.yml -f compose.demo.yml --profile demo up -d --build
+#
+# Garantia (TCP e HTTP): o documento esta' na RAM deste no'. SIGTERM nao perde
+# (dreno); FATAL do banco nao perde (dump JSON Lines em /data/emergency,
+# reingerido no boot seguinte); SIGKILL e OOM perdem o backlog (SPEC §19). UDP
+# nao tem confirmacao: ring cheio ou banco fora e' descarte contado.
+#
+# Publicado no host, com defaults que nao colidem com os compose do
+# go-gelf-server (12201/12202, admin 9104): GELF 12301/udp e 12301/tcp
+# (GELF_PORT), HTTP 12302 (GELF_HTTP_PORT), admin 127.0.0.1:19304
+# (GELF_ADMIN_PORT), PostgreSQL 127.0.0.1:15494 (GELF_POSTGRES_PORT).
+
+name: gelf-pg
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gelf-pg-base
+    container_name: gelf-pg
+    # Vira o Hostname do go-loghub-ident (e o application_name
+    # gelf-pg/<AgentName>@<Hostname> no PostgreSQL); precisa ser RFC 1123.
+    hostname: gelf-pg
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- ring: memory (o unico; nao ha GELF_RING_MODE) ----------------------
+      GELF_RING_CAPACITY_ITEMS: ${GELF_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      GELF_RING_MAX_BYTES: ${GELF_RING_MAX_BYTES:-256MiB}
+      GELF_RING_HIGH_WATER: ${GELF_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL ou dreno estourado despeja o
+      # backlog em /data/emergency/emg-*.jsonl, um JLH por linha (SPEC §12).
+      GELF_EMERGENCY_ENABLED: "true"
+
+      # --- sink: PostgreSQL (o unico; nao ha GELF_SINK_TYPE) ------------------
+      # 4 e' o padrao; acima de 16 o boot avisa: cada worker prende uma conexao
+      # de um orcamento que a frota inteira divide (SPEC §10.5).
+      GELF_SINK_WORKERS: ${GELF_SINK_WORKERS:-4}
+      GELF_SINK_POSTGRES_TABLE: ${GELF_SINK_POSTGRES_TABLE:-loghub.inbox}
+      # 0 deriva sink.workers + 1 = 5.
+      GELF_SINK_POSTGRES_POOL_SIZE: ${GELF_SINK_POSTGRES_POOL_SIZE:-0}
+      # Conexao, SEM TLS (sempre sslmode=disable, SPEC §1.2): o banco precisa
+      # estar numa rede confiavel -- aqui, a rede interna do compose.
+      # Estas quatro sao as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para
+      # usar a URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README); a URL leva a senha do servico postgres abaixo
+      # (postgres://gelf:gelf@postgres:5432/gelf), sem sslmode=require.
+      # Usuario e banco sem valor so' entram se definidos no .env ou no shell;
+      # sem eles vale o padrao do servidor, gelf/gelf, o mesmo do servico
+      # postgres.
+      GELF_SINK_POSTGRES_ADDR: postgres:5432
+      GELF_SINK_POSTGRES_PASSWORD: ${GELF_SINK_POSTGRES_PASSWORD:-gelf}
+      GELF_SINK_POSTGRES_USERNAME:
+      GELF_SINK_POSTGRES_DATABASE:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      - "${GELF_PORT:-12301}:12201/udp"
+      - "${GELF_PORT:-12301}:12201/tcp"
+      - "${GELF_HTTP_PORT:-12302}:12202/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-19304}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) e os dumps moram
+      # nele, e duas replicas no mesmo volume enfileirariam o mesmo `from`
+      # (SPEC §16.6). ./conf (as chaves recarregaveis) vem de common.yml.
+      - gelf-pg-data:/data
+
+  postgres:
+    image: ${GELF_POSTGRES_IMAGE:-postgres:18-alpine}
+    container_name: gelf-pg-postgres
+    hostname: gelf-pg-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${GELF_SINK_POSTGRES_USERNAME:-gelf}
+      POSTGRES_PASSWORD: ${GELF_SINK_POSTGRES_PASSWORD:-gelf}
+      POSTGRES_DB: ${GELF_SINK_POSTGRES_DATABASE:-gelf}
+    volumes:
+      # A imagem 18 guarda os dados em /var/lib/postgresql/18/docker e recusa
+      # um volume montado no antigo /var/lib/postgresql/data.
+      - gelf-pg-postgres-data:/var/lib/postgresql
+      # O servidor nunca faz DDL (SPEC §10.5): a fila loghub.inbox vem daqui,
+      # na criacao do volume (DDL literal da skill, SPEC §3.7.1).
+      - ./postgres/inbox.sql:/docker-entrypoint-initdb.d/10-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${GELF_POSTGRES_PORT:-15494}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${GELF_SINK_POSTGRES_USERNAME:-gelf} -d ${GELF_SINK_POSTGRES_DATABASE:-gelf}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  gelf-pg-data:
+  gelf-pg-postgres-data:

@@ -1,0 +1,30 @@
+{
+  "host": {
+    "hostname": "h",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "short-message": "x",
+  "fields": {
+    "id": "must-not",
+    "ok": "true"
+  },
+  "size": 93,
+  "parse": {
+    "warnings": [
+      "level-default",
+      "field-coerced",
+      "field-null",
+      "field-id-reserved"
+    ]
+  }
+}

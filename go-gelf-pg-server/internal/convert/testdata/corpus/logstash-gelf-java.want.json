@@ -1,0 +1,36 @@
+{
+  "host": {
+    "hostname": "app-server-01.acme.local",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "facility": "logstash-gelf",
+  "timestamp": "2025-10-31T12:00:00.456Z",
+  "short-message": "Order 4711 placed",
+  "full-message": "Order 4711 placed",
+  "fields": {
+    "Thread": "http-nio-8080-exec-3",
+    "Severity": "INFO",
+    "SourceClassName": "com.acme.orders.OrderService",
+    "SourceMethodName": "place",
+    "SourceLineNumber": 42,
+    "LoggerName": "com.acme.orders.OrderService",
+    "Time": "2026-10-31 12:00:00,456"
+  },
+  "size": 423,
+  "parse": {
+    "warnings": [
+      "level-coerced",
+      "timestamp-coerced"
+    ]
+  }
+}

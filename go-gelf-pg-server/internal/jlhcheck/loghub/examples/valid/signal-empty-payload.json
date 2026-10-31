@@ -1,0 +1,15 @@
+{
+  "uuid": "019dc7e4-e844-7190-92ca-14afee492965",
+  "from": "019bc119-0100-7266-97fb-d735facdf2d2",
+  "space": "com.acme.store",
+  "type": "catalog.cache_reload",
+  "level": 8,
+  "sid": 0,
+  "step": 0,
+  "event": {
+    "uts": 1777175160,
+    "sub": 900400300,
+    "iso": "2026-04-26T03:46:00.900Z"
+  },
+  "payload": {}
+}

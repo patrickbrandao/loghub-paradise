@@ -1,0 +1,26 @@
+{
+  "host": {
+    "hostname": "node-a",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "timestamp": "2026-10-31T19:09:47.750Z",
+  "short-message": "kube-proxy: Syncing iptables rules",
+  "fields": {
+    "stream": "stderr",
+    "kubernetes_pod_name": "kube-proxy-x7k2p",
+    "kubernetes_namespace_name": "kube-system",
+    "kubernetes_labels_app": "kube-proxy",
+    "list": "1, a"
+  },
+  "size": 289
+}

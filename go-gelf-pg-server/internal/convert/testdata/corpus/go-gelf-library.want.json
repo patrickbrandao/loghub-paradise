@@ -1,0 +1,24 @@
+{
+  "host": {
+    "hostname": "api-3",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "timestamp": "2025-10-31T12:00:00.500Z",
+  "short-message": "listening on :8080",
+  "full-message": "listening on :8080\n",
+  "fields": {
+    "file": "/go/src/api/main.go",
+    "line": 51
+  },
+  "size": 184
+}
