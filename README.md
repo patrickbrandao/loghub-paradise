@@ -58,6 +58,7 @@ Fica no repositório como referência de código, não como produto.
 |---|---|---|---|
 | [`go-syslog-injector`](go-syslog-injector/) | `go-syslog-server`, cortes e qualquer servidor syslog | UDP, TCP (octet-counting ou LF), TLS/mTLS, unix datagram; PROXY v1/v2 | gerador `seq=N`, modelo com marcadores, arquivo/stdin, **replay de pcap/pcapng** |
 | [`go-relplog-injector`](go-relplog-injector/) | `go-relplog-server`, cortes e qualquer `imrelp` | sessão RELP em TCP ou TLS/mTLS; PROXY v1/v2; janela, confirmação por mensagem, retransmissão | os mesmos, com replay de RELP, syslog TCP ou UDP capturados |
+| [`go-webhook-injector`](go-webhook-injector/) | `go-webhook-server`, `go-webhook-fast-server`, cortes e qualquer servidor HTTP | HTTP/1.1 keep-alive com **pipelining**; HTTP/2 (h2c ou ALPN) com muitos streams; TLS/mTLS; reenvio de `429`/`503` | gerador JSON com `seq`, modelo com marcadores (corpo, URL, cabeçalhos), arquivo/stdin/pasta, **replay de requisições HTTP de pcap/pcapng** |
 
 Os injetores servem para teste funcional e de carga. Aceitam `--count`,
 `--duration`, `--rate` e `--concurrency`. Ao fim imprimem um relatório (texto
@@ -65,8 +66,22 @@ ou JSON) com desfechos, vazão e latência. O código de saída diz o resultado:
 `0` ok, `1` alguma falha, `2` uso, `3` alvo inalcançável, `130` interrompido.
 Não têm dependência fora da biblioteca padrão.
 
-O injetor HTTP da família webhook (`go-webhook-injector`) está em
-desenvolvimento e ainda não faz parte do repositório.
+### Que injetor usar com cada servidor
+
+Cada servidor tem um injetor que fala o protocolo dele, provado contra o
+servidor real (números em `docs/TESTING.md` de cada injetor):
+
+| Servidor | Injetor | Carga extrema medida (Mac M2, mesma máquina) |
+|---|---|---|
+| `go-webhook-server` | `go-webhook-injector` | ~165 mil req/s com pipelining; 1,58 milhão gravadas no SQLite, conferidas |
+| `go-webhook-fast-server` | `go-webhook-injector` | ~169 mil req/s |
+| `go-webhook-pg-server` | `go-webhook-injector` | 200 mil, cada `X-LogHub-UUID` achado na `loghub.inbox` |
+| `go-webhook-nats-server` | `go-webhook-injector` | 300 mil por HTTP/2, 300 mil no stream JetStream |
+| `go-syslog-server` | `go-syslog-injector` | ~1 milhão de msg/s por TCP |
+| `go-syslog-pg-server`, `go-syslog-nats-server` | `go-syslog-injector` | (mesmo protocolo do `go-syslog-server`, sem TLS) |
+| `go-syslog-standard-server` | `go-syslog-injector` (syslog) ou `go-relplog-injector` (RELP) | — |
+| `go-relplog-server` | `go-relplog-injector` | ~510 mil msg/s confirmadas uma a uma |
+| `go-relplog-pg-server`, `go-relplog-nats-server` | `go-relplog-injector` | (mesmo protocolo do `go-relplog-server`, sem TLS) |
 
 ---
 
@@ -2141,6 +2156,8 @@ flowchart LR
 ## 5. Os injetores, um diagrama por caso
 
 Os injetores mandam mensagens para os servidores, para teste e para medir carga.
+Os casos 5.1 a 5.7 são do syslog e do RELP; 5.13 a 5.19, do HTTP; 5.20 em
+diante ligam cada servidor ao seu injetor.
 
 ### 5.1 go-syslog-injector por UDP
 
@@ -2248,6 +2265,153 @@ flowchart LR
     I["Injetor"] --> R["Relatório<br/>texto ou JSON"]
     I --> X["Código de saída<br/>0, 1, 2, 3 ou 130"]
 ```
+
+### 5.13 go-webhook-injector: HTTP/1.1 keep-alive
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"POST /hook"| S["Servidor webhook"]
+    S -.->|"200 OK"| I
+```
+
+Uma conexão por `--concurrency`, reaproveitada: a próxima requisição sai na mesma conexão depois da resposta.
+
+### 5.14 go-webhook-injector: pipelining
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"req 1, req 2, req 3...<br/>sem esperar"| S["Servidor webhook"]
+    S -.->|"resp 1, resp 2, resp 3...<br/>na mesma ordem"| I
+```
+
+Com `--pipeline N`, até N requisições seguem antes da primeira resposta. É o modo de carga extrema no HTTP/1.1.
+
+### 5.15 go-webhook-injector: HTTP/2
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"muitos streams<br/>numa conexão"| S["Servidor webhook"]
+```
+
+Com `--http2`: h2c em `http://`, ALPN em `https://`, até `--streams` requisições em voo por conexão.
+
+### 5.16 go-webhook-injector: 429 e reenvio
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"POST"| S["Servidor webhook"]
+    S -.->|"429 Retry-After: 1"| I
+    I -->|"espera e reenvia"| S
+```
+
+Com `--retries N`. Sem ele, o `429` é o desfecho e conta como falha.
+
+### 5.17 go-webhook-injector: servidor fecha a conexão
+
+```mermaid
+flowchart LR
+    S["Servidor webhook"] -.->|"200 + Connection: close"| I["go-webhook-injector"]
+    I -->|"o que estava atrás<br/>vai numa conexão nova"| S2["Servidor webhook"]
+```
+
+O servidor não leu as requisições atrás do fechamento, então reenviá-las não duplica nada.
+
+### 5.18 go-webhook-injector: conferir a entrega
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector<br/>--uuid-out uuids.txt"] -->|"POST"| S["Servidor webhook"]
+    S --> D[("Destino")]
+    S -.->|"X-LogHub-UUID"| I
+```
+
+Compare `uuids.txt` com os `uuid` gravados no destino.
+
+### 5.19 go-webhook-injector: replay de captura HTTP
+
+```mermaid
+flowchart LR
+    C[("prod.pcap")] -->|"método, caminho,<br/>cabeçalhos, corpo"| I["go-webhook-injector"]
+    I --> S["Servidor webhook"]
+```
+
+### 5.20 go-webhook-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-server"]
+```
+
+### 5.21 go-webhook-fast-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-fast-server"]
+```
+
+### 5.22 go-webhook-pg-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-pg-server"]
+```
+
+### 5.23 go-webhook-nats-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-nats-server"]
+```
+
+### 5.24 go-syslog-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"UDP, TCP, TLS, unix"| S["go-syslog-server"]
+```
+
+### 5.25 go-syslog-pg-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"UDP, TCP, unix"| S["go-syslog-pg-server"]
+```
+
+### 5.26 go-syslog-nats-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector"] -->|"UDP, TCP, unix"| S["go-syslog-nats-server"]
+```
+
+### 5.27 go-syslog-standard-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-syslog-injector ou go-relplog-injector"] -->|"syslog ou RELP"| S["go-syslog-standard-server"]
+```
+
+### 5.28 go-relplog-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-relplog-injector"] -->|"RELP, RELP/TLS"| S["go-relplog-server"]
+```
+
+### 5.29 go-relplog-pg-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-relplog-injector"] -->|"RELP"| S["go-relplog-pg-server"]
+```
+
+### 5.30 go-relplog-nats-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-relplog-injector"] -->|"RELP"| S["go-relplog-nats-server"]
+```
+
 
 ---
 
@@ -2457,6 +2621,7 @@ emissor rsyslog.
 ```bash
 cd go-syslog-injector  && go build -o go-syslog-injector  ./cmd/go-syslog-injector
 cd go-relplog-injector && go build -o go-relplog-injector ./cmd/go-relplog-injector
+cd go-webhook-injector && go build -o go-webhook-injector ./cmd/go-webhook-injector
 ```
 
 Não precisam de configuração nem de identidade: tudo vem das flags (`--help`).
@@ -2534,10 +2699,50 @@ nats stream view LOGHUB_WEBHOOK_REQUEST       # sink=nats (W; F e N: LOGHUB_WEBH
 O stream é `loghub.{space}.{type}` por padrão. Os nomes de chave, stream e
 tabela efetivos aparecem no `--dump-config`.
 
-Uma carga simples sem ferramenta própria, com o `ab`:
+Com o `go-webhook-injector`:
 
 ```bash
-ab -n 100000 -c 64 -p body.json -T application/json http://127.0.0.1:8080/carga
+# 1 requisição com o JSON do gerador ({"seq":1,"run":...})
+./go-webhook-injector --url http://127.0.0.1:8080/hook
+
+# carga extrema: 60 s, 16 conexões com 32 requisições em pipelining cada
+./go-webhook-injector --url http://127.0.0.1:8080/hook --duration 60s --concurrency 16 --pipeline 32
+
+# HTTP/2 em claro (h2c): 8 conexões x 128 streams, a 50 000 req/s
+./go-webhook-injector --url http://127.0.0.1:8080/hook --http2 --concurrency 8 --streams 128 \
+  --rate 50000 --duration 60s
+
+# ring cheio responde 429: reenviar seguindo o Retry-After (até 100 vezes)
+./go-webhook-injector --url http://127.0.0.1:8080/hook --count 1000000 --concurrency 8 \
+  --pipeline 64 --retries 100 --retry-max-wait 100ms
+
+# custo de abrir conexão: uma conexão nova a cada 10 requisições
+./go-webhook-injector --url http://127.0.0.1:8080/hook --duration 30s --concurrency 8 --requests-per-conn 10
+
+# modelo: marcadores na URL, nos cabeçalhos e no corpo JSON
+./go-webhook-injector --url 'http://127.0.0.1:8080/github/{seq}?run={run}' \
+  --header 'X-GitHub-Event: push' --header 'X-Request-Id: {uuid}' \
+  --template '{"ref":"refs/heads/main","n":{seq},"user":"{rand:8}","at":"{ts}"}' --count 1000
+
+# outros métodos e tipos
+./go-webhook-injector --url http://127.0.0.1:8080/stripe --method PUT --content-type text/plain --file eventos.txt
+
+# corpos de 64 KiB (JSON válido, com "pad")
+./go-webhook-injector --url http://127.0.0.1:8080/big --count 10000 --size 65536 --concurrency 4
+
+# HTTPS com CA própria e mTLS (atrás de um proxy reverso)
+./go-webhook-injector --url https://hooks.lab/hook --tls-ca ca.crt --tls-cert cli.crt --tls-key cli.key --count 100
+
+# conferir a entrega: cada X-LogHub-UUID devolvido está na fila?
+./go-webhook-injector --url http://127.0.0.1:8080/x --count 100000 --concurrency 8 --uuid-out uuids.txt
+awk '{print $3}' uuids.txt | sort > enviados.txt
+psql "$DSN" -Atc 'select uuid from loghub.inbox' | sort > gravados.txt
+comm -3 enviados.txt gravados.txt     # vazio = tudo gravado
+
+# replay do tráfego real de produção
+tcpdump -i eth0 -s 0 -B 65536 -U -w prod.pcap 'tcp port 8080'
+./go-webhook-injector --url http://127.0.0.1:8080 --pcap prod.pcap --pcap-timing original
+./go-webhook-injector --url http://127.0.0.1:8080 --pcap prod.pcap --concurrency 8 --pipeline 16 --loop --duration 5m
 ```
 
 ### 7.2 go-syslog-server e cortes syslog
@@ -2676,6 +2881,9 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514
 | Perda em UDP | injetor UDP com `--rate` crescente; compare o `seq` recebido com o `syslog_messages_dropped_total` |
 | Retransmissão RELP | `go-relplog-injector --count N` e reinicie o servidor no meio |
 | Tráfego real | `tcpdump` em produção + `--pcap ... --pcap-timing original` no laboratório |
+| HTTP no limite | `go-webhook-injector --concurrency 16 --pipeline 32 --duration 60s` (ou `--http2 --streams 128`) |
+| Backpressure do webhook | `ring=memory` com um sink lento: conte os `429` do relatório; com `--retries`, todas devem acabar em `2xx` |
+| Entrega sem perda | `--uuid-out` e compare com o destino (`loghub.inbox`, stream NATS) |
 
 ---
 

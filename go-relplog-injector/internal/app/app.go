@@ -99,7 +99,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.proxySrc, "proxy-src", "", "source `ip:port` announced in the PROXY header (default: the real one)")
 	fs.StringVar(&c.proxyDst, "proxy-dst", "", "destination `ip:port` announced in the PROXY header (default: the real one)")
 
-	fs.Int64Var(&c.count, "count", -1, "messages to send; 0 = no limit (default: 1, or the whole --file/--pcap)")
+	fs.Int64Var(&c.count, "count", -1, "messages to send; 0 = no limit (default: 1; no limit with --duration; the whole --file/--pcap)")
 	fs.DurationVar(&c.duration, "duration", 0, "stop after this `time` (0 = no limit)")
 	fs.Float64Var(&c.rate, "rate", 0, "target `msg/s` over all connections (0 = as fast as possible)")
 	fs.IntVar(&c.concurrency, "concurrency", 1, "parallel RELP sessions")
@@ -286,9 +286,11 @@ func build(c *config) (*runner, error) {
 	}
 	count := c.count
 	if count < 0 {
+		// Unset: one message, unless something else bounds the run -- the
+		// whole --file/--pcap, or --duration.
 		count = 1
-		if finite {
-			count = 0 // the whole source
+		if finite || c.duration > 0 {
+			count = 0
 		}
 	}
 	r.plan.Count = uint64(count)
