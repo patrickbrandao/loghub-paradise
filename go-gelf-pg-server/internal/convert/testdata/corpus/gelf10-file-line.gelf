@@ -1,0 +1,1 @@
+{"version":"1.0","host":"legacy-01","short_message":"disk 91% full","timestamp":1761912000,"level":4,"facility":"diskmon","file":"/opt/diskmon/check.rb","line":356}

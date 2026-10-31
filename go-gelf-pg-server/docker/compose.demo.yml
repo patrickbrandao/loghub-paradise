@@ -1,0 +1,40 @@
+# Emissor GELF de demonstracao: fluent-bit com duas saidas gelf (fluent-bit/).
+#
+#   - UDP com gzip e Packet_Size 1420, registro de ~12 KiB aleatorio: chega em
+#     varios chunks GELF e prova remontagem + descompressao (SPEC §5.2, §5.4);
+#   - TCP com moldura \0, registro pequeno (SPEC §5.3).
+#
+# Fica no perfil "demo": nunca sobe sem ser pedido.
+#
+#   docker compose -f docker-compose.yml -f compose.demo.yml --profile demo up -d --build
+#
+# O que chega aparece na fila (payload.chunks > 1 e payload.compression =
+# "gzip" nos de UDP; payload.transport = "tcp" nos outros):
+#
+#   docker exec gelf-pg-postgres psql -U gelf -d gelf -c \
+#     "select payload->>'transport', payload->'chunks', payload->>'short-message' from loghub.inbox order by uuid desc limit 6"
+#
+# O `docker run --log-driver=gelf` (o driver GELF do Docker) nao roda dentro
+# de um compose de forma util: ele manda o log do PROPRIO container para um
+# endereco visto pelo daemon do host. Para prova-lo, use as portas publicadas:
+#
+#   docker run --rm --log-driver=gelf --log-opt gelf-address=udp://127.0.0.1:12301 \
+#     --log-opt gelf-compression-type=gzip alpine:3.22 echo "ola do docker"
+
+services:
+  fluent-bit:
+    image: ${GELF_FLUENT_BIT_IMAGE:-fluent/fluent-bit:4.1.1}
+    container_name: gelf-pg-demo-fluent-bit
+    profiles: ["demo"]
+    restart: unless-stopped
+    depends_on:
+      gelf:
+        condition: service_healthy
+    environment:
+      GELF_DEMO_HOST: gelf
+      # Um registro por saida a cada N segundos.
+      GELF_DEMO_INTERVAL: ${GELF_DEMO_INTERVAL:-5}
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/gelf-demo.conf"]
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/gelf-demo.conf:ro
+      - ./fluent-bit/gelf-demo.lua:/fluent-bit/etc/gelf-demo.lua:ro

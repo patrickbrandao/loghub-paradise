@@ -1,0 +1,20 @@
+{
+  "host": {
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "malformed",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "short-message": "",
+  "size": 48,
+  "raw": "{\"version\":\"1.1\",\"host\":\"h\",\"short_message\":\"cut",
+  "parse": {
+    "error": "documento não é JSON válido"
+  }
+}

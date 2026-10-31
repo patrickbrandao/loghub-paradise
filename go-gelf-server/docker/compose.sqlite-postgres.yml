@@ -1,0 +1,98 @@
+# ring em disco (ring.db)  ->  PostgreSQL compartilhado (fila loghub.inbox)
+#
+# Garantia (TCP/TLS): COMMIT com fsync no /data/ring.db antes de voltar a ler;
+#   zero perda sob crash do processo.
+#
+#   docker compose -f compose.sqlite-postgres.yml up -d --build
+#
+# Publicado no host: GELF 22091/udp e 22091/tcp (GELF_PORT), HTTP 22092 (GELF_HTTP_PORT),
+# TCP+TLS 22093 e HTTPS 22094 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29109 (GELF_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: gls-sqlite-postgres
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gls-base
+    container_name: gls-sqlite-postgres
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: gls-sqlite-postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      GELF_RING_MODE: sqlite
+      GELF_RING_SQLITE_SYNCHRONOUS: ${GELF_RING_SQLITE_SYNCHRONOUS:-FULL}
+      GELF_RING_CAPACITY_ITEMS: ${GELF_RING_CAPACITY_ITEMS:-65536}
+      GELF_RING_MAX_BYTES: ${GELF_RING_MAX_BYTES:-512MiB}
+      GELF_EMERGENCY_ENABLED: "false"
+
+      # --- sink: postgres ----------------------------------------------------
+      GELF_SINK_TYPE: postgres
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao de um orcamento que a frota inteira divide
+      # (SPEC §10.5). Acima de 16 tambem e' WARN.
+      GELF_SINK_WORKERS: "4"
+      GELF_SINK_POSTGRES_TABLE: ${GELF_SINK_POSTGRES_TABLE:-loghub.inbox}
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, fora do pool).
+      GELF_SINK_POSTGRES_POOL_SIZE: ${GELF_SINK_POSTGRES_POOL_SIZE:-0}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README); a URL leva a senha do servico postgres abaixo
+      # (postgres://gelf:gelf@postgres:5432/gelf). Usuario e banco sem
+      # valor so' entram se definidos no .env ou no shell; sem eles vale o
+      # padrao do servidor, gelf/gelf, o mesmo do servico postgres.
+      GELF_SINK_POSTGRES_ADDR: postgres:5432
+      GELF_SINK_POSTGRES_PASSWORD: ${GELF_SINK_POSTGRES_PASSWORD:-gelf}
+      GELF_SINK_POSTGRES_USERNAME:
+      GELF_SINK_POSTGRES_DATABASE:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # As portas do container sao as do GELF (SPEC §4.1); o host escolhe.
+      - "${GELF_PORT:-22091}:12201/udp"
+      - "${GELF_PORT:-22091}:12201/tcp"
+      - "${GELF_HTTP_PORT:-22092}:12202/tcp"
+      - "${GELF_TLS_PORT:-22093}:12203/tcp"
+      - "${GELF_HTTPS_PORT:-22094}:12204/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-29109}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - gls-data:/data
+
+  postgres:
+    image: ${GELF_POSTGRES_IMAGE:-postgres:18-alpine}
+    container_name: gls-sqlite-postgres-postgres
+    hostname: gls-sqlite-postgres-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${GELF_SINK_POSTGRES_USERNAME:-gelf}
+      POSTGRES_PASSWORD: ${GELF_SINK_POSTGRES_PASSWORD:-gelf}
+      POSTGRES_DB: ${GELF_SINK_POSTGRES_DATABASE:-gelf}
+    volumes:
+      # A imagem 18 guarda os dados em /var/lib/postgresql/18/docker e recusa
+      # um volume montado no antigo /var/lib/postgresql/data.
+      - postgres-data:/var/lib/postgresql
+      # O servidor nunca faz DDL (SPEC §10.5): a fila loghub.inbox vem daqui,
+      # na criacao do volume (DDL literal da skill, SPEC §3.7.1).
+      - ./postgres/inbox.sql:/docker-entrypoint-initdb.d/10-inbox.sql:ro
+    ports:
+      - "127.0.0.1:${GELF_POSTGRES_PORT:-25409}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${GELF_SINK_POSTGRES_USERNAME:-gelf} -d ${GELF_SINK_POSTGRES_DATABASE:-gelf}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  gls-data:
+  postgres-data:

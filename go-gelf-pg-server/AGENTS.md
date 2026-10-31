@@ -1,0 +1,357 @@
+# AGENTS.md — go-gelf-pg-server
+
+Instruções para agentes de IA que trabalham **dentro desta pasta**. Leia antes
+de editar qualquer arquivo.
+
+---
+
+## 1. Onde você está
+
+```
+loghub-paradise/                  <- monorepo, SEM go.mod
+  go-gelf-pg-server/              <- VOCÊ ESTÁ AQUI (módulo Go independente, letra GP)
+    go.mod                        module github.com/patrickbrandao/loghub-paradise/go-gelf-pg-server
+    cmd/go-gelf-pg-server/
+    internal/
+    docs/DECISOES.md              as decisões da família GELF que valem aqui e as do corte
+    docs/SPEC.md                  fonte da verdade do comportamento
+    docs/TESTING.md               como testar e o que ainda não é provado
+    docker/                       Dockerfile, docker-compose.yml (memory -> PostgreSQL),
+                                  compose.demo.yml (fluent-bit), conf/gelf.ini
+  go-gelf-server/                 <- o PAI do GELF (G): recepção e conversão vêm de lá. Referência, nunca dependência
+  go-syslog-pg-server/            <- o MOLDE do corte (SP): ring, sink, dump e registry vêm de lá
+  go-gelf-nats-server/            <- o irmão (GN): ring memory -> NATS
+  go-gelf-injector/               <- o cliente de carga (GI)
+```
+
+Este é um servidor GELF do ecossistema **LogHub**, criado em 2026-10-31 como
+**corte** do `go-gelf-server`, pelo molde do `go-syslog-pg-server`: recebe UDP
+(com chunks e gzip/zlib), TCP (moldura `\0`) e HTTP (`POST /gelf`), converte
+cada documento num envelope **JLH** com `type=gelf` e o **enfileira** na
+`loghub.inbox` do PostgreSQL. Ring só em memória, emergência em JSON Lines,
+**sem TLS em lugar nenhum**, três dependências de produção. É um Bridge-IN:
+`step = 0`.
+
+## 2. As fontes normativas mandam, e a SPEC diz onde não
+
+- A GELF Payload Specification 1.1 (Graylog); skills do servidor MCP
+  `loghub-mcp`: `loghub-json-schema` (envelope), `loghub-postgres-table-inbox`
+  (a fila), `go-loghub-uuidv7` e `go-loghub-ident`. Não existe skill
+  `type=gelf`: o schema do payload é o da família,
+  `internal/jlhcheck/loghub/jlh-gelf-payload.schema.json` (cópia de G).
+- `docs/SPEC.md` §1.3 lista os **desvios deliberados** (os de G: D1 `level`
+  ausente = 6, D2 `host`/`short_message` ausentes aceitos, D3 schema só em
+  teste, D4 nível de UUID fixo, D5 espaço em branco em `host`, D6 teto de
+  128 KiB). Fora deles, divergir da fonte é **bug**.
+- `docs/SPEC.md` está congelada: discrepância entre código e spec é bug no
+  código. Para mudar comportamento: **spec primeiro**, com o porquê; depois o
+  código; depois o teste. Cite a spec por seção (`§6.4.3`).
+- **A numeração da SPEC é a do `go-gelf-server`.** Seção removida mantém o
+  título com a nota "Removido no go-gelf-pg-server"; **nunca renumere**, o
+  código cita os números. Seção nova entra no fim da seção-mãe, com número
+  novo.
+- `docs/TESTING.md` registra as lacunas com honestidade. Fechou uma, atualize;
+  achou outra, acrescente.
+
+## 3. Os pais são a referência, não a dependência
+
+`../go-gelf-server/` (G) tem o GELF: recepção, chunks, descompressão, moldura
+`\0`, HTTP, conversão, schema e oráculo. `../go-syslog-pg-server/` (SP) tem o
+corte: o que SP tirou de S, GP tirou de G, com o mesmo código. Para entender
+por que algo é assim, leia lá (o histórico de bugs está no TESTING de cada um).
+**Nada é importado de lá**, nem de nenhum outro módulo do monorepo. **Não edite
+os pais** a partir daqui.
+
+**Cópia literal.** `internal/convert`, `internal/item`, `internal/jlhcheck` e
+`internal/receiver/{chunks,decompress,framing}.go` (com testes, corpora e fuzz)
+são cópias de G a menos do module path. **Não os edite aqui**: uma correção vai
+para G e é copiada para G, GP e GN juntos (DESIGN §1). O `http.go` é o de G
+menos o TLS (DECISOES §2). Um `diff -r` contra G nesses caminhos deve mostrar só
+o module path.
+
+O que saiu (SPEC §1.2) não volta sem decisão do usuário registrada em
+`docs/DECISOES.md`: TLS (TCP+TLS, HTTPS, cliente do PostgreSQL), os outros
+sinks e rings, filtro, rate-limit, beacon. O objetivo do módulo é ser rápido e
+ter poucas dependências.
+
+## 4. Fronteira de responsabilidade
+
+| Assunto | Quem responde |
+|---|---|
+| Código, testes, docs e Docker **desta** pasta | você |
+| Outras pastas do monorepo (o pai inclusive) | o agente de cada uma |
+| **Git: init, commit, branch, tag, remoto** | o nível do monorepo, e só com pedido explícito do usuário |
+
+Nunca rode `git` de dentro desta pasta. Tags seguem `go-gelf-pg-server/vX.Y.Z`.
+
+## 5. O modelo mental
+
+### Um ring, um sink
+
+- **RING**: `memory`, e só. Não há chave `ring.mode`.
+- **SINK**: `postgres`, a fila `loghub.inbox`, e só. Não há chave `sink.type`.
+
+As interfaces `ring.Ring` e `sink.Sink` ficam, com uma implementação cada: são
+a costura dos testes. O ring não consulta o sink, e vice-versa. O log de boot e
+o `gelf_config_info` dizem `ring_mode="memory"` e `sink_type="postgres"`, por
+compatibilidade com os painéis do pai.
+
+### Cru no ring, conversão no dreno (SPEC §2.2)
+
+A recepção só faz remontagem de chunks, moldura `\0`, corpo HTTP,
+descompressão com teto, **uma** amostra de relógio, o estado do sink, o ring
+cheio e o `uuid`. **Não lê o documento**: nem o `level` (não há filtro). O item
+no ring é **cabeçalho + documento descomprimido**, sem JLH, e o cabeçalho só
+existe em memória (o codec de G está no pacote copiado, sem uso). A conversão
+completa e a serialização rodam no worker de dreno.
+
+Consequência: **o JLH é função pura de cabeçalho + cru + config de conversão**
+(SPEC §3.5). Toda chave de `[convert]` exige restart, e um retry reenvia os
+mesmos bytes.
+
+### O dump é JLH pronto, e volta sem conversão (SPEC §12)
+
+Em FATAL ou dreno estourado, o ring pendente é **convertido** e escrito como
+JSON Lines, um JLH por linha, idêntico ao que o worker escreveria. No boot
+seguinte cada linha vai **como está** para a fila; as colunas saem do cabeçalho
+da própria linha. Um dump sobrevive a uma troca de `[convert]`.
+
+### O que o transporte confirma
+
+| Transporte | Confirmação | Ring cheio |
+|---|---|---|
+| TCP | continuar lendo | parar de ler; a janela TCP segura o emissor |
+| HTTP | `202 Accepted` | `503` com `Retry-After: 1` |
+| UDP | não existe | **descarte contado** |
+
+Não invente confirmação onde o protocolo não tem.
+
+## 6. Mapa do código
+
+```
+cmd/go-gelf-pg-server/main.go  flags que encerram, lhident.Initialize(), internal/app
+internal/
+  app/        montagem, boot, shutdown, SIGHUP, reingestão, admin
+  config/     registry único -> INI + flags + env + --help + dump; LOGHUB_EB_URL
+              (só postgres://, regra do sslmode); removed.go (chaves de G -> exit 1 / WARN)
+  ident/      Identity congelada e gramática de space              [lógica pura]
+  jlh/        escritor JSON por append, Event, envelope, UUID, Payload [lógica pura]
+  convert/    GELF -> payload type=gelf -> JLH        [CÓPIA DE G, lógica pura, fuzz]
+  item/       Item, Head, codec (sem uso), pools      [CÓPIA DE G, fuzz]
+  jlhcheck/   oráculo de teste: schemas + regras      [CÓPIA DE G, só em teste]
+  receiver/   chunks, decompress, framing             [CÓPIA DE G, fuzz]
+              http (G sem TLS), udp (pktinfo), stream/tcp, proxy, limites, ingest
+  ring/       interface + memory
+  sink/       interface + postgres, workers, chunk, health, instrumented [fuzz]
+  emergency/  dump JSON Lines, ParseLine, reingestão                [fuzz]
+  obs/        métricas Prometheus próprias + slog
+```
+
+## 7. Comandos
+
+Todos a partir desta pasta.
+
+```bash
+gofmt -l . && go vet ./... && go test -race ./...
+```
+
+O `-race` **não é opcional**. Sem `GELF_TEST_PG_DSN` a integração pula: o
+PostgreSQL é o único destino, então a prova ponta a ponta precisa dele.
+
+```bash
+# a infraestrutura compartilhada do monorepo (docs/TESTING.md §6)
+source ../tasks/infra/env.sh   # GELF_TEST_PG_DSN, GELF_TEST_EMITTERS=1
+go test -race -count=1 -timeout 1200s ./...
+```
+
+Vetores dourados e contratos dos schemas:
+
+```bash
+go test -race -run 'Golden|Schema|Corpus' -v ./internal/convert/ ./internal/jlhcheck/
+```
+
+Fuzz, obrigatório antes de release (10 min cada; 60 s no dia a dia):
+
+```bash
+go test ./internal/convert/   -run=XXX -fuzz=^FuzzConvert$      -fuzztime=60s
+go test ./internal/item/      -run=XXX -fuzz=^FuzzHead$         -fuzztime=60s
+go test ./internal/receiver/  -run=XXX -fuzz=^FuzzFrame$        -fuzztime=60s
+go test ./internal/receiver/  -run=XXX -fuzz=^FuzzReassemble$   -fuzztime=60s
+go test ./internal/receiver/  -run=XXX -fuzz=^FuzzDecompress$   -fuzztime=60s
+go test ./internal/receiver/  -run=XXX -fuzz=^FuzzProxy$        -fuzztime=60s
+go test ./internal/emergency/ -run=XXX -fuzz=^FuzzRead$         -fuzztime=60s
+go test ./internal/sink/      -run=XXX -fuzz=^FuzzJSONBSafe$    -fuzztime=60s
+go test ./internal/sink/      -run=XXX -fuzz=^FuzzInboxPayload$ -fuzztime=60s
+```
+
+O `^…$` importa: o Go recusa um `-fuzz` que case dois alvos do pacote.
+
+Executar localmente (um `DATADIR` relativo é resolvido a partir do diretório de
+trabalho antes do `Initialize()`, SPEC §13.1 passo 2; o hostname do macOS não
+pode ter `_`, ou o `go-loghub-ident` sai com um código entre 100 e 114). A fila
+precisa existir (`docker/postgres/inbox.sql`): o servidor nunca faz DDL.
+
+```bash
+mkdir -p /tmp/gelfpg-data
+DATADIR=/tmp/gelfpg-data AGENT_NAME=go-gelf-pg-server HOSTNAME=dev-mac \
+  LOGHUB_EB_URL='postgres://whs:whs@127.0.0.1:25432/whs_test' \
+  go run ./cmd/go-gelf-pg-server --listen.udp=127.0.0.1:12201 \
+  --listen.tcp=127.0.0.1:12201 --listen.http=127.0.0.1:12202 --admin.bind=127.0.0.1:19304
+printf '{"version":"1.1","host":"dev","short_message":"teste"}' | nc -u -w1 127.0.0.1 12201
+```
+
+## 8. Convenções
+
+- Código, identificadores e comentários em **inglês**; docs e conversa em
+  **português**. As únicas strings em português no código são os textos
+  normativos de `parse.error` (SPEC §6.1), que são dado.
+- Comentários explicam o **porquê** e o que daria errado com a alternativa.
+- **Dependências: três em produção** (SPEC §17.3): `pgx/v5`, `go-loghub-ident`,
+  `go-loghub-uuidv7`. `jsonschema/v6` só em teste. Nada de `golang.org/x/net`
+  (PKTINFO é `syscall`).
+  Dependência nova exige justificativa na spec — e vai contra o objetivo do
+  módulo.
+- **Config:** o registry é a fonte única. Um parâmetro novo entra só em
+  `internal/config/registry.go`. Prefixo `GELF_` e nomes iguais aos de G para
+  as chaves comuns; uma chave de G que não existe aqui vai para `removed.go`
+  (exit 1 na linha de comando e no INI, aviso no env). `removed.go` é gerado da
+  diferença dos dois registries: se G ganhar uma chave, ela entra lá
+  (`TestRemovedParamsAreTheRemovedEnv` confere as duas listas).
+- **Métricas:** prefixo `gelf_`, cardinalidade fixa; nenhum label vindo do
+  emissor; série que nunca sobe não é exposta.
+- **Identidade:** `lhident.Initialize()` só no `main`, uma vez. Pacotes recebem
+  `ident.Identity`; testes que precisam da biblioteca usam `TestMain`.
+- **Escrita em disco:** tudo sob `server.data_dir` (`DATADIR`), inclusive a
+  identidade. Sem exceção (o socket unix do syslog não existe aqui).
+
+## 9. Armadilhas que já custaram bugs reais (herdadas de G, de SP e da standard)
+
+Novas do GELF (G, DESIGN §5):
+
+- **Bomba de descompressão:** o teto vale no leitor do `gzip`/`zlib`
+  (`io.LimitReader` + 1 byte), nunca depois.
+- **Nunca alocar pelo que o par declara:** `count` de chunks, `Content-Length`.
+- **Remontagem de chunks é estado compartilhado** com teto global; o prazo é
+  varrido por um relógio próprio, não por chunk recebido.
+- **Números JSON** nunca passam por `float64` (`1e400`, `0.1`, inteiros > 2^53),
+  e na `loghub.inbox` um número fora do `numeric` vai como string na cópia
+  (SPEC §3.7.1): sem isso, `1e1000000` num campo derrubava o pedaço inteiro.
+- **HTTP 4xx é final para o cliente:** só o que nunca vai passar ganha `4xx`.
+- **O documento com NUL cru não viaja no TCP** (o `\0` é a moldura): nos testes,
+  mande-o por UDP ou HTTP.
+
+Herdadas do corte (SP):
+
+- **A linha do dump é reingerida SEM conversão.** `emergency.ParseLine` é a
+  **única** porta entre um arquivo em disco e as colunas da fila. Uma linha que
+  a fila recusasse seria `ClassLogic` do **pedaço inteiro** — todo envelope
+  daquele `INSERT`, os íntegros junto. Por isso a porta exige o cabeçalho byte a
+  byte igual ao de `jlh.AppendHeader`, escapes `\u` só de controle, todo número
+  inteiro simples de até 20 dígitos (`1e1000000` é `22003` no `jsonb`), payload
+  com `short-message` string (grafia exata, a última se repetida), números pela
+  gramática do JSON, o payload cortado
+  por posição igual ao do parser, e o resto de SPEC §12.2. Se você
+  "simplificar" uma dessas regras, pergunte-se qual linha a fila passaria a
+  recusar.
+- **Sem TLS, de propósito.** Não "conserte" o `sslmode=disable`, o `TLSConfig`
+  nulo nem a recusa de `sslmode=require` na `LOGHUB_EB_URL`: é decisão do
+  usuário (DECISOES, decisão 4). E não remova os *fallbacks* nulos: com eles uma
+  segunda tentativa poderia negociar outra coisa, ou bater em `localhost`.
+- **O ambiente libpq não chega ao pool.** A config do pool é lida com **toda**
+  variável `PG*` escondida (`parseWithoutLibpqEnv`, sob mutex), não
+  sobrescrita depois: a própria leitura falhava (`PGSSLMODE=bogus`,
+  `PGSERVICE` inexistente, `PGPORT=abc`: exit 1) ou deixava passar o que não
+  tem campo para sobrescrever (`PGCHANNELBINDING=require`,
+  `PGREQUIREAUTH=md5`: toda conexão recusada sem SQLSTATE, retentada até o
+  `boot_timeout`). SPEC §10.5.
+- **Posse de buffer.** O item é dono do cru; volta ao pool **uma vez**, após a
+  confirmação. Num retry ainda é o dono. Erro devolvido não significa "ninguém
+  mais lê": na dúvida, `Discard`/`Taint` e deixe para o GC.
+- **Lote retido não está no ring.** O shutdown coleta `Workers.Pending()`; o
+  `hold` faz `append`, nunca atribuição. E os dois tetos do ring contam o lote
+  retido.
+- **Contar o que se segura:** o ring conta `cap(cru)` + `ItemOverhead` (288 B),
+  não `len(cru)`. `TestItemOverheadCoversTheStruct` falha se a struct crescer.
+- **Fronteira de histograma como string** pré-formatada na inicialização.
+- **Slices do pool do `unnest`** voltam zerados.
+- **Classes `42` e `3D`, o `23502` e o `0A000` são fatais**, nunca `logic` nem
+  `network` (uma tabela ou um banco que não existe não aparece esperando; o
+  `NULL` de um `23502` nunca vem deste servidor, vem da tabela). Erro
+  desconhecido é `network`.
+- **A validação do boot tem prazo próprio** (`sink.op_timeout`), não o da sonda
+  de saúde (1 s, que a ~55 ms de RTT nunca bastava); toda checagem de saúde
+  carrega o contexto de quem a chamou (`withLifetime`), para que um `SIGTERM`
+  ainda a interrompa.
+- **Nunca DDL.** A fila vem de `docker/postgres/inbox.sql`, DDL literal da skill
+  (um teste confere o hash: não edite o bloco), chave só `uuid`, PostgreSQL 18.
+- **`jsonb` recusa `\u0000`** (`22P05`, classe 22, o pedaço inteiro
+  descartado) **e o número fora do `numeric`** (`22003`): o payload vai como
+  cópia reconstruída (`raw` em base64, U+FFFD nos outros textos e nas chaves,
+  número como string); o JLH do pedaço e o do dump nunca são tocados.
+- **Nunca alocar pelo que o par declara** (PROXY v2, linha do dump):
+  alocar pelo que chegou, com teto. `emergency.MaxLine` é teto, não `make`.
+- **O `\0` da moldura não é do documento**, e um quadro só de espaço é
+  separador, sem contagem.
+- **UDP sem `SO_RCVBUF` grande perde em silêncio**; o efetivo é lido de volta.
+- **A hora do documento não é tempo.** O tempo é a amostra da recepção (`event`).
+- **Duas leituras de relógio** fazem o fato parecer posterior ao envelope: uma
+  amostra só, para `uuid` e `event`.
+- **`time.RFC3339Nano` remove zeros**; `strings.ToValidUTF8` junta octetos
+  inválidos; `time.Date` normaliza 30/fev; `json.Marshal` (e `json.Unmarshal`)
+  troca UTF-8 inválido em silêncio. A SPEC §6 diz o que usar.
+- **O dump nasce com nome temporário.** Escreve em `.emg-…jsonl.tmp`, `fsync`,
+  `link` para o nome final (nunca um `rename` às cegas, que substituiria; sem
+  *hard link* — vfat, exFAT, FUSE — o `rename` vem só depois de conferir o nome
+  livre), `fsync` do diretório. Escrito direto no nome final, um dump cortado numa fronteira de
+  linha parecia limpo, era entregue em parte e **removido**. Falha em qualquer
+  passo remove o temporário e é exit 3; um `.tmp` que sobra nunca é listado.
+- **A reingestão é em fluxo.** `Store.Open` + `Reader.Next(batch, max_bytes)`,
+  nunca o arquivo inteiro: o dump chega a ~12× o ring, e carregá-lo matava o boot
+  por OOM em laço. Um único `boot_timeout` **sem progresso** para a reingestão
+  inteira (cada pedaço entregue o empurra).
+- **Shutdown por FATAL tolera o primeiro sinal.** Ele começa sem sinal; o
+  primeiro `SIGTERM` não pode cortar o dump, só o segundo aborta. E o abort conta
+  em `abort` o que já fora entregue ao dump, não só o que ficou no ring.
+- **A perda do abort tem um dono só** (SPEC §13.4). Da fase do dump em diante
+  o abort conta o contador `dumping`, nunca o ring; as passagens
+  (`enterDumpPhase`, `oweDump`) e o abort vão sob `lossMu`, o dump o toma com
+  `Swap` também sob ele (`settleDump`: fora dele, um dump que via `aborted`
+  antes de o abort tomar o contador contava `emergency_failed` no lugar de
+  `abort`), e um dump já contado como perdido desiste (`SetAbandon`). Conte cada
+  mensagem num lado só, e teste o abort caindo em **cada** janela (os ganchos
+  `beforeCollect`, `beforeDump`, `inAbort`): a corrida esperada não aparece. `SIGQUIT`
+  nunca é tolerado, e um `SIGQUIT` tardio chega por `quitNow`.
+- **SIGHUP** compara chave recarregável com o que está em execução e chave de
+  restart com o boot. Só `[log]` recarrega.
+- **Chave de G no env some em silêncio** se não estiver em `removed.go`: o
+  registry lê só os próprios nomes.
+- **Os parsers de INI e de flags nomeiam a linha ou a flag, nunca o valor**:
+  `password: x` e `sink.postgres.password=x` iam inteiros ao stderr. Um
+  argumento com forma de flag nunca é valor de outra flag e só é nomeado se for
+  uma flag deste servidor, e nada depois de um valor é citado (SPEC §13.2).
+- **Valores de URL repetidos:** `url.Values.Get` lê o primeiro, a libpq vale o
+  último. A `LOGHUB_EB_URL` recusa parâmetro repetido; sem isso
+  `sslmode=disable&sslmode=require` passava pela recusa do TLS.
+- **Durações zero** são recusadas onde zero não significa "sem limite".
+- **Testes portados que passam vazios:** um helper que devolve zero quando a
+  chave falta faz o teste passar sem provar nada. O mesmo vale para casos de
+  recusa: sem um caso de controle válido, uma regra nova pode recusar todos pelo
+  motivo errado.
+- **O `\s` do motor de regex não é o do schema.** O `^\S+$` do schema é
+  ECMAScript; o RE2 do `jsonschema/v6` deixa passar U+00A0, U+2028, U+FEFF e
+  `\v`, e o Python da skill recusa ainda U+001C–U+001F e U+0085. O oráculo
+  (`jlhcheck`) confere o conjunto completo na etapa semântica.
+- **Escrita no boot é por pedaço.** Um erro `logic` no meio da reingestão não
+  pode deixar os pedaços seguintes sem escrita e confirmados. Use
+  `Instrumented.Deliver`.
+- **Valores aceitos pela config precisam significar algo para quem os usa.** Um
+  enum aceito pelo registry e desconhecido no pacote consumidor desliga o recurso
+  em silêncio (`windows-1252` no charset de SP).
+- **`obs.Transport` não é um *cast* do `item.Transport`**: o enum de `item` é o
+  de G (com `tls` e `https`), o de `obs` só tem `udp`, `tcp`, `http`;
+  `obsTransport` mapeia por nome (`TestTransportEnumsAgree`).
+
+## 10. Estado do projeto
+
+Ver `docs/TESTING.md` §8 (lacunas), `docs/SPEC.md` §22.1 (pendências
+conhecidas) e a ordem de entrega em `docs/DECISOES.md` §5.

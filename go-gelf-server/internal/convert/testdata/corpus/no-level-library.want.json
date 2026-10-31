@@ -1,0 +1,23 @@
+{
+  "host": {
+    "hostname": "svc-b",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "short-message": "cache warm",
+  "size": 62,
+  "parse": {
+    "warnings": [
+      "level-default"
+    ]
+  }
+}

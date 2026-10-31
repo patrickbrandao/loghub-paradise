@@ -1,0 +1,15 @@
+{
+  "uuid": "019dc7e2-b4af-707b-888f-e96dffd6e718",
+  "from": "019bc119-0100-7266-97fb-d735facdf2d2",
+  "space": "com.acme.store",
+  "type": "order.created",
+  "level": 6,
+  "sid": 14921,
+  "step": 0,
+  "event": {
+    "uts": 1777175016,
+    "sub": 623123136,
+    "iso": "2026-04-26T03:43:36.623Z"
+  },
+  "payload": null
+}

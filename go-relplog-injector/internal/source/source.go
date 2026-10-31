@@ -166,6 +166,11 @@ type File struct {
 	empty uint64
 	long  uint64
 	pass  uint64
+	// passDocs counts the documents of the current pass. A pass that ends
+	// with none ends the source even with --loop: a file of blank lines (or
+	// one emptied between passes) would otherwise be reopened forever at
+	// 100 % CPU.
+	passDocs uint64
 }
 
 // MaxLine bounds a line of --file; a longer one is cut (and counted).
@@ -196,35 +201,34 @@ func (f *File) open() error {
 	}
 	f.r = bufio.NewReaderSize(f.f, 64<<10)
 	f.pass++
+	f.passDocs = 0
 	return nil
 }
 
 // Next implements Source.
 func (f *File) Next(_ uint64, now time.Time) (Message, error) {
-	emptyPass := true
 	for {
 		line, err := f.readLine()
 		if err == io.EOF {
-			if !f.loop || emptyPass && f.lines == 0 {
+			if !f.loop || f.passDocs == 0 {
 				return Message{}, io.EOF
 			}
 			_ = f.f.Close()
 			if err := f.open(); err != nil {
 				return Message{}, err
 			}
-			emptyPass = true
 			continue
 		}
 		if err != nil {
 			return Message{}, err
 		}
-		emptyPass = false
 		line = bytes.TrimRight(line, "\r")
 		if len(line) == 0 {
 			f.empty++
 			continue
 		}
 		f.lines++
+		f.passDocs++
 		m := f.h.Wrap(make([]byte, 0, len(line)+96), line, now)
 		return Message{Data: m, At: -1}, nil
 	}

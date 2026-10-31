@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -38,11 +39,20 @@ type fake struct {
 	status func(n int64, r *http.Request) (code int, retryAfter string)
 	n      atomic.Int64
 	srv    *httptest.Server
+	// maxPerConn, when > 0, answers the N-th request of each connection
+	// with "Connection: close" (a keep-alive server with a per-connection
+	// cap; 1 is a server without keep-alive). Set before the first request.
+	maxPerConn int64
 }
+
+type connCount struct{}
 
 func (f *fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
 	n := f.n.Add(1)
+	if c, ok := r.Context().Value(connCount{}).(*atomic.Int64); ok && f.maxPerConn > 0 && c.Add(1) >= f.maxPerConn {
+		w.Header().Set("Connection", "close")
+	}
 	f.mu.Lock()
 	f.reqs = append(f.reqs, seen{r.Method, r.RequestURI, r.Host, r.Proto, r.Header.Clone(), string(b), r.RemoteAddr})
 	f.mu.Unlock()
@@ -69,6 +79,9 @@ func newFake(t *testing.T, mode string) *fake {
 	t.Helper()
 	f := &fake{}
 	s := httptest.NewUnstartedServer(f)
+	s.Config.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+		return context.WithValue(ctx, connCount{}, new(atomic.Int64))
+	}
 	s.Config.ConnState = func(_ net.Conn, st http.ConnState) {
 		if st == http.StateNew {
 			f.conns.Add(1)
@@ -329,6 +342,39 @@ func TestServerClosesConnection(t *testing.T) {
 		if code != ExitOK || sum.OK != 300 || served.Load() != 300 || sum.Conns.Opened != 100 {
 			t.Fatalf("pipeline %s: exit %d %+v served %d", pipe, code, sum, served.Load())
 		}
+	}
+}
+
+// A server that answers "Connection: close" (no keep-alive, or a
+// per-connection cap): every request arrives exactly once, no connection
+// counts as broken, and with --pipeline 1 nothing is written behind the
+// close. Before the fix (review-gi #3, found in the copy in GI) the reader
+// freed the pipeline slot before marking the connection closing, so the
+// worker wrote its next request to a socket the server no longer read, and
+// the broken pipe or reset of a pipelined write counted as a broken
+// connection.
+func TestHTTPServerClosingConnections(t *testing.T) {
+	for _, c := range []struct {
+		perConn  int64
+		pipeline int
+	}{{1, 1}, {1, 32}, {7, 1}, {7, 8}, {50, 32}} {
+		f := newFake(t, "h1")
+		f.maxPerConn = c.perConn
+		run := "close" + strconv.FormatInt(c.perConn, 10) + "_" + strconv.Itoa(c.pipeline)
+		code, sum := runJSON(t, "--url", f.srv.URL, "--count", "1000", "--concurrency", "4",
+			"--pipeline", strconv.Itoa(c.pipeline), "--run", run)
+		f.srv.Close()
+		if code != ExitOK || sum.OK != 1000 || sum.Outcomes["200"] != 1000 {
+			t.Fatalf("%s: exit %d %+v", run, code, sum)
+		}
+		checkSeqs(t, f.all(), 1000, run)
+		if sum.Conns.Broken != 0 {
+			t.Fatalf("%s: %d broken connections, events %v", run, sum.Conns.Broken, sum.Events)
+		}
+		if c.pipeline == 1 && sum.Events["resent on a new connection"] != 0 {
+			t.Fatalf("%s: requests written behind Connection: close: events %v", run, sum.Events)
+		}
+		t.Logf("%s: connections %d, events %v", run, sum.Conns.Opened, sum.Events)
 	}
 }
 

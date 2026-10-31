@@ -1,0 +1,564 @@
+package receiver
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/netip"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-nats-server/internal/item"
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-nats-server/internal/obs"
+)
+
+// backpressurePoll is how often a stalled reader re-checks the ring.
+//
+// It is a poll and not a notification on purpose: a notification would need the
+// ring to know about its readers, and 50ms of extra latency at the exact moment
+// the system is saturated is not a cost anyone can measure (SPEC §5.7).
+const backpressurePoll = 50 * time.Millisecond
+
+// defaultBackpressureTimeout is tcp.backpressure_timeout (SPEC §5.7, §16.5).
+const defaultBackpressureTimeout = 30 * time.Second
+
+// streamReadBuffer is the bufio.Reader size of one TCP connection. It is
+// not a configuration key: a frame is read through it one refill at a time, so
+// a bigger buffer buys little and a smaller one only costs syscalls.
+//
+// 4 KiB, not 64 (a known pendência, fixed on 2026-10-14 as in
+// go-syslog-server; SPEC §5.4, §15.1): the reader is held for as long as the
+// connection lives, idle or not, outside ring.max_bytes, and with
+// max_conns = 0 (the default) a few thousand silent connections at 64 KiB
+// each took the heap to GOMEMLIMIT. The largest Peek of the code is the
+// 12-byte PROXY v2 signature (the framer's detection peeks eleven, the v1
+// header is read byte by byte), so 4 KiB holds every one of them;
+// BenchmarkTCPReceive measured the refills it adds (TESTING §4).
+const streamReadBuffer = 4 << 10
+
+// proxyReadBuffer is the reader in front of an HTTP connection when the PROXY
+// protocol is on. It only has to hold what a Peek of the header needs (at most
+// the 107 bytes of v1); the request behind it flows through in reads of its
+// own size. On TCP the same reader carries the frames.
+const proxyReadBuffer = streamReadBuffer
+
+// keepAlivePeriod is the SO_KEEPALIVE period of SPEC §4.4.
+const keepAlivePeriod = 30 * time.Second
+
+// StreamConfig is the connection-oriented transport's configuration: listen.tcp
+// and the [tcp] section (SPEC §4.4).
+type StreamConfig struct {
+	// Addr is listen.tcp ("host:port"; ":1514" is every address).
+	Addr string
+	// Listeners is listen.tcp_listeners; above 1 the sockets share Addr
+	// through SO_REUSEPORT.
+	Listeners int
+	// IdleTimeout closes a connection with no traffic (120 s); zero never
+	// does.
+	IdleTimeout time.Duration
+	// MaxConns and MaxConnsPerIP are per TRANSPORT, across its listeners;
+	// zero is unlimited. The global cap blocks in accept, the per-IP cap
+	// closes at once (SPEC §4.4).
+	MaxConns      int
+	MaxConnsPerIP int
+	// BackpressureTimeout is how long a reader stays stopped on a full ring
+	// or a DOWN sink before closing the connection (30 s, SPEC §5.7). Zero or
+	// negative selects 30 s; the configuration refuses zero (SPEC §13.2).
+	BackpressureTimeout time.Duration
+	// Proxy is the [proxy] section.
+	Proxy ProxyConfig
+}
+
+// Stream receives the connection-oriented GELF transport: TCP (SPEC §4.4),
+// NUL-framed (SPEC §5.3). Build it with NewTCP. There is no TLS (SPEC §1.2).
+//
+// It is the transport with real backpressure, and the one that should be the
+// default for any emitter that cares about its data. A full ring does not drop
+// anything here: the reader simply STOPS READING, the socket buffer fills, the
+// TCP window closes, and the emitter stops transmitting. Its own queue is
+// exactly where the data should sit while we cannot take it (SPEC §5.7).
+//
+// Per connection, in order (SPEC §2.1): the PROXY header when configured and
+// the peer is trusted, then frames until the connection ends.
+type Stream struct {
+	transport item.Transport
+	obsT      obs.Transport
+	cfg       StreamConfig
+
+	in  *Ingest
+	m   *obs.Metrics
+	log *obs.Logger
+
+	lns []net.Listener
+	wg  sync.WaitGroup
+
+	// conns tracks live connections so shutdown can close them and unblock
+	// readers parked in Read.
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+
+	// closing is atomic because the read loop checks it on every frame without
+	// taking mu. See armDeadline for why that check is needed at all.
+	closing atomic.Bool
+
+	// Sampled anomaly lines, one per 30 s per kind (SPEC §14.2): a broken
+	// emitter or balancer must not be able to flood the collector's log.
+	proxyLog  *obs.Sampler
+	bpLog     *obs.Sampler
+	acceptLog *obs.Sampler
+}
+
+func newStream(ctx context.Context, t item.Transport, cfg StreamConfig,
+	in *Ingest, m *obs.Metrics, log *obs.Logger) (*Stream, error) {
+	if err := cfg.Proxy.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.BackpressureTimeout <= 0 {
+		cfg.BackpressureTimeout = defaultBackpressureTimeout
+	}
+	s := &Stream{
+		transport: t, obsT: obsTransport(t), cfg: cfg,
+		in: in, m: m, log: log,
+		conns:    map[net.Conn]struct{}{},
+		proxyLog: obs.NewSampler(30 * time.Second),
+		bpLog:    obs.NewSampler(30 * time.Second),
+
+		acceptLog: obs.NewSampler(30 * time.Second),
+	}
+	n := cfg.Listeners
+	if n < 1 {
+		n = 1
+	}
+	// One limiter for every listener of this transport: the ceilings are per
+	// transport, not per listener (SPEC §4.4).
+	limiter := newConnLimiter(cfg.MaxConns, cfg.MaxConnsPerIP, func(l obs.ConnLimit) {
+		m.ConnsRefusedTotal[s.obsT][l].Inc()
+	})
+	for i := 0; i < n; i++ {
+		l, err := listenStream(ctx, cfg.Addr, n > 1)
+		if err != nil {
+			s.closeListeners()
+			return nil, fmt.Errorf("receiver %s: %s: %w", t, cfg.Addr, err)
+		}
+		s.lns = append(s.lns, limiter.wrap(l))
+	}
+	return s, nil
+}
+
+// Addr reports the bound address, for the boot log (SPEC §4.1).
+func (s *Stream) Addr() string {
+	if len(s.lns) == 0 {
+		return s.cfg.Addr
+	}
+	return s.lns[0].Addr().String()
+}
+
+// Transport is tcp.
+func (s *Stream) Transport() item.Transport { return s.transport }
+
+// Start launches one accept loop per listener. ctx is the RECEIVE context:
+// cancelling it is what releases a reader held in the backpressure loop
+// (SPEC §13.4), so it must be cancelled before Close is called.
+func (s *Stream) Start(ctx context.Context) {
+	for i := range s.lns {
+		s.wg.Add(1)
+		go func(l net.Listener) {
+			defer s.wg.Done()
+			s.acceptLoop(ctx, l)
+		}(s.lns[i])
+	}
+}
+
+func (s *Stream) acceptLoop(ctx context.Context, l net.Listener) {
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// A transient accept error (descriptor exhaustion, for instance)
+			// must not end the loop: the listener is still good, and giving up
+			// would take the transport down for the life of the process. The
+			// pause keeps the loop from spinning; the line is SAMPLED, because
+			// EMFILE under a connection flood persists, and one unsampled WARN
+			// every 10 ms would flood the log for as long as it lasts (SPEC
+			// §14.2).
+			if ok, suppressed := s.acceptLog.Allow(); ok {
+				s.log.Warn("accept failed", "transport", s.transport.String(), "error", err,
+					"suppressed", suppressed)
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if !s.track(c) {
+			c.Close()
+			continue
+		}
+		s.m.ConnsTotal[s.obsT].Inc()
+		s.m.ConnsActive[s.obsT].Inc()
+
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.m.ConnsActive[s.obsT].Dec()
+			defer s.untrack(c)
+			s.serve(ctx, c)
+		}()
+	}
+}
+
+func (s *Stream) track(c net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing.Load() {
+		return false
+	}
+	s.conns[c] = struct{}{}
+	return true
+}
+
+func (s *Stream) untrack(c net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
+	c.Close()
+}
+
+// connAddrs is what serve knows about one connection's two ends.
+type connAddrs struct {
+	src, dst, peer netip.AddrPort
+	proxied        bool
+}
+
+// serve reads one connection until it ends.
+func (s *Stream) serve(ctx context.Context, c net.Conn) {
+	// SO_KEEPALIVE, because a connection that died without a FIN -- an expired
+	// NAT entry, a machine that vanished -- would otherwise hang around until the
+	// idle timeout, holding a descriptor and a max_conns slot. An appliance that
+	// logs once an hour is a normal case, so that timeout is generous.
+	if tc, ok := tcpConnOf(c); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(keepAlivePeriod)
+	}
+
+	// The payload's two ends are the socket's (SPEC §4.4), unless a trusted
+	// PROXY header says otherwise below.
+	var a connAddrs
+	pip, pport := addrPortOf(c.RemoteAddr())
+	lip, lport := addrPortOf(c.LocalAddr())
+	a.peer = netip.AddrPortFrom(pip, pport)
+	a.src = a.peer
+	a.dst = netip.AddrPortFrom(lip, lport)
+
+	// --- PROXY: before anything else -----------------------------------------
+	br := bufio.NewReaderSize(c, streamReadBuffer)
+	if s.cfg.Proxy.Mode != ProxyOff {
+		if !s.readProxy(c, br, &a) {
+			return
+		}
+	}
+
+	fr := NewFramer(br, s.in.MaxMessageBytes())
+	// One Wire per connection, refilled per frame: the pipeline keeps a
+	// pointer to it across retries, and a fresh one per frame would be a heap
+	// allocation per message.
+	var w Wire
+	for {
+		armDeadline(c, s.cfg.IdleTimeout, &s.closing)
+		raw, err := fr.Next()
+		if errors.Is(err, ErrFrameTooLarge) {
+			// Consumed up to its NUL; the connection stays in sync and lives
+			// on (SPEC §5.3, §5.5).
+			s.in.Reject(s.transport, TooLarge)
+			continue
+		}
+		if err != nil {
+			s.frameError(err, a)
+			return
+		}
+		w = Wire{
+			Transport: s.transport,
+			SrcIP:     a.src.Addr(),
+			SrcPort:   a.src.Port(),
+			DstIP:     a.dst.Addr(),
+			DstPort:   a.dst.Port(),
+			// The one clock sample: the NUL of the frame was just read, and
+			// nothing has parsed it yet (SPEC §3.1).
+			Time: time.Now(),
+		}
+		if a.proxied {
+			w.PeerIP, w.PeerPort = a.peer.Addr(), a.peer.Port()
+		}
+
+		// This is the 429 of this protocol, and it is better than one: a 429
+		// depends on the client honouring Retry-After, and most do not. A
+		// closed TCP window is not optional.
+		if !s.holdFor(ctx, raw, &w) {
+			return
+		}
+	}
+}
+
+// readProxy applies proxy.protocol to one connection (SPEC §4.6). It returns
+// false when the connection must be closed.
+func (s *Stream) readProxy(c net.Conn, br *bufio.Reader, a *connAddrs) bool {
+	return applyProxy(c, br, a, s.cfg.Proxy, &s.closing, s.m, s.warnProxy)
+}
+
+// applyProxy is the PROXY protocol of SPEC §4.6 for one connection, shared by
+// the stream transports and the HTTP ones. It returns false when the
+// connection must be closed.
+func applyProxy(c net.Conn, br *bufio.Reader, a *connAddrs, px ProxyConfig, closing *atomic.Bool,
+	m *obs.Metrics, warn func(string, connAddrs, error)) bool {
+	if !px.Trusts(a.peer.Addr()) {
+		if px.Mode == ProxyRequired {
+			m.MessagesDroppedTotal[obs.DropProxy].Inc()
+			warn("refusing a connection from an untrusted peer: proxy.protocol=required", *a, nil)
+			return false
+		}
+		// optional: nothing is read from an untrusted peer. A header it
+		// sends anyway is the start of a malformed message, which is the
+		// honest record of a forgery attempt.
+		return true
+	}
+
+	armDeadline(c, px.headerTimeout(), closing)
+	hdr, found, err := ReadProxyHeader(br)
+	if closing.Load() && (err != nil || (!found && px.Mode == ProxyRequired)) {
+		// The shutdown expired the deadline of a connection still waiting for
+		// its header (or halfway through one). That is a deploy, not the
+		// balancer's fault: nothing is counted and nothing is logged (SPEC
+		// §4.6; a known pendência, fixed on 2026-10-14 as in go-syslog-server).
+		//
+		// Only then. With proxy.protocol=optional, found=false and err=nil is
+		// a connection that sent no header and whose GELF documents are already
+		// in the reader: they are messages read off the socket, and SPEC §13.4
+		// lets what was read finish entering the ring. The rule of
+		// go-relplog-server -- "(err != nil || !found) && closing" -- dropped
+		// up to 4 KiB of them uncounted on every Close (independent review of
+		// the go-syslog-server port, 2026-10-13); in RELP nothing is confirmed
+		// before the header, here the TCP window already took them.
+		//
+		// And only without a header in required mode: a VALID header the
+		// balancer sent in the same segment as the first lines is not a wait.
+		// Header and lines are already in the reader, and closing here lost
+		// them uncounted (independent review of 2026-10-14, A1).
+		return false
+	}
+	switch {
+	case errors.Is(err, ErrProxyHeader):
+		m.ProxyHeadersTotal[obs.ProxyInvalid].Inc()
+		m.MessagesDroppedTotal[obs.DropProxy].Inc()
+		warn("closing a connection with an invalid PROXY header", *a, err)
+		return false
+	case err != nil && !isTimeout(err):
+		// The connection ended before its first byte: a balancer's TCP
+		// health check, or a client that gave up. Nothing to count.
+		return false
+	case !found:
+		// No header, or none within header_timeout.
+		m.ProxyHeadersTotal[obs.ProxyAbsent].Inc()
+		if px.Mode == ProxyRequired {
+			m.MessagesDroppedTotal[obs.DropProxy].Inc()
+			warn("closing a connection without a PROXY header: proxy.protocol=required", *a, nil)
+			return false
+		}
+		return true
+	case hdr.Local:
+		// LOCAL, UNSPEC, UNIX, DGRAM, UNKNOWN: the real peer stands, as if
+		// there were no header.
+		m.ProxyHeadersTotal[obs.ProxyLocal].Inc()
+		return true
+	}
+	if hdr.Version == 1 {
+		m.ProxyHeadersTotal[obs.ProxyV1].Inc()
+	} else {
+		m.ProxyHeadersTotal[obs.ProxyV2].Inc()
+	}
+	// The payload takes the client and the address it dialed; the real TCP
+	// peer -- the balancer -- goes to x-proxy, so the actual end of the
+	// transport stays on record (invariant §20.8). The connection limiter
+	// already counted the balancer, which is what SPEC §4.4 says it sees.
+	a.src, a.dst, a.proxied = hdr.Src, hdr.Dst, true
+	return true
+}
+
+func (s *Stream) warnProxy(msg string, a connAddrs, err error) {
+	if ok, suppressed := s.proxyLog.Allow(); ok {
+		args := []any{"transport", s.transport.String(), "peer", a.peer.String(), "suppressed", suppressed}
+		if err != nil {
+			args = append(args, "error", err)
+		}
+		s.log.Warn(msg, args...)
+	}
+}
+
+// holdFor runs Accept, and on a retryable refusal stops reading until the ring
+// drains or the deadline passes (SPEC §5.7).
+//
+// It returns false when the connection must be closed.
+//
+// The deadline exists because an emitter blocked forever is worse than one that
+// reconnects: it holds a descriptor, a kernel buffer and a max_conns slot
+// indefinitely, and with a thousand emitters in that state the server cannot
+// even accept the one that WOULD drain.
+func (s *Stream) holdFor(ctx context.Context, raw []byte, w *Wire) bool {
+	// From the frame being whole to the ring's guarantee being met -- the
+	// confirmation this transport gives by reading on (SPEC §14.1).
+	held := w.Time
+	out := s.in.Accept(ctx, raw, w)
+	if !out.Retryable() {
+		// Accepted, empty, unaddressable or shutting down: nothing to hold
+		// back.
+		if out == Accepted {
+			s.m.ConfirmDuration.ObserveDuration(time.Since(held))
+		}
+		s.in.RecordDrop(out)
+		return out != Shutdown
+	}
+
+	start := time.Now()
+	deadline := start.Add(s.cfg.BackpressureTimeout)
+	timer := time.NewTimer(backpressurePoll)
+	defer timer.Stop()
+
+	for {
+		// While this loop runs, nothing is read from the socket. The receive
+		// buffer fills, the advertised window goes to zero, and the emitter
+		// stops sending. Nothing is lost.
+		select {
+		case <-ctx.Done():
+			s.m.AddBackpressure(s.obsT, time.Since(start))
+			s.in.RecordDrop(Shutdown)
+			return false
+		case <-timer.C:
+			timer.Reset(backpressurePoll)
+		}
+
+		// Retry does not count the arrival again: Accept already did.
+		out = s.in.Retry(ctx, raw, w)
+		if !out.Retryable() {
+			s.m.AddBackpressure(s.obsT, time.Since(start))
+			if out == Accepted {
+				s.m.ConfirmDuration.ObserveDuration(time.Since(held))
+			}
+			s.in.RecordDrop(out)
+			return out != Shutdown
+		}
+		if time.Now().After(deadline) {
+			// The message in hand is counted as dropped; what the emitter
+			// has not sent yet stays with it (SPEC §5.7).
+			s.m.AddBackpressure(s.obsT, time.Since(start))
+			s.in.RecordDrop(out)
+			if ok, suppressed := s.bpLog.Allow(); ok {
+				s.log.Warn("closing a connection after holding it at the backpressure "+
+					"timeout; the emitter should reconnect and retry",
+					"transport", s.transport.String(), "peer", w.SrcIP.String(),
+					"held", time.Since(start).String(), "reason", out.String(),
+					"suppressed", suppressed)
+			}
+			return false
+		}
+	}
+}
+
+func (s *Stream) frameError(err error, a connAddrs) {
+	switch {
+	case errors.Is(err, io.EOF):
+		return // the emitter closed cleanly
+	case isTimeout(err):
+		return // the idle timeout, or the shutdown's deadline: not an error
+	default:
+		s.log.Debug("connection ended", "transport", s.transport.String(),
+			"peer", a.peer.String(), "error", err)
+	}
+}
+
+// closeGrace is how long Close waits, after expiring every deadline, before
+// it closes the sockets of readers that still have not returned.
+const closeGrace = time.Second
+
+// Close stops accepting and stops reading, and waits for every connection's
+// reader to return.
+//
+// An expired deadline breaks a reader out of Read (or out of a PROXY read);
+// the message it was already handing to the ring still gets its
+// Accept. A reader held in the backpressure loop is released by the cancelled
+// receive context, which the app cancels BEFORE calling Close (SPEC §13.4).
+// The transport has no answer to send, so the socket is closed by serve on its
+// way out -- after the last message it read has either entered the ring or
+// been counted. Should a reader STILL not return within closeGrace, its socket
+// is closed under it: a shutdown must not wait on a peer.
+func (s *Stream) Close() error {
+	s.mu.Lock()
+	s.closing.Store(true)
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+
+	err := s.closeListeners()
+	for _, c := range conns {
+		_ = c.SetDeadline(time.Now())
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeGrace):
+		s.mu.Lock()
+		for c := range s.conns {
+			_ = c.Close()
+		}
+		s.mu.Unlock()
+		<-done
+	}
+	return err
+}
+
+func (s *Stream) closeListeners() error {
+	var errs []error
+	for _, l := range s.lns {
+		if err := l.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// armDeadline sets the deadline for the next frame, without undoing a
+// shutdown. It sets read and write together, which costs nothing: this server
+// never writes, so the write deadline is inert.
+//
+// Close stops a reader by setting its deadlines to "now". A reader that is
+// between two frames at that instant would otherwise renew them for another
+// idle_timeout before its next read, and shutdown would sit waiting for up to
+// two minutes. So the reader sets its deadline FIRST and checks closing AFTER;
+// Close sets closing FIRST and the deadline AFTER. In every interleaving the
+// last deadline written is "now", which is the one property that matters.
+//
+// A zero d clears the deadlines: idle_timeout = 0 means never (SPEC §16.5).
+func armDeadline(c net.Conn, d time.Duration, closing *atomic.Bool) {
+	if d > 0 {
+		_ = c.SetDeadline(time.Now().Add(d))
+	} else {
+		_ = c.SetDeadline(time.Time{})
+	}
+	if closing.Load() {
+		_ = c.SetDeadline(time.Now())
+	}
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}

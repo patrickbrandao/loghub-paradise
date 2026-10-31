@@ -1,0 +1,22 @@
+{
+  "host": {
+    "hostname": "legacy-01",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.0",
+  "level": {
+    "code": 4,
+    "name": "warning"
+  },
+  "facility": "diskmon",
+  "timestamp": "2025-10-31T12:00:00.000Z",
+  "short-message": "disk 91% full",
+  "file": "/opt/diskmon/check.rb",
+  "line": 356,
+  "size": 165
+}

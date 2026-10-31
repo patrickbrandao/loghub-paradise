@@ -1,0 +1,32 @@
+{
+  "host": {
+    "hostname": "nginx-edge-2",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "timestamp": "2025-10-31T12:00:00.000Z",
+  "short-message": "GET /health 200",
+  "full-message": "10.1.2.3 - - [31/Oct/2026:12:00:00 +0000] \"GET /health HTTP/1.1\" 200 2",
+  "fields": {
+    "@version": "1",
+    "path": "/var/log/nginx/access.log",
+    "tags": "[\"nginx\",\"edge\"]",
+    "type": "nginx-access"
+  },
+  "size": 299,
+  "parse": {
+    "warnings": [
+      "field-coerced",
+      "field-name-invalid"
+    ]
+  }
+}

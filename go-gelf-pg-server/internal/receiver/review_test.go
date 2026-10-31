@@ -1,0 +1,250 @@
+package receiver
+
+// Regression tests for the independent review of 2026-10-05. Each names its
+// finding (F1..F7, and the sink reviewer's ring=none logic refusal).
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-pg-server/internal/item"
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-pg-server/internal/obs"
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-pg-server/internal/sink"
+)
+
+// ------------------------------------------------------------------------ F1
+
+// ------------------------------------------------------------------------ F2
+
+// recConn records the deadlines set on it.
+type recConn struct {
+	net.Conn
+	mu            sync.Mutex
+	read, written time.Time
+	readSet       int
+	writeSet      int
+}
+
+func (c *recConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.read, c.written = t, t
+	c.readSet++
+	c.writeSet++
+	return nil
+}
+func (c *recConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.read = t
+	c.readSet++
+	return nil
+}
+func (c *recConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.written = t
+	c.writeSet++
+	return nil
+}
+
+// F2: the frame loop arms the WRITE deadline with the read one -- crypto/tls
+// writes from inside Read -- and a shutdown expires both.
+func TestArmDeadlineArmsBothDirections(t *testing.T) {
+	var closing atomic.Bool
+	c := &recConn{}
+	armDeadline(c, time.Minute, &closing)
+	if c.writeSet == 0 || c.written.IsZero() || !c.written.Equal(c.read) {
+		t.Fatalf("write deadline %v, read %v: the write direction is not armed", c.written, c.read)
+	}
+	armDeadline(c, 0, &closing)
+	if !c.written.IsZero() || !c.read.IsZero() {
+		t.Fatal("idle_timeout=0 must clear both deadlines")
+	}
+	closing.Store(true)
+	armDeadline(c, time.Hour, &closing)
+	if time.Until(c.written) > time.Second || time.Until(c.read) > time.Second {
+		t.Fatal("a reader re-arming during shutdown undid the shutdown's deadline")
+	}
+}
+
+// blockConn blocks its reader until Close, ignoring every deadline: a reader no
+// deadline can reach, the worst case Close's grace exists for.
+type blockConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *blockConn) Close() error                     { b.once.Do(func() { close(b.closed) }); return nil }
+func (b *blockConn) SetDeadline(time.Time) error      { return nil }
+func (b *blockConn) SetReadDeadline(time.Time) error  { return nil }
+func (b *blockConn) SetWriteDeadline(time.Time) error { return nil }
+
+// F2: if a reader still does not return after closeGrace, Close closes its
+// socket instead of waiting on the peer forever.
+func TestStreamCloseForceClosesAfterGrace(t *testing.T) {
+	h := newHarness(t, 10)
+	s := &Stream{transport: item.TransportTCP, obsT: obs.TransportTCP, in: h.in, m: h.m, log: logger(),
+		conns: map[net.Conn]struct{}{}}
+	c := &blockConn{closed: make(chan struct{})}
+	if !s.track(c) {
+		t.Fatal("track")
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer s.untrack(c)
+		<-c.closed // a reader parked where no deadline reaches
+	}()
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { s.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(closeGrace + 5*time.Second):
+		t.Fatal("Close waited on a reader its deadlines could not reach")
+	}
+	if el := time.Since(start); el < closeGrace/2 {
+		t.Fatalf("Close returned after %v: it did not give the readers their grace", el)
+	}
+}
+
+// ------------------------------------------------------------------------ F3
+
+// F3 over a socket: the idle timeout in the middle of a frame delivers what
+// arrived (SPEC §5.3) -- a whole document without its NUL, or half of one,
+// which the converter marks malformed.
+func TestTCPIdleTimeoutMidFrameDeliversIt(t *testing.T) {
+	for _, payload := range []string{doc("no NUL yet"), `{"short_message":"cut`, "123"} {
+		h := newHarness(t, 10)
+		tr := startTCP(t, h, TCPConfig{StreamConfig: StreamConfig{IdleTimeout: 200 * time.Millisecond}})
+		c := dial(t, tr.Addr())
+		fmt.Fprint(c, payload)
+		expectClosed(t, c)
+		h.waitItems(t, 1)
+		if got := h.drainRing(); len(got) != 1 || string(got[0].Raw) != payload {
+			t.Fatalf("payload %q: %v", payload, got)
+		}
+	}
+}
+
+// ------------------------------------------------------------------------ F7
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
+func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
+type emfileListener struct {
+	mu     sync.Mutex
+	closed bool
+	calls  int
+}
+
+func (l *emfileListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, net.ErrClosed
+	}
+	l.calls++
+	return nil, &net.OpError{Op: "accept", Net: "tcp", Err: syscall.EMFILE}
+}
+func (l *emfileListener) Close() error   { l.mu.Lock(); l.closed = true; l.mu.Unlock(); return nil }
+func (l *emfileListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+// F7: a persistent accept error (EMFILE under a flood) logged an unsampled
+// WARN every 10 ms. It is sampled now, and the loop still pauses and goes on.
+func TestAcceptErrorLogIsSampled(t *testing.T) {
+	h := newHarness(t, 10)
+	var buf syncBuf
+	l := &emfileListener{}
+	s := &Stream{transport: item.TransportTCP, obsT: obs.TransportTCP, in: h.in, m: h.m,
+		log: obs.NewLogger(&buf, "text", "warn"), conns: map[net.Conn]struct{}{},
+		lns: []net.Listener{l}, acceptLog: obs.NewSampler(30 * time.Second)}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Start(ctx)
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	l.Close()
+	s.wg.Wait()
+	if n := strings.Count(buf.String(), "accept failed"); n != 1 {
+		t.Fatalf("%d accept-failed lines in 0.5 s, want 1 (sampled)", n)
+	}
+	l.mu.Lock()
+	calls := l.calls
+	l.mu.Unlock()
+	if calls < 5 || calls > 100 {
+		t.Fatalf("%d accept attempts in 0.5 s: the loop must keep trying, with its 10 ms pause", calls)
+	}
+}
+
+// --------------------------------------------- ring=none logic refusal (sink)
+
+// fakeSink refuses, with a ClassLogic error, every write that carries a line
+// containing "refused" -- permanently, as a real constraint violation would --
+// and records the rest.
+type fakeSink struct {
+	mu      sync.Mutex
+	refused int
+	written []string
+}
+
+func (s *fakeSink) Write(ctx context.Context, b *sink.Batch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range b.Envelopes {
+		if bytes.Contains(e.Item.Raw, []byte("refused")) {
+			s.refused++
+			return &sink.Error{Class: sink.ClassLogic, Op: "insert", Err: errors.New("value too long")}
+		}
+	}
+	for _, e := range b.Envelopes {
+		s.written = append(s.written, e.UUID())
+	}
+	return nil
+}
+func (s *fakeSink) Health(ctx context.Context) error { return nil }
+func (s *fakeSink) Close() error                     { return nil }
+func (s *fakeSink) Type() string                     { return "fake" }
+
+func (s *fakeSink) count() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refused, len(s.written)
+}
+
+// --------------------------------------------------- PROXY: a stalled header
+
+// A trusted peer whose v1 header starts and then stalls past header_timeout is
+// an INVALID header (the signature matched), closed as reason="proxy" -- never
+// "absent", and never fed to the framer.
+func TestProxyStalledHeaderIsInvalid(t *testing.T) {
+	h := newHarness(t, 10)
+	cidrs, _ := ParseCIDRList("127.0.0.1/32")
+	tr := startTCP(t, h, TCPConfig{StreamConfig: StreamConfig{
+		Proxy: ProxyConfig{Mode: ProxyOptional, Trusted: cidrs, HeaderTimeout: 150 * time.Millisecond}}})
+	c := dial(t, tr.Addr())
+	fmt.Fprint(c, "PROXY TCP4 1.2.3.4") // and nothing more
+	expectClosed(t, c)
+	waitFor(t, "the invalid header", func() bool {
+		return h.m.ProxyHeadersTotal[obs.ProxyInvalid].Load() == 1 &&
+			h.m.MessagesDroppedTotal[obs.DropProxy].Load() == 1
+	})
+	if h.m.ProxyHeadersTotal[obs.ProxyAbsent].Load() != 0 || h.m.MessagesTotal[obs.TransportTCP].Load() != 0 {
+		t.Fatal("a stalled header was treated as absent and framed")
+	}
+}

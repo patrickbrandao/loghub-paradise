@@ -1,7 +1,7 @@
 # loghub-paradise
 
 Monorepo dos **bridges de entrada (Bridge-IN) do LogHub** e das ferramentas que
-os testam. Cada servidor recebe eventos de um protocolo (HTTP, syslog, RELP),
+os testam. Cada servidor recebe eventos de um protocolo (HTTP, syslog, RELP, GELF),
 converte cada um num envelope **JLH** do LogHub, guarda-o num **ring** e o
 entrega a um **sink**. Os injetores mandam tráfego sintético ou capturado para
 esses servidores.
@@ -44,6 +44,9 @@ esses servidores.
 | [`go-relplog-server`](go-relplog-server/) | RELP (`omrelp` do rsyslog) em claro ou TLS; PROXY v1/v2 | `syslog` + `x-transport: relp` | `memory` `sqlite` `redis` `none` | `nats` `redis` `sqlite` `postgres` `mysql` `clickhouse` `none` | memory → nats |
 | [`go-relplog-pg-server`](go-relplog-pg-server/) | RELP em claro | `syslog` + `x-transport: relp` | `memory` | `postgres` (`loghub.inbox`) | fixo |
 | [`go-relplog-nats-server`](go-relplog-nats-server/) | RELP em claro | `syslog` + `x-transport: relp` | `memory` | `nats` (`loghub.{space}.syslog`) | fixo |
+| [`go-gelf-server`](go-gelf-server/) | GELF 1.1 por UDP (chunks, gzip/zlib), TCP (`\0`), TLS, HTTP e HTTPS (`POST /gelf`); PROXY v1/v2 | `gelf` | `memory` `sqlite` `redis` `none` | `nats` `redis` `sqlite` `postgres` `mysql` `clickhouse` `none` | memory → nats |
+| [`go-gelf-pg-server`](go-gelf-pg-server/) | GELF UDP, TCP, HTTP (sem TLS) | `gelf` | `memory` | `postgres` (`loghub.inbox`) | fixo |
+| [`go-gelf-nats-server`](go-gelf-nats-server/) | GELF UDP, TCP, HTTP (sem TLS) | `gelf` | `memory` | `nats` (`loghub.{space}.gelf`) | fixo |
 | [`go-syslog-standard-server`](go-syslog-standard-server/) | syslog UDP, TCP, TLS, unix, RELP | — (formato próprio) | `memory` `sqlite` `none` | `redis` `sqlite` `postgres` `mysql` `nats` `none` | memory → redis |
 
 Os nomes "pg" e "nats" indicam **cortes**. Um corte é um servidor reduzido a
@@ -59,6 +62,7 @@ Fica no repositório como referência de código, não como produto.
 | [`go-syslog-injector`](go-syslog-injector/) | `go-syslog-server`, cortes e qualquer servidor syslog | UDP, TCP (octet-counting ou LF), TLS/mTLS, unix datagram; PROXY v1/v2 | gerador `seq=N`, modelo com marcadores, arquivo/stdin, **replay de pcap/pcapng** |
 | [`go-relplog-injector`](go-relplog-injector/) | `go-relplog-server`, cortes e qualquer `imrelp` | sessão RELP em TCP ou TLS/mTLS; PROXY v1/v2; janela, confirmação por mensagem, retransmissão | os mesmos, com replay de RELP, syslog TCP ou UDP capturados |
 | [`go-webhook-injector`](go-webhook-injector/) | `go-webhook-server`, `go-webhook-fast-server`, cortes e qualquer servidor HTTP | HTTP/1.1 keep-alive com **pipelining**; HTTP/2 (h2c ou ALPN) com muitos streams; TLS/mTLS; reenvio de `429`/`503` | gerador JSON com `seq`, modelo com marcadores (corpo, URL, cabeçalhos), arquivo/stdin/pasta, **replay de requisições HTTP de pcap/pcapng** |
+| [`go-gelf-injector`](go-gelf-injector/) | `go-gelf-server`, cortes e qualquer receptor GELF (Graylog, Logstash) | UDP com chunks GELF (até 128) e gzip/zlib; TCP e TLS/mTLS (moldura `\0`); HTTP/HTTPS (`POST /gelf`, keep-alive, pipelining, `Content-Encoding`, reenvio de `429`/`503`); PROXY v1/v2 | gerador GELF 1.1 com `_seq`/`_run` e `--payload-size`, modelo com marcadores, um documento por linha de arquivo/stdin, **replay de pcap/pcapng** (UDP com chunks, TCP, HTTP) |
 
 Os injetores servem para teste funcional e de carga. Aceitam `--count`,
 `--duration`, `--rate` e `--concurrency`. Ao fim imprimem um relatório (texto
@@ -82,6 +86,8 @@ servidor real (números em `docs/TESTING.md` de cada injetor):
 | `go-syslog-standard-server` | `go-syslog-injector` (syslog) ou `go-relplog-injector` (RELP) | — |
 | `go-relplog-server` | `go-relplog-injector` | ~510 mil msg/s confirmadas uma a uma |
 | `go-relplog-pg-server`, `go-relplog-nats-server` | `go-relplog-injector` | (mesmo protocolo do `go-relplog-server`, sem TLS) |
+| `go-gelf-server` | `go-gelf-injector` | contra o servidor real (M2, `sink=none`): ~1,4 milhão de msg/s por TCP, ~173 mil req/s por HTTP keep-alive com `--pipeline 32`, 20 mil msg/s por UDP sem perda; com `sink=sqlite`, cada `_seq` de UDP, TCP, TLS, HTTP e HTTPS achado uma vez |
+| `go-gelf-pg-server`, `go-gelf-nats-server` | `go-gelf-injector` | (mesmo protocolo do `go-gelf-server`, sem TLS) |
 
 ---
 
@@ -156,7 +162,7 @@ flowchart LR
 
 ### 3.4 Ring redis: espera compartilhada entre réplicas
 
-Só nos servidores de syslog e RELP completos (`go-syslog-server`, `go-relplog-server`). Várias réplicas gravam no mesmo stream Redis.
+Só nos servidores completos de syslog, RELP e GELF (`go-syslog-server`, `go-relplog-server`, `go-gelf-server`). Várias réplicas gravam no mesmo stream Redis.
 
 ```mermaid
 flowchart LR
@@ -172,7 +178,7 @@ flowchart LR
     B --> D[("Destino")]
 ```
 
-Todas as réplicas precisam da mesma configuração `[syslog]`, do mesmo `WORKSPACE` e da mesma versão.
+Todas as réplicas precisam da mesma configuração `[syslog]` (no GELF, `[convert]`), do mesmo `WORKSPACE` e da mesma versão.
 
 ### 3.5 Ring none: sem espera
 
@@ -337,7 +343,101 @@ flowchart LR
     B -.->|"200 OK"| A
 ```
 
-### 3.17 NATS: publicação confirmada
+### 3.17 GELF UDP: chunks remontados e descomprimidos
+
+Um documento GELF grande chega em vários datagramas (chunks, até 128). O servidor junta os chunks de cada mensagem, pela origem e pelo id, e só então descomprime (gzip ou zlib).
+
+```mermaid
+flowchart LR
+    A["Emissor GELF UDP"] -->|"chunk 1 de 3"| M["Remontagem<br/>(origem + id)"]
+    A -->|"chunk 2 de 3"| M
+    A -->|"chunk 3 de 3"| M
+    M --> Z["Descomprime<br/>gzip ou zlib"]
+    Z --> R["Ring"]
+```
+
+Um chunk que não chega em 5 s descarta a mensagem inteira, contada em `gelf_messages_dropped_total`. Com o ring cheio, o UDP também descarta e conta, como no syslog (3.12):
+
+```mermaid
+flowchart LR
+    A["Emissor GELF UDP"] -->|"chunk 1 de 3<br/>(faltam 2)"| M["Remontagem"]
+    M -->|"5 s sem completar"| X["Descarta e conta"]
+```
+
+A descompressão tem teto: o documento descomprimido não passa de `convert.max_message_bytes` (128 KiB). Acima disso é recusado e contado, nunca truncado.
+
+### 3.18 GELF TCP e TLS: a moldura `\0` e o servidor para de ler
+
+No TCP e no TLS os documentos vêm um atrás do outro, cada um terminado por um byte `\0`. Não há resposta: com o ring cheio, o servidor para de ler a conexão, e a janela TCP faz o emissor esperar.
+
+```mermaid
+flowchart LR
+    A["Emissor GELF TCP"] -->|"documento \0 documento \0"| B["Servidor GELF"]
+    B -->|"ring cheio"| X["Para de ler"]
+    X -.->|"janela TCP fecha<br/>emissor espera"| A
+```
+
+Não há compressão no TCP. Um documento acima do teto é descartado até o próximo `\0`, e a conexão continua.
+
+### 3.19 GELF HTTP: a resposta 202
+
+`POST /gelf`, um documento por requisição (ou um por linha, com `http.bulk`). O `202 Accepted`, sem corpo, só sai depois da garantia da combinação ring × sink. A conexão continua aberta (keep-alive) para as próximas requisições; não há HTTP/2.
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] -->|"POST /gelf"| B["Servidor GELF"]
+    B --> R["Ring"]
+    B -.->|"202 Accepted"| A
+```
+
+### 3.20 GELF HTTP: 503 com Retry-After e 413
+
+Com o ring cheio, o destino fora, o rate-limit ou o desligamento, o servidor responde `503` com `Retry-After: 1`. Nada é segurado; o cliente reenvia. Nos webhooks a mesma recusa é `429` (3.9).
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] -->|"POST /gelf"| B["Servidor GELF"]
+    B -->|"ring cheio"| X["Recusa"]
+    X -.->|"503 + Retry-After: 1"| A
+```
+
+Um documento acima de 128 KiB, depois de descomprimido, recebe `413`. É final: reenviar não adianta.
+
+```mermaid
+flowchart LR
+    A["Cliente HTTP"] -->|"POST /gelf<br/>documento grande demais"| B["Servidor GELF"]
+    B -.->|"413"| A
+```
+
+Também são finais `400` (corpo vazio ou descompressão inválida), `404` (outro caminho), `405` (outro método) e `415` (`Content-Encoding` desconhecido).
+
+### 3.21 GELF: cru no ring, conversão na saída
+
+Como no syslog (3.13), o ring guarda o documento cru e o worker converte para JLH na hora de entregar. No GELF, o cru já é o documento remontado e descomprimido: o ring, o `ring.db` e o dump guardam JSON legível.
+
+```mermaid
+flowchart LR
+    A["Chunks ou corpo<br/>comprimido"] --> P["Remonta e<br/>descomprime"]
+    P --> R["Ring<br/>(documento cru)"]
+    R --> W["Worker converte<br/>para JLH type=gelf"]
+    W --> D[("Destino")]
+```
+
+A conversão nunca falha: um documento que não é JSON vira um envelope `format: "malformed"`, com o original em `raw`.
+
+### 3.22 GELF: level ausente vira 6
+
+A GELF 1.1 manda tratar um documento sem `level` como `1` (alert). Muitas bibliotecas omitem o campo, e tudo viraria alerta. Os servidores GELF usam `6` (info) e marcam o aviso `level-default`.
+
+```mermaid
+flowchart LR
+    A["Documento<br/>sem level"] --> W["Conversão"]
+    W --> E["level 6 (info)<br/>+ aviso level-default"]
+```
+
+Um `level` inválido (`8`, `"info"`, `null`) também vira `6`, com o aviso `level-invalid`.
+
+### 3.23 NATS: publicação confirmada
 
 Com `sink=nats` em modo JetStream, cada publicação recebe um `PubAck`. O `uuid` do evento vai como `Nats-Msg-Id`, e o stream descarta repetições.
 
@@ -347,7 +447,7 @@ flowchart LR
     J -.->|"PubAck"| W
 ```
 
-### 3.18 NATS: heartbeat beacon
+### 3.24 NATS: heartbeat beacon
 
 Os servidores com NATS anunciam que estão vivos em `loghub._ctl.beacon`.
 
@@ -356,16 +456,16 @@ flowchart LR
     B["Servidor"] -->|"a cada intervalo"| C[("loghub._ctl.beacon")]
 ```
 
-### 3.19 Ring redis com sink redis: não pode
+### 3.25 Ring redis com sink redis: não pode
 
-Nos servidores de syslog e RELP, pedir ring redis com destino redis faz o servidor usar ring memory e avisar no log. Um ring no mesmo Redis do destino não protegeria nada.
+Nos servidores de syslog, RELP e GELF, pedir ring redis com destino redis faz o servidor usar ring memory e avisar no log. Um ring no mesmo Redis do destino não protegeria nada.
 
 ```mermaid
 flowchart LR
     C["ring=redis<br/>sink=redis"] -->|"no boot"| M["vira ring=memory<br/>+ aviso"]
 ```
 
-### 3.20 O servidor nunca cria o esquema
+### 3.26 O servidor nunca cria o esquema
 
 Tabelas e streams são criados por você antes. O servidor só confere no boot e, se algo estiver errado, sai com código `3`.
 
@@ -376,7 +476,7 @@ flowchart LR
     V -->|"não"| X["Sai com código 3"]
 ```
 
-### 3.21 Sink nats: NATS JetStream
+### 3.27 Sink nats: NATS JetStream
 
 Um barramento de mensagens. Outros programas assinam o subject e recebem os eventos.
 
@@ -385,7 +485,7 @@ flowchart LR
     W["Worker"] --> D[("NATS JetStream<br/>loghub.{space}.{type}")]
 ```
 
-### 3.22 Sink redis: Redis Streams
+### 3.28 Sink redis: Redis Streams
 
 Uma fila no Redis (`XADD`). Padrão da família webhook.
 
@@ -394,7 +494,7 @@ flowchart LR
     W["Worker"] --> D[("Redis Streams")]
 ```
 
-### 3.23 Sink sqlite: SQLite
+### 3.29 Sink sqlite: SQLite
 
 Um arquivo local, só para acrescentar. Bom para um nó único sem infraestrutura.
 
@@ -403,7 +503,7 @@ flowchart LR
     W["Worker"] --> D[("SQLite<br/>events.db")]
 ```
 
-### 3.24 Sink postgres: PostgreSQL
+### 3.30 Sink postgres: PostgreSQL
 
 A fila `loghub.inbox` do LogHub. Várias instâncias podem gravar na mesma tabela.
 
@@ -412,7 +512,7 @@ flowchart LR
     W["Worker"] --> D[("PostgreSQL<br/>loghub.inbox")]
 ```
 
-### 3.25 Sink mysql: MySQL
+### 3.31 Sink mysql: MySQL
 
 Uma tabela `inbox` igual à do PostgreSQL.
 
@@ -421,16 +521,16 @@ flowchart LR
     W["Worker"] --> D[("MySQL<br/>tabela inbox")]
 ```
 
-### 3.26 Sink clickhouse: ClickHouse
+### 3.32 Sink clickhouse: ClickHouse
 
 Um banco analítico para consultar o histórico.
 
 ```mermaid
 flowchart LR
-    W["Worker"] --> D[("ClickHouse<br/>inbox ou inbox_syslog")]
+    W["Worker"] --> D[("ClickHouse<br/>inbox, inbox_syslog<br/>ou inbox_gelf")]
 ```
 
-### 3.27 Sink none: none
+### 3.33 Sink none: none
 
 Não grava nada. Serve só para medir desempenho; o servidor avisa no boot.
 
@@ -1070,7 +1170,7 @@ flowchart LR
     R --> D[("Destino")]
 ```
 
-Rings: `memory`, `sqlite`, `redis`, `none`. Sinks: `nats`, `redis`, `sqlite`, `postgres`, `mysql`, `clickhouse`, `none`. A combinação ring `redis` com sink `redis` não existe (3.19).
+Rings: `memory`, `sqlite`, `redis`, `none`. Sinks: `nats`, `redis`, `sqlite`, `postgres`, `mysql`, `clickhouse`, `none`. A combinação ring `redis` com sink `redis` não existe (3.25).
 
 #### go-syslog-server: ring memory → sink NATS ★
 
@@ -1509,7 +1609,7 @@ flowchart LR
     R --> D[("Destino")]
 ```
 
-Rings: `memory`, `sqlite`, `redis`, `none`. Sinks: `nats`, `redis`, `sqlite`, `postgres`, `mysql`, `clickhouse`, `none`. A combinação ring `redis` com sink `redis` não existe (3.19).
+Rings: `memory`, `sqlite`, `redis`, `none`. Sinks: `nats`, `redis`, `sqlite`, `postgres`, `mysql`, `clickhouse`, `none`. A combinação ring `redis` com sink `redis` não existe (3.25).
 
 #### go-relplog-server: ring memory → sink NATS ★
 
@@ -1908,7 +2008,448 @@ flowchart LR
 - **Confirmação ao emissor:** quando o evento está na RAM.
 - **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
 
-### 4.11 go-syslog-standard-server
+### 4.11 go-gelf-server
+
+Recebe GELF 1.1 por UDP (com chunks e gzip/zlib), TCP e TLS (moldura `\0`), HTTP e HTTPS (`POST /gelf`) e grava cada documento como um evento JLH `type=gelf`.
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+Portas: UDP e TCP `:12201`, HTTP `:12202`; TLS `:12203` e HTTPS `:12204` ficam desligados até haver certificado.
+
+Rings: `memory`, `sqlite`, `redis`, `none`. Sinks: `nats`, `redis`, `sqlite`, `postgres`, `mysql`, `clickhouse`, `none`. A combinação ring `redis` com sink `redis` não existe (3.25).
+
+#### go-gelf-server: ring memory → sink NATS ★
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring memory → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("Redis Streams<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring memory → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring memory → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring memory → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("MySQL<br/>tabela gelf_events")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring memory → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("ClickHouse<br/>tabela inbox_gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring memory → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring sqlite → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring sqlite → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("Redis Streams<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring sqlite → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Atenção:** `ring.db` e `events.db` precisam ser arquivos diferentes, de preferência em discos diferentes.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring sqlite → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring sqlite → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("MySQL<br/>tabela gelf_events")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring sqlite → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D[("ClickHouse<br/>tabela inbox_gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring sqlite → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring sqlite<br/>ring.db em disco")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no disco (fsync).
+- **Perda se o servidor cair de repente:** nada.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring redis → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("NATS JetStream<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring redis → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("SQLite<br/>events.db")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring redis → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring redis → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("MySQL<br/>tabela gelf_events")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring redis → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D[("ClickHouse<br/>tabela inbox_gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring redis → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B --> R[("Ring redis<br/>stream compartilhado")]
+    R --> D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está gravado no Redis do ring.
+- **Perda se o servidor cair de repente:** o que o Redis do ring perder.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring none → sink NATS
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B -->|"escrita direta"| D[("NATS JetStream<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** depois do PubAck do JetStream.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring none → sink Redis
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B -->|"escrita direta"| D[("Redis Streams<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** depois do XADD confirmado pelo Redis.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring none → sink SQLite
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B -->|"escrita direta"| D[("SQLite<br/>events.db")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** depois do COMMIT no events.db.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring none → sink PostgreSQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B -->|"escrita direta"| D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo PostgreSQL.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring none → sink MySQL
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B -->|"escrita direta"| D[("MySQL<br/>tabela gelf_events")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT confirmado pelo MySQL.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring none → sink ClickHouse
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B -->|"escrita direta"| D[("ClickHouse<br/>tabela inbox_gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** depois do INSERT respondido pelo ClickHouse.
+- **Perda se o servidor cair de repente:** nada.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+#### go-gelf-server: ring none → sink none (descarte)
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, TLS, HTTP, HTTPS"] --> B["go-gelf-server"]
+    B -->|"escrita direta"| D["Descarte<br/>(só benchmark)"]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** na hora, e o evento é descartado.
+- **Perda se o servidor cair de repente:** tudo.
+- **Uso:** só para medir desempenho. O evento nunca é guardado.
+- **Lembrete:** UDP não tem confirmação; TCP e TLS seguram o emissor parando de ler; HTTP e HTTPS respondem `202` (ou `503` + `Retry-After`).
+
+### 4.12 go-gelf-pg-server
+
+Corte do `go-gelf-server`, sem TLS, com uma única combinação: ring na RAM e a fila `loghub.inbox` do PostgreSQL.
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, HTTP"] --> B["go-gelf-pg-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-gelf-pg-server: ring memory → sink PostgreSQL ★
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, HTTP"] --> B["go-gelf-pg-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("PostgreSQL<br/>loghub.inbox")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP segura o emissor parando de ler; HTTP responde `202` (ou `503` + `Retry-After`).
+
+### 4.13 go-gelf-nats-server
+
+Corte do `go-gelf-server`, sem TLS, com uma única combinação: ring na RAM e o NATS JetStream (ou NATS core, se configurado). Emite o heartbeat beacon (3.24).
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, HTTP"] --> B["go-gelf-nats-server"]
+    B --> R["Ring"]
+    R --> D[("Destino")]
+```
+
+#### go-gelf-nats-server: ring memory → sink NATS ★
+
+```mermaid
+flowchart LR
+    A["Emissor GELF<br/>UDP, TCP, HTTP"] --> B["go-gelf-nats-server"]
+    B --> R["Ring memory<br/>(na RAM)"]
+    R --> D[("NATS JetStream<br/>loghub.{space}.gelf")]
+    B -.->|"aceito<br/>(202 no HTTP)"| A
+```
+
+- **Confirmação ao emissor:** quando o evento está na RAM.
+- **Perda se o servidor cair de repente:** o que estava na RAM; o dump de emergência salva o que conseguir.
+- **Lembrete:** UDP não tem confirmação; TCP segura o emissor parando de ler; HTTP responde `202` (ou `503` + `Retry-After`).
+
+### 4.14 go-syslog-standard-server
 
 O servidor syslog antigo, anterior ao LogHub, mantido como referência de código. Não gera envelope JLH.
 
@@ -2156,8 +2697,8 @@ flowchart LR
 ## 5. Os injetores, um diagrama por caso
 
 Os injetores mandam mensagens para os servidores, para teste e para medir carga.
-Os casos 5.1 a 5.7 são do syslog e do RELP; 5.13 a 5.19, do HTTP; 5.20 em
-diante ligam cada servidor ao seu injetor.
+Os casos 5.1 a 5.7 são do syslog e do RELP; 5.13 a 5.19, do HTTP; 5.20 a
+5.23, do GELF; 5.24 em diante ligam cada servidor ao seu injetor.
 
 ### 5.1 go-syslog-injector por UDP
 
@@ -2335,81 +2876,140 @@ flowchart LR
     I --> S["Servidor webhook"]
 ```
 
-### 5.20 go-webhook-server com o seu injetor
+### 5.20 go-gelf-injector por UDP com chunks
+
+```mermaid
+flowchart LR
+    I["go-gelf-injector"] -->|"UDP<br/>chunks + gzip ou zlib"| S["Servidor GELF"]
+```
+
+Não há resposta. `--chunk-size` (8192) é o maior datagrama; `--payload-size` força documentos grandes, em vários chunks.
+
+### 5.21 go-gelf-injector por TCP e TLS
+
+```mermaid
+flowchart LR
+    I["go-gelf-injector"] -->|"TCP ou TLS<br/>documento + \0"| S["Servidor GELF"]
+```
+
+Sem compressão. No TLS, o mTLS é opcional.
+
+### 5.22 go-gelf-injector por HTTP e HTTPS
+
+```mermaid
+flowchart LR
+    I["go-gelf-injector"] -->|"POST /gelf<br/>keep-alive, pipelining"| S["Servidor GELF"]
+    S -.->|"202 Accepted"| I
+```
+
+Com `--retries N`, um `503` (ou `429`) é reenviado depois do `Retry-After`. `--compress gzip` manda o corpo com `Content-Encoding: gzip`.
+
+### 5.23 go-gelf-injector: replay de captura GELF
+
+```mermaid
+flowchart LR
+    C[("prod.pcap")] -->|"chunks UDP remontados,<br/>TCP com \0, HTTP"| I["go-gelf-injector"]
+    I --> S["Servidor GELF"]
+```
+
+A captura pode começar no meio de uma conexão TCP: o injetor pula o quadro parcial do começo e segue do próximo `\0`.
+
+### 5.24 go-webhook-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-server"]
 ```
 
-### 5.21 go-webhook-fast-server com o seu injetor
+### 5.25 go-webhook-fast-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-fast-server"]
 ```
 
-### 5.22 go-webhook-pg-server com o seu injetor
+### 5.26 go-webhook-pg-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-pg-server"]
 ```
 
-### 5.23 go-webhook-nats-server com o seu injetor
+### 5.27 go-webhook-nats-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-webhook-injector"] -->|"HTTP"| S["go-webhook-nats-server"]
 ```
 
-### 5.24 go-syslog-server com o seu injetor
+### 5.28 go-syslog-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-syslog-injector"] -->|"UDP, TCP, TLS, unix"| S["go-syslog-server"]
 ```
 
-### 5.25 go-syslog-pg-server com o seu injetor
+### 5.29 go-syslog-pg-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-syslog-injector"] -->|"UDP, TCP, unix"| S["go-syslog-pg-server"]
 ```
 
-### 5.26 go-syslog-nats-server com o seu injetor
+### 5.30 go-syslog-nats-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-syslog-injector"] -->|"UDP, TCP, unix"| S["go-syslog-nats-server"]
 ```
 
-### 5.27 go-syslog-standard-server com o seu injetor
+### 5.31 go-syslog-standard-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-syslog-injector ou go-relplog-injector"] -->|"syslog ou RELP"| S["go-syslog-standard-server"]
 ```
 
-### 5.28 go-relplog-server com o seu injetor
+### 5.32 go-relplog-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-relplog-injector"] -->|"RELP, RELP/TLS"| S["go-relplog-server"]
 ```
 
-### 5.29 go-relplog-pg-server com o seu injetor
+### 5.33 go-relplog-pg-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-relplog-injector"] -->|"RELP"| S["go-relplog-pg-server"]
 ```
 
-### 5.30 go-relplog-nats-server com o seu injetor
+### 5.34 go-relplog-nats-server com o seu injetor
 
 ```mermaid
 flowchart LR
     I["go-relplog-injector"] -->|"RELP"| S["go-relplog-nats-server"]
+```
+
+### 5.35 go-gelf-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-gelf-injector"] -->|"UDP, TCP, TLS, HTTP, HTTPS"| S["go-gelf-server"]
+```
+
+### 5.36 go-gelf-pg-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-gelf-injector"] -->|"UDP, TCP, HTTP"| S["go-gelf-pg-server"]
+```
+
+### 5.37 go-gelf-nats-server com o seu injetor
+
+```mermaid
+flowchart LR
+    I["go-gelf-injector"] -->|"UDP, TCP, HTTP"| S["go-gelf-nats-server"]
 ```
 
 
@@ -2457,6 +3057,7 @@ Cada parâmetro tem três formas equivalentes:
 | webhook (W, F, P, N) | `WHS_` | `server.bind = :8080` | `127.0.0.1:9101` |
 | syslog (S, SP, SN) | `SYSLOG_` (`[syslog]` usa `SYSLOG_<CHAVE>`) | UDP/TCP `:1514`; TLS `:6514` se ligado; unix opcional | `127.0.0.1:9102` |
 | RELP (R, RP, RN) | `RELPLOG_` | `listen.tcp = :20514`; TLS `:20515` se ligado (só R) | `127.0.0.1:9103` |
+| GELF (G, GP, GN) | `GELF_` | UDP/TCP `:12201`, HTTP `:12202`; TLS `:12203` e HTTPS `:12204` se ligados (só G) | `127.0.0.1:9104` |
 
 Algumas variáveis têm nome fixado pelas skills do LogHub:
 
@@ -2481,9 +3082,9 @@ código entre 100 e 114. Use, por exemplo, `HOSTNAME=dev-mac`.
 | Sink | O que criar antes | Arquivo de referência |
 |---|---|---|
 | `postgres` | a fila `loghub.inbox` (DDL literal da skill) | `<módulo>/docker/postgres/inbox.sql` |
-| `mysql` | a tabela `inbox`; o usuário precisa de `INSERT` e `UPDATE (uuid)` | `go-webhook-server/docker/mysql/inbox.sql`, `go-syslog-server/docker/mysql/schema.sql` |
-| `clickhouse` | `inbox` (webhooks) ou `inbox_syslog` (syslog/RELP) | `<módulo>/docker/clickhouse/*.sql` |
-| `nats` | o stream JetStream (`LOGHUB_WEBHOOK`, `LOGHUB_SYSLOG`) cobrindo `loghub.{space}.{type}` | `<módulo>/docker/nats/stream.json` |
+| `mysql` | a tabela `inbox` (no GELF, `gelf_events`); o usuário precisa de `INSERT` e `UPDATE (uuid)` | `go-webhook-server/docker/mysql/inbox.sql`, `go-syslog-server/docker/mysql/schema.sql`, `go-gelf-server/docker/mysql/schema.sql` |
+| `clickhouse` | `inbox` (webhooks), `inbox_syslog` (syslog/RELP) ou `inbox_gelf` (GELF) | `<módulo>/docker/clickhouse/*.sql` |
+| `nats` | o stream JetStream (`LOGHUB_WEBHOOK`, `LOGHUB_SYSLOG`, `LOGHUB_GELF`) cobrindo `loghub.{space}.{type}` | `<módulo>/docker/nats/stream.json` |
 | `redis`, `sqlite`, `none` | nada | — |
 
 Por exemplo, para a fila do PostgreSQL:
@@ -2616,24 +3217,76 @@ RELPLOG_SINK_NATS_URLS=nats://nats:4222 DATADIR=/data ./go-relplog-nats-server
 O `docker compose up -d --build` de cada um sobe o servidor, o destino e um
 emissor rsyslog.
 
-### 6.10 Injetores
+### 6.10 go-gelf-server
+
+1. Escolha a combinação na seção [4.11](#411-go-gelf-server).
+   A padrão é `memory → nats`.
+2. Ligue os transportes de que precisa:
+
+   | Transporte | Como ligar |
+   |---|---|
+   | UDP | `listen.udp` |
+   | TCP | `listen.tcp` |
+   | TLS | `listen.tls` + `tls.cert_file`/`tls.key_file` |
+   | HTTP | `listen.http` |
+   | HTTPS | `listen.https` + os mesmos certificados de `[tls]` |
+
+   Um endereço vazio desliga o transporte.
+3. No contêiner as portas são as GELF: `12201` (UDP e TCP), `12202` (HTTP),
+   `12203` (TLS) e `12204` (HTTPS). A imagem é `tmsoftbrasil/go-gelf-server`.
+4. Para o output `http` do fluent-bit, que manda vários documentos num corpo,
+   ligue `http.bulk=true`.
+5. Para várias réplicas sem perda, use `ring=redis`. Todas precisam da mesma
+   config `[convert]` e da mesma versão.
+
+```bash
+cd go-gelf-server/docker
+docker compose up -d --build                                # memory -> nats
+docker compose -f compose.redis-postgres.yml up -d --build  # ring compartilhado
+docker compose --profile demo up -d --build                 # + emissor fluent-bit
+```
+
+Local, sem infraestrutura:
+
+```bash
+mkdir -p /tmp/gls-data
+DATADIR=/tmp/gls-data AGENT_NAME=go-gelf-server HOSTNAME=dev-mac \
+  ./go-gelf-server --sink.type=sqlite --listen.udp=127.0.0.1:12201 \
+  --listen.tcp=127.0.0.1:12201 --listen.http=127.0.0.1:12202
+```
+
+### 6.11 go-gelf-pg-server e go-gelf-nats-server
+
+```bash
+GELF_SINK_POSTGRES_ADDR=db:5432 GELF_SINK_POSTGRES_PASSWORD=*** DATADIR=/data ./go-gelf-pg-server
+GELF_SINK_NATS_URLS=nats://nats:4222 DATADIR=/data ./go-gelf-nats-server
+```
+
+Recebem UDP, TCP e HTTP, sem TLS. O `go-gelf-nats-server` também emite o
+heartbeat em `loghub._ctl.beacon`; o stream `LOGHUB_GELF` é criado por você
+(`go-gelf-nats-server/docker/nats/stream.json`). As imagens são
+`tmsoftbrasil/go-gelf-pg-server` e `tmsoftbrasil/go-gelf-nats-server`, e há
+uma stack pronta em `docker/` de cada um.
+
+### 6.12 Injetores
 
 ```bash
 cd go-syslog-injector  && go build -o go-syslog-injector  ./cmd/go-syslog-injector
 cd go-relplog-injector && go build -o go-relplog-injector ./cmd/go-relplog-injector
 cd go-webhook-injector && go build -o go-webhook-injector ./cmd/go-webhook-injector
+cd go-gelf-injector    && go build -o go-gelf-injector    ./cmd/go-gelf-injector
 ```
 
 Não precisam de configuração nem de identidade: tudo vem das flags (`--help`).
 Também há imagem em `docker/Dockerfile` de cada um. Para conferir a entrega,
 compare o relatório do injetor com os contadores do `/metrics` do servidor.
 
-### 6.11 Operação em produção
+### 6.13 Operação em produção
 
 - **Saúde.** Use `/readyz` como readiness (reflete a saúde do destino e o
   enchimento do ring) e `/healthz` como liveness. As métricas ficam em
   `/metrics`, com os prefixos
-  `whs_`, `syslog_` e `relplog_`.
+  `whs_`, `syslog_`, `relplog_` e `gelf_`.
 - **Shutdown.** O `SIGTERM` drena o ring até o `drain_timeout`. O que não
   couber vai para o dump em `emergency/`, que é reingerido no próximo boot.
 - **Contêiner.**
@@ -2861,7 +3514,54 @@ Ver o resultado:
 curl -s http://127.0.0.1:9103/metrics | grep -E '^relplog_(relp_responses|messages_accepted|events_written|relp_unanswered)_total'
 ```
 
-### 7.4 go-syslog-standard-server
+### 7.4 go-gelf-server e cortes GELF
+
+Com ferramentas do sistema:
+
+```bash
+# UDP, documento inteiro
+printf '{"version":"1.1","host":"dev","short_message":"oi","level":4}' | nc -u -w1 127.0.0.1 12201
+# TCP, moldura \0
+printf '{"version":"1.1","host":"dev","short_message":"oi"}\0' | nc -w1 127.0.0.1 12201
+# HTTP, gzip
+printf '{"version":"1.1","host":"dev","short_message":"oi","_pedido":42}' | gzip |
+  curl -sS -w '%{http_code}\n' -H 'Content-Encoding: gzip' --data-binary @- http://127.0.0.1:12202/gelf
+# o driver de log do Docker
+docker run --rm --log-driver=gelf --log-opt gelf-address=udp://127.0.0.1:12201 alpine echo oi
+```
+
+Com o `go-gelf-injector`:
+
+```bash
+# 1 mensagem GELF por TCP em 127.0.0.1:12201
+./go-gelf-injector
+
+# carga UDP: 60 s a 10 000 msg/s, documentos de 20 KB (2 chunks gzip)
+./go-gelf-injector --transport udp --target 10.0.0.5:12201 --duration 60s --rate 10000 --payload-size 20000
+
+# HTTP com gzip e pipelining, reenviando 503
+./go-gelf-injector --transport http --target 10.0.0.5:12202 --count 100000 --concurrency 4 \
+  --pipeline 32 --compress gzip --retries 5
+
+# modelo
+./go-gelf-injector --template '{"version":"1.1","host":"{host}","short_message":"login {rand:6}","level":4,"_id":"{uuid}"}' --count 100
+```
+
+Replay de uma captura de produção:
+
+```bash
+tcpdump -i eth0 -s 0 -w prod.pcap 'port 12201 or port 12202'
+./go-gelf-injector --target 127.0.0.1:12201 --pcap prod.pcap --pcap-timing original
+```
+
+O mesmo vale para os cortes (`go-gelf-pg-server`, `go-gelf-nats-server`),
+só sem TLS e HTTPS. Para conferir a entrega:
+
+```bash
+curl -s http://127.0.0.1:9104/metrics | grep -E '^gelf_(messages_total|messages_dropped_total|events_written_total)'
+```
+
+### 7.5 go-syslog-standard-server
 
 É a referência antiga, sem envelope LogHub. O uso é igual ao do syslog,
 inclusive com RELP:
@@ -2871,7 +3571,7 @@ cd go-syslog-standard-server/docker && docker compose up -d --build   # memory -
 printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514
 ```
 
-### 7.5 Receitas de teste de carga
+### 7.6 Receitas de teste de carga
 
 | Objetivo | Receita |
 |---|---|
@@ -2879,6 +3579,7 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514
 | Custo do ring | `ring=memory sink=none`, compare com o anterior |
 | Custo do destino | `ring=memory sink=<real>`, compare com o anterior |
 | Perda em UDP | injetor UDP com `--rate` crescente; compare o `seq` recebido com o `syslog_messages_dropped_total` |
+| Perda em UDP GELF | `go-gelf-injector --transport udp --payload-size 20000` com `--rate` crescente; compare os `_seq` no destino com o `gelf_messages_dropped_total` |
 | Retransmissão RELP | `go-relplog-injector --count N` e reinicie o servidor no meio |
 | Tráfego real | `tcpdump` em produção + `--pcap ... --pcap-timing original` no laboratório |
 | HTTP no limite | `go-webhook-injector --concurrency 16 --pipeline 32 --duration 60s` (ou `--http2 --streams 128`) |

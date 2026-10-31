@@ -1,0 +1,57 @@
+# ring na RAM  ->  descarte (benchmark)
+#
+# Garantia: NENHUMA. sink=none converte, serializa e DESCARTA todo envelope
+#   (SPEC §10.8, §19: "qualquer + none" perde tudo); nunca sai de UP. Mede o
+#   custo de recepcao, moldura, ring, conversao e serializacao sem I/O de
+#   destino. Nao guarde log com isto.
+#
+#   docker compose -f compose.memory-none.yml up -d --build
+#
+# Publicado no host: GELF 22051/udp e 22051/tcp (GELF_PORT), HTTP 22052 (GELF_HTTP_PORT),
+# TCP+TLS 22053 e HTTPS 22054 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29105 (GELF_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: gls-memory-none
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gls-base
+    container_name: gls-memory-none
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: gls-memory-none
+    environment:
+      # --- ring: memory ------------------------------------------------------
+      GELF_RING_MODE: memory
+      GELF_RING_CAPACITY_ITEMS: ${GELF_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      GELF_RING_MAX_BYTES: ${GELF_RING_MAX_BYTES:-256MiB}
+      GELF_RING_HIGH_WATER: ${GELF_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte (SPEC §12).
+      GELF_EMERGENCY_ENABLED: "true"
+
+      # --- sink: none --------------------------------------------------------
+      GELF_SINK_TYPE: none
+
+    ports:
+      # As portas do container sao as do GELF (SPEC §4.1); o host escolhe.
+      - "${GELF_PORT:-22051}:12201/udp"
+      - "${GELF_PORT:-22051}:12201/tcp"
+      - "${GELF_HTTP_PORT:-22052}:12202/tcp"
+      - "${GELF_TLS_PORT:-22053}:12203/tcp"
+      - "${GELF_HTTPS_PORT:-22054}:12204/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-29105}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - gls-data:/data
+
+volumes:
+  gls-data:

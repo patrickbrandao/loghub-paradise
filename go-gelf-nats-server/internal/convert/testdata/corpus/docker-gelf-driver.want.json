@@ -1,0 +1,28 @@
+{
+  "host": {
+    "hostname": "docker-desktop",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "timestamp": "2025-10-31T12:00:00.123Z",
+  "short-message": "hello from alpine",
+  "fields": {
+    "command": "echo hello from alpine",
+    "container_id": "0f3c5a7d9e1b2c4d6f8a0b1c3d5e7f9a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e",
+    "container_name": "focused_turing",
+    "created": "2026-10-31T11:59:59.874512345Z",
+    "image_id": "sha256:9a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e0f3c5a7d9e1b2c4d6f8a0b1c3d5e7f",
+    "image_name": "alpine",
+    "tag": "0f3c5a7d9e1b"
+  },
+  "size": 444
+}

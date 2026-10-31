@@ -1,0 +1,246 @@
+package config
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// removedEnv are the environment names of the parent go-gelf-server that this
+// server does not have (SPEC §1.2): other sinks and rings, TLS (listen.tls,
+// listen.https, [tls] and the NATS client's), the filter and the rate limiter.
+//
+// A removed key on the command line or in the INI is exit 1 (unknown
+// parameter). In the environment it would be ignored in silence -- the
+// environment is read per registry name, never scanned -- and an operator who
+// swapped one server for the other, keeping GELF_LISTEN_HTTPS or
+// GELF_FILTER_MIN_LEVEL, would believe a listener or a filter exists. It
+// is a WARN rather than an error because environments are shared: the same
+// .env may feed both servers.
+var removedEnv = []string{
+	"GELF_FILTER_LEVELS",
+	"GELF_FILTER_MIN_LEVEL",
+	"GELF_LISTEN_HTTPS",
+	"GELF_LISTEN_TLS",
+	"GELF_LISTEN_TLS_LISTENERS",
+	"GELF_RATELIMIT_BURST",
+	"GELF_RATELIMIT_ENABLED",
+	"GELF_RATELIMIT_EXEMPT",
+	"GELF_RATELIMIT_MAX_BUCKETS",
+	"GELF_RATELIMIT_RATE",
+	"GELF_RATELIMIT_SWEEP_INTERVAL",
+	"GELF_RATELIMIT_V4_MASK",
+	"GELF_RATELIMIT_V6_MASK",
+	"GELF_RING_MAX_INFLIGHT",
+	"GELF_RING_MODE",
+	"GELF_RING_REDIS_ADDRS",
+	"GELF_RING_REDIS_CLAIM_IDLE",
+	"GELF_RING_REDIS_DB",
+	"GELF_RING_REDIS_GROUP",
+	"GELF_RING_REDIS_PASSWORD",
+	"GELF_RING_REDIS_SENTINEL_MASTER",
+	"GELF_RING_REDIS_STREAM",
+	"GELF_RING_REDIS_TLS",
+	"GELF_RING_REDIS_TLS_CA",
+	"GELF_RING_REDIS_TLS_INSECURE",
+	"GELF_RING_REDIS_USERNAME",
+	"GELF_RING_SQLITE_BUSY_TIMEOUT",
+	"GELF_RING_SQLITE_COMMIT_BATCH",
+	"GELF_RING_SQLITE_COMMIT_MAX_DELAY",
+	"GELF_RING_SQLITE_PATH",
+	"GELF_RING_SQLITE_SYNCHRONOUS",
+	"GELF_RING_SQLITE_WAL_AUTOCHECKPOINT",
+	"GELF_SINK_CLICKHOUSE_ADDRS",
+	"GELF_SINK_CLICKHOUSE_DATABASE",
+	"GELF_SINK_CLICKHOUSE_PASSWORD",
+	"GELF_SINK_CLICKHOUSE_POOL_SIZE",
+	"GELF_SINK_CLICKHOUSE_TABLE",
+	"GELF_SINK_CLICKHOUSE_TLS",
+	"GELF_SINK_CLICKHOUSE_TLS_CA",
+	"GELF_SINK_CLICKHOUSE_TLS_INSECURE",
+	"GELF_SINK_CLICKHOUSE_USERNAME",
+	"GELF_SINK_MYSQL_ADDR",
+	"GELF_SINK_MYSQL_DATABASE",
+	"GELF_SINK_MYSQL_PASSWORD",
+	"GELF_SINK_MYSQL_POOL_SIZE",
+	"GELF_SINK_MYSQL_TABLE",
+	"GELF_SINK_MYSQL_TLS",
+	"GELF_SINK_MYSQL_TLS_CA",
+	"GELF_SINK_MYSQL_TLS_INSECURE",
+	"GELF_SINK_MYSQL_USERNAME",
+	"GELF_SINK_NATS_TLS",
+	"GELF_SINK_NATS_TLS_CA",
+	"GELF_SINK_NATS_TLS_INSECURE",
+	"GELF_SINK_POSTGRES_ADDR",
+	"GELF_SINK_POSTGRES_DATABASE",
+	"GELF_SINK_POSTGRES_PASSWORD",
+	"GELF_SINK_POSTGRES_POOL_SIZE",
+	"GELF_SINK_POSTGRES_TABLE",
+	"GELF_SINK_POSTGRES_TLS",
+	"GELF_SINK_POSTGRES_TLS_CA",
+	"GELF_SINK_POSTGRES_TLS_INSECURE",
+	"GELF_SINK_POSTGRES_USERNAME",
+	"GELF_SINK_REDIS_ADDRS",
+	"GELF_SINK_REDIS_DB",
+	"GELF_SINK_REDIS_MAXLEN",
+	"GELF_SINK_REDIS_PASSWORD",
+	"GELF_SINK_REDIS_PIPELINE_MULTIPLEX",
+	"GELF_SINK_REDIS_READ_BUFFER_EACH_CONN",
+	"GELF_SINK_REDIS_RING_SCALE_EACH_CONN",
+	"GELF_SINK_REDIS_SENTINEL_MASTER",
+	"GELF_SINK_REDIS_STREAM",
+	"GELF_SINK_REDIS_TLS",
+	"GELF_SINK_REDIS_TLS_CA",
+	"GELF_SINK_REDIS_TLS_INSECURE",
+	"GELF_SINK_REDIS_USERNAME",
+	"GELF_SINK_REDIS_WRITE_BUFFER_EACH_CONN",
+	"GELF_SINK_SQLITE_BUSY_TIMEOUT",
+	"GELF_SINK_SQLITE_KEEP_FILES",
+	"GELF_SINK_SQLITE_PATH",
+	"GELF_SINK_SQLITE_ROTATE",
+	"GELF_SINK_SQLITE_SYNCHRONOUS",
+	"GELF_SINK_SQLITE_WAL_AUTOCHECKPOINT",
+	"GELF_SINK_TYPE",
+	"GELF_TLS_BACKPRESSURE_TIMEOUT",
+	"GELF_TLS_CERT_FILE",
+	"GELF_TLS_CLIENT_AUTH",
+	"GELF_TLS_CLIENT_CA",
+	"GELF_TLS_HANDSHAKE_TIMEOUT",
+	"GELF_TLS_IDLE_TIMEOUT",
+	"GELF_TLS_KEY_FILE",
+	"GELF_TLS_MAX_CONNS",
+	"GELF_TLS_MAX_CONNS_PER_IP",
+	"GELF_TLS_MIN_VERSION",
+}
+
+// removedEnvWarnings names every removed variable that is set, in one line.
+func removedEnvWarnings(lookup func(string) (string, bool)) []string {
+	var set []string
+	for _, k := range removedEnv {
+		if _, ok := lookup(k); ok {
+			set = append(set, k)
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	sort.Strings(set)
+	return []string{fmt.Sprintf("%s: set in the environment, but go-gelf-nats-server has no such "+
+		"parameter (no TLS, no other sink or ring, no filter or rate limiter; SPEC §1.2). "+
+		"Ignored", strings.Join(set, ", "))}
+}
+
+// removedSections are the sections of go-gelf-server that this server does
+// not have at all (SPEC §1.2).
+var removedSections = map[string]bool{
+	"filter":          true,
+	"ratelimit":       true,
+	"ring.redis":      true,
+	"ring.sqlite":     true,
+	"sink.clickhouse": true,
+	"sink.mysql":      true,
+	"sink.postgres":   true,
+	"sink.redis":      true,
+	"sink.sqlite":     true,
+	"tls":             true,
+}
+
+// removedParams are the dotted names of removedEnv: go-gelf-server's keys
+// that this server does not have. On the command line or in the INI they are
+// exit 1 like any unknown parameter; the error says where they come from.
+// TestRemovedParamsAreTheRemovedEnv pins it to removedEnv.
+var removedParams = map[string]bool{
+	"filter.levels":                     true,
+	"filter.min_level":                  true,
+	"listen.https":                      true,
+	"listen.tls":                        true,
+	"listen.tls_listeners":              true,
+	"ratelimit.burst":                   true,
+	"ratelimit.enabled":                 true,
+	"ratelimit.exempt":                  true,
+	"ratelimit.max_buckets":             true,
+	"ratelimit.rate":                    true,
+	"ratelimit.sweep_interval":          true,
+	"ratelimit.v4_mask":                 true,
+	"ratelimit.v6_mask":                 true,
+	"ring.max_inflight":                 true,
+	"ring.mode":                         true,
+	"ring.redis.addrs":                  true,
+	"ring.redis.claim_idle":             true,
+	"ring.redis.db":                     true,
+	"ring.redis.group":                  true,
+	"ring.redis.password":               true,
+	"ring.redis.sentinel_master":        true,
+	"ring.redis.stream":                 true,
+	"ring.redis.tls":                    true,
+	"ring.redis.tls_ca":                 true,
+	"ring.redis.tls_insecure":           true,
+	"ring.redis.username":               true,
+	"ring.sqlite.busy_timeout":          true,
+	"ring.sqlite.commit_batch":          true,
+	"ring.sqlite.commit_max_delay":      true,
+	"ring.sqlite.path":                  true,
+	"ring.sqlite.synchronous":           true,
+	"ring.sqlite.wal_autocheckpoint":    true,
+	"sink.clickhouse.addrs":             true,
+	"sink.clickhouse.database":          true,
+	"sink.clickhouse.password":          true,
+	"sink.clickhouse.pool_size":         true,
+	"sink.clickhouse.table":             true,
+	"sink.clickhouse.tls":               true,
+	"sink.clickhouse.tls_ca":            true,
+	"sink.clickhouse.tls_insecure":      true,
+	"sink.clickhouse.username":          true,
+	"sink.mysql.addr":                   true,
+	"sink.mysql.database":               true,
+	"sink.mysql.password":               true,
+	"sink.mysql.pool_size":              true,
+	"sink.mysql.table":                  true,
+	"sink.mysql.tls":                    true,
+	"sink.mysql.tls_ca":                 true,
+	"sink.mysql.tls_insecure":           true,
+	"sink.mysql.username":               true,
+	"sink.nats.tls":                     true,
+	"sink.nats.tls_ca":                  true,
+	"sink.nats.tls_insecure":            true,
+	"sink.postgres.addr":                true,
+	"sink.postgres.database":            true,
+	"sink.postgres.password":            true,
+	"sink.postgres.pool_size":           true,
+	"sink.postgres.table":               true,
+	"sink.postgres.tls":                 true,
+	"sink.postgres.tls_ca":              true,
+	"sink.postgres.tls_insecure":        true,
+	"sink.postgres.username":            true,
+	"sink.redis.addrs":                  true,
+	"sink.redis.db":                     true,
+	"sink.redis.maxlen":                 true,
+	"sink.redis.password":               true,
+	"sink.redis.pipeline_multiplex":     true,
+	"sink.redis.read_buffer_each_conn":  true,
+	"sink.redis.ring_scale_each_conn":   true,
+	"sink.redis.sentinel_master":        true,
+	"sink.redis.stream":                 true,
+	"sink.redis.tls":                    true,
+	"sink.redis.tls_ca":                 true,
+	"sink.redis.tls_insecure":           true,
+	"sink.redis.username":               true,
+	"sink.redis.write_buffer_each_conn": true,
+	"sink.sqlite.busy_timeout":          true,
+	"sink.sqlite.keep_files":            true,
+	"sink.sqlite.path":                  true,
+	"sink.sqlite.rotate":                true,
+	"sink.sqlite.synchronous":           true,
+	"sink.sqlite.wal_autocheckpoint":    true,
+	"sink.type":                         true,
+	"tls.backpressure_timeout":          true,
+	"tls.cert_file":                     true,
+	"tls.client_auth":                   true,
+	"tls.client_ca":                     true,
+	"tls.handshake_timeout":             true,
+	"tls.idle_timeout":                  true,
+	"tls.key_file":                      true,
+	"tls.max_conns":                     true,
+	"tls.max_conns_per_ip":              true,
+	"tls.min_version":                   true,
+}

@@ -1,0 +1,28 @@
+{
+  "host": {
+    "hostname": "edge",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.1",
+  "level": {
+    "code": 5,
+    "name": "notice"
+  },
+  "short-message": "",
+  "extra": {
+    "message": "wrong key for the text",
+    "@timestamp": "2026-10-31T12:00:00.000Z"
+  },
+  "size": 117,
+  "parse": {
+    "warnings": [
+      "short-message-missing",
+      "key-unknown"
+    ]
+  }
+}

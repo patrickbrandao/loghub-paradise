@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loghub/schemas/jlh-envelope.schema.json",
+  "title": "JLH (JSON LogHub) Envelope",
+  "description": "Envelope of every message on the LogHub eventbus. Nine required fields and nothing else at the top level. The payload is a free object whose structure is defined by each type; this schema does not validate payloads.",
+  "$comment": "loghub-json-schema 1.0.0 (2026-10-03). space follows go-loghub-ident validWorkspace; type follows go-loghub-ident validAgentName. Rules JSON Schema cannot express (uuid precision level 3, level 11-15 usage, step limit processing, timeline semantics, reserved control types) live in the skill text.",
+  "type": "object",
+  "required": ["uuid", "from", "space", "type", "level", "sid", "step", "event", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "uuid": {
+      "description": "Message identity: UUIDv7 (RFC 9562) generated when the envelope is created; never changes when forwarded. Producers use precision level 3 (microseconds in rand_a, nanoseconds in the top 10 bits of rand_b). Any letter case is accepted; producers emit lowercase.",
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "from": {
+      "description": "AgentUUID of the worker that emitted this envelope, persisted across restarts. Any RFC 9562 version (1-8) with the RFC variant, canonical lowercase form. Nil and Max are rejected.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "space": {
+      "description": "Workspace (tenant) of the emitting worker; part of the subject loghub.{space}.{type}. Same rule as the go-loghub-ident Workspace.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9.-]+$",
+      "not": { "enum": [".", ".."] },
+      "default": "default",
+      "examples": ["default", "intranet", "com.site.api", "service.tenant.91282"]
+    },
+    "type": {
+      "description": "Kind of payload, chosen by the program that defines it; selects the payload structure and the subsystem that processes it. Same rule as the go-loghub-ident AgentName. beacon, ping and pong are reserved for the control plane.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9._-]+$",
+      "not": { "enum": [".", ".."] },
+      "examples": ["order.created", "sensor_reading", "access-log", "beacon"]
+    },
+    "level": {
+      "description": "0-7 severity (emergency..debug); 8 data-signal; 9 data-channel; 10 done-signal; 11-15 reserved (emit only when the type defines the meaning).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 15
+    },
+    "sid": {
+      "description": "Session/grouping id (job, workflow, connection). 0 when the type has no session; the process PID by default; never random. Capped at 2^53-1 so every JSON parser reads it exactly.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "step": {
+      "description": "Hop counter (anti-loop). 0 on first insertion; +1 on every forward and every derived envelope. A receiver drops and logs an envelope whose step has reached the limit (default 32, can only be lowered).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 32
+    },
+    "event": {
+      "description": "When the fact described by the payload happened. uts and sub are the source of truth; iso is the same instant for humans.",
+      "type": "object",
+      "required": ["uts", "sub", "iso"],
+      "additionalProperties": false,
+      "properties": {
+        "uts": {
+          "description": "Unix timestamp, UTC, whole seconds. Upper bound is 9999-12-31T23:59:59Z, the last second iso can represent.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 253402300799
+        },
+        "sub": {
+          "description": "Fraction of the second in nanoseconds.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        },
+        "iso": {
+          "description": "yyyy-MM-ddTHH:mm:ss.SSSZ, UTC, exactly three fraction digits and the Z suffix.",
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+        }
+      }
+    },
+    "payload": {
+      "description": "Message content. Always a JSON object ({} when empty); its structure is defined by the type.",
+      "type": "object"
+    }
+  }
+}

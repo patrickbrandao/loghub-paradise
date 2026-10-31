@@ -31,6 +31,7 @@ N-ésima, mandar `serverclose`, segurar tudo):
 | `TestDurationWithoutCount` | `--duration` sem `--count` envia durante o tempo todo, a `--rate` (falhava antes de 2026-10-31: uma mensagem só) |
 | `TestUsageErrors` | 11 combinações recusadas |
 | `TestPcapReplay` | a captura sintética do SI (UDP, octet, LF midstream, RELP e a direção `rsp`, DNS) reenviada por RELP, em ordem; pcapng, `--pcap-port`, `original` a 10x, `--loop`, `--format 5424` |
+| `source` | `--loop` numa passada sem mensagem termina (`TestLoopBlankFileEnds`: arquivo só de linhas em branco; `TestLoopFileEmptiedBetweenPassesEnds`: arquivo esvaziado entre passadas). Antes de 2026-10-31 girava a 100 % de CPU para sempre (achado da revisão do GI) |
 
 ## 2. Fuzz
 

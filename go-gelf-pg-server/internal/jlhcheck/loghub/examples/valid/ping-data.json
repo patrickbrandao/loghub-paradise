@@ -1,0 +1,18 @@
+{
+  "uuid": "019dc7e4-0fdc-7000-8007-f121b929c6d9",
+  "from": "019a43b0-0340-703e-95ec-71ff4cde1c40",
+  "space": "default",
+  "type": "ping",
+  "level": 9,
+  "sid": 0,
+  "step": 0,
+  "event": {
+    "uts": 1777175105,
+    "sub": 500000000,
+    "iso": "2026-04-26T03:45:05.500Z"
+  },
+  "payload": {
+    "seq": 1,
+    "pad": "0123456789abcdef"
+  }
+}

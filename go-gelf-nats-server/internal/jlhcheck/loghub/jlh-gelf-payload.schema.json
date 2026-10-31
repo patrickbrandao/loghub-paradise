@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loghub/schemas/jlh-gelf-payload.schema.json",
+  "title": "JLH payload — type=gelf",
+  "description": "Payload de envelopes JLH com type=gelf, produzido por servidores GELF (Bridge-IN) a partir de documentos GELF 1.1 (Graylog Extended Log Format) recebidos por UDP (com chunks e compressão), TCP (moldura \\0), TLS, HTTP ou HTTPS. Escrito pelo go-gelf-server (não há skill type=gelf; decisão 1 da família GELF, 2026-10-31). Campos ausentes no documento são OMITIDOS (nunca null, nunca string vazia), exceto 'short-message', que é sempre presente. Chaves com mais de uma palavra usam kebab-case.",
+  "type": "object",
+  "required": ["host", "transport", "format", "level", "short-message", "size"],
+  "properties": {
+    "host": {
+      "description": "Origem do documento. 'hostname' é o campo GELF 'host' declarado pelo emissor; os demais vêm do socket que recebeu o documento (ou do PROXY protocol de um par confiável).",
+      "type": "object",
+      "required": ["src-ip", "src-port", "dst-port"],
+      "properties": {
+        "hostname": {
+          "description": "Campo GELF 'host', preservado como recebido: sem resolução DNS, sem mudar caixa. Omitido se ausente, vazio, com espaço em branco ou de outro tipo.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S+$"
+        },
+        "src-ip": {
+          "description": "IP de origem, em forma canônica: IPv4 decimal pontuado; IPv6 RFC 5952 minúsculo; IPv4-mapeado convertido para IPv4; sem zona.",
+          "type": "string",
+          "anyOf": [{ "format": "ipv4" }, { "format": "ipv6" }]
+        },
+        "src-port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "dst-ip": {
+          "description": "IP local que recebeu o documento (PKTINFO no UDP, LocalAddr nos demais). Omitido se desconhecido; nunca 0.0.0.0 ou ::.",
+          "type": "string",
+          "anyOf": [{ "format": "ipv4" }, { "format": "ipv6" }]
+        },
+        "dst-port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      },
+      "additionalProperties": false
+    },
+    "transport": {
+      "description": "Como o documento chegou ao servidor.",
+      "enum": ["udp", "tcp", "tls", "http", "https"]
+    },
+    "compression": {
+      "description": "Contêiner de compressão em que o documento chegou: gzip ou zlib detectados pelos bytes (UDP, HTTP), ou deflate cru (só HTTP com Content-Encoding: deflate sem cabeçalho zlib). Omitido sem compressão.",
+      "enum": ["gzip", "zlib", "deflate"]
+    },
+    "chunks": {
+      "description": "Número de chunks GELF UDP de que o documento foi remontado (1..128). Omitido sem chunk.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 128
+    },
+    "tls": {
+      "description": "Sessão TLS que entregou o documento. Somente com transport tls ou https.",
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "version": { "type": "string", "pattern": "^TLS1\\.[0-3]$", "examples": ["TLS1.3"] },
+        "cipher": { "type": "string", "pattern": "^TLS_[A-Z0-9_]+$", "examples": ["TLS_AES_128_GCM_SHA256"] },
+        "peer-subject": { "description": "Subject DN do certificado do cliente (RFC 4514).", "type": "string", "minLength": 1, "maxLength": 1024 },
+        "peer-fingerprint": {
+          "description": "Fingerprint do certificado do cliente: rótulo do hash em minúsculas, ':' e octetos em hexadecimal maiúsculo separados por ':'.",
+          "type": "string",
+          "pattern": "^[a-z0-9-]+(:[0-9A-F]{2})+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "format": {
+      "description": "'gelf' (um objeto JSON válido, interpretado campo a campo) ou 'malformed' (UTF-8 inválido, JSON inválido, valor de topo que não é objeto, aninhamento acima de 64: nada é interpretado, o documento vai em 'raw').",
+      "enum": ["gelf", "malformed"]
+    },
+    "gelf-version": {
+      "description": "Campo GELF 'version' como veio ('1.1', '1.0' ou outro, com aviso version-unknown).",
+      "type": "string",
+      "minLength": 1
+    },
+    "level": { "$ref": "#/$defs/level" },
+    "facility": {
+      "description": "Campo GELF 1.0 'facility' (obsoleto na 1.1). Um número vira o seu texto (aviso facility-coerced).",
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "description": "Campo GELF 'timestamp' (segundos desde a época, com fração), normalizado para UTC com sufixo Z e a precisão decimal que veio: mínimo 3 e máximo 9 dígitos. Omitido se ausente ou inválido.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3,9}Z$"
+    },
+    "short-message": {
+      "description": "Campo GELF 'short_message'. Sempre presente: string vazia quando ausente, nulo ou vazio (aviso short-message-missing) e em format=malformed.",
+      "type": "string"
+    },
+    "full-message": { "description": "Campo GELF 'full_message', se não vazio.", "type": "string", "minLength": 1 },
+    "file": { "description": "Campo GELF 1.0 'file'.", "type": "string", "minLength": 1 },
+    "line": { "description": "Campo GELF 1.0 'line'.", "type": "integer", "minimum": 0, "maximum": 2147483647 },
+    "fields": {
+      "description": "Campos adicionais GELF ('_nome'), sem o '_' inicial. Valores string, ou número com o texto literal que chegou; booleanos, objetos e arrays viram string com o JSON compacto (aviso field-coerced); null é omitido (aviso field-null).",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": ["string", "number"] }
+    },
+    "extra": {
+      "description": "Chaves de topo não padronizadas e sem '_' (aviso key-unknown), com o valor JSON reescrito compacto. null é omitido.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": ["string", "number", "boolean", "object", "array"] }
+    },
+    "size": {
+      "description": "Octetos do documento GELF descomprimido (o GELF nunca é truncado).",
+      "type": "integer",
+      "minimum": 1
+    },
+    "raw": {
+      "description": "O documento descomprimido inteiro. Presente em format=malformed, quando um aviso indica perda (version-invalid, host-invalid, full-message-invalid, level-invalid, timestamp-invalid, facility-invalid, file-invalid, line-invalid, duplicate-key, encoding-replaced) ou com keep_raw=always.",
+      "type": "string",
+      "minLength": 1
+    },
+    "raw-encoding": {
+      "description": "Codificação de 'raw'. Ausente significa UTF-8.",
+      "const": "base64"
+    },
+    "parse": {
+      "description": "Desvios detectados na conversão. Omitido quando não houve nenhum.",
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "warnings": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/warningCode" }
+        },
+        "error": {
+          "description": "Por que o documento é malformed. Somente em format=malformed.",
+          "enum": [
+            "UTF-8 inválido no documento",
+            "documento não é JSON válido",
+            "conteúdo depois do fim do documento JSON",
+            "o documento JSON não é um objeto",
+            "aninhamento JSON acima de 64 níveis"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "x-proxy": {
+      "description": "Extensão: o par TCP real quando o PROXY protocol substituiu os endereços de 'host'.",
+      "type": "object",
+      "required": ["peer-ip", "peer-port"],
+      "properties": {
+        "peer-ip": { "type": "string", "anyOf": [{ "format": "ipv4" }, { "format": "ipv6" }] },
+        "peer-port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "patternProperties": {
+    "^x-": {}
+  },
+  "additionalProperties": false,
+
+  "allOf": [
+    {
+      "if": { "properties": { "transport": { "enum": ["tcp", "tls"] } } },
+      "then": { "not": { "anyOf": [{ "required": ["compression"] }, { "required": ["chunks"] }] } }
+    },
+    {
+      "if": { "properties": { "transport": { "enum": ["http", "https"] } } },
+      "then": { "not": { "required": ["chunks"] } }
+    },
+    {
+      "if": { "properties": { "transport": { "const": "udp" } } },
+      "then": { "properties": { "compression": { "enum": ["gzip", "zlib"] } }, "not": { "required": ["x-proxy"] } }
+    },
+    {
+      "if": { "properties": { "transport": { "enum": ["udp", "tcp", "http"] } } },
+      "then": { "not": { "required": ["tls"] } }
+    },
+    {
+      "if": { "properties": { "format": { "const": "malformed" } } },
+      "then": {
+        "required": ["raw", "parse"],
+        "properties": {
+          "short-message": { "const": "" },
+          "level": { "properties": { "code": { "const": 6 } } },
+          "parse": { "required": ["error"], "not": { "required": ["warnings"] } }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["gelf-version"] }, { "required": ["facility"] }, { "required": ["timestamp"] },
+            { "required": ["full-message"] }, { "required": ["file"] }, { "required": ["line"] },
+            { "required": ["fields"] }, { "required": ["extra"] },
+            { "properties": { "host": { "required": ["hostname"] } } }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "properties": { "format": { "const": "gelf" } } },
+      "then": {
+        "properties": { "parse": { "not": { "required": ["error"] } } },
+        "not": { "required": ["raw-encoding"] }
+      }
+    },
+    {
+      "if": { "required": ["raw-encoding"] },
+      "then": { "required": ["raw"] }
+    },
+    {
+      "if": {
+        "required": ["parse"],
+        "properties": {
+          "parse": {
+            "required": ["warnings"],
+            "properties": {
+              "warnings": {
+                "contains": {
+                  "enum": ["version-invalid", "host-invalid", "full-message-invalid", "level-invalid",
+                           "timestamp-invalid", "facility-invalid", "file-invalid", "line-invalid",
+                           "duplicate-key", "encoding-replaced"]
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": { "required": ["raw"] }
+    }
+  ],
+
+  "$defs": {
+    "level": {
+      "description": "Nível GELF (a severidade syslog, 0–7) com o rótulo da RFC 5424. O level do envelope é igual a level.code. Ausente: 6 (aviso level-default; desvio da GELF 1.1, que manda 1).",
+      "type": "object",
+      "required": ["code", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "integer", "minimum": 0, "maximum": 7 },
+        "name": { "type": "string" }
+      },
+      "oneOf": [
+        { "properties": { "code": { "const": 0 }, "name": { "const": "emerg" } } },
+        { "properties": { "code": { "const": 1 }, "name": { "const": "alert" } } },
+        { "properties": { "code": { "const": 2 }, "name": { "const": "crit" } } },
+        { "properties": { "code": { "const": 3 }, "name": { "const": "err" } } },
+        { "properties": { "code": { "const": 4 }, "name": { "const": "warning" } } },
+        { "properties": { "code": { "const": 5 }, "name": { "const": "notice" } } },
+        { "properties": { "code": { "const": 6 }, "name": { "const": "info" } } },
+        { "properties": { "code": { "const": 7 }, "name": { "const": "debug" } } }
+      ]
+    },
+    "warningCode": {
+      "description": "Códigos de desvio detectados na conversão (SPEC §6.8), nesta ordem canônica.",
+      "enum": [
+        "version-missing",
+        "version-unknown",
+        "version-invalid",
+        "host-missing",
+        "host-invalid",
+        "short-message-missing",
+        "short-message-coerced",
+        "full-message-invalid",
+        "level-default",
+        "level-coerced",
+        "level-invalid",
+        "timestamp-coerced",
+        "timestamp-invalid",
+        "facility-coerced",
+        "facility-invalid",
+        "file-invalid",
+        "line-coerced",
+        "line-invalid",
+        "field-coerced",
+        "field-null",
+        "field-id-reserved",
+        "field-name-invalid",
+        "key-unknown",
+        "duplicate-key",
+        "encoding-replaced"
+      ]
+    }
+  },
+
+  "examples": [
+    {
+      "host": { "hostname": "web01", "src-ip": "10.0.0.3", "src-port": 59922, "dst-ip": "10.0.0.10", "dst-port": 12201 },
+      "transport": "udp",
+      "compression": "gzip",
+      "chunks": 2,
+      "format": "gelf",
+      "gelf-version": "1.1",
+      "level": { "code": 3, "name": "err" },
+      "timestamp": "2026-10-31T12:00:00.123Z",
+      "short-message": "NullPointerException in OrderService",
+      "full-message": "java.lang.NullPointerException\n\tat com.acme.OrderService.place(OrderService.java:42)",
+      "fields": { "app": "orders", "latency_ms": 12.5 },
+      "size": 9123
+    }
+  ]
+}

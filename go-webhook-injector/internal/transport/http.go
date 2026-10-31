@@ -206,6 +206,7 @@ type h1Conn struct {
 	written uint64
 	spent   bool // the Connection: close request is written
 	closing bool // the server answered "Connection: close"
+	idle    bool // the server closed with nothing pending (keep-alive idle timeout)
 	unsent  []sched.Pending
 	answers uint64
 
@@ -244,7 +245,7 @@ func (h *h1Conn) write(p *pend) error {
 		// the responses that free a slot never come.
 		if err := h.bw.Flush(); err != nil {
 			h.giveBack(p)
-			return err
+			return h.writeErr(err)
 		}
 		select {
 		case h.slots <- struct{}{}:
@@ -257,9 +258,10 @@ func (h *h1Conn) write(p *pend) error {
 	if h.closing || h.spent || h.dead != nil {
 		// Not written: back to the worker, for the next connection. A spent
 		// connection already sent its "Connection: close" request; nothing
-		// may follow it (a retry may have been that request).
-		closing, dead := h.closing || h.spent, h.dead
-		h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0})
+		// may follow it (a retry may have been that request). A server that
+		// closed an idle keep-alive connection is a planned close too.
+		closing, dead := h.closing || h.spent || h.idle, h.dead
+		h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: true})
 		h.mu.Unlock()
 		<-h.slots
 		if closing {
@@ -284,13 +286,13 @@ func (h *h1Conn) write(p *pend) error {
 	// the socket: the server may have said "Connection: close" in a response
 	// still unread, and only the reader can tell what it did not process.
 	if _, err := h.bw.Write(h.buf); err != nil {
-		return err
+		return h.writeErr(err)
 	}
 	// With one request in flight there is nothing to batch: push it now, or
 	// the server waits for bytes still in our buffer.
 	if h.o.Pipeline == 1 || last {
 		if err := h.bw.Flush(); err != nil {
-			return err
+			return h.writeErr(err)
 		}
 	}
 	if last {
@@ -299,9 +301,41 @@ func (h *h1Conn) write(p *pend) error {
 	return nil
 }
 
+// writeErr qualifies a failed write. A pipelining client writes ahead of the
+// responses, so against a server that answers "Connection: close" (the last
+// request of its per-connection cap, or its shutdown) a write after the
+// close fails with a broken pipe or a reset. That is the planned end of the
+// connection, not a broken one: once the reader has seen the close (it reads
+// what was answered and gives the rest back), the write error becomes
+// ErrSpent. A timeout is backpressure, and is returned as it is.
+func (h *h1Conn) writeErr(err error) error {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return err
+	}
+	// The reader has a deadline while requests are pending, so it ends; the
+	// bound covers a reader idle in Peek with nothing pending.
+	t := time.NewTimer(h.o.ResponseTimeout)
+	select {
+	case <-h.readerDone:
+	case <-t.C:
+	}
+	t.Stop()
+	h.mu.Lock()
+	planned := h.closing || h.idle
+	h.mu.Unlock()
+	if planned {
+		return sched.ErrSpent
+	}
+	return err
+}
+
 func (h *h1Conn) deadErr() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closing || h.idle {
+		return sched.ErrSpent
+	}
 	if h.dead != nil {
 		return h.dead
 	}
@@ -359,7 +393,7 @@ func (h *h1Conn) Flush() error {
 		return err
 	}
 	if ferr := h.bw.Flush(); ferr != nil {
-		return ferr
+		return h.writeErr(ferr)
 	}
 	return err
 }
@@ -432,7 +466,7 @@ func (h *h1Conn) Close(ctx context.Context) error {
 // giveBack hands a request that never reached the wire back to the worker.
 func (h *h1Conn) giveBack(p *pend) {
 	h.mu.Lock()
-	h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0})
+	h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: true})
 	h.mu.Unlock()
 }
 
@@ -459,6 +493,12 @@ func (h *h1Conn) read() {
 			// Peek blocks until a byte or an error: an unsolicited close
 			// (idle timeout of the server) is seen here.
 			if _, err := br.Peek(1); err != nil {
+				h.mu.Lock()
+				// Nothing pending: a keep-alive server closing an idle
+				// connection (or shutting down between requests). What the
+				// worker writes next goes on a new connection, unbroken.
+				h.idle = len(h.queue) == 0
+				h.mu.Unlock()
 				h.fail(err, true)
 				return
 			}
@@ -489,6 +529,14 @@ func (h *h1Conn) read() {
 		h.queue[0] = nil
 		h.queue = h.queue[1:]
 		h.answers++
+		if resp.Close {
+			// Before the slot is freed below: a worker waiting for that
+			// slot must find the connection closing and give its request
+			// back, not write it to a socket the server no longer reads
+			// (every request after the first of a connection was written
+			// for nothing: review-gi #3, found in the copy in GI).
+			h.closing = true
+		}
 		if retry {
 			p.tries++
 			p.last = strconv.Itoa(resp.StatusCode)
@@ -504,7 +552,6 @@ func (h *h1Conn) read() {
 			// RFC 9112 §9.6: the server reads nothing after this response,
 			// so what is behind it was not processed and can go again.
 			h.mu.Lock()
-			h.closing = true
 			for _, q := range h.queue {
 				h.unsent = append(h.unsent, sched.Pending{Seq: q.seq, Msg: q.msg, Done: q.done, Stuck: h.answers == 0})
 				<-h.slots

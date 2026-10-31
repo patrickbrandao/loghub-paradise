@@ -39,7 +39,10 @@ type Pcap struct {
 	last  time.Duration
 	pass  uint64
 	sent  uint64
-	cut   uint64 // passes that ended at a truncated record
+	// passSent counts the messages of the current pass: a pass with none ends
+	// --loop (a capture rewritten empty between passes would spin forever).
+	passSent uint64
+	cut      uint64 // passes that ended at a truncated record
 
 	// totals of the previous passes, so the report covers the whole run
 	decTotal pcap.Stats
@@ -81,6 +84,7 @@ func (p *Pcap) open() error {
 	})
 	p.first = time.Time{}
 	p.pass++
+	p.passSent = 0
 	return nil
 }
 
@@ -112,7 +116,7 @@ func (p *Pcap) Next(_ uint64, now time.Time) (Message, error) {
 			if !errors.Is(err, io.EOF) {
 				return Message{}, err
 			}
-			if !p.opt.Loop || p.sent == 0 {
+			if !p.opt.Loop || p.passSent == 0 {
 				return Message{}, io.EOF
 			}
 			if err := p.reopen(); err != nil {
@@ -127,6 +131,7 @@ func (p *Pcap) Next(_ uint64, now time.Time) (Message, error) {
 		m.Data = p.opt.Header.Wrap(make([]byte, 0, len(m.Data)+96), m.Data, now)
 	}
 	p.sent++
+	p.passSent++
 	return m, nil
 }
 

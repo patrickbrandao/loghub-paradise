@@ -1,0 +1,13 @@
+# Combinacao padrao: ring=memory -> sink=nats (JetStream), o eventbus do LogHub.
+#
+#   docker compose up -d --build
+#   docker compose --profile demo up -d --build     # + emissor GELF fluent-bit
+#
+# As demais combinacoes estao em compose.<ring>-<sink>.yml (README.md); o
+# emissor de demonstracao, em compose.demo.yml (perfil "demo").
+
+name: gls-memory-nats
+
+include:
+  - compose.memory-nats.yml
+  - compose.demo.yml

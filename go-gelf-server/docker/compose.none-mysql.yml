@@ -1,0 +1,96 @@
+# ring sem ring  ->  MySQL compartilhado (tabela gelf_events)
+#
+# Garantia (TCP/TLS): a escrita no destino terminou antes de voltar a ler.
+#   O modo lento por definicao: a conversao roda na recepcao.
+#
+#   docker compose -f compose.none-mysql.yml up -d --build
+#
+# Publicado no host: GELF 22161/udp e 22161/tcp (GELF_PORT), HTTP 22162 (GELF_HTTP_PORT),
+# TCP+TLS 22163 e HTTPS 22164 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29116 (GELF_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: gls-none-mysql
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gls-base
+    container_name: gls-none-mysql
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: gls-none-mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      # --- ring: none --------------------------------------------------------
+      GELF_RING_MODE: none
+      # Igual ao pool (sink.workers = 4): sem ring a escrita e' sincrona, e um
+      # max_inflight acima do pool so' cria fila escondida dentro dele (SPEC
+      # §9.6; o boot avisa). Quem subir o pool sobe este junto.
+      GELF_RING_MAX_INFLIGHT: ${GELF_RING_MAX_INFLIGHT:-4}
+      GELF_EMERGENCY_ENABLED: "false"
+
+      # --- sink: mysql -------------------------------------------------------
+      GELF_SINK_TYPE: mysql
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao de um orcamento que a frota inteira divide
+      # (SPEC §10.5). Acima de 16 tambem e' WARN.
+      GELF_SINK_WORKERS: "4"
+      GELF_SINK_MYSQL_ADDR: mysql:3306
+      GELF_SINK_MYSQL_USERNAME: ${GELF_SINK_MYSQL_USERNAME:-gelf}
+      GELF_SINK_MYSQL_PASSWORD: ${GELF_SINK_MYSQL_PASSWORD:-gelf}
+      GELF_SINK_MYSQL_DATABASE: ${GELF_SINK_MYSQL_DATABASE:-gelf}
+      GELF_SINK_MYSQL_TABLE: ${GELF_SINK_MYSQL_TABLE:-gelf_events}
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, fora do pool).
+      GELF_SINK_MYSQL_POOL_SIZE: ${GELF_SINK_MYSQL_POOL_SIZE:-0}
+      GELF_SINK_MYSQL_TLS: ${GELF_SINK_MYSQL_TLS:-false}
+
+    ports:
+      # As portas do container sao as do GELF (SPEC §4.1); o host escolhe.
+      - "${GELF_PORT:-22161}:12201/udp"
+      - "${GELF_PORT:-22161}:12201/tcp"
+      - "${GELF_HTTP_PORT:-22162}:12202/tcp"
+      - "${GELF_TLS_PORT:-22163}:12203/tcp"
+      - "${GELF_HTTPS_PORT:-22164}:12204/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-29116}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - gls-data:/data
+
+  mysql:
+    image: ${GELF_MYSQL_IMAGE:-mysql:8.4}
+    container_name: gls-none-mysql-mysql
+    hostname: gls-none-mysql-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GELF_MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${GELF_SINK_MYSQL_DATABASE:-gelf}
+      MYSQL_USER: ${GELF_SINK_MYSQL_USERNAME:-gelf}
+      MYSQL_PASSWORD: ${GELF_SINK_MYSQL_PASSWORD:-gelf}
+    command:
+      - mysqld
+      - --innodb_flush_log_at_trx_commit=1
+      # O pior JLH tem ~776 KiB (SPEC §3.9); 64 MiB sobram.
+      - --max_allowed_packet=64M
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # O servidor nunca faz DDL (SPEC §10.6): a tabela vem daqui.
+      - ./mysql/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "127.0.0.1:${GELF_MYSQL_PORT:-23316}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  gls-data:
+  mysql-data:
