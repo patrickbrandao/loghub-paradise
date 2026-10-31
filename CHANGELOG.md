@@ -12,9 +12,33 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 **S** = `go-syslog-server`, **F** = `go-webhook-fast-server`, **P** = `go-webhook-pg-server`,
 **SP** = `go-syslog-pg-server`, **SN** = `go-syslog-nats-server`,
 **N** = `go-webhook-nats-server`, **R** = `go-relplog-server`,
-**RP** = `go-relplog-pg-server`, **RN** = `go-relplog-nats-server`. Nas entradas anteriores a 2026-10-05, **S** é o
+**RP** = `go-relplog-pg-server`, **RN** = `go-relplog-nats-server`,
+**SI** = `go-syslog-injector`, **RI** = `go-relplog-injector`. Nas entradas anteriores a 2026-10-05, **S** é o
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
+
+## 2026-10-31 — SI, RI: injetores de mensagens; README da raiz
+
+Pedido: ferramentas cliente para injetar mensagens nos servidores, um módulo
+por família, para teste funcional e de carga, com replay de capturas do
+tcpdump. Novos **SI** = `go-syslog-injector` (o pai do código) e **RI** =
+`go-relplog-injector`, sem dependência fora da stdlib; decisões em
+`docs/DECISOES.md` (o mesmo texto nos dois). Provados contra os servidores
+reais: SI por UDP, TCP, TLS, unix e PROXY v1/v2, e replay de tcpdump real
+(9000/9000, captura no meio da conexão sem duplicata); RI com 100k
+confirmadas, reinício do servidor no meio (retransmissão sem perda) e TLS com
+PROXY v2. Defeitos achados: o `FuzzStream` achou três ressincronizações que
+dependiam da divisão em segmentos (um candidato pendente anterior agora segura
+a decisão); a cauda da captura sumia sem lacuna quando o tcpdump parava cedo
+(`tcp_unterminated`, e `-B 65536 -U` na receita); no RI uma mensagem segurada
+sem nunca ter sido enviada gastava uma tentativa. Não feito: revisão
+independente dos dois; o injetor HTTP (`go-webhook-injector`) fica fora do
+repositório até ficar pronto. Lição: replay de captura só é confiável se a
+ressincronização for invariante à divisão em segmentos, e só um fuzz de
+invariância prova isso.
+
+O `README.md` da raiz passa a descrever todos os módulos, as topologias de
+ring × sink (diagramas mermaid), a implantação e os exemplos de uso.
 
 ## 2026-10-14 — go-syslog-standard-server: seis pendências baratas (porte do S)
 
