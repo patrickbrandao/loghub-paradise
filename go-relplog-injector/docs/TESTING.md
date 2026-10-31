@@ -28,6 +28,7 @@ N-ésima, mandar `serverclose`, segurar tudo):
 | `TestAckTimeoutAndWindow` | janela 2, servidor que nunca responde: 2 transações por sessão, 2 sessões quebradas por `--ack-timeout`, mensagem que esperava vaga não gasta tentativa |
 | `TestTLSAndProxyV2` | RELP sobre TLS com CA própria e PROXY v2 byte a byte; sem a CA, saída 3 |
 | `TestUnreachable`, `TestOpenRefusedIsDialError` | alvo fechado e `open` recusado: saída 3 |
+| `TestDurationWithoutCount` | `--duration` sem `--count` envia durante o tempo todo, a `--rate` (falhava antes de 2026-10-31: uma mensagem só) |
 | `TestUsageErrors` | 11 combinações recusadas |
 | `TestPcapReplay` | a captura sintética do SI (UDP, octet, LF midstream, RELP e a direção `rsp`, DNS) reenviada por RELP, em ordem; pcapng, `--pcap-port`, `original` a 10x, `--loop`, `--format 5424` |
 

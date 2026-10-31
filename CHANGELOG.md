@@ -13,9 +13,47 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 **SP** = `go-syslog-pg-server`, **SN** = `go-syslog-nats-server`,
 **N** = `go-webhook-nats-server`, **R** = `go-relplog-server`,
 **RP** = `go-relplog-pg-server`, **RN** = `go-relplog-nats-server`,
-**SI** = `go-syslog-injector`, **RI** = `go-relplog-injector`. Nas entradas anteriores a 2026-10-05, **S** é o
+**SI** = `go-syslog-injector`, **RI** = `go-relplog-injector`,
+**WI** = `go-webhook-injector`. Nas entradas anteriores a 2026-10-05, **S** é o
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
+
+## 2026-10-31 — WI: go-webhook-injector; correção de `--duration` em SI e RI
+
+Pedido: terminar o injetor de webhook, testar e publicar, e garantir que cada
+software tenha a sua ferramenta de injeção com suporte a envio extremo. Lido
+como cobertura (DECISOES 16): WI para W/F/P/N, SI para S/SP/SN e o standard,
+RI para R/RP/RN, com uma tabela servidor → injetor no `README.md` da raiz. O
+WI tem cliente HTTP/1.1 próprio com pipelining e HTTP/2 (h2c/ALPN) com muitos
+streams, `--retries` para `429`/`503`, `--uuid-out` e replay de requisições
+HTTP de pcap. Provado contra W, F, P (PostgreSQL 18, cada `X-LogHub-UUID`
+achado na `loghub.inbox`) e N (JetStream, 300 mil no stream), e com tcpdump real
+num container (3200 requisições reproduzidas, conteúdo conferido no
+`events.db`).
+
+Defeitos achados: **`--duration` sem `--count` enviava uma mensagem só** nos
+três injetores (o README publicado na v2026.10.31 tinha exemplos assim), corrigido
+com teste que falha sem a correção; o modelo do SI tratava todo `{` como
+marcador e quebrava o JSON do gerador (regra própria no WI, SPEC WI §5.2); o
+`http.ReadRequest` acusa malformação, não "faltam bytes", num cabeçalho ou num
+chunked cortado (o extrator espera o cabeçalho inteiro e acha o fim do chunked
+sozinho); o `FuzzStream` achou o corte da janela de ressincronização no meio de
+uma palavra maiúscula; o `-race` achou o `tls.Config` compartilhado entre os
+transportes HTTP/2; pipelining sem empurrar o buffer antes de esperar vaga era
+impasse; requisições atrás de um `Connection: close` contavam como falha,
+quando o servidor garantidamente não as leu (agora voltam ao worker e saem na
+conexão seguinte). Revisão
+independente do transporte (um revisor, só leitura) achou mais quatro, todos
+corrigidos: reenvio pendente e requisição nova numa conexão já desligada viravam
+`conn_error` em vez de voltar ao worker; uma conexão gasta por um reenvio
+continuava aceitando requisições atrás do `Connection: close`; uma janela entre
+tirar a resposta da fila e agendar o reenvio deixava o `Close` fechar cedo; e um
+`Content-Length` enorme numa captura fazia o extrator guardar até o tamanho
+declarado. Lição: num cliente de carga, "reenviar" só é seguro para o que o
+servidor provadamente não processou; o resto é desfecho.
+
+A portar para SI e RI: nada do transporte (protocolos diferentes); o
+`sched.Resender` do WI pode servir ao RI se um dia ele reenviar por sessão.
 
 ## 2026-10-31 — SI, RI: injetores de mensagens; README da raiz
 

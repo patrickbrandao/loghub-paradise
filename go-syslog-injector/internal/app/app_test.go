@@ -578,3 +578,14 @@ func TestBadPcap(t *testing.T) {
 		t.Fatalf("exit %d %q", code, errs)
 	}
 }
+
+// --duration without --count runs for the whole duration (it used to stop
+// after the single default message).
+func TestDurationWithoutCount(t *testing.T) {
+	addr, s := streamServer(t, false, false, nil)
+	code, sum := runJSON(t, "--target", addr, "--duration", "400ms", "--rate", "100")
+	if code != ExitOK || sum.Messages < 20 || sum.Messages > 41 {
+		t.Fatalf("exit %d, %d messages: %+v", code, sum.Messages, sum)
+	}
+	waitFor(t, s, int(sum.Messages))
+}

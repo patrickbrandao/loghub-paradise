@@ -114,7 +114,7 @@ go-syslog-injector [flags]
 | `--tls-insecure` | `false` | não verifica o certificado |
 | `--proxy-protocol` | `off` | cabeçalho PROXY no TCP/TLS: `off`, `v1`, `v2` (§4.4) |
 | `--proxy-src` / `--proxy-dst` | os reais | `ip:porta` anunciados no cabeçalho |
-| `--count` | 1; a fonte inteira com `--file`/`--pcap` | mensagens a enviar; `0` = sem limite |
+| `--count` | 1; sem limite com `--duration`; a fonte inteira com `--file`/`--pcap` | mensagens a enviar; `0` = sem limite |
 | `--duration` | `0` | para depois deste tempo |
 | `--rate` | `0` | mensagens/s somando todas as conexões; `0` = o máximo |
 | `--concurrency` | `1` | conexões (sockets) em paralelo |
@@ -395,7 +395,9 @@ Decididas **uma vez por fluxo**, nos primeiros bytes, como o servidor decide
 
 ## 7. Escalonamento
 
-- `--count` e `--duration` limitam a execução; o que vier primeiro. Uma fonte
+- `--count` e `--duration` limitam a execução; o que vier primeiro. Sem
+  `--count`, `--duration` sozinho não limita a contagem (até 2026-10-31 o padrão
+  de 1 mensagem valia também aqui: defeito dos três injetores). Uma fonte
   finita (arquivo, captura) termina antes se acabar.
 - `--rate R` agenda a mensagem `seq` em `início + (seq−1)/R`: a taxa é **global**
   (somando as conexões), e o produtor que se atrasa não compensa com rajada além
