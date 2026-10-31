@@ -1,0 +1,4 @@
+.git
+*.test
+*.pcap
+internal/app/testdata
