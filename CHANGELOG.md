@@ -14,9 +14,73 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 **N** = `go-webhook-nats-server`, **R** = `go-relplog-server`,
 **RP** = `go-relplog-pg-server`, **RN** = `go-relplog-nats-server`,
 **SI** = `go-syslog-injector`, **RI** = `go-relplog-injector`,
-**WI** = `go-webhook-injector`. Nas entradas anteriores a 2026-10-05, **S** é o
+**WI** = `go-webhook-injector`, **G** = `go-gelf-server`,
+**GP** = `go-gelf-pg-server`, **GN** = `go-gelf-nats-server`,
+**GI** = `go-gelf-injector`. Nas entradas anteriores a 2026-10-05, **S** é o
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
+
+## 2026-10-31 — G, GP, GN, GI: família GELF; `--loop` em SI/RI/WI; fechamento de conexão no WI
+
+Pedido: versões GELF de todos os softwares de ingestão e injeção de syslog e
+RELP, entrevista só no que não se importa dos irmãos, sub-agentes em paralelo,
+e publicação. O RELP não tem par (o GELF não confirma por mensagem). Pais do
+código: S → **G** (completo, com TLS/HTTPS), SP → **GP** (memory → `loghub.inbox`,
+sem TLS), SN → **GN** (memory → NATS, beacon, sem TLS), SI + cliente HTTP do
+WI → **GI**. Entrevista (todas as recomendadas): `type=gelf` com payload
+kebab-case próprio (`jlh-gelf-payload.schema.json`, não há skill), UDP+TCP+HTTP,
+`level` ausente = 6 com `level-default` (desvio da spec GELF, que manda 1),
+`raw` só no malformado. O resto foi decidido pelos irmãos e está em cada
+`docs/DECISOES.md` §2 (portas 12201/12202, TLS 12203/HTTPS 12204 desligados,
+admin 9104, `GELF_*`, teto de 128 KiB do documento descomprimido — 256 KiB não
+cabia no `max_payload` de 1 MiB do NATS pela conta do maior evento, SPEC §3.9).
+
+Construção: G e GI em paralelo, depois GP e GN copiando byte a byte de G
+`internal/convert`, `item`, `jlhcheck` e a recepção GELF (chunks, descompressão,
+moldura `\0`; `http.go` = o de G sem TLS). Provas: `-race` com PG18, MySQL 8.4,
+ClickHouse 25.8, Redis, NATS (JetStream, core, permissões, TLS); fuzz 60 s de
+cada alvo; emissores reais fluent-bit 4.0.3 e `docker --log-driver=gelf` (UDP
+gzip/zlib em chunks, TCP, TLS); GI → G/GP/GN com cada `_seq` uma vez (TCP, UDP
+gzip em chunks, HTTP keep-alive com pipelining, bulk); GI com tcpdump real
+(17 000 de 17 000, captura iniciada no meio inclusive).
+
+Revisão independente (5 revisores só leitura: recepção, conversão, sinks/app,
+cortes, injetor). Corrigido, cada um com teste conferido por mutação:
+- **HTTP sem keep-alive** (o e2e abriu 20 000 conexões para 20 000 requisições):
+  o desenho dizia "keep-alive e h2c não" querendo dizer só h2c. Agora HTTP/1.1
+  persistente, `http.idle_timeout`, `http.max_requests_per_conn`. Lição: uma
+  negação com dois objetos numa frase de desenho é lida dos dois jeitos.
+- **`WriteTimeout` contado do fim dos cabeçalhos** (regressão da correção do W
+  de 2026-10-14): corpo lento + `Accept` demorado perdia o `202` de um documento
+  já no ring, e o cliente duplicava. Conta da resposta.
+- **Número fora do `numeric` do PostgreSQL** (`1e1000000` em `fields`) derrubava o
+  pedaço inteiro (22003); achado no GP, portado a G, com oráculo do PG real
+  (mantissa zero com expoente grande cabe).
+- `chunk_overflow` contado por chunk (até 128 por mensagem) e de novo como
+  `chunk_timeout`: agora lápide e uma contagem; buffers de corpo e descompressão
+  dobravam além do teto; `line: "0042"` descartado em vez de `line-coerced`;
+  oráculo `jlhcheck` aceitava UTF-8 inválido e avisos contraditórios; o golden
+  comparava JSON ordenado (nunca provou a ordem fixa); o vetor fluent-bit não era
+  saída real (o fluent-bit achata mapas: capturado de novo); `chPayload` do
+  ClickHouse 19 µs/84 alocações → 1 µs/1; `ItemOverhead` diferente em GP e GN.
+- Decisão nova sem entrevista (contestável): `http.bulk = false` como o
+  `enable_bulk_receiving` do Graylog; com `true`, um documento por linha, 413
+  tudo-ou-nada, ring cheio no meio guarda as linhas anteriores e responde 503
+  (reenvio duplica: documentado). `http.bulk_max_bytes` 4 MiB.
+- GI: `--loop` num arquivo só de linhas em branco girava a 100% de CPU — **o
+  mesmo código estava em SI, RI e WI**, corrigido nos quatro; ` HTTP/1.` dentro
+  de um documento (log de acesso) virava a direção TCP para HTTP no replay de
+  captura iniciada no meio; a vaga do pipeline era liberada antes de marcar a
+  conexão como fechando, e um `EPIPE` atrás de `Connection: close` contava como
+  conexão quebrada — **portado ao WI**; `--run` sem escape quebrava o JSON.
+
+Pendências conhecidas nas SPECs: remontagem UDP sob um mutex (não medida),
+falha de handshake HTTPS não contada, código morto de `item` em GP/GN, cruzamento
+opcional do oráculo com `raw`, conferência de entrega no destino pelo GI.
+
+A portar: nada para S/SP/SN (as correções de recepção são do código GELF; o
+`WriteTimeout` já está certo no W); o cliente HTTP de WI e GI agora é o mesmo —
+uma correção num vale para o outro.
 
 ## 2026-10-31 — WI: go-webhook-injector; correção de `--duration` em SI e RI
 
