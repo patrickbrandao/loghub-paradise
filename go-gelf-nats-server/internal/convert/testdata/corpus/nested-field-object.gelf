@@ -1,0 +1,1 @@
+{"version":"1.1","short_message":"kube-proxy: Syncing iptables rules","timestamp":1761912000.123456789,"host":"node-a","level":6,"_kubernetes":{"pod_name":"kube-proxy-x7k2p","namespace_name":"kube-system"},"_stream":"stderr"}

@@ -1,0 +1,1 @@
+{"version":"1.1","host":"nginx-edge-2","short_message":"GET /health 200","full_message":"10.1.2.3 - - [31/Oct/2026:12:00:00 +0000] \"GET /health HTTP/1.1\" 200 2","timestamp":1761912000.0,"level":6,"_@version":"1","_path":"/var/log/nginx/access.log","_tags":["nginx","edge"],"_type":"nginx-access"}

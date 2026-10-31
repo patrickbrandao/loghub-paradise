@@ -1,0 +1,30 @@
+{
+  "host": {
+    "hostname": "worker-7",
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "gelf",
+  "gelf-version": "1.0",
+  "level": {
+    "code": 3,
+    "name": "err"
+  },
+  "timestamp": "2025-10-31T12:00:00.789012Z",
+  "short-message": "division by zero",
+  "full-message": "Traceback (most recent call last):\n  File \"/srv/app/jobs.py\", line 88, in run\n    ratio = done / total\nZeroDivisionError: division by zero",
+  "fields": {
+    "facility": "jobs",
+    "file": "/srv/app/jobs.py",
+    "line": 88,
+    "function": "run",
+    "pid": 4242,
+    "process_name": "MainProcess",
+    "thread_name": "MainThread",
+    "logger_name": "jobs"
+  },
+  "size": 466
+}

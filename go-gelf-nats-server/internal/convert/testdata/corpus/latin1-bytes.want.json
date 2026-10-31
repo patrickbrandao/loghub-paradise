@@ -1,0 +1,21 @@
+{
+  "host": {
+    "src-ip": "10.0.0.3",
+    "src-port": 59922,
+    "dst-ip": "10.0.0.10",
+    "dst-port": 12201
+  },
+  "transport": "udp",
+  "format": "malformed",
+  "level": {
+    "code": 6,
+    "name": "info"
+  },
+  "short-message": "",
+  "size": 58,
+  "raw": "eyJ2ZXJzaW9uIjoiMS4xIiwiaG9zdCI6ImgiLCJzaG9ydF9tZXNzYWdlIjoiY2Fm6SBsYXRpbjEifQ==",
+  "raw-encoding": "base64",
+  "parse": {
+    "error": "UTF-8 inválido no documento"
+  }
+}
