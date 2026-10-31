@@ -1,0 +1,176 @@
+# Fragmento compartilhado por todos os compose deste diretorio.
+#
+# NAO suba este arquivo sozinho: ele define o servico-base `gls-base`, que os
+# compose.<ring>-<sink>.yml herdam via `extends`. O que distingue uma combinacao
+# (ring.mode, sink.type, portas, volumes, dependencias, hostname) fica no arquivo
+# de cada uma.
+#
+# Regra de heranca do Compose: `environment` e `healthcheck` sao mapas e o filho
+# sobrescreve chave a chave; `ports` e' sequencia e concatena (por isso as portas
+# ficam so' no filho); `volumes` junta por destino (os de config ficam aqui, o
+# /data de cada um no filho); `depends_on` NAO e' herdado por `extends`.
+#
+# Config em dois lugares, de proposito (SPEC §16.1, §16.3):
+#   - env (aqui e em cada compose): SO' chaves que exigem restart. Env vence o
+#     INI e nao muda num container de pe'.
+#   - conf/gelf.ini, montado em /etc/gelf: SO' as recarregaveis (filtro,
+#     rate-limit, log.level, log.access*, sink.sqlite.keep_files). Edite o
+#     arquivo e mande `docker kill -s HUP <container>`.
+
+services:
+  gls-base:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${GELF_VERSION:-dev}
+        COMMIT: ${GELF_COMMIT:-none}
+        GO_VERSION: ${GELF_GO_VERSION:-1.25}
+        ALPINE_VERSION: ${GELF_ALPINE_VERSION:-3.22}
+    image: ${GELF_IMAGE:-go-gelf-server}:${GELF_IMAGE_TAG:-local}
+
+    restart: unless-stopped
+
+    # Precisa ser maior que shutdown.pre_stop_delay + shutdown.drain_timeout,
+    # ou o Docker mata o processo no meio do dreno do ring (SPEC §13.4).
+    stop_grace_period: 45s
+    stop_signal: SIGTERM
+
+    environment:
+      # --- identidade LogHub (go-loghub-ident, SPEC §13.1) ------------------
+      # DATADIR e AGENT_NAME ja' vem da imagem. WORKSPACE e' o TENANT, nao o
+      # ambiente: prod e staging nao sao tenants. Ele vira o `space` de todo
+      # envelope e o subject loghub.<space>.gelf -- o stream NATS de
+      # nats/stream.json cobre so' "default"; quem trocar um troca o outro.
+      # HOSTNAME vem do `hostname:` de cada servico. AGENT_UUID e MACHINE_ID
+      # sao gerados e persistidos em /data na primeira subida.
+      # Lido de GELF_WORKSPACE, nunca de WORKSPACE: o shell de CI (Jenkins)
+      # exporta WORKSPACE com o caminho do job, e o compose o interpolaria.
+      WORKSPACE: ${GELF_WORKSPACE:-default}
+
+      # --- transportes -------------------------------------------------------
+      # Dentro do container as portas sao as do GELF (SPEC §4.1): 12201 UDP e
+      # TCP, 12202 HTTP; 12203 (TCP+TLS) e 12204 (HTTPS) quando ligados.
+      # 0.0.0.0 e' o que recebe as portas publicadas; por isso todo compose
+      # deste diretorio sobe com um WARN esperado, "ratelimit.enabled=false with
+      # listen.udp=... reachable off this host" (por que fica desligado:
+      # [ratelimit] de conf/gelf.ini).
+      GELF_LISTEN_UDP: 0.0.0.0:12201
+      GELF_LISTEN_TCP: 0.0.0.0:12201
+      GELF_LISTEN_HTTP: 0.0.0.0:12202
+      # TLS e HTTPS desligados ate' haver certificado: ponha server.crt e
+      # server.key em ./tls (montada em /etc/gelf/tls, abaixo) e defina
+      # GELF_LISTEN_TLS=0.0.0.0:12203 e/ou GELF_LISTEN_HTTPS=0.0.0.0:12204 (README).
+      GELF_LISTEN_TLS: ${GELF_LISTEN_TLS:-}
+      GELF_LISTEN_HTTPS: ${GELF_LISTEN_HTTPS:-}
+      GELF_TLS_CERT_FILE: ${GELF_TLS_CERT_FILE:-/etc/gelf/tls/server.crt}
+      GELF_TLS_KEY_FILE: ${GELF_TLS_KEY_FILE:-/etc/gelf/tls/server.key}
+      GELF_TLS_CLIENT_AUTH: ${GELF_TLS_CLIENT_AUTH:-optional}
+      GELF_TLS_CLIENT_CA: ${GELF_TLS_CLIENT_CA:-}
+      GELF_LISTEN_UDP_LISTENERS: ${GELF_LISTEN_UDP_LISTENERS:-1}
+      # O parametro mais importante do UDP. O teto real e' net.core.rmem_max do
+      # HOST; o valor efetivo aparece em gelf_udp_read_buffer_bytes.
+      GELF_LISTEN_UDP_READ_BUFFER: ${GELF_LISTEN_UDP_READ_BUFFER:-8MiB}
+      # Remontagem de chunks UDP (SPEC §5.2): teto global de bytes e de
+      # mensagens abertas; o uso aparece em gelf_udp_reassembly_bytes.
+      GELF_LISTEN_UDP_REASSEMBLY_MAX_BYTES: ${GELF_LISTEN_UDP_REASSEMBLY_MAX_BYTES:-64MiB}
+      GELF_LISTEN_UDP_REASSEMBLY_MAX_MESSAGES: ${GELF_LISTEN_UDP_REASSEMBLY_MAX_MESSAGES:-16384}
+      # HTTP e HTTPS (SPEC §4.5): prazos contra slowloris; zero e' recusado.
+      GELF_HTTP_READ_HEADER_TIMEOUT: ${GELF_HTTP_READ_HEADER_TIMEOUT:-10s}
+      GELF_HTTP_READ_TIMEOUT: ${GELF_HTTP_READ_TIMEOUT:-30s}
+      # PROXY protocol (SPEC §4.6): so' com um balanceador na frente.
+      GELF_PROXY_PROTOCOL: ${GELF_PROXY_PROTOCOL:-off}
+      GELF_PROXY_TRUSTED: ${GELF_PROXY_TRUSTED:-127.0.0.1/32,::1/128}
+
+      GELF_ADMIN_ENABLED: "true"
+      GELF_ADMIN_BIND: 0.0.0.0:9104
+
+      # --- LOGHUB_EB_URL (SPEC §10.9) -----------------------------------------
+      # NAO e' repassada daqui, de proposito: um LOGHUB_EB_URL exportado no shell
+      # de quem roda o compose (comum num ambiente LogHub) colidiria com as
+      # chaves de conexao que cada compose define, e o boot sairia com 1. Cada
+      # compose de nats, redis e postgres traz a linha comentada junto das
+      # chaves que ela substitui (README, "LOGHUB_EB_URL").
+
+      # --- conversao (SPEC §6; exigem restart) -------------------------------
+      # Todo o [convert]. Replicas de um ring Redis compartilhado precisam de
+      # TODOS iguais (SPEC §3.5; README).
+      # Teto do documento DESCOMPRIMIDO (SPEC §5.5): acima dele, recusa contada.
+      # O pior JLH e' 6 x isto + 8 KiB (776 KiB no padrao) e cabe no 1 MiB do
+      # NATS; acima de ~170 KiB, suba o max_payload de nats/nats-server.conf.
+      GELF_CONVERT_MAX_MESSAGE_BYTES: ${GELF_CONVERT_MAX_MESSAGE_BYTES:-128KiB}
+      GELF_CONVERT_KEEP_RAW: ${GELF_CONVERT_KEEP_RAW:-malformed}
+      GELF_CONVERT_ACCEPT_MALFORMED: ${GELF_CONVERT_ACCEPT_MALFORMED:-true}
+
+      # --- chaves recarregaveis: conf/gelf.ini ---------------------------------
+      # Filtro, rate-limit, log.level, log.access, log.access_sample e
+      # sink.sqlite.keep_files NAO entram no env: env vence o INI e nunca muda
+      # num container de pe', e o `docker kill -s HUP` nao mudaria nada. Edite
+      # conf/gelf.ini e mande o HUP. O caminho e' fixo; a pasta vem do volume
+      # abaixo.
+      GELF_CONFIG: /etc/gelf/gelf.ini
+
+      # --- observabilidade -----------------------------------------------------
+      GELF_LOG_FORMAT: ${GELF_LOG_FORMAT:-json}
+
+      # --- desligamento --------------------------------------------------------
+      GELF_SHUTDOWN_PRE_STOP_DELAY: ${GELF_SHUTDOWN_PRE_STOP_DELAY:-0s}
+      GELF_SHUTDOWN_DRAIN_TIMEOUT: ${GELF_SHUTDOWN_DRAIN_TIMEOUT:-30s}
+
+      # --- memoria (SPEC §15.4) ------------------------------------------------
+      # Sem GOMEMLIMIT o GC nao sabe do teto do container e o OOM killer chega
+      # antes. Com ring=memory precisa cobrir 2 x ring.max_bytes; o limite do
+      # container fica ACIMA dele.
+      GOMEMLIMIT: ${GELF_GOMEMLIMIT:-512MiB}
+
+    # /healthz e' liveness pura: 200 enquanto o processo vive. /readyz NAO e'
+    # o healthcheck de proposito: ele da' 503 com o destino fora, com o ring
+    # acima de ring.high_water e durante o dreno do backlog de boot, e marcar o
+    # container unhealthy por isso (ou reinicia-lo, num orquestrador que o faca)
+    # nao conserta um destino inalcancavel -- so' interrompe o dreno. /readyz e'
+    # para o balanceador e para o operador (README, "Saude").
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9104/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+    # So' leitura, e por isso aqui e nao em cada compose. O /data gravavel e'
+    # um volume nomeado POR INSTANCIA, declarado no compose de cada combinacao.
+    volumes:
+      # conf/gelf.ini: as chaves recarregaveis. A PASTA, nao o arquivo: um
+      # bind de arquivo prende o inode, e o editor que salva por rename deixaria
+      # o container lendo a versao antiga para sempre.
+      - ./conf:/etc/gelf:ro
+      # Certificados do TLS e do HTTPS; server.key legivel pelo uid 65532
+      # (tls/README.md). Montada por cima de ./conf, que traz a subpasta conf/tls
+      # so' como ponto de montagem: sem ela, com ./conf so' leitura, o Docker nao
+      # cria /etc/gelf/tls e o container nao sobe (conf/tls/README.md).
+      - ./tls:/etc/gelf/tls:ro
+
+    # read_only transforma "so' /data e' gravavel" em garantia: um caminho de
+    # escrita fora do volume falha no boot em vez de gravar na camada efemera.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    deploy:
+      resources:
+        limits:
+          memory: ${GELF_MEMORY_LIMIT:-768M}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

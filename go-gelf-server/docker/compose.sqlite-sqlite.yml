@@ -1,0 +1,63 @@
+# ring em disco (ring.db)  ->  SQLite local (/data/events.db, tabela gelf_events)
+#
+# Garantia (TCP/TLS): COMMIT com fsync no /data/ring.db antes de voltar a ler;
+#   zero perda sob crash do processo.
+#
+# WARN esperado no boot: "ring.mode=sqlite with sink.type=sqlite: every message
+#   pays TWO fsyncs" (SPEC §9.7). Aqui ring.db e events.db estao no MESMO
+#   volume, que e' o caso caro: compose.memory-sqlite.yml da' a mesma
+#   durabilidade no destino pela metade do custo. Esta combinacao so' compensa
+#   com os dois arquivos em discos distintos, sem sair da raiz /data (SPEC
+#   §16.6): por exemplo GELF_SINK_SQLITE_PATH=/data/disco2/events.db com um
+#   segundo volume montado em /data/disco2.
+#
+#   docker compose -f compose.sqlite-sqlite.yml up -d --build
+#
+# Publicado no host: GELF 22081/udp e 22081/tcp (GELF_PORT), HTTP 22082 (GELF_HTTP_PORT),
+# TCP+TLS 22083 e HTTPS 22084 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29108 (GELF_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: gls-sqlite-sqlite
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gls-base
+    container_name: gls-sqlite-sqlite
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: gls-sqlite-sqlite
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      GELF_RING_MODE: sqlite
+      GELF_RING_SQLITE_SYNCHRONOUS: ${GELF_RING_SQLITE_SYNCHRONOUS:-FULL}
+      GELF_RING_CAPACITY_ITEMS: ${GELF_RING_CAPACITY_ITEMS:-65536}
+      GELF_RING_MAX_BYTES: ${GELF_RING_MAX_BYTES:-512MiB}
+      GELF_EMERGENCY_ENABLED: "false"
+
+      # --- sink: sqlite ------------------------------------------------------
+      GELF_SINK_TYPE: sqlite
+      GELF_SINK_SQLITE_SYNCHRONOUS: ${GELF_SINK_SQLITE_SYNCHRONOUS:-FULL}
+      GELF_SINK_SQLITE_ROTATE: ${GELF_SINK_SQLITE_ROTATE:-daily}
+      # Quantos rotacionados manter (keep_files) e' recarregavel: conf/gelf.ini.
+      GELF_SINK_WORKERS: "1"
+
+    ports:
+      # As portas do container sao as do GELF (SPEC §4.1); o host escolhe.
+      - "${GELF_PORT:-22081}:12201/udp"
+      - "${GELF_PORT:-22081}:12201/tcp"
+      - "${GELF_HTTP_PORT:-22082}:12202/tcp"
+      - "${GELF_TLS_PORT:-22083}:12203/tcp"
+      - "${GELF_HTTPS_PORT:-22084}:12204/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-29108}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - gls-data:/data
+
+volumes:
+  gls-data:

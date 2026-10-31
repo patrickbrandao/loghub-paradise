@@ -1,0 +1,99 @@
+# ring na RAM  ->  MySQL compartilhado (tabela gelf_events)
+#
+# Garantia (TCP/TLS): a mensagem esta' na RAM deste no'. SIGTERM nao perde
+#   (dreno); FATAL do sink nao perde (dump); SIGKILL e OOM perdem o backlog.
+#
+#   docker compose -f compose.memory-mysql.yml up -d --build
+#
+# Publicado no host: GELF 22041/udp e 22041/tcp (GELF_PORT), HTTP 22042 (GELF_HTTP_PORT),
+# TCP+TLS 22043 e HTTPS 22044 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29104 (GELF_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: gls-memory-mysql
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gls-base
+    container_name: gls-memory-mysql
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: gls-memory-mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      # --- ring: memory ------------------------------------------------------
+      GELF_RING_MODE: memory
+      GELF_RING_CAPACITY_ITEMS: ${GELF_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): o boot avisa se GOMEMLIMIT
+      # for menor que o dobro (SPEC §15.4). Quem subir um sobe o outro.
+      GELF_RING_MAX_BYTES: ${GELF_RING_MAX_BYTES:-256MiB}
+      GELF_RING_HIGH_WATER: ${GELF_RING_HIGH_WATER:-0.80}
+      # Rede de seguranca do ring em RAM: em FATAL despeja o backlog em
+      # /data/emergency e reingere no boot seguinte (SPEC §12).
+      GELF_EMERGENCY_ENABLED: "true"
+
+      # --- sink: mysql -------------------------------------------------------
+      GELF_SINK_TYPE: mysql
+      # Explicito: no padrao (8) o boot o rebaixaria para 4 com WARN, porque cada
+      # worker prende uma conexao de um orcamento que a frota inteira divide
+      # (SPEC §10.5). Acima de 16 tambem e' WARN.
+      GELF_SINK_WORKERS: "4"
+      GELF_SINK_MYSQL_ADDR: mysql:3306
+      GELF_SINK_MYSQL_USERNAME: ${GELF_SINK_MYSQL_USERNAME:-gelf}
+      GELF_SINK_MYSQL_PASSWORD: ${GELF_SINK_MYSQL_PASSWORD:-gelf}
+      GELF_SINK_MYSQL_DATABASE: ${GELF_SINK_MYSQL_DATABASE:-gelf}
+      GELF_SINK_MYSQL_TABLE: ${GELF_SINK_MYSQL_TABLE:-gelf_events}
+      # 0 deriva sink.workers = 4 (a sonda de saude tem conexao propria, fora do pool).
+      GELF_SINK_MYSQL_POOL_SIZE: ${GELF_SINK_MYSQL_POOL_SIZE:-0}
+      GELF_SINK_MYSQL_TLS: ${GELF_SINK_MYSQL_TLS:-false}
+
+    ports:
+      # As portas do container sao as do GELF (SPEC §4.1); o host escolhe.
+      - "${GELF_PORT:-22041}:12201/udp"
+      - "${GELF_PORT:-22041}:12201/tcp"
+      - "${GELF_HTTP_PORT:-22042}:12202/tcp"
+      - "${GELF_TLS_PORT:-22043}:12203/tcp"
+      - "${GELF_HTTPS_PORT:-22044}:12204/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-29104}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - gls-data:/data
+
+  mysql:
+    image: ${GELF_MYSQL_IMAGE:-mysql:8.4}
+    container_name: gls-memory-mysql-mysql
+    hostname: gls-memory-mysql-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GELF_MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${GELF_SINK_MYSQL_DATABASE:-gelf}
+      MYSQL_USER: ${GELF_SINK_MYSQL_USERNAME:-gelf}
+      MYSQL_PASSWORD: ${GELF_SINK_MYSQL_PASSWORD:-gelf}
+    command:
+      - mysqld
+      - --innodb_flush_log_at_trx_commit=1
+      # O pior JLH tem ~776 KiB (SPEC §3.9); 64 MiB sobram.
+      - --max_allowed_packet=64M
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # O servidor nunca faz DDL (SPEC §10.6): a tabela vem daqui.
+      - ./mysql/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "127.0.0.1:${GELF_MYSQL_PORT:-23304}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  gls-data:
+  mysql-data:

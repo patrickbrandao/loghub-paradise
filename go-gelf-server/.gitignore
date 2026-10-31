@@ -1,0 +1,12 @@
+# Padroes estritamente locais desta pasta (AGENTS.md §4). O .gitignore principal
+# e' do nivel acima.
+data/
+*.db
+*.db-wal
+*.db-shm
+cov.out
+# Certificados do TLS montados nos compose: nunca versionados.
+docker/tls/*.crt
+docker/tls/*.key
+docker/tls/*.pem
+docker/.env

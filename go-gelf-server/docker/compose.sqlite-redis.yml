@@ -1,0 +1,92 @@
+# ring em disco (ring.db)  ->  Redis Stream (loghub.<space>.gelf, campo e)
+#
+# Garantia (TCP/TLS): COMMIT com fsync no /data/ring.db antes de voltar a ler;
+#   zero perda sob crash do processo.
+#
+#   docker compose -f compose.sqlite-redis.yml up -d --build
+#
+# Publicado no host: GELF 22071/udp e 22071/tcp (GELF_PORT), HTTP 22072 (GELF_HTTP_PORT),
+# TCP+TLS 22073 e HTTPS 22074 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29107 (GELF_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: gls-sqlite-redis
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gls-base
+    container_name: gls-sqlite-redis
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: gls-sqlite-redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      GELF_RING_MODE: sqlite
+      GELF_RING_SQLITE_SYNCHRONOUS: ${GELF_RING_SQLITE_SYNCHRONOUS:-FULL}
+      GELF_RING_CAPACITY_ITEMS: ${GELF_RING_CAPACITY_ITEMS:-65536}
+      GELF_RING_MAX_BYTES: ${GELF_RING_MAX_BYTES:-512MiB}
+      GELF_EMERGENCY_ENABLED: "false"
+
+      # --- sink: redis -------------------------------------------------------
+      GELF_SINK_TYPE: redis
+      GELF_SINK_REDIS_STREAM: ${GELF_SINK_REDIS_STREAM:-loghub.{space}.gelf}
+      # 0 desliga o trim: MAXLEN descartaria envelopes antigos em silencio.
+      GELF_SINK_REDIS_MAXLEN: ${GELF_SINK_REDIS_MAXLEN:-0}
+      # Conexao: as chaves "donas" do LOGHUB_EB_URL (SPEC §10.9). Para usar a
+      # URL no lugar delas, apague as quatro linhas abaixo e descomente a
+      # LOGHUB_EB_URL (README). As sem valor so' entram se definidas no .env
+      # ou no shell: vazias contariam como explicitas e travariam a URL.
+      GELF_SINK_REDIS_ADDRS: redis:6379
+      GELF_SINK_REDIS_DB:
+      GELF_SINK_REDIS_USERNAME:
+      GELF_SINK_REDIS_PASSWORD:
+      #LOGHUB_EB_URL: ${LOGHUB_EB_URL:?defina LOGHUB_EB_URL no .env ou no shell}
+
+    ports:
+      # As portas do container sao as do GELF (SPEC §4.1); o host escolhe.
+      - "${GELF_PORT:-22071}:12201/udp"
+      - "${GELF_PORT:-22071}:12201/tcp"
+      - "${GELF_HTTP_PORT:-22072}:12202/tcp"
+      - "${GELF_TLS_PORT:-22073}:12203/tcp"
+      - "${GELF_HTTPS_PORT:-22074}:12204/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-29107}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - gls-data:/data
+
+  redis:
+    image: ${GELF_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: gls-sqlite-redis-redis
+    hostname: gls-sqlite-redis-redis
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1 s num crash do Redis.
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${GELF_REDIS_PORT:-26307}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  gls-data:
+  redis-data:

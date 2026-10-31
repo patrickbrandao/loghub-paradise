@@ -1,0 +1,53 @@
+# ring em disco (ring.db)  ->  descarte (benchmark)
+#
+# Garantia: NENHUMA. O COMMIT com fsync no /data/ring.db acontece antes de
+#   voltar a ler, mas o que sai do ring e' convertido, serializado e
+#   DESCARTADO (SPEC §10.8, §19: "qualquer + none" perde tudo). Mede o custo do
+#   ring em disco sem I/O de destino. Nao guarde log com isto.
+#
+#   docker compose -f compose.sqlite-none.yml up -d --build
+#
+# Publicado no host: GELF 22111/udp e 22111/tcp (GELF_PORT), HTTP 22112 (GELF_HTTP_PORT),
+# TCP+TLS 22113 e HTTPS 22114 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29111 (GELF_ADMIN_PORT).
+# Defaults distintos por combinacao para que varias rodem lado a lado.
+
+name: gls-sqlite-none
+
+services:
+  gelf:
+    extends:
+      file: common.yml
+      service: gls-base
+    container_name: gls-sqlite-none
+    # Vira o Hostname do go-loghub-ident (beacon) e precisa ser RFC 1123.
+    hostname: gls-sqlite-none
+    environment:
+      # --- ring: sqlite ------------------------------------------------------
+      GELF_RING_MODE: sqlite
+      GELF_RING_SQLITE_SYNCHRONOUS: ${GELF_RING_SQLITE_SYNCHRONOUS:-FULL}
+      GELF_RING_CAPACITY_ITEMS: ${GELF_RING_CAPACITY_ITEMS:-65536}
+      GELF_RING_MAX_BYTES: ${GELF_RING_MAX_BYTES:-512MiB}
+      GELF_EMERGENCY_ENABLED: "false"
+
+      # --- sink: none --------------------------------------------------------
+      GELF_SINK_TYPE: none
+
+    ports:
+      # As portas do container sao as do GELF (SPEC §4.1); o host escolhe.
+      - "${GELF_PORT:-22111}:12201/udp"
+      - "${GELF_PORT:-22111}:12201/tcp"
+      - "${GELF_HTTP_PORT:-22112}:12202/tcp"
+      - "${GELF_TLS_PORT:-22113}:12203/tcp"
+      - "${GELF_HTTPS_PORT:-22114}:12204/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${GELF_ADMIN_PORT:-29111}:9104"
+
+    volumes:
+      # UM volume por instancia: a identidade (agent_uuid) mora nele, e duas
+      # replicas no mesmo volume publicariam o mesmo `from` (SPEC §16.6).
+      # ./conf (as chaves recarregaveis) e ./tls vem de common.yml.
+      - gls-data:/data
+
+volumes:
+  gls-data:
