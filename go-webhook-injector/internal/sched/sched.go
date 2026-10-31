@@ -49,6 +49,10 @@ type Pending struct {
 	// Stuck says the connection that gave it back answered nothing at all:
 	// no progress was made (SPEC §7.3 bounds those resends).
 	Stuck bool
+	// Unwritten says it never reached the wire (the connection was already
+	// closing or dead): the report tells it apart from a request the server
+	// received and announced it would not process.
+	Unwritten bool
 }
 
 // Resender is implemented by a connection that can give messages back. After
@@ -242,7 +246,11 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 					u.Done("conn_error", false)
 					continue
 				}
-				rep.Event("resent on a new connection")
+				if u.Unwritten {
+					rep.Event("requeued unwritten (connection closing)")
+				} else {
+					rep.Event("resent on a new connection")
+				}
 				redo = append(redo, u)
 			}
 		}

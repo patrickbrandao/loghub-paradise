@@ -82,5 +82,10 @@ A prova com tcpdump real roda num container Linux (TESTING §3.5).
   fim do chunked por conta própria (SPEC §6.6).
 - **`{` em JSON não é marcador**: a regra de chaves do `tmpl` difere da do SI
   (SPEC §5.2). Não "unifique" com o pai.
+- **Liberar a vaga do pipeline antes de marcar `closing`** fazia o worker
+  escrever num socket que o servidor já não lia; e a escrita que falha depois
+  de um `Connection: close` (ou de um fechamento ocioso) é fechamento
+  planejado (`ErrSpent`), não quebra (SPEC §4.4).
+  `TestHTTPServerClosingConnections` e `TestIdleCloseIsPlanned` seguram.
 - **`--duration` sem `--count`** já mandou uma requisição só (o padrão de 1
   valia também ali); `TestUUIDOutAndDuration` segura.

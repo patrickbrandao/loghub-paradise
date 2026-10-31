@@ -261,8 +261,11 @@ inválidos de propósito, para testar o parser do servidor).
 finais saem, linhas vazias são puladas (contadas), a última linha sem LF conta.
 Linha acima de 16 MiB é cortada ali (contada). O padrão é `--format raw` (as
 linhas já são mensagens syslog); com `5424`/`3164`, cada linha vira o corpo.
-`--loop` relê o arquivo do início, limitado por `--count`/`--duration`; um
-arquivo sem nenhuma linha termina em vez de girar no vazio. O stdin (`-`) não
+`--loop` relê o arquivo do início, limitado por `--count`/`--duration`; uma
+passada sem nenhuma mensagem (arquivo vazio, só de linhas em branco, ou
+esvaziado entre passadas) termina a fonte em vez de girar no vazio; o mesmo
+vale para uma passada de `--pcap` sem mensagem (correção de 2026-10-31,
+achada na revisão do go-gelf-injector). O stdin (`-`) não
 pode ser relido: `--loop` com ele é erro de uso.
 
 ---

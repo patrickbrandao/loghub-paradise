@@ -36,7 +36,10 @@ type Pcap struct {
 	last  time.Duration
 	pass  uint64
 	sent  uint64
-	cut   uint64
+	// passSent counts the messages of the current pass: a pass with none ends
+	// --loop (a capture rewritten empty between passes would spin forever).
+	passSent uint64
+	cut      uint64
 
 	decTotal pcap.Stats
 	asmTotal pcap.AsmStats
@@ -74,6 +77,7 @@ func (p *Pcap) open() error {
 	})
 	p.first = time.Time{}
 	p.pass++
+	p.passSent = 0
 	return nil
 }
 
@@ -101,7 +105,7 @@ func (p *Pcap) Next(_ uint64, _ time.Time) (Message, error) {
 			if !errors.Is(err, io.EOF) {
 				return Message{}, err
 			}
-			if !p.opt.Loop || p.sent == 0 {
+			if !p.opt.Loop || p.passSent == 0 {
 				return Message{}, io.EOF
 			}
 			if err := p.reopen(); err != nil {
@@ -113,6 +117,7 @@ func (p *Pcap) Next(_ uint64, _ time.Time) (Message, error) {
 	p.queue[0] = Message{}
 	p.queue = p.queue[1:]
 	p.sent++
+	p.passSent++
 	return m, nil
 }
 

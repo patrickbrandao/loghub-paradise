@@ -222,8 +222,33 @@ conexão (sem contá-la como quebrada) e disca outra. Serve para medir o custo d
 - **`Connection: close` na resposta** (RFC 9112 §9.6): o servidor não lê nada
   depois dela. As requisições já escritas atrás dela, em pipelining, **não
   foram processadas**: voltam ao worker (`Unsent`) e saem de novo na próxima
-  conexão, sem desfecho e sem duplicata. O mesmo vale para uma requisição que
-  nunca chegou ao fio (a escrita falhou antes, ou a conexão já estava morta).
+  conexão, sem desfecho e sem duplicata (evento `resent on a new connection`).
+  O mesmo vale para uma requisição que nunca chegou ao fio (a escrita falhou
+  antes, ou a conexão já estava fechando ou morta), com o evento próprio
+  `requeued unwritten (connection closing)` (`sched.Pending.Unwritten`): ela
+  não foi "reenviada", nunca saiu.
+- A vaga do pipeline só é liberada **depois** de a conexão ser marcada como
+  fechando, quando a resposta traz `Connection: close`: o worker que esperava
+  a vaga devolve a requisição sem escrevê-la. Antes de 2026-10-31 a ordem era
+  a inversa, e cada requisição depois da 1ª de uma conexão ia a um socket que
+  o servidor não lia mais (achado 3 da revisão do GI, que copiou este cliente;
+  inofensivo pela RFC 9112 §9.6, mas desperdício).
+- Fechamento **planejado** não é conexão quebrada (`connections.broken`): uma
+  escrita que falha (`broken pipe`, `reset`) depois de a leitora ter visto o
+  `Connection: close` — o pipelining escreve adiante das respostas — e o
+  fechamento de uma conexão **ociosa** pelo servidor (o *idle timeout* do
+  keep-alive, ou o shutdown entre requisições) viram `ErrSpent`: o worker
+  reabre sem contar quebra, e o que não foi escrito volta sem desfecho. Para
+  decidir, a escrita que falhou espera a leitora terminar (limitado por
+  `--response-timeout`). Um prazo de escrita estourado (contrapressão) segue
+  sendo erro, e uma requisição pendente quando o servidor fecha sem
+  `Connection: close` continua `no_response`.
+- Um servidor que fecha **toda** conexão (sem keep-alive, ou teto 1 por
+  conexão) só tem uma requisição útil por conexão: a carga contra ele se faz
+  com `--concurrency`, e `--pipeline > 1` só desperdiça — o escrito atrás da
+  1ª é descartado pelo servidor e volta ao worker (com 32, ~30× o tráfego).
+  Com teto N por conexão, cada conexão perde no máximo o que estava em voo
+  atrás da N-ésima.
 - **Fechamento sem aviso** (EOF, RST) com requisições pendentes: elas **podem**
   ter sido processadas, então não são reenviadas — `no_response` (ou
   `conn_error` para a que estava sendo lida). Um `POST` não é idempotente.
@@ -300,7 +325,10 @@ linha, os `CR` finais saem, linhas vazias são puladas (contadas), a última
 linha sem LF conta. Com uma **pasta**, cada arquivo regular é um corpo inteiro
 (quebras de linha incluídas), em ordem de nome. Corpo acima de 64 MiB é cortado
 (contado). `--loop` relê do início, limitado por `--count`/`--duration`; uma
-fonte sem nenhum corpo termina em vez de girar. O stdin (`-`) não pode ser
+passada sem nenhum corpo (arquivo vazio, só de linhas em branco, ou esvaziado
+entre passadas) termina a fonte em vez de girar; o mesmo vale para uma passada
+de `--pcap` sem mensagem (correção de 2026-10-31, achada na revisão do
+go-gelf-injector). O stdin (`-`) não pode ser
 relido: `--loop` com ele é erro de uso.
 
 ### 5.4 Ordem dos cabeçalhos
@@ -465,7 +493,9 @@ dos sucessos, do `Send` à resposta final), `connections` (`opened`,
 | `not_sent` | não | nenhuma conexão até o fim, ou interrompido |
 
 Eventos (`events`): erros de discagem e quebras de conexão agrupados pelo texto
-do erro, `resent on a new connection` (§4.4), `behind_schedule`.
+do erro, `resent on a new connection` (escrita atrás de um `Connection: close`,
+§4.4), `requeued unwritten (connection closing)` (nunca chegou ao fio, §4.4),
+`behind_schedule`.
 
 ### 8.3 Progresso
 
@@ -507,3 +537,8 @@ destino (`select uuid from loghub.inbox`), como a TESTING §3 faz.
 7. **Corpo chunked grande chegando aos poucos**: cada segmento novo reanalisa o
    buffer inteiro (o tamanho final não é conhecido antes do último pedaço), um
    custo quadrático no replay de uploads chunked de muitos megabytes.
+8. **Adaptação automática a servidor sem keep-alive**: se as primeiras
+   conexões respondem `Connection: close` à 1ª requisição, o worker poderia
+   passar a mandar uma por conexão, com `Connection: close` próprio, em vez de
+   escrever um pipeline inteiro para nada (sugestão b do achado 3 da revisão
+   do GI). Hoje cabe ao usuário usar `--pipeline 1` e `--concurrency` (§4.4).

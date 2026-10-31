@@ -33,6 +33,7 @@ não produz.
 | `TestRetryGivesUpWithLastStatus` | `503` sempre: 3 tentativas cada, desfecho `503`, em HTTP/1.1 e HTTP/2 |
 | `TestRequestsPerConn` | 1000 requisições, 100 por conexão: 10 conexões, nenhuma contada como quebrada |
 | `TestServerClosesConnection` | servidor que responde 3 e fecha com `Connection: close`: com pipeline 1, 8 e 64, as 300 chegam exatamente uma vez (as de trás do fechamento são devolvidas e reenviadas, SPEC §4.4) |
+| `TestHTTPServerClosingConnections` | servidor falso com teto por conexão (`fake.maxPerConn`: a N-ésima requisição de cada conexão sai com `Connection: close`), teto/pipeline 1/1, 1/32, 7/1, 7/8 e 50/32, 1000 requisições em 4 conexões: todas exatamente uma vez, `connections.broken` 0, e com pipeline 1 nenhum `resent on a new connection` (nada escrito atrás do fechamento). Mutação conferida em 2026-10-31: liberar a vaga antes de marcar `closing` dá eventos de reenvio com pipeline 1; `writeErr` devolvendo o erro cru dá `broken pipe`/`reset` como conexões quebradas; sem `Unwritten`, as devolvidas viram `resent` (SPEC §4.4, achado 3 da revisão do GI) |
 | `TestServerHangsUp` | servidor que lê e desliga sem responder: `no_response`/`conn_error`, saída 1, nada reenviado, a execução termina |
 | `TestResponseTimeout` | servidor que nunca responde: `timeout` nas 4 do pipeline; idem em HTTP/2 |
 | `TestUnreachable` | porta fechada: saída 3, em HTTP/1.1 e HTTP/2 |
@@ -47,6 +48,7 @@ não produz.
 |---|---|
 | `TestDeadConnGivesBackRetryAndNewRequest` | reenvio pendente e requisição nova numa conexão que o servidor desligou: as duas voltam ao worker, nenhuma vira `conn_error` (falha sem a correção) |
 | `TestSpentByRetryTakesNothingMore` | com 2 por conexão, o reenvio que gasta a conexão faz o `Flush` devolver `ErrSpent`, e a requisição seguinte volta ao worker em vez de sair atrás do `Connection: close` |
+| `TestIdleCloseIsPlanned` | servidor que fecha a conexão ociosa (sem `Connection: close`): o `Send` seguinte devolve `ErrSpent` (não quebra) e a requisição volta com `Unwritten`, sem desfecho; a anterior fica `200`. Mutação conferida: sem marcar `idle`, o `Send` devolve `EOF` |
 
 `internal/httpx` (o extrator de requisições, SPEC §6.6):
 
@@ -58,6 +60,12 @@ não produz.
 | `TestGapLosesOnlyTheCutRequest` | uma lacuna perde só a requisição atingida |
 | `TestIncompleteAtEndIsLost`, `TestGarbageBetweenRequestsResyncs` | fim cortado; lixo entre requisições |
 | `TestHugeContentLengthRefusedEarly` | `Content-Length` de 1 GB recusado no cabeçalho, sem guardar o corpo, e a requisição seguinte achada |
+
+`internal/source`:
+
+| Teste | O que prova |
+|---|---|
+| `TestLoopBlankFileEnds`, `TestLoopFileEmptiedBetweenPassesEnds` | `--loop` numa passada sem corpo (arquivo só de linhas em branco, ou esvaziado entre passadas) termina; antes de 2026-10-31 girava a 100 % de CPU para sempre (achado da revisão do GI) |
 
 ## 2. Fuzz
 
@@ -161,3 +169,9 @@ distintos.
   dividem a mesma CPU, e o teto medido é o da máquina, não o do servidor.
 - Captura midstream real (o tcpdump iniciado com conexões já abertas): coberta
   pelos testes e pelo fuzz, não por uma captura real.
+- As correções do fechamento pelo servidor de 2026-10-31 (SPEC §4.4: vaga
+  liberada depois de `closing`, escrita falha depois do fechamento como
+  `ErrSpent`, fechamento ocioso planejado, evento
+  `requeued unwritten (connection closing)`) foram provadas só contra o
+  servidor falso (`net/http` com teto por conexão), não contra W/F/P/N reais
+  com `max_requests_per_conn` ou `idle_timeout`.

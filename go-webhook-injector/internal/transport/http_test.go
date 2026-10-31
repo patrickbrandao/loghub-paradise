@@ -162,3 +162,30 @@ func TestSpentByRetryTakesNothingMore(t *testing.T) {
 		t.Fatalf("unsent %v, seq 3 outcomes %v", got, o.get(3))
 	}
 }
+
+// A keep-alive server that closes an idle connection (its idle timeout, or
+// a shutdown between requests) ends it as planned: the next request is given
+// back unwritten with ErrSpent, not counted as a broken connection, and the
+// report says "requeued unwritten", not "resent".
+func TestIdleCloseIsPlanned(t *testing.T) {
+	o := &outcomes{m: map[uint64][]string{}}
+	h := dialH1(t, server(t, nil, 1), 0)
+	m := &source.Message{Body: []byte("x")}
+	if err := h.Send(1, m, o.done(1)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { h.mu.Lock(); defer h.mu.Unlock(); return h.dead != nil })
+	if err := h.Send(2, m, o.done(2)); !errors.Is(err, sched.ErrSpent) {
+		t.Fatalf("Send after an idle close: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	h.Close(ctx)
+	u := h.Unsent()
+	if len(u) != 1 || u[0].Seq != 2 || !u[0].Unwritten || o.get(2) != nil {
+		t.Fatalf("unsent %+v", u)
+	}
+	if got := o.get(1); len(got) != 1 || got[0] != "200" {
+		t.Fatalf("seq 1: %v", got)
+	}
+}
