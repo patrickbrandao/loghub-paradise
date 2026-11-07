@@ -62,6 +62,8 @@ type Options struct {
 	OnDial func(error)
 	// OnResponse, when set, sees every final response (--uuid-out).
 	OnResponse func(seq uint64, status int, uuid string)
+	// OnEvent, when set, is told of named events (the report counts them).
+	OnEvent func(string)
 }
 
 // Dialer returns the dialer of o.
@@ -75,19 +77,96 @@ func Dialer(o Options) (sched.Dialer, error) {
 	if o.OnDial == nil {
 		o.OnDial = func(error) {}
 	}
+	if o.OnEvent == nil {
+		o.OnEvent = func(string) {}
+	}
 	o.Pipeline = max(o.Pipeline, 1)
 	o.Streams = max(o.Streams, 1)
 	if o.HTTP2 {
 		return func(context.Context) (sched.Conn, error) { return newH2(o), nil }, nil
 	}
+	ad := &adapter{off: o.PerConn == 1, event: o.OnEvent}
 	return func(ctx context.Context) (sched.Conn, error) {
 		c, err := dial(ctx, o)
 		o.OnDial(err)
 		if err != nil {
 			return nil, err
 		}
-		return newH1(o, c), nil
+		return newH1(o, c, ad), nil
 	}, nil
+}
+
+// Adaptation to a server without keep-alive (SPEC §4.6).
+const (
+	adaptAfter = 2  // consecutive connections closed at their first response
+	probeEvery = 64 // adapted connections between two probes
+)
+
+// connMode is how a connection of an adapting dialer behaves.
+type connMode uint8
+
+const (
+	modeNormal connMode = iota // --pipeline and --requests-per-conn
+	modeSingle                 // one request, with our own Connection: close
+	modeProbe                  // one request in flight, no Connection: close
+)
+
+// adapter is shared by every connection of a dialer: a server without
+// keep-alive is a property of the server, not of one worker.
+type adapter struct {
+	off   bool // --requests-per-conn 1: nothing to adapt
+	event func(string)
+
+	mu          sync.Mutex
+	closedFirst int
+	on          bool
+	sinceProbe  int
+}
+
+// next says how the next connection behaves.
+func (a *adapter) next() connMode {
+	if a.off {
+		return modeNormal
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.on {
+		return modeNormal
+	}
+	a.sinceProbe++
+	if a.sinceProbe >= probeEvery {
+		a.sinceProbe = 0
+		return modeProbe
+	}
+	return modeSingle
+}
+
+// first is told how the first response of a connection ended. A single
+// connection asked for the close itself, so it says nothing.
+func (a *adapter) first(m connMode, closed bool) {
+	if a.off || m == modeSingle {
+		return
+	}
+	a.mu.Lock()
+	var ev string
+	switch {
+	case closed:
+		a.closedFirst++
+		if !a.on && a.closedFirst >= adaptAfter {
+			a.on, a.sinceProbe = true, 0
+			ev = "adapted: server without keep-alive (one request per connection)"
+		}
+	default:
+		a.closedFirst = 0
+		if a.on && m == modeProbe {
+			a.on = false
+			ev = "adapted back: server keeps alive"
+		}
+	}
+	a.mu.Unlock()
+	if ev != "" {
+		a.event(ev)
+	}
 }
 
 func addr(u *url.URL) string {
@@ -192,10 +271,14 @@ type pend struct {
 // response, from fail when the connection dies, or from Close for a retry
 // that never went out again.
 type h1Conn struct {
-	o   Options
-	c   net.Conn
-	bw  *bufio.Writer
-	buf []byte
+	o       Options
+	c       net.Conn
+	bw      *bufio.Writer
+	buf     []byte
+	ad      *adapter
+	mode    connMode
+	perConn uint64 // --requests-per-conn, or 1 for an adapted connection
+	inLine  int    // requests in flight (--pipeline, or 1 when adapting)
 
 	slots chan struct{} // one token per request in flight
 
@@ -213,11 +296,44 @@ type h1Conn struct {
 	readerDone chan struct{}
 }
 
-func newH1(o Options, c net.Conn) *h1Conn {
-	h := &h1Conn{o: o, c: c, bw: bufio.NewWriterSize(c, 64<<10),
-		slots: make(chan struct{}, o.Pipeline), readerDone: make(chan struct{})}
+func newH1(o Options, c net.Conn, ad *adapter) *h1Conn {
+	if ad == nil {
+		ad = &adapter{off: true, event: func(string) {}}
+	}
+	h := &h1Conn{o: o, c: c, bw: bufio.NewWriterSize(c, 64<<10), ad: ad,
+		mode: ad.next(), perConn: o.PerConn, inLine: o.Pipeline, readerDone: make(chan struct{})}
+	switch h.mode {
+	case modeSingle:
+		h.perConn, h.inLine = 1, 1
+	case modeProbe:
+		h.inLine = 1
+	}
+	h.slots = make(chan struct{}, h.inLine)
 	go h.read()
 	return h
+}
+
+// pending is p as handed back to the worker, with its retry schedule.
+func (h *h1Conn) pending(p *pend, unwritten bool) sched.Pending {
+	return sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: unwritten,
+		Due: p.due, Tries: p.tries, Last: p.last}
+}
+
+// Adopt implements sched.Adopter: a retry another connection handed back
+// joins this one's retries with the Retry-After it still has to wait and
+// the tries it already made (SPEC §4.5).
+func (h *h1Conn) Adopt(pd sched.Pending) error {
+	p := &pend{seq: pd.Seq, msg: pd.Msg, req: h.o.Build(pd.Seq, pd.Msg), done: pd.Done,
+		tries: pd.Tries, due: pd.Due, last: pd.Last}
+	h.mu.Lock()
+	if h.spent || h.closing || h.dead != nil {
+		h.unsent = append(h.unsent, h.pending(p, true))
+		h.mu.Unlock()
+		return sched.ErrSpent
+	}
+	h.retries = append(h.retries, p)
+	h.mu.Unlock()
+	return h.resendDue(false)
 }
 
 var (
@@ -261,7 +377,7 @@ func (h *h1Conn) write(p *pend) error {
 		// may follow it (a retry may have been that request). A server that
 		// closed an idle keep-alive connection is a planned close too.
 		closing, dead := h.closing || h.spent || h.idle, h.dead
-		h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: true})
+		h.unsent = append(h.unsent, h.pending(p, true))
 		h.mu.Unlock()
 		<-h.slots
 		if closing {
@@ -270,7 +386,7 @@ func (h *h1Conn) write(p *pend) error {
 		return dead
 	}
 	h.written++
-	last := h.o.PerConn > 0 && h.written >= h.o.PerConn
+	last := h.perConn > 0 && h.written >= h.perConn
 	h.spent = last
 	h.queue = append(h.queue, p)
 	if len(h.queue) == 1 {
@@ -290,7 +406,7 @@ func (h *h1Conn) write(p *pend) error {
 	}
 	// With one request in flight there is nothing to batch: push it now, or
 	// the server waits for bytes still in our buffer.
-	if h.o.Pipeline == 1 || last {
+	if h.inLine == 1 || last {
 		if err := h.bw.Flush(); err != nil {
 			return h.writeErr(err)
 		}
@@ -452,7 +568,7 @@ func (h *h1Conn) Close(ctx context.Context) error {
 	// next one; one stranded by the end of the run keeps its last answer.
 	if (h.spent || h.closing) && ctx.Err() == nil {
 		for _, p := range rs {
-			h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0})
+			h.unsent = append(h.unsent, h.pending(p, false))
 		}
 		rs = nil
 	}
@@ -466,7 +582,7 @@ func (h *h1Conn) Close(ctx context.Context) error {
 // giveBack hands a request that never reached the wire back to the worker.
 func (h *h1Conn) giveBack(p *pend) {
 	h.mu.Lock()
-	h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: true})
+	h.unsent = append(h.unsent, h.pending(p, true))
 	h.mu.Unlock()
 }
 
@@ -529,6 +645,7 @@ func (h *h1Conn) read() {
 		h.queue[0] = nil
 		h.queue = h.queue[1:]
 		h.answers++
+		first := h.answers == 1
 		if resp.Close {
 			// Before the slot is freed below: a worker waiting for that
 			// slot must find the connection closing and give its request
@@ -544,6 +661,9 @@ func (h *h1Conn) read() {
 			h.retries = append(h.retries, p)
 		}
 		h.mu.Unlock()
+		if first {
+			h.ad.first(h.mode, resp.Close)
+		}
 		<-h.slots
 		if !retry {
 			h.answer(p, resp)
@@ -553,7 +673,7 @@ func (h *h1Conn) read() {
 			// so what is behind it was not processed and can go again.
 			h.mu.Lock()
 			for _, q := range h.queue {
-				h.unsent = append(h.unsent, sched.Pending{Seq: q.seq, Msg: q.msg, Done: q.done, Stuck: h.answers == 0})
+				h.unsent = append(h.unsent, h.pending(q, false))
 				<-h.slots
 			}
 			h.queue = nil

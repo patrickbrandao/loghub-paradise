@@ -18,6 +18,9 @@ type PcapOptions struct {
 	// ports. The content must be HTTP/1.x either way.
 	Ports map[uint16]bool
 	Loop  bool
+	// Flows yields a FlowEnd marker when a client direction ends, for
+	// --pcap-flows (SPEC §6.9).
+	Flows bool
 }
 
 // Pcap replays the HTTP/1.x requests of a capture, in capture order.
@@ -40,6 +43,8 @@ type Pcap struct {
 	// --loop (a capture rewritten empty between passes would spin forever).
 	passSent uint64
 	cut      uint64
+	flows    uint64 // directions numbered so far, over all passes
+	flowEnds uint64
 
 	decTotal pcap.Stats
 	asmTotal pcap.AsmStats
@@ -71,9 +76,14 @@ func (p *Pcap) open() error {
 			return nil
 		}
 		src, dst := k.Src, k.Dst
-		return httpx.NewStream(mid, &p.ext, func(r *httpx.Request, ts time.Time) {
-			p.push(r, ts, src, dst)
+		p.flows++
+		flow := p.flows
+		h := &flowStream{p: p, flow: flow}
+		h.Stream = httpx.NewStream(mid, &p.ext, func(r *httpx.Request, ts time.Time) {
+			h.sent = true
+			p.push(r, ts, src, dst, flow)
 		})
+		return h
 	})
 	p.first = time.Time{}
 	p.pass++
@@ -81,7 +91,29 @@ func (p *Pcap) open() error {
 	return nil
 }
 
-func (p *Pcap) push(r *httpx.Request, ts time.Time, src, dst netip.AddrPort) {
+// flowStream tells the source when a client direction ends, so that its
+// replay connection can close (SPEC §6.9).
+type flowStream struct {
+	*httpx.Stream
+	p    *Pcap
+	flow uint64
+	sent bool // at least one request came from it
+	done bool
+}
+
+func (f *flowStream) End() {
+	f.Stream.End()
+	if f.done {
+		return
+	}
+	f.done = true
+	if f.p.opt.Flows && f.sent {
+		f.p.flowEnds++
+		f.p.queue = append(f.p.queue, Message{Flow: f.flow, FlowEnd: true, At: -1})
+	}
+}
+
+func (p *Pcap) push(r *httpx.Request, ts time.Time, src, dst netip.AddrPort, flow uint64) {
 	at := time.Duration(-1)
 	if !ts.IsZero() {
 		if p.first.IsZero() {
@@ -95,7 +127,7 @@ func (p *Pcap) push(r *httpx.Request, ts time.Time, src, dst netip.AddrPort) {
 			p.last = at
 		}
 	}
-	p.queue = append(p.queue, Message{Body: r.Body, Req: r, At: at, Src: src, Dst: dst})
+	p.queue = append(p.queue, Message{Body: r.Body, Req: r, At: at, Src: src, Dst: dst, Flow: flow})
 }
 
 // Next implements Source.
@@ -116,8 +148,10 @@ func (p *Pcap) Next(_ uint64, _ time.Time) (Message, error) {
 	m := p.queue[0]
 	p.queue[0] = Message{}
 	p.queue = p.queue[1:]
-	p.sent++
-	p.passSent++
+	if !m.FlowEnd {
+		p.sent++
+		p.passSent++
+	}
 	return m, nil
 }
 
@@ -220,6 +254,11 @@ func (p *Pcap) Stats() map[string]uint64 {
 		"http_skipped_bytes":      e.SkippedBytes,
 		"http_requests_lost":      e.Lost,
 		"http_requests_too_large": e.TooLarge,
+		"http2_requests":          e.H2Requests,
+		"http2_streams_reset":     e.H2Reset,
+		"http2_streams_lost":      e.H2Lost,
+		"http2_errors":            e.H2Errors,
+		"pcap_flows_ended":        p.flowEnds,
 		"messages_replayed":       p.sent,
 	}
 }

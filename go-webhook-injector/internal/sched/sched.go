@@ -53,6 +53,20 @@ type Pending struct {
 	// closing or dead): the report tells it apart from a request the server
 	// received and announced it would not process.
 	Unwritten bool
+	// A retry of a 429/503 handed on by a spent or server-closed connection
+	// keeps its schedule (SPEC §4.5): Due is when it may go again, Tries the
+	// resends already made, Last the outcome of its last answer.
+	Due   time.Time
+	Tries int
+	Last  string
+}
+
+// Adopter is implemented by a connection that can take over a retry another
+// connection handed back, keeping its Retry-After and its count of tries
+// (SPEC §4.5). Without it the retry would go at once, and --retries would
+// start again on every connection.
+type Adopter interface {
+	Adopt(p Pending) error
 }
 
 // Resender is implemented by a connection that can give messages back. After
@@ -76,6 +90,9 @@ type Plan struct {
 	Workers  int
 	// Drain bounds the wait for in-flight messages at the end.
 	Drain time.Duration
+	// Flows gives every captured flow its own connection (--pcap-flows,
+	// SPEC §6.9); Workers is then the cap of flows open at once.
+	Flows bool
 }
 
 // Stats of the producer, for the report.
@@ -118,6 +135,9 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 	if p.Workers < 1 {
 		p.Workers = 1
 	}
+	if p.Flows {
+		return runFlows(ctx, p, src, dial, rep)
+	}
 	jobs := make(chan job, p.Workers*4)
 	var wg sync.WaitGroup
 	// Workers outlive ctx: they must drain what was produced. They stop on
@@ -135,7 +155,7 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 			worker(stopDial, jobs, dial, rep.NewShard(), rep, p.Drain)
 		}()
 	}
-	st := produce(ctx, p, src, jobs)
+	st := produce(ctx, p, src, func(*source.Message) chan<- job { return jobs }, nil)
 	close(jobs)
 	// What is still queued gets Drain to find a connection; past it, a
 	// worker that cannot dial gives up and its messages are not_sent.
@@ -145,7 +165,10 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 	return st
 }
 
-func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) Stats {
+// produce takes the messages from the source at the planned pace. queue
+// says where a message goes; flowEnd, when set, is told of the end of a
+// captured flow (a marker that is no message: it takes no seq).
+func produce(ctx context.Context, p Plan, src source.Source, queue func(*source.Message) chan<- job, flowEnd func(uint64)) Stats {
 	var st Stats
 	start := time.Now()
 	var deadline time.Time
@@ -178,6 +201,13 @@ func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) St
 			}
 			break
 		}
+		if m.FlowEnd {
+			if flowEnd != nil {
+				flowEnd(m.Flow)
+			}
+			seq-- // the marker took no seq
+			continue
+		}
 		var due time.Time
 		switch {
 		case p.Original && m.At >= 0:
@@ -205,7 +235,7 @@ func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) St
 			}
 		}
 		select {
-		case jobs <- job{seq: seq, msg: m}:
+		case queue(&m) <- job{seq: seq, msg: m}:
 			st.Produced++
 		case <-ctx.Done():
 			return st
@@ -331,7 +361,10 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 			continue
 		}
 		var err error
-		if p != nil {
+		if a, ok := c.(Adopter); ok && p != nil && p.Tries > 0 {
+			// A retry handed on keeps its Retry-After and its tries.
+			err = a.Adopt(*p)
+		} else if p != nil {
 			err = c.Send(p.Seq, p.Msg, p.Done)
 		} else {
 			start := time.Now()
@@ -344,4 +377,76 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 			closeConn(brokenErr(err))
 		}
 	}
+}
+
+// runFlows is Run with one connection per captured flow (SPEC §6.9): every
+// flow gets its own worker, dialed at its first message and closed when the
+// source marks its end. At most p.Workers flows are open; a new one past the
+// cap closes the flow idle the longest.
+func runFlows(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *report.Report) Stats {
+	type flow struct {
+		jobs chan job
+		last time.Time
+		slot int
+	}
+	var wg sync.WaitGroup
+	stopDial, cancelDial := context.WithCancel(context.Background())
+	defer cancelDial()
+	go func() {
+		<-ctx.Done()
+		cancelDial()
+	}()
+	// One shard per slot, not per flow: a capture has many more flows than
+	// connections open at once, and a shard holds a 16 KiB histogram.
+	shards := make([]*report.Shard, p.Workers)
+	free := make([]int, 0, p.Workers)
+	for i := p.Workers - 1; i >= 0; i-- {
+		free = append(free, i)
+	}
+	active := map[uint64]*flow{}
+	end := func(id uint64) {
+		if f, ok := active[id]; ok {
+			close(f.jobs)
+			delete(active, id)
+			free = append(free, f.slot)
+		}
+	}
+	queue := func(m *source.Message) chan<- job {
+		f := active[m.Flow]
+		if f == nil {
+			if len(active) >= p.Workers {
+				var lru uint64
+				var at time.Time
+				for id, g := range active {
+					if at.IsZero() || g.last.Before(at) {
+						lru, at = id, g.last
+					}
+				}
+				end(lru)
+				rep.Event("flow split (concurrency cap)")
+			}
+			slot := free[len(free)-1]
+			free = free[:len(free)-1]
+			if shards[slot] == nil {
+				shards[slot] = rep.NewShard()
+			}
+			f = &flow{jobs: make(chan job, 64), slot: slot}
+			active[m.Flow] = f
+			wg.Add(1)
+			go func(jobs <-chan job, sh *report.Shard) {
+				defer wg.Done()
+				worker(stopDial, jobs, dial, sh, rep, p.Drain)
+			}(f.jobs, shards[slot])
+		}
+		f.last = time.Now()
+		return f.jobs
+	}
+	st := produce(ctx, p, src, queue, end)
+	for id := range active {
+		end(id)
+	}
+	giveUp := time.AfterFunc(p.Drain, cancelDial)
+	wg.Wait()
+	giveUp.Stop()
+	return st
 }

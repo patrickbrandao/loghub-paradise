@@ -114,6 +114,9 @@ func FuzzStream(f *testing.F) {
 	f.Add([]byte(reqA+reqB+reqC), uint8(3), false)
 	f.Add([]byte(reqA[20:]+reqB), uint8(1), true)
 	f.Add([]byte("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nab"), uint8(2), false)
+	// HTTP/2 (SPEC §6.8): whole frames only, so the split cannot matter.
+	f.Add(h2Sample(), uint8(5), false)
+	f.Add([]byte("GET /u HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\n\r\n"+string(h2Sample())), uint8(9), false)
 	f.Fuzz(func(t *testing.T, in []byte, chunk uint8, mid bool) {
 		// Whatever the input and the split, the requests are the same and
 		// nothing panics.

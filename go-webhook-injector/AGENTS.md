@@ -36,7 +36,10 @@ captura do tcpdump. Não é parte do pipeline LogHub.
 - **Nada é importado de outro módulo do monorepo.** `report`, `pcap` e `sched`
   vieram do `go-syslog-injector`: uma correção lá ou aqui vale para os irmãos —
   confira e registre no `CHANGELOG.md` da raiz o que ficou "a portar".
-- **Zero dependências** fora da stdlib (DECISOES 6).
+- **Dependências** (DECISOES 6′, 2026-11-07): envio, pcap e remontagem só na
+  stdlib; as bibliotecas dos servidores, nas versões do
+  `go-webhook-server/go.mod`, só em `internal/verify`; `golang.org/x/net/http2`
+  só no extrator h2c (`internal/httpx/h2.go`). Nenhuma outra.
 - Git (commit, branch, tag, remoto) é do nível do monorepo, e só com pedido
   explícito do usuário. Tags: `go-webhook-injector/vX.Y.Z`.
 
@@ -87,5 +90,9 @@ A prova com tcpdump real roda num container Linux (TESTING §3.5).
   de um `Connection: close` (ou de um fechamento ocioso) é fechamento
   planejado (`ErrSpent`), não quebra (SPEC §4.4).
   `TestHTTPServerClosingConnections` e `TestIdleCloseIsPlanned` seguram.
+- **A `inbox` SQLite guarda o `payload` do JLH**, não o envelope: é
+  `$.content.body`, não `$.payload.content.body` (TESTING §3.6).
+- **`FetchNoWait` do consumer ordenado do NATS recomeça do início** (achado
+  do SI): a conferência usa `Fetch` + `FetchMaxWait` e ignora o já visto.
 - **`--duration` sem `--count`** já mandou uma requisição só (o padrão de 1
   valia também ali); `TestUUIDOutAndDuration` segura.

@@ -67,6 +67,46 @@ não produz.
 |---|---|
 | `TestLoopBlankFileEnds`, `TestLoopFileEmptiedBetweenPassesEnds` | `--loop` numa passada sem corpo (arquivo só de linhas em branco, ou esvaziado entre passadas) termina; antes de 2026-10-31 girava a 100 % de CPU para sempre (achado da revisão do GI) |
 
+### 1.1 Rodada de 2026-11-07 (pendências 1–8)
+
+| Teste | O que prova |
+|---|---|
+| `httpx.TestFieldsKeepOrderAndCase` | campos na ordem capturada, nome como escrito, repetidos um por linha, *obs-fold* juntado; segmentos de 1, 5 e 1000 bytes (SPEC §5.5) |
+| `httpx.TestLargeCandidateSplitInvariant` | linha de requisição de 20 KiB achada inteira **e** aos pedaços (antes, só inteira), no início e em ressincronização; cabeçalho acima de 1 MiB recusado dos dois jeitos; linha de chunked acima de 4 KiB igual dos dois jeitos (SPEC §6.6) |
+| `httpx.TestChunkedIncremental` | upload chunked de 4 MiB em 4000 pedaços, segmentos de 1460 bytes: no máximo 3 leituras de linha por pedaço (com a reanálise antiga, 5,6 milhões) |
+| `httpx.TestH2CPriorKnowledge` | h2c com `HEADERS` + 2 `CONTINUATION`, `DATA` com *padding*, `PING`, *streams* intercalados, `RST_STREAM`, *trailers*, `cookie` repartido, tabela dinâmica do HPACK; segmentos de 1, 7, 100 e inteiro dão o mesmo (SPEC §6.8) |
+| `httpx.TestH2CUpgrade`, `TestH2CGapEndsDirection` | *upgrade* h2c (a requisição HTTP/1.1 e depois o HTTP/2); lacuna encerra a direção (`http2_streams_lost`), quadro inválido conta `http2_errors` |
+| `app.TestReplayKeepsHeaderOrder` | servidor cru vê os campos na ordem e caixa capturadas, `X-Forwarded-For` juntado no lugar do primeiro com o IP no fim, `--header` depois |
+| `app.TestReplayH2C` | captura h2c reproduzida em HTTP/1.1 (servidor cru) e em h2c (`httptest`) |
+| `app.TestPcapConnFlow` | `--pcap-flows`: 3 fluxos → 3 conexões, cada uma com as requisições do seu fluxo, em ordem; `--concurrency 1` divide (`flow split`); sem a flag, uma conexão só (SPEC §6.9) |
+| `app.TestRetryAfterAcrossConnections` | `429` com `Retry-After: 1` e `--requests-per-conn 1`: o reenvio sai ≥ 0,9 s depois (antes, em ~3 ms); `503` sempre com `--retries 2`: exatamente 3 tentativas por requisição (antes, ~700 por requisição até o dreno) (SPEC §4.5) |
+| `app.TestNoKeepAliveAdapts`, `TestNoKeepAliveAdaptsBack` | servidor que fecha toda conexão, pipeline 32: evento `adapted`, 2000 exatamente uma vez, < 200 escritas atrás de um fechamento (sem a adaptação, 62 944); servidor que passa a manter a conexão: a sonda acha e a adaptação acaba (SPEC §4.6) |
+| `app.TestVerifySQLite` | servidor falso que grava numa `inbox` SQLite: tudo achado (saída 0, `complete`); 10 perdidas + 1 processada duas vezes (saída 1, `lost_seqs` com as 10); gravada mas respondida `500` (`unexpected` 3, saída 1 pelo `500`); arquivo sem `inbox`: saída 4 e **nada enviado** (SPEC §8.6) |
+| `app.TestVerifyUsageErrors` | 10 combinações recusadas com 2, sem ecoar a URL |
+| `verify.TestAccounting`, `TestWaitsForTheSink`, `TestNoUUID`, `TestFinalReadCatchesLateDuplicate`, `TestRanges`, `TestMarker`, `TestUUIDFloor`, `TestNoSecretsEchoed` | a contagem de SPEC §8.6.4 com tudo errado de uma vez; a espera; a leitura extra depois da completa; o marcador (`"seq":"12"` entre aspas não conta); a janela por UUIDv7; nenhuma credencial no texto |
+| `verify.TestSQLiteReader` | sempre roda: janela pelo `uuid`, leitura seguinte só depois do último `rowid`, tabela ausente recusada |
+| `verify.TestPGReader`, `TestRedisReader`, `TestValkeyReader`, `TestNATSReader` | opt-in, contra os servidores reais (abaixo): janela, cursor, o mesmo envelope adicionado duas vezes (Redis, NATS), chave que não é stream, stream ausente |
+
+Integração opt-in (2026-11-07: PostgreSQL 18, Redis 7.4, Valkey 8.1, NATS
+2.12, em contêineres `vkg-*`):
+
+```bash
+WI_TEST_NATS_URL=nats://127.0.0.1:38720 WI_TEST_PG_URL=postgres://webhook:webhook@127.0.0.1:38721/webhook \
+WI_TEST_REDIS_URL=redis://127.0.0.1:38722 WI_TEST_VALKEY_URL=valkey://127.0.0.1:38723 \
+  go test -race ./internal/verify/
+```
+
+**Mutação** (2026-11-07, cada uma derruba o teste que trava a regra): limite
+da linha de volta a 16 KiB, cabeçalho inteiro acima de 1 MiB aceito, chunked
+sem retomar de onde parou, campos fora de ordem, `cookie` sem juntar, lacuna
+h2 sem encerrar a direção, `Adopt` desligado, `Due` ou `Tries` perdidos na
+passagem, adaptação que nunca liga ou nunca volta, `--pcap-flows` ignorado ou
+sem fechar o fluxo mais ocioso, `X-Forwarded-For` no fim, conferência sem a
+leitura extra, sem ignorar a chave já vista, destino inalcançável com 2, perda
+com 4. Um sobreviveu, e é esperado: o teto de 4 KiB da linha de chunked
+inteira já era garantido pelo `httputil.NewChunkedReader` (a guarda nova é
+redundante; o comportamento era coerente antes).
+
 ## 2. Fuzz
 
 ```bash
@@ -77,7 +117,9 @@ go test ./internal/pcap/  -run=XXX -fuzz=^FuzzReader$ -fuzztime=60s
 `FuzzStream` confere que a divisão do fluxo em segmentos não muda as
 requisições extraídas. Achou o corte da janela de ressincronização no meio de
 uma palavra maiúscula (SPEC §6.6; a entrada fica no corpus). Depois da correção,
-2 min e 10,7 milhões de execuções limpas (2026-10-31).
+2 min e 10,7 milhões de execuções limpas (2026-10-31). Em 2026-11-07, com as
+sementes h2c (prefácio e *upgrade*) e a procura incremental: 60 s, 2 milhões de
+execuções limpas.
 
 ## 3. Prova contra os servidores reais (2026-10-31)
 
@@ -159,6 +201,32 @@ corpo igual ao N do caminho, o `X-Seq` igual, o `Content-Length` igual ao corpo;
 os 200 corpos de 20 000 bytes (vários segmentos TCP cada) inteiros e com `seq`
 distintos.
 
+### 3.6 Conferência no destino (2026-11-07)
+
+Binários de W, N, P e F compilados do worktree; NATS 2.12 (`max_payload 8MB`,
+streams `LOGHUB_WEBHOOK_REQUEST` e `LOGHUB_WEBHOOK` dos `docker/nats/stream.json`),
+PostgreSQL 18 (`docker/postgres/inbox.sql`), Redis 7.4 e Valkey 8.1. 100 000
+requisições cada, 8 conexões, pipeline 16 (ou h2c com 64 streams),
+`--retries 1000 --retry-max-wait 50ms`:
+
+| Servidor e destino | Conferência |
+|---|---|
+| W `sink=nats` (HTTP/1.1 e h2c) | 100 000 / 100 000, `complete`, saída 0 |
+| W `sink=postgres` (`ring=sqlite`) | 100 000 / 100 000, saída 0 |
+| W `sink=redis`, Redis 7.4 (`redis://`) | 100 000 / 100 000, saída 0 |
+| W `sink=redis`, Valkey 8.1 (`valkey://`) | 100 000 / 100 000, saída 0 |
+| W `sink=sqlite` | 100 000 / 100 000, saída 0 |
+| N (NATS), P (`postgresql://`), F `sink=sqlite` | 100 000 / 100 000 cada, saída 0 |
+| modelo com o mesmo `seq` em 3 requisições (PostgreSQL) | `duplicated` 2, saída 1 |
+| cópia congelada do `events.db`; Redis errado | `lost` 500 / 200, `lost_seqs` `1-500` / `1-200`, saída 1 |
+| NATS sem `--verify-stream` com os dois streams padrão | recusado antes de enviar, saída 4 |
+| PostgreSQL inalcançável | nada enviado, saída 4, senha não ecoada |
+
+Achado da prova: a coluna `payload` da `inbox` SQLite é o `payload` do JLH, não
+o envelope inteiro (o texto da W SPEC §3.7 sugere o contrário); a primeira
+versão lia `$.payload.content` e não achava nenhum marcador (só o `uuid`
+salvava a contagem). Corrigido antes do commit.
+
 ## 4. O que ainda não está provado
 
 - O W/F atrás de um proxy confiável recebendo o `X-Forwarded-For` de
@@ -169,6 +237,12 @@ distintos.
   dividem a mesma CPU, e o teto medido é o da máquina, não o do servidor.
 - Captura midstream real (o tcpdump iniciado com conexões já abertas): coberta
   pelos testes e pelo fuzz, não por uma captura real.
+- A adaptação a servidor sem keep-alive (SPEC §4.6) e o `--pcap-flows` foram
+  provados só contra servidores falsos; o replay h2c, só com capturas
+  sintéticas (feitas com o `Framer` do próprio x/net), não com um tcpdump de
+  h2c real.
+- A conferência contra Valkey 7.2/9.0, Redis Cluster ou Sentinel, e contra
+  NATS com TLS (`tls://`) ou credenciais: não rodou.
 - As correções do fechamento pelo servidor de 2026-10-31 (SPEC §4.4: vaga
   liberada depois de `closing`, escrita falha depois do fechamento como
   `ErrSpent`, fechamento ocioso planejado, evento
