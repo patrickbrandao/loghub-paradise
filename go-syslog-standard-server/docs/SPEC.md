@@ -1,15 +1,16 @@
-# go-syslog-server — Especificação v1
+# go-syslog-standard-server — Especificação v1
 
 Status: **congelada para implementação**
 Data: 2026-09-12
 Revisão: 2026-09-14 — posse de buffer nos caminhos de erro do `Enqueue` (§9.4, §9.5, §12.3, §14.2); leitura incremental do frame declarado (§5.5); sonda de saúde do `sink=sqlite` por heartbeat (§10.4); quarentena de linhas indecodificáveis do `ring.db` (§9.4, §13.1); tetos de conexão por transporte, não por listener (§4.4); duas referências na recarga por `SIGHUP` (§15.3); durações zero recusadas na validação (§15.5); métricas mortas alimentadas ou separadas, sobras do `ring=sqlite` não contam como perda (§12.3, §13.1); nome do dump com nanossegundos (§11.1) e invariante do parser como igualdade (§3.2, §17.2); aviso de `GOMEMLIMIT` por modo de ring (§14.4)
 Revisão: 2026-09-15 — revisão independente das correções: recusa permanente na discagem ou na sonda é fatal na hora (§10.3); `ring=none` devolve o buffer ao pool após o `Write` (§14.2); tabela `health` no esquema (§3.5); `syslog_sink_errors_total{kind}` com `timeout`, `syslog_config_info` com os rótulos reais e séries de conexão só para tcp e relp (§13.1); quarentena sem teto documentada e guarda do dreno na tabela de códigos de saída (§9.4, §12.4); `sink.retry_backoff_max` recusa zero e `sink.fail_timeout = 0` documentado (§15.5); tetos de conexão descritos na tabela `[relp]` (§15.5); §17.5 sem prometer suítes que não existem
 Revisão: 2026-09-15 — `sink=mysql` e `sink=nats` saem do roteiro pós-v1 (§20) e entram na v1, a pedido do dono do projeto e no molde que o `go-webhook-server` validou contra servidores reais no mesmo dia: tabela MySQL (§3.7) e mensagem JetStream (§3.8), os dois destinos (§10.7, §10.8), o teto de evento conferido no boot contra `max_allowed_packet` e `max_payload` (§3.9), o envelope no corpo da mensagem NATS e não num header, porque o JetStream recusa header acima de 64 KiB (§3.8), a matriz com dezoito combinações (§2.1, §18), a configuração (§12.1, §15.5), as métricas (§13.1), seis dependências (§16.3) e dois invariantes (§19)
+Revisão: 2026-11-07 — todas as pendências abertas de §21.1 corrigidas e paridade Redis/Valkey: custo fixo por conexão (§5.5), teto global das cópias em voo do RELP (§4.5), `sink.nats.urls` validada e redigida (§10.8.9), erros de configuração sem eco (§15.1), coluna extra obrigatória recusada no boot (§10.5.5), validação sob `sink.op_timeout` (§10.5.5, §10.7.4), ambiente libpq fora do pool (§10.5.2), `sink.mysql.database` validado (§10.7.1), política de despejo no boot e em toda sonda, cluster com `db != 0`, identidade do servidor, alias `valkey`, Sentinel (§10.3, §15.2), gauges de emergência recontados (§11.2), abort durante o dump (§12.3), sonda do `sink=sqlite` com trava por contexto (§10.4), prazo único de boot do sink (§12.1), `syslog_conns_refused_total` (§13.1), nomes próprios — imagem, `slstd-`, `relp_software`, dumps `slstd-emg-` (§4.5, §11.1, §17.5)
 Revisão: 2026-10-11 — recusa por IP em laço, keep-alive sob o limitador e padrão `0` dos tetos de conexão como decisão (§4.4); fase 3 do RELP sem `serverclose`, como o código faz (§12.3); arquivo inválido no `SIGHUP` (§15.3); dump falho conta só `emergency_failed` (§11.3); pendências conhecidas desta referência (§21)
 Linguagem: Go 1.25+
 Repositório: `https://github.com/patrickbrandao/loghub-paradise` (monorepo)
 Module path: `github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server`
-Binário: `go-syslog-server`
+Binário: `go-syslog-standard-server` (até 2026-11-07, `go-syslog-server`, nome que é do servidor LogHub de `../go-syslog-server/`)
 
 Serviço irmão do `go-webhook-server`. O desenho, os dois eixos, a máquina de
 saúde, o registry de configuração, o arquivo de emergência e as cinco fases do
@@ -234,7 +235,7 @@ contrato do `go-webhook-server` na forma, e completamente diferente no conteúdo
   "msg-size": 31,
   "raw-size": 129,
   "truncated": false,
-  "node-id": "sls-prod-a1"
+  "node-id": "slstd-prod-a1"
 }
 ```
 
@@ -726,7 +727,7 @@ ports:
 Quem roda direto no host e quer 514 tem dois caminhos, ambos sem root:
 
 ```bash
-setcap cap_net_bind_service=+ep /app/go-syslog-server
+setcap cap_net_bind_service=+ep /app/go-syslog-standard-server
 # ou, para o sistema inteiro:
 sysctl net.ipv4.ip_unprivileged_port_start=0
 ```
@@ -799,8 +800,13 @@ emissor que se importe com o dado.
   `accept`, nunca por recursão: um emissor reconectando em laço apertado
   cresceria a pilha um quadro por recusa até o runtime abortar o processo.
 - O padrão `0` dos dois tetos é decisão, não esquecimento: o número certo
-  depende do parque. O preço é que o custo fixo de cada conexão (§21.1, item 1)
-  fica sem teto, e quem expõe a porta fora do host define `max_conns`.
+  depende do parque. O preço é que o custo fixo de cada conexão (§5.5: o
+  leitor de 4 KiB e o primeiro bloco de 2 KiB da leitura contada) fica sem
+  teto, e quem expõe a porta fora do host define `max_conns`.
+- Cada recusa por `max_conns_per_ip` conta em
+  `syslog_conns_refused_total{transport}` (§13.1): sem ele o operador não
+  distingue "ninguém conecta" de "um IP é recusado o tempo todo". O teto global
+  não recusa — segura no backlog do kernel — e por isso não conta ali.
 - `tcp.idle_timeout` (padrão 120s) fecha conexão sem tráfego. Generoso de
   propósito: um appliance que loga uma linha por hora é caso normal, e
   reconectar custa mais que manter o socket.
@@ -838,7 +844,7 @@ parque instalado por causa de um byte.
 
 ```
 cliente  1 open 71 relp_version=0\nrelp_software=librelp,1.11.0\ncommands=syslog\n
-servidor 1 rsp 84 200 OK\nrelp_version=0\nrelp_software=go-syslog-server,<versão>\ncommands=syslog\n
+servidor 1 rsp 93 200 OK\nrelp_version=0\nrelp_software=go-syslog-standard-server,<versão>\ncommands=syslog\n
 
 cliente  2 syslog 38 <13>Sep 12 14:33:01 web-01 app: oi
 servidor 2 rsp 6 200 OK
@@ -859,6 +865,26 @@ servidor 0 serverclose 0
   limpo que o do TCP porque é explícito no protocolo.
 - Confirmações podem sair **fora de ordem** — o `TXNR` está na resposta. Isso é
   o que permite confirmar um lote inteiro de uma vez quando o ring confirma.
+- O `relp_software` anunciado é `go-syslog-standard-server,<versão>`, o nome
+  deste servidor; até 2026-11-07 ele dizia `go-syslog-server`, o nome do
+  servidor LogHub do monorepo, e um log do rsyslog não distinguia os dois.
+- **Cópias em voo e o teto global.** O buffer do frame é reaproveitado pela
+  leitura seguinte, então cada transação em voo segura a própria cópia da linha
+  da leitura até a decisão — e essas cópias **não estão no ring**: nada disso
+  conta em `ring.max_bytes` nem em §14.4, e é justamente com o ring cheio que
+  elas se acumulam. Por isso a cópia é feita **depois** de obter a vaga na
+  janela **e** os bytes em `relp.inflight_max_bytes` (padrão 64 MiB), um teto
+  **global ao processo**, somando todas as conexões e listeners. A conta de
+  cada transação é `2 × len(linha) + 8 KiB` (a cópia da transação, a do item
+  dentro do `Ingest.Accept` e a goroutine, a pilha, o `Wire` e o timer; o
+  número do `go-relplog-server`, medido lá). Esgotado o teto, o leitor **para
+  de ler** (`syslog_relp_inflight_waits_total` conta cada parada) e a janela
+  TCP segura o emissor; nada é recusado por isso. O teto precisa ser ≥
+  `relp.max_frame_bytes` (exit 1 com RELP ligado), e uma aquisição maior que
+  ele é reduzida a ele, para nunca esperar para sempre.
+  `syslog_relp_inflight_bytes` mostra o que está em voo. Antes de 2026-11-07 a
+  cópia vinha antes da vaga: até `relp.window + 1` cópias de até
+  `relp.max_frame_bytes` por conexão, cerca de 2 GiB com os padrões.
 - `COMMAND` desconhecido recebe `500` e a conexão continua. Um `DATALEN` que não
   couber em `relp.max_frame_bytes`, ou uma moldura que não fecha, **fecha a
   conexão**: o fluxo está dessincronizado e não há como recuperar.
@@ -975,10 +1001,10 @@ O teto existe como **fusível, não como política**:
 
 - Na moldura octet-counting o comprimento vem **declarado**. Um `DATALEN` acima
   do teto é recusado **antes de ler um byte do payload**, e a conexão é
-  fechada. Abaixo do teto, o buffer **cresce conforme os bytes chegam**, em
-  blocos de 64 KiB, e nunca é dimensionado pelo valor declarado: quem declara
-  16 MiB e fica calado custa 64 KiB, não 16 MiB (mais o buffer de leitura que
-  toda conexão tem; §21.1, item 1). Sem isso cada conexão ociosa
+  fechada. Abaixo do teto, o buffer **cresce conforme os bytes chegam** — o
+  que o leitor já tem, uma recarga por vez —, começando num bloco de 2 KiB que
+  dobra (limitado ao declarado), e nunca é dimensionado pelo valor declarado:
+  quem declara 16 MiB e fica calado custa 2 KiB, não 16 MiB. Sem isso cada conexão ociosa
   custaria o teto inteiro durante `idle_timeout`, e com `max_conns` ilimitado
   (o padrão) mil conexões seriam 16 GiB residentes por nove bytes enviados —
   um OOM kill que o `ring.max_bytes` não vê, porque esses bytes ainda não são
@@ -992,6 +1018,18 @@ morrer, e o teto de bytes do ring **não protege** — ele só conta o que já v
 evento, e esses bytes ainda não são um evento.
 
 O parâmetro é exposto no registry para quem tiver um emissor exótico.
+
+**O custo fixo de uma conexão** (corrigido em 2026-11-07, porte do
+`go-syslog-server`). O `bufio.Reader` de cada conexão TCP ou RELP é de
+**4 KiB**, não 64: ele vive enquanto a conexão vive, ociosa ou não, fora de
+`ring.max_bytes`, e com `max_conns = 0` (o padrão) alguns milhares de conexões
+paradas a 64 KiB mais o bloco de 64 KiB da leitura contada levavam o contêiner
+ao OOM kill — e com `ring=memory` o backlog confirmado junto. O maior `Peek` do
+código é de um byte (a detecção da moldura); o resto é `ReadByte`, `ReadSlice`
+e a leitura contada, uma recarga por vez. E um buffer de frame que cresceu além
+de 16 KiB (uma mensagem grande) é largado antes do frame seguinte: o que uma
+conexão ociosa segura é limitado pelas mensagens pequenas, não pela maior que
+ela já mandou.
 
 ---
 
@@ -1598,15 +1636,58 @@ binary-safe.
 
 Knobs de memória do rueidis expostos: `sink.redis.ring_scale_each_conn`,
 `sink.redis.pipeline_multiplex`, `sink.redis.read_buffer_each_conn`,
-`sink.redis.write_buffer_each_conn`.
+`sink.redis.write_buffer_each_conn`. Cada discagem e handshake (no boot e em
+toda reconexão) tem o prazo de `sink.op_timeout`, e o `NewClient` do boot roda
+dentro do contexto do boot: um endereço que aceita TCP e nunca fala não segura
+uma tentativa além do prazo.
+
+#### Redis e Valkey
+
+O destino fala o **protocolo** Redis, e `redis` é o nome canônico em toda
+parte (chaves, logs, métricas, `--dump-config`). Servidores declarados e
+testados (`docs/TESTING.md` §6.1): **Redis 7.4** e **Valkey 7.2, 8.1 e 9.0**.
+Recursos usados: Streams (`XADD`, `XLEN`, `NOMKSTREAM`), `INFO`/`CONFIG GET`
+para a política, `SELECT` para `db`; nada de Lua, nada de comando de versão
+nova.
+
+- **Alias `valkey`** (§15.2): `sink.type=valkey` é `sink.type=redis`, e
+  `[sink.valkey]`, `--sink.valkey.<chave>` e `SYSLOG_SINK_VALKEY_<CHAVE>` são a
+  mesma chave de `[sink.redis]`. Normalizado para `redis` ao carregar.
+- **Nunca decidir por `redis_version`.** O Valkey responde
+  `redis_version:7.2.4` em todas as versões; a versão real é `valkey_version`,
+  com `server_name:valkey` (e o Valkey 7.2 ainda diz `server redis` no
+  `HELLO`). Se um dia um recurso depender de versão, decide-se pela presença do
+  comando (`COMMAND INFO`) ou por `valkey_version` quando
+  `server_name=valkey`.
+- **Identidade no boot.** Depois da sonda do boot, um `INFO server` →
+  o log `sink ready` leva `server` (`redis` \| `valkey` \| `unknown`) e
+  `server_version`. Um ACL sem `INFO` dá `unknown`, sem erro. Sem métrica: é
+  dado de log, nunca de decisão.
+- **Cluster com `db != 0`.** O rueidis manda `SELECT <db>` no handshake.
+  Redis Cluster e Valkey < 9 respondem `ERR SELECT is not allowed in cluster
+  mode`; Valkey 9 aceita bancos em cluster até `cluster-databases` (padrão 1) e
+  responde `ERR DB index is out of range` além disso. As duas respostas são
+  **fatais**, casadas pelo texto (o prefixo `ERR` é genérico demais), com a
+  mensagem "Redis Cluster e Valkey < 9 só têm o db 0; em Valkey 9 o db precisa
+  existir (`cluster-databases`)". Não há recusa estática: Valkey 9 com
+  `--cluster-databases 16` e `db=1` funciona. Antes eram "não reconhecidas" →
+  `network`, retentadas até `sink.boot_timeout`.
+- **Sentinel** (`sink.redis.sentinel_master`): Redis Sentinel e
+  `valkey-sentinel` provados com failover (`docs/TESTING.md` §6.1). Durante o
+  failover a escrita recebe `READONLY`/`MASTERDOWN` (`network`) e o worker
+  retenta o lote até o novo primário. A replicação é **assíncrona**: uma
+  escrita que o primário antigo confirma entre a promoção do novo e a própria
+  rebaixa se perde quando ele vira réplica. Isso é do servidor, não do sink;
+  quem precisa fechar essa janela usa `min-replicas-to-write` no servidor.
 
 #### O health check pergunta "consigo escrever?", não "você está vivo?"
 
-Duas chamadas num pipeline, a cada `sink.health_interval`:
+Três chamadas num pipeline, a cada `sink.health_interval`:
 
 ```
 XLEN <sink.redis.stream>
 XADD <sink.redis.stream>:healthprobe NOMKSTREAM * p 1
+INFO memory          (ou CONFIG GET maxmemory-policy; ver abaixo)
 ```
 
 Um `PING` não serve, e um `XLEN` sozinho também não. Os dois são **leitura**, e
@@ -1627,6 +1708,35 @@ no boot, em vez de aparecer no primeiro lote.
 **Comandos do rueidis são reciclados após executar.** Um retry precisa
 **reconstruir** os comandos; reusar o slice corrompe os dados sem erro nenhum.
 
+#### A política de despejo
+
+O desenho supõe que um servidor cheio responde `OOM` (fatal, abaixo). Com
+`maxmemory-policy allkeys-*` ele não responde: **despeja** qualquer chave antes
+do `XADD` — inclusive a stream, que é uma chave só — e as mensagens já
+entregues somem em bloco, com o sink UP e nenhum contador; a sonda de escrita
+nem vê, porque sob `allkeys-*` o `XADD` no teto **passa**, despejando. Por isso
+a premissa é declarada — `noeviction`, ou `volatile-*` (a stream nunca tem TTL,
+então para ela um `volatile-*` no teto age como `noeviction`) — e conferida
+(porte do `go-webhook-server`, 2026-11-07):
+
+- a política é lida **no boot e em toda sonda** (um `CONFIG SET` muda a de um
+  servidor vivo, e um Valkey/Redis gerenciado muda pelo painel sem reinício),
+  no mesmo pipeline da sonda: `INFO memory` primeiro (o que um serviço
+  gerenciado ainda responde, e categoria de ACL mais estreita que `@admin`),
+  `CONFIG GET maxmemory-policy` quando o `INFO` não traz a linha. O método que
+  funcionou é lembrado, e a sonda continua uma ida e volta;
+- `allkeys-*` (casado pelo prefixo, para uma política nova da família também
+  ser recusada) é **fatal**: exit 3 no boot, FATAL depois;
+- política ilegível (ACL sem `INFO` nem `CONFIG`, proxy que não implementa) é
+  um `WARN` **único** com a premissa, e a checagem passa: recusar trancaria
+  fora todo ACL de privilégio mínimo; uma resposta de erro a ambos não é
+  "retentar" (não muda esperando);
+- com Sentinel a leitura vai ao primário, o nó que guarda a stream;
+- **em cluster** o rueidis recusa (com `panic`) um `DoMulti` que mistura um
+  comando sem chave (`INFO`, `CONFIG GET`) com comandos com chave, então lá a
+  leitura da política é uma ida e volta própria, depois da sonda (achado contra
+  um cluster de um nó em 2026-11-07; `TestRedisIntegrationClusterDB`).
+
 `sink.redis.maxlen` (padrão `0`, desligado) aplica `MAXLEN ~ N`. Desligado por
 padrão porque trimming descarta eventos em silêncio, que é o oposto de tudo o
 que esta spec promete.
@@ -1636,6 +1746,8 @@ que esta spec promete.
 | Resposta | Classe | Por quê |
 |---|---|---|
 | `OOM` | **`fatal`** | O servidor está **vivo** e recusando escrita por `maxmemory`. Esperar não conserta; retentar só enche o ring e começa a descartar enquanto nada escoa |
+| `maxmemory-policy` `allkeys-*` (lida pela sonda) | **`fatal`** | O servidor cheio despeja a stream em vez de responder `OOM` (acima) |
+| `ERR SELECT is not allowed in cluster mode`, `ERR DB index is out of range` | **`fatal`** | `sink.redis.db` não existe neste cluster (acima); não muda esperando |
 | `WRONGTYPE` | **`fatal`** | A chave da stream é outro tipo. Não muda sozinho, e **todo** lote vai falhar igual |
 | `NOPERM`, `NOAUTH`, `WRONGPASS` | **`fatal`** | Credencial ou ACL. Idem: não muda sozinho |
 | `LOADING`, `BUSY`, `MASTERDOWN`, `READONLY`, `CLUSTERDOWN`, `TRYAGAIN` | `network` | Vivo mas temporariamente incapaz — réplica em failover, dataset carregando. Retentar é o certo, e se persistir os fusíveis de §12.2 escalam |
@@ -1676,6 +1788,17 @@ Destino final append-only no esquema de §3.5.
   `rotate = none`, um dia passaria de `sink.health_timeout`, levando o sink a
   DOWN, a FATAL e a um boot que falha em laço. Arquivo corrompido no boot é
   erro fatal (`exit 3`).
+- A sonda adquire a trava da escritora **dentro do prazo da checagem**
+  (corrigido em 2026-11-07). A escritora segura a trava durante um lote
+  inteiro, e um lote mais longo que `sink.health_timeout` — grande, num disco
+  lento — fazia a sonda falhar por prazo com o banco íntegro: um ciclo DOWN
+  por lentidão. Agora, se o prazo passa com a **escritora** segurando a trava,
+  o banco está sendo escrito naquele instante e o resultado daquela escrita é o
+  que os workers classificam: a sonda reporta saudável em vez de inventar uma
+  falha. Uma trava presa por qualquer outra coisa ainda é falha. A escritora
+  não segura para sempre: toda escrita roda sob `sink.op_timeout`, e um disco
+  quebrado faz cada uma falhar rápido, soltar a trava e deixar a próxima sonda
+  ver o erro.
 
 ### 10.5 `sink.type = postgres`
 
@@ -1697,6 +1820,19 @@ Um `INSERT` por lote, com `unnest` sobre dezessete arrays paralelos e
 buffers já voltaram ao pool, e o lote seguinte carregaria a linha de outro
 emissor.
 
+**O ambiente libpq não chega ao pool** (corrigido em 2026-11-07, porte do
+`go-syslog-server`). `pgxpool.ParseConfig` lê as `PG*` do ambiente, e
+sobrescrever os campos depois não basta: `PGSSLMODE` ou `PGPORT` inválidos
+derrubavam o parse (exit 1 por uma variável que não é deste servidor), e
+`PGCHANNELBINDING`, `PGREQUIREAUTH`, `PGSSLNEGOTIATION`, `PGMINPROTOCOLVERSION`,
+`PGTARGETSESSIONATTRS` ou `PGCONNECT_TIMEOUT` sobreviviam em campos que ninguém
+sobrescrevia e podiam recusar toda conexão até `sink.boot_timeout`. O parse
+roda com **todas as `PG*` escondidas** (sob mutex, só no boot, restauradas
+depois), sobre `sslmode=disable` explícito (o TLS vem só de
+`[sink.postgres]`), e todo campo é preenchido da configuração: sem
+*fallbacks*, sem `ValidateConnect`, parâmetros de sessão reconstruídos do zero
+(só `application_name`).
+
 #### 10.5.3 Workers
 
 `sink.workers` no default é **rebaixado para 4** com `WARN`; um valor
@@ -1717,7 +1853,13 @@ O protocolo do PostgreSQL limita o tamanho de uma mensagem. Com
 A primeira checagem de saúde válida verifica, nesta ordem:
 
 1. a tabela existe e é acessível;
-2. as dezessete colunas de §3.6 existem com tipos compatíveis;
+2. as dezessete colunas de §3.6 existem com tipos compatíveis, e **nenhuma
+   coluna extra é obrigatória** — `NOT NULL` sem default, sem identidade e sem
+   expressão de geração: o servidor preenche exatamente as dezessete, então
+   uma extra assim recusaria toda linha com `23502` (fatal na escrita, §10.5.7).
+   Lido do catálogo (`pg_attribute`), não por um `INSERT` de sonda revertido,
+   que dispararia os gatilhos do operador e consumiria sequências; a recusa
+   nomeia a coluna (corrigido em 2026-11-07);
 3. existe um índice **único** exatamente sobre `(id)`;
 4. o papel tem `INSERT`;
 5. o servidor não está em recuperação (`pg_is_in_recovery()`), porque uma
@@ -1726,6 +1868,15 @@ A primeira checagem de saúde válida verifica, nesta ordem:
 Qualquer falha estrutural é FATAL **imediato** — `exit 3` sem esperar
 `sink.boot_timeout`. Esperar cinco minutos por uma coluna que não vai aparecer
 sozinha só atrasa o diagnóstico.
+
+**A validação tem prazo próprio: `sink.op_timeout`** (corrigido em 2026-11-07,
+porte do `go-syslog-server`; vale igual para §10.7.4). São cerca de uma dúzia
+de idas e voltas, e o prazo da checagem de saúde é `sink.health_timeout`, 1 s
+por padrão: com o banco a uns 60 ms ela nunca terminava, o prazo fechava a
+conexão, cada tentativa recomeçava do zero e o processo saía com 3 depois de
+`sink.boot_timeout` dizendo que o banco não respondeu. O contexto da validação
+se desliga do **prazo** da checagem que a iniciou, mas continua seguindo o
+**cancelamento** do boot (um shutdown, um boot abortado).
 
 #### 10.5.6 Durabilidade
 
@@ -1800,6 +1951,13 @@ retorna sucesso, a conta de duplicatas fecha, e as linhas somem quando a
 conexão fecha — perda silenciosa de mensagens confirmadas, com a sonda do boot
 passando. A validação de §10.7.4 relê o valor.
 
+`sink.mysql.database` entra entre crases em todo comando e, ao contrário de
+`table`, não segue `mysqlIdent`: por isso é validado na configuração **e** no
+construtor — não vazio, até 64 caracteres, sem crase, barra invertida nem byte
+de controle (corrigido em 2026-11-07, porte do `go-syslog-server`). Uma crase
+no nome quebrava o comando com `1064`, que cai em `network` e esperava
+`sink.boot_timeout`, e era o furo na defesa de injeção que o código anuncia.
+
 O pool nasce **preguiçoso**: `sql.OpenDB` não conecta, e o `WaitReady` do boot
 (§12.1) é quem retenta. O log do driver vai para o `slog` em `WARN`: por padrão
 ele escreve em stderr uma linha por conexão que morre, e numa queda isso vira
@@ -1866,7 +2024,8 @@ dezesseis bytes no cliente.
 
 Corre uma vez, na primeira checagem de saúde bem-sucedida, com a regra de
 §10.5.5: cada recusa é FATAL, o `WaitReady` desiste na hora e o processo sai com
-3, com a razão no log.
+3, com a razão no log. E com o prazo de §10.5.5: `sink.op_timeout`, não
+`sink.health_timeout`, seguindo o cancelamento do boot.
 
 | Verificação | Como | Se falhar |
 |---|---|---|
@@ -2120,6 +2279,27 @@ que não existe é `exit 1` no boot, não um laço de retry. TLS como §10.7.9:
 verificado por padrão, CA própria por `tls_ca`, `tls_insecure` desliga a
 verificação.
 
+**Credencial dentro de `sink.nats.urls`** (corrigido em 2026-11-07, porte do
+`go-syslog-server`). `nats://usuario:senha@host` e `nats://token@host` são
+aceitos, e a URL é tratada como segredo:
+
+- **validação sem eco**: cada entrada é parseada e nunca citada na mensagem
+  (o `url.Parse` cita a entrada inteira, e o erro interno dele cita o pedaço
+  da senha até a `/`); exige host; recusa caminho, consulta e fragmento em
+  `nats://` e `tls://` (é o que pega a senha com `/`, `#` ou `?` não
+  codificados, que de outro modo parseava como host "usuário" e porta "início
+  da senha"); recusa um `@` depois do primeiro `/`, `?` ou `#`; esquemas só
+  `nats`, `tls`, `ws`, `wss` (um esquema que não tem forma de esquema nem é
+  nomeado). A mensagem diz para codificar `%`, `/`, `#`, `?` e `,`;
+- **credencial na URL junto de `username`, `password`, `token` ou
+  `credentials` é `exit 1`**: o `nats.go` usa a da URL e ignora a chave — a
+  regra "uma forma só" acima;
+- **logs e dump**: o log de conexão e o de reconexão mostram só esquema e host
+  (o `ConnectedUrlRedacted` da biblioteca esconde senha e deixa o token); o
+  log `sink configured` e o `--dump-config` mostram as URLs com a parte de
+  usuário mascarada (`nats://u:***@h`, `nats://***@h`), trabalhando no texto
+  (vírgula e `/` numa senha não quebram a redação).
+
 ---
 
 ## 11. Arquivo de emergência
@@ -2136,7 +2316,13 @@ não-vazio.
 
 ### 11.1 Formato
 
-`<emergency.dir>/emg-<node-id>-<unixnano>.bin`
+`<emergency.dir>/slstd-emg-<node-id>-<unixnano>.bin`
+
+O prefixo é **deste** servidor (desde 2026-11-07): o `go-syslog-server` grava
+`emg-*.bin` num formato de cabeçalho diferente, e um decodificador que lesse os
+dele os renomearia para `.corrupt` quando os dois dividissem o diretório. Cada
+um lista só o próprio prefixo; um dump `emg-*` antigo desta referência (que
+nunca entrou em produção) não é mais lido.
 
 ```
 <len_head> <len_raw>\n
@@ -2159,7 +2345,7 @@ codificador.
 
 ### 11.2 Reingestão
 
-No boot, todo arquivo `emg-*.bin` em `emergency.dir` é carregado para o ring
+No boot, todo arquivo `slstd-emg-*.bin` em `emergency.dir` é carregado para o ring
 **antes** da drenagem do backlog (§12.1), em ordem lexicográfica de nome (que é
 temporal pelo sufixo unix), e **removido só depois de todos os seus itens serem
 confirmados no sink**.
@@ -2182,6 +2368,14 @@ restantes) é processado até o último registro íntegro; o resto é logado em
 `.corrupt` em vez de removido. O decoder **nunca confia no comprimento
 declarado** e precisa tolerar arquivo truncado sem pânico — é um dos alvos de
 fuzz obrigatórios (§17.2).
+
+**Os gauges vêm do disco** (corrigido em 2026-11-07, porte do
+`go-syslog-server`). No fim da reingestão, e depois de todo dump,
+`syslog_emergency_files` e `syslog_emergency_events_pending` são **recontados a
+partir da listagem do diretório**, nunca zerados nem fixados no dump do
+momento: um arquivo deixado para trás (ilegível, ou com a remoção ou a
+quarentena falha) conta como um, e um alerta sobre `> 0` dispara. As mensagens
+de um arquivo ilegível são desconhecíveis e contam como zero.
 
 ### 11.3 Falha do próprio dump
 
@@ -2223,13 +2417,18 @@ só é criado durante o incidente falha durante o incidente.
                 FATAL => exit 3 IMEDIATO
       none:     no-op
 5. se ring.mode = sqlite: abre ring.db e conta o backlog
-   se existem arquivos emg-*.bin: carrega para o ring (§11.2)
+   se existem arquivos slstd-emg-*.bin: carrega para o ring (§11.2)
 6. DRENA o backlog integralmente
       NENHUM transporte está aberto
       /readyz reporta: "draining backlog: 412k pending"
 7. abre os transportes configurados, na ordem unix, udp, tcp, relp
 8. /readyz -> 200
 ```
+
+**Um prazo só para o boot do sink** (corrigido em 2026-11-07).
+`sink.boot_timeout` conta do início do passo 4: a discagem do `sink=redis` e o
+`WaitReady` que vem depois dividem o mesmo prazo. Antes cada um recebia o prazo
+inteiro, e um Redis que oscilasse entre os dois passos dobrava a espera.
 
 A porta admin aberta durante todo o processo é o ponto: mesmo num crashloop por
 sink indisponível, o operador tem `/readyz` com o motivo exato e `/metrics` com
@@ -2355,6 +2554,20 @@ e sai com `0` — a menos que o sink esteja FATAL, quando o código continua `3`
 Um segundo sinal com `ring=sqlite` também não perde nada: sai com 130 sem
 contar descarte.
 
+**O que um segundo sinal conta como perdido** (`reason="abort"`, corrigido em
+2026-11-07). Com `ring=memory` o ring conta, até o `Commit`, tanto a fila
+quanto os lotes que os workers seguram; mas a fase 4 tira os dois da conta
+(`Workers.Pending()` com `Commit`, e `Drain`) **antes** de escrever o dump. Um
+segundo sinal que chegava enquanto o dump era escrito lia o ring quase vazio e
+contava uma fração de uma perda que era o dump inteiro — o `exit 130` corta a
+escrita. Agora a fase 4 registra, sob uma trava, quantas mensagens recolheu e
+ainda não despejou, e o abort soma esse número ao que o ring ainda conta; o
+dump concluído (ou contado como `emergency_failed`) zera o registro. Um dump
+cortado pelo abort pode deixar um arquivo truncado, que o boot seguinte
+reingere até o último registro íntegro (§11.2): essas mensagens foram contadas
+como perdidas e voltam — erro para o lado de contar perda a mais, nunca a
+menos.
+
 ### 12.4 Códigos de saída
 
 | Código | Significado |
@@ -2398,9 +2611,12 @@ conhecido em tempo de compilação.
 | `syslog_parse_anomalies_total` | counter | `kind` (dup_sd_id, sd_truncated, sd_unterminated, bad_timestamp) |
 | `syslog_conns_active` | gauge | `transport` (tcp, relp) |
 | `syslog_conns_total` | counter | `transport` |
+| `syslog_conns_refused_total` | counter | `transport` (tcp, relp) — conexões fechadas no accept por `max_conns_per_ip` (§4.4) |
 | `syslog_backpressure_seconds_total` | counter | `transport` (tcp, relp) |
 | `syslog_udp_receive_errors_total` | counter | — |
 | `syslog_relp_frames_total` | counter | `command` (open, syslog, close, unknown) |
+| `syslog_relp_inflight_bytes` | gauge | — (cópias das transações em voo contadas em `relp.inflight_max_bytes`, §4.5) |
+| `syslog_relp_inflight_waits_total` | counter | — (leitores que pararam por esse teto) |
 | `syslog_ring_items` / `_bytes` | gauge | — |
 | `syslog_ring_capacity_items` / `_bytes` | gauge | — |
 | `syslog_ring_quarantined_total` | counter | — (linhas do `ring.db` movidas para `quarantine`, §9.4) |
@@ -2549,12 +2765,36 @@ argv  >  env  >  arquivo ini  >  padrão
 - INI: seção `[ring]`, chave `capacity_items`
 - `--config=/caminho/arquivo.ini` (env `SYSLOG_CONFIG`) indica o arquivo.
 
+**Erros de configuração nunca ecoam um valor** (corrigido em 2026-11-07, porte
+do `go-syslog-server`): eles vão ao stderr e, num `SIGHUP`, ao log. O INI
+nomeia a **linha**, nunca o texto dela (`password: x` sem `=` e o cabeçalho de
+seção malformado eram citados inteiros); uma chave desconhecida só é nomeada
+quando tem forma de chave, numa seção que existe, e não vem logo depois de um
+segredo (pode ser o resto dele numa segunda linha). As flags nomeiam a flag e a
+posição, nunca o valor: um argumento solto mostra só o que vem antes do `=`;
+um argumento depois de um valor não é citado (pode ser o resto de um valor que
+o shell partiu num espaço); um argumento com forma de flag nunca é tomado como
+valor de outra flag (`--sink.workers --sink.nats.password=x`); e um nome que
+começa com o nome de um parâmetro e continua (`--sink.nats.passwordx`) não é
+citado.
+
 ### 15.2 Registry único
 
 Uma **única tabela** declara, para cada parâmetro: seção, chave, tipo, valor
 padrão, descrição e se é recarregável. Dela são derivados o parser de INI, o
 registro de flags, a leitura de env, o `--help` e o dump da configuração
 efetiva no boot. É impossível os cinco divergirem.
+
+**Seções-alias** (desde 2026-11-07): `[sink.valkey]` é `[sink.redis]`, chave
+por chave, nas três fontes — INI `[sink.valkey]`, flag `--sink.valkey.<chave>`,
+env `SYSLOG_SINK_VALKEY_<CHAVE>` —, e `sink.type=valkey` é normalizado para
+`redis` (§10.3). O `--help` diz numa linha que o alias existe (sem duplicar a
+tabela); o dump e os logs mostram só os nomes canônicos. **Conflito:** a mesma
+chave pelos dois nomes na **mesma fonte** é aceita se os valores (lidos pelo
+tipo: `yes` e `true` concordam) são iguais e é `exit 1` se diferem, com a
+mensagem nomeando as duas chaves e nunca os valores (qualquer um pode ser uma
+senha). Entre fontes vale a precedência de §15.1 sem mudança: o alias conta
+como a mesma chave na sua fonte.
 
 Sem `gopkg.in/ini.v1` e sem `spf13/pflag`, pela mesma razão do serviço irmão:
 unir essas bibliotecas numa precedência coerente daria mais código de cola que o
@@ -2593,7 +2833,7 @@ O filtro ser recarregável é a razão principal de o `SIGHUP` existir aqui (§7
 
 ```ini
 [node]
-id = sls-prod-a1
+id = slstd-prod-a1
 
 [listen]
 udp  = :1514
@@ -2698,6 +2938,7 @@ continua legítimo onde é o que diz: `shutdown.pre_stop_delay` (sem espera),
 | `max_conns_per_ip` | `0` | Por transporte; fecha na hora |
 | `window` | `128` | Transações não confirmadas antes de parar de ler |
 | `backpressure_timeout` | `30s` | Antes de responder `500 ring full` |
+| `inflight_max_bytes` | `64MiB` | Teto, para o processo inteiro, das cópias das transações ainda não decididas (fora de `ring.max_bytes`); ≥ `max_frame_bytes`; esgotado, os leitores param de ler (§4.5) |
 
 #### `[parse]`
 
@@ -2759,7 +3000,7 @@ passa fácil de cem.
 
 | Chave | Padrão | Descrição |
 |---|---|---|
-| `type` | `redis` | `redis` \| `sqlite` \| `postgres` \| `mysql` \| `nats` \| `none` |
+| `type` | `redis` | `redis` \| `sqlite` \| `postgres` \| `mysql` \| `nats` \| `none`; `valkey` é alias de `redis` (§10.3) |
 | `workers` | `8` | Goroutines de dreno; 1 com `sqlite`, 4 com `postgres` ou `mysql` |
 | `batch` | `256` | Itens por escrita; até 3855 com `mysql` (§10.7.3) |
 | `batch_max_delay` | `5ms` | Espera máxima para completar o lote |
@@ -2774,12 +3015,14 @@ passa fácil de cem.
 
 #### `[sink.redis]`
 
+Alias: `[sink.valkey]`, `--sink.valkey.*`, `SYSLOG_SINK_VALKEY_*` (§15.2).
+
 | Chave | Padrão | Descrição |
 |---|---|---|
 | `addrs` | `127.0.0.1:6379` | Endereços, ou do Sentinel se `sentinel_master` |
 | `username` | `""` | Usuário ACL |
 | `password` | `""` | Senha ACL; redigida no dump |
-| `db` | `0` | Índice do banco |
+| `db` | `0` | Índice do banco; em cluster só `0`, salvo Valkey 9 com `cluster-databases` (§10.3) |
 | `sentinel_master` | `""` | Nome do master; não-vazio seleciona Sentinel |
 | `tls` | `false` | TLS para o Redis; nenhum proxy resolve isto |
 | `tls_ca` | `""` | CA; vazio usa o pool do sistema |
@@ -2892,7 +3135,7 @@ de §12.1 não reclama.
 Caminhos fixos do contêiner, iguais em todo o ecossistema: `/app` guarda o
 binário (dono `root`), `/data` é a única área gravável, `/etc/syslog` é o INI em
 `:ro` e `/tmp` é tmpfs volátil. O `WORKDIR` é `/data` e o binário é invocado
-pelo caminho absoluto `/app/go-syslog-server`, nunca pelo nome solto.
+pelo caminho absoluto `/app/go-syslog-standard-server`, nunca pelo nome solto.
 
 ---
 
@@ -2905,7 +3148,7 @@ loghub-paradise/                  monorepo, sem go.mod
   go-webhook-server/              serviço irmão, módulo independente
   go-syslog-server/               ESTE módulo
     go.mod                        .../loghub-paradise/go-syslog-standard-server
-    cmd/go-syslog-server/
+    cmd/go-syslog-standard-server/
     internal/
     docs/SPEC.md
     docs/TESTING.md
@@ -2920,7 +3163,7 @@ necessária — que já existe, no envelope — viraria um parâmetro condiciona
 ### 16.2 Layout interno
 
 ```
-cmd/go-syslog-server/main.go   só injeta versão/commit e chama internal/app
+cmd/go-syslog-standard-server/main.go   só injeta versão/commit e chama internal/app
 internal/
   app/        montagem, ciclo de vida, boot, shutdown, SIGHUP, reingestão
   config/     registry único -> ini + flags + env + --help + dump; validação
@@ -3073,8 +3316,8 @@ fabricantes fazem com ela, que é outra coisa.
 A prova de interoperabilidade que o corpus **não** dá: a moldura no fio.
 
 ```bash
-docker run --rm -d --name sls-test-rsyslog rsyslog/syslog_appliance_alpine
-docker run --rm -d --name sls-test-syslogng balabit/syslog-ng
+docker run --rm -d --name slstd-test-rsyslog rsyslog/syslog_appliance_alpine
+docker run --rm -d --name slstd-test-syslogng balabit/syslog-ng
 ```
 
 Cenários obrigatórios, cada um contra o servidor real:
@@ -3093,20 +3336,30 @@ ter enviado, confirmações que o servidor diz ter dado, e linhas no destino.
 
 ### 17.5 Integração com destinos
 
-A suíte contra Redis e PostgreSQL reais **ainda não existe** (`docs/TESTING.md`
-§8, itens 1 e 2); os comandos abaixo são o formato combinado com o serviço
-irmão, para quando ela for escrita. O servidor **nunca cria a tabela** do
-PostgreSQL.
+As suítes contra Redis/Valkey e PostgreSQL reais existem desde 2026-11-07,
+opt-in, com o prefixo **`SLSTD_TEST_`** — nunca o `SYSLOG_TEST_*` do
+`go-syslog-server`, para as duas rodarem na mesma máquina contra servidores
+diferentes: `SLSTD_TEST_REDIS_ADDR` (escrita/`XLEN`, `OOM` fatal, política
+relida pela sonda, réplica `READONLY` → `/readyz` 503), `SLSTD_TEST_REDIS_LRU_ADDR`
+(`allkeys-lru` fatal no boot), `SLSTD_TEST_REDIS_SENTINEL_ADDR` +
+`SLSTD_TEST_REDIS_SENTINEL_MASTER` (failover), `SLSTD_TEST_REDIS_CLUSTER_ADDR` e
+`SLSTD_TEST_REDIS_CLUSTER_DB_ADDR` (cluster com `db`), `SLSTD_TEST_PG_DSN`
+(coluna obrigatória extra, validação sob `op_timeout`). Rodam contra Redis 7.4
+e Valkey 7.2, 8.1 e 9.0; receitas em `docs/TESTING.md` §6.1 e §6.2. O
+servidor **nunca cria a tabela** do PostgreSQL: a suíte cria a dela a partir de
+`docker/postgres/schema.sql`.
 
-```bash
-docker run --rm -d -p 16379:6379 --name sls-test-redis redis:7-alpine
-SYSLOG_TEST_REDIS_ADDR=127.0.0.1:16379 go test -race -timeout 600s ./internal/app/
-
-docker run --rm -d -p 15432:5432 -e POSTGRES_USER=sls -e POSTGRES_PASSWORD=sls \
-  -e POSTGRES_DB=sls_test --name sls-test-pg postgres:17-alpine
-SYSLOG_TEST_PG_DSN='postgres://sls:sls@127.0.0.1:15432/sls_test?sslmode=disable' \
-  go test -race -timeout 600s ./internal/sink/ ./internal/app/
-```
+Os compose de Redis têm gêmeos Valkey (`compose.<ring>-valkey.yml`), com
+imagem `${SYSLOG_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}`, `command:
+valkey-server …` (o entrypoint da imagem só rebaixa o privilégio para o
+usuário `valkey` quando o primeiro argumento é `valkey-server`; com o symlink
+`redis-server` o processo rodaria como root), healthcheck `valkey-cli ping` e
+nomes próprios. **Todo nome de pilha é deste servidor** (desde 2026-11-07):
+imagem `go-syslog-standard-server`, projetos, contêineres, volumes e `node.id`
+com o prefixo `slstd-`; antes eles eram os `sls-*` e `go-syslog-server:local`
+do servidor LogHub, e subir os compose daqui retagueava a imagem dele e
+assumia as pilhas e os volumes dele. `TestComposeValkeyFiles` e
+`TestComposeNamesAreThisServers` conferem.
 
 A de MySQL e a de NATS existem desde a entrada dos dois destinos, pulam sem a
 variável e criam a própria tabela ou o próprio stream **a partir do arquivo que o
@@ -3116,7 +3369,7 @@ nem Docker é preciso para ele:
 
 ```bash
 docker run --rm -d -p 13306:3306 -e MYSQL_ROOT_PASSWORD=sls -e MYSQL_DATABASE=sls_test \
-  --name sls-test-mysql mysql:8.4 --max_allowed_packet=256M
+  --name slstd-test-mysql mysql:8.4 --max_allowed_packet=256M
 SYSLOG_TEST_MYSQL_DSN='root:sls@tcp(127.0.0.1:13306)/sls_test' \
   go test -race -timeout 600s ./internal/sink/ ./internal/app/
 
@@ -3293,56 +3546,27 @@ sido medidos pela primeira vez.
 
 ## 21. Lacunas e riscos
 
-Este módulo é **referência**: o código fica como está (salvo os seis itens de
-§21.1 corrigidos em 2026-10-14 por porte do `go-syslog-server`), e quem porta
-um trecho dele para outro módulo confere esta seção antes. As lacunas de teste estão em
+Este módulo é **referência**. Os seis itens de §21.1 corrigidos em 2026-10-14
+e todos os abertos, corrigidos em 2026-11-07 (rodada Valkey), foram portados do
+`go-syslog-server` e dos irmãos; quem porta um trecho dele para outro módulo
+confere esta seção antes. As lacunas de teste estão em
 `docs/TESTING.md` §8.
 
 ### 21.1 Pendências conhecidas
 
-Defeitos reais que o código ainda tem, cada um com a direção da correção. Um
-trecho portado leva a correção junto, não o defeito.
+Defeitos que esta referência teve, cada um com a regra que o corrigiu. Desde
+2026-11-07 nenhum está aberto; um defeito novo entra aqui com a direção da
+correção, e um trecho portado leva a correção junto, não o defeito.
 
-1. **Custo fixo por conexão.** Cada conexão TCP ou RELP aloca no accept um
-   `bufio.Reader` de 64 KiB, e a leitura contada (§5.5) cresce em blocos de
-   64 KiB: cerca de 128 KiB por conexão ociosa, fora de `ring.max_bytes` e sem
-   teto com `max_conns = 0` (§4.4). Alguns milhares de conexões paradas levam o
-   contêiner ao OOM kill, e com `ring=memory` o backlog confirmado se perde.
-   Direção: `bufio` de 4 KiB (o maior `Peek` dos leitores é de um byte; o resto
-   é `ReadByte`, `ReadSlice` e leitura contada) e primeiro bloco pequeno, que
-   dobra conforme os bytes chegam.
-2. **Cópias da janela RELP fora do ring.** O leitor copia o frame **antes** de
-   obter a vaga na janela, e cada transação segura a cópia durante todo o
-   backpressure (§5.4): até `relp.window + 1` cópias de até
-   `relp.max_frame_bytes` por conexão, cerca de 2 GiB com os padrões, que nem
-   `ring.max_bytes` nem a conta de §14.4 enxergam — justamente quando o ring
-   está cheio. Direção: copiar depois da vaga e limitar os bytes em voo por um
-   teto global ao processo, adquirido antes da cópia e de pelo menos
-   `relp.max_frame_bytes`; esgotado, o leitor para de ler e a janela TCP segura
-   o emissor.
+1. *Corrigido em 2026-11-07 (porte do go-syslog-server):* custo fixo por conexão — `bufio` de 4 KiB, leitura contada a partir de um bloco de 2 KiB que dobra, buffer acima de 16 KiB largado entre frames; regra em §5.5.
+2. *Corrigido em 2026-11-07 (porte do go-relplog-server):* a cópia da transação RELP sai depois da vaga na janela e dos bytes em `relp.inflight_max_bytes`, teto global ao processo; regra em §4.5.
 3. *Corrigido em 2026-10-14 (porte do go-syslog-server):* `listen.unix` só
    remove um socket (`Lstat`, sem seguir link) cujo `connect` datagrama é
    recusado (`ECONNREFUSED`); arquivo comum, diretório, link ou socket vivo de
    qualquer tipo é `exit 1` sem apagar, e o boot recusado não remove o caminho
    na saída; regra em §4.3.
-4. **Credencial dentro de `sink.nats.urls`.** Com `nats://usuario:senha@host`
-   ou `nats://token@host`, a credencial aparece nos logs de conexão e de
-   reconexão (`ConnectedUrl`), no log de sink configurado e no `--dump-config`,
-   que não redige a URL. A validação não confere a forma: uma senha com `/`,
-   `#` ou `?` faz o erro repetir a URL inteira a cada tentativa até
-   `sink.boot_timeout`, ou faz discar um "host" que é um pedaço da credencial.
-   E credencial na URL junto de `username`, `token` ou `credentials` não é
-   recusada, contra §10.8.9; a biblioteca usa a da URL e ignora as chaves.
-   Direção: logar só esquema e host; redigir a URL no dump; na validação,
-   parsear cada entrada sem ecoá-la, exigir host, recusar caminho, consulta e
-   fragmento em `nats://` e `tls://`, e recusar credencial na URL junto das
-   chaves.
-5. **Erros de configuração ecoam segredo.** O INI responde
-   `expected 'key = value', got "<linha>"` (e o cabeçalho malformado ecoa a
-   linha), e as flags respondem `unexpected argument "<arg>"`: um
-   `password: x` no INI ou um `sink.nats.password=x` sem `--` vai inteiro para
-   o stderr e, no `SIGHUP`, para o log, contra a regra de §15.3. Direção:
-   mensagens com o número da linha ou a posição do argumento, nunca o texto.
+4. *Corrigido em 2026-11-07 (porte do go-syslog-server):* `sink.nats.urls` validada sem eco, credencial na URL junto das chaves recusada, logs só com esquema e host, dump redigido; regra em §10.8.9.
+5. *Corrigido em 2026-11-07 (porte do go-syslog-server):* erros do INI e das flags nomeiam a linha ou a flag, nunca o valor; regra em §15.1.
 6. *Corrigido em 2026-10-14 (porte do go-syslog-server):* stream com
    `retention: interest` é recusado como fatal na validação do boot; regra em
    §10.8.5.
@@ -3352,68 +3576,17 @@ trecho portado leva a correção junto, não o defeito.
 8. *Corrigido em 2026-10-14 (porte do go-syslog-server):* a sessão MySQL fixa
    `autocommit=1` no mesmo `SET` do `sql_mode`, e a validação do boot relê
    `@@session.autocommit` (fatal se não for 1); regra em §10.7.1 e §10.7.4.
-9. *Corrigido em 2026-10-14 (porte do go-syslog-server):* `23502` do PostgreSQL
-   é `fatal`; regra em §10.5.7. A outra metade da direção — a validação recusar
-   no boot coluna extra `NOT NULL` sem default — não foi portada: hoje a tabela
-   assim passa no boot e a primeira escrita é fatal.
-10. **Validação do boot dentro de `sink.health_timeout`.** A validação do
-    PostgreSQL e do MySQL (§10.5.5, §10.7.4) roda no contexto da checagem de
-    saúde, de 1 s por padrão, e faz cerca de uma dúzia de idas e voltas. Com o
-    banco a uns 60 ms de RTT ela nunca termina; o prazo fecha a conexão, cada
-    tentativa recomeça do zero, e o processo sai com 3 depois de
-    `sink.boot_timeout` dizendo que o banco não respondeu. Direção: prazo
-    próprio para a validação (`sink.op_timeout`), que continue seguindo o
-    cancelamento do boot.
-11. **Ambiente libpq chega ao pool.** `pgxpool.ParseConfig("")` lê as `PG*` do
-    ambiente, e só parte dos campos é sobrescrita depois: `PGSSLMODE` ou
-    `PGPORT` inválidos derrubam o boot com `exit 1` por uma variável que não é
-    deste servidor, e `PGCHANNELBINDING`, `PGREQUIREAUTH`, `PGSSLNEGOTIATION`,
-    `PGMINPROTOCOLVERSION` e `PGCONNECT_TIMEOUT` sobrevivem e podem recusar
-    toda conexão até `sink.boot_timeout`. Direção: parsear com todas as `PG*`
-    escondidas (sob mutex, só no boot) e preencher tudo a partir da
-    configuração.
-12. **Nome do banco MySQL cru no SQL.** `sink.mysql.database` entra entre
-    crases no `INSERT` sem validação; só `table` é conferida. Uma crase no nome
-    quebra o comando (`1064`, que cai em `network` e espera
-    `sink.boot_timeout`), e a defesa contra injeção que o código anuncia tem um
-    furo. Direção: validar `database` como `table` (sem crase, barra invertida
-    nem byte de controle, até 64 bytes), na configuração e no construtor.
-13. **Despejo do Redis apaga o stream.** §10.3 supõe que `maxmemory` produz
-    `OOM`, que é fatal. Com `maxmemory-policy allkeys-*` o Redis despeja
-    qualquer chave antes do `XADD` — inclusive o stream, que é uma chave só — e
-    as mensagens já entregues somem em bloco, com o sink UP e nenhum contador.
-    Direção: declarar a premissa (`noeviction`, ou `volatile-*` sem TTL no
-    stream) e ler `maxmemory_policy` no boot: `allkeys-*` é fatal, e a falta de
-    permissão para ler é um `WARN` único.
-14. **Gauges de emergência zerados com dump no disco.** No fim da reingestão,
-    `syslog_emergency_files` e `syslog_emergency_events_pending` vão a zero
-    mesmo quando um arquivo ficou para trás (ilegível, ou com quarentena ou
-    remoção falha), e um alerta sobre `> 0` não dispara. Direção: recontar a
-    partir da listagem do diretório no fim.
-15. **O segundo sinal subconta a perda.** Com `ring=memory` ou `ring=none`, o
-    abort de §12.3 soma em `reason="abort"` só o que está no ring, não os lotes
-    retidos pelos workers (`Workers.Pending()`). Direção: somar os dois.
-16. **A sonda do `sink=sqlite` espera a trava da escritora sem contexto.** Um
-    lote mais longo que `sink.health_timeout` faz a sonda falhar por prazo com
-    o banco íntegro: um ciclo DOWN por lentidão (§10.4). Direção: adquirir a
-    trava respeitando o contexto da checagem.
-17. **Dois orçamentos de `boot_timeout` com `sink=redis`.** A discagem do boot
-    (§12.1, passo 4) e o `WaitReady` recebem cada um o prazo inteiro, e um
-    Redis que oscile entre os dois passos pode dobrar a espera. Direção: um
-    prazo único para o boot do sink.
-18. **Recusa por IP invisível.** Nenhuma métrica ou log conta as conexões
-    recusadas por `max_conns_per_ip`; o operador não distingue "ninguém
-    conecta" de "um IP é recusado o tempo todo". Direção: um contador com o
-    rótulo `transport` em §13.1, antes do código.
+9. *Corrigido em 2026-10-14 e 2026-11-07 (porte do go-syslog-server):* `23502` é `fatal` (§10.5.7), e a validação recusa no boot coluna extra `NOT NULL` sem default, identidade ou geração; regra em §10.5.5.
+10. *Corrigido em 2026-11-07 (porte do go-syslog-server):* a validação do PostgreSQL e do MySQL roda sob `sink.op_timeout`, seguindo o cancelamento do boot; regra em §10.5.5 e §10.7.4.
+11. *Corrigido em 2026-11-07 (porte do go-syslog-server):* o pool é parseado com todas as `PG*` escondidas e preenchido só da configuração; regra em §10.5.2.
+12. *Corrigido em 2026-11-07 (porte do go-syslog-server):* `sink.mysql.database` validado na configuração e no construtor (sem crase, barra invertida nem controle, até 64); regra em §10.7.1.
+13. *Corrigido em 2026-11-07 (porte do go-webhook-server):* `maxmemory-policy` lida no boot e em toda sonda, `allkeys-*` fatal, ilegível um `WARN` único; regra em §10.3.
+14. *Corrigido em 2026-11-07 (porte do go-syslog-server):* os gauges de emergência são recontados do diretório no fim da reingestão e depois de todo dump; regra em §11.2.
+15. *Corrigido em 2026-11-07:* um segundo sinal durante o dump conta tudo o que a fase 4 recolheu e não despejou, além do que o ring ainda conta; regra em §12.3.
+16. *Corrigido em 2026-11-07:* a sonda do `sink=sqlite` adquire a trava dentro do prazo e trata a escritora ocupada como saudável; regra em §10.4.
+17. *Corrigido em 2026-11-07:* um prazo `sink.boot_timeout` só para a discagem e o `WaitReady`; regra em §12.1.
+18. *Corrigido em 2026-11-07:* `syslog_conns_refused_total{transport}` conta as recusas por `max_conns_per_ip`; regra em §4.4 e §13.1.
 19. *Corrigido em 2026-10-14 (porte do go-syslog-server):*
     `natsio/nats-box:0.20.0` nos três compose de NATS e no `.env.example`,
     conferido por `TestComposeNATSBoxIsPinned`; regra em §17.5.
-20. **Nomes que colidem com o `go-syslog-server` atual.** A imagem padrão
-    (`go-syslog-server:local`), os projetos e contêineres `sls-*`, os volumes
-    (`sls-data`, `nats-data`, `redis-data`), o `--version` e o `relp_software`
-    usam os nomes do servidor LogHub que hoje ocupa `../go-syslog-server/`. Subir
-    os compose daqui retagueia a imagem dele e assume as pilhas e os volumes
-    dele sem aviso, e o decodificador daqui renomeia para `.corrupt` os dumps
-    `emg-*.bin` que ele deixou. Direção: nomes próprios — imagem
-    `go-syslog-standard-server`, prefixo `slstd-` nos projetos, contêineres e
-    `node.id` dos compose, e o mesmo nome no `--version` e no `relp_software`.
+20. *Corrigido em 2026-11-07:* nomes próprios — imagem e binário `go-syslog-standard-server`, prefixo `slstd-` nos compose, `relp_software` e `--version` com o nome, dumps `slstd-emg-*` (os `emg-*` do go-syslog-server não são lidos); regra em §4.5, §11.1 e §17.5.

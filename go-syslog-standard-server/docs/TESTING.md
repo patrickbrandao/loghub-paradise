@@ -1,4 +1,4 @@
-# go-syslog-server — Procedimentos de teste
+# go-syslog-standard-server — Procedimentos de teste
 
 Como provar que o código cumpre `docs/SPEC.md`, e o que **ainda não** está
 provado. A §8 é a parte mais importante deste arquivo: ela é mantida por
@@ -97,9 +97,74 @@ escritas.
 
 ## 6. Destinos externos
 
-### 6.1 Redis
+### 6.1 Redis e Valkey
 
-Verificado **à mão** com a combinação de referência, contra um Redis 7.4 real:
+Suíte automatizada desde 2026-11-07 (`internal/sink/redis_integration_test.go`,
+`internal/app/redis_test.go`), opt-in, com o prefixo **`SLSTD_TEST_`** para
+nunca colidir com o `SYSLOG_TEST_*` do `go-syslog-server`:
+
+| Variável | Servidor | Testes |
+|---|---|---|
+| `SLSTD_TEST_REDIS_ADDR` | `noeviction` | escrita e `XLEN` com os três campos, sonda sem chave criada, identidade (`server`/`server_version`), `OOM` fatal (`CONFIG SET maxmemory 1`), política relida por toda sonda (`CONFIG SET maxmemory-policy allkeys-lru` → fatal, pelos dois métodos de leitura), réplica `READONLY` → `network` e `/readyz` 503 → 200 com `REPLICAOF NO ONE`, ponta a ponta com `sink.type=redis` e `sink.type=valkey` |
+| `SLSTD_TEST_REDIS_LRU_ADDR` | `allkeys-lru` | `NewRedis` fatal com `ErrEvictionPolicy`; o boot sai com 3 sem abrir transporte |
+| `SLSTD_TEST_REDIS_SENTINEL_ADDR` + `_MASTER` | Sentinel com primário e réplica | boot pelo Sentinel, 5 escritas, `WAIT 1`, `SENTINEL FAILOVER`, espera o primário antigo virar réplica, 5 escritas, `XLEN` = 10 no novo primário |
+| `SLSTD_TEST_REDIS_CLUSTER_ADDR` | cluster de um nó | `db=1` fatal em menos de 2 s com a mensagem de §10.3; `db=0` escreve |
+| `SLSTD_TEST_REDIS_CLUSTER_DB_ADDR` | Valkey 9 com `--cluster-databases 16` | `db=1` escreve |
+| `SLSTD_TEST_REDIS_EXPECT` | — | opcional: confere `server server_version` (ex. `valkey 8.1`) |
+
+Os testes reconfiguram o servidor (`CONFIG SET`, `REPLICAOF`): rode com
+**`-p 1`** quando `./internal/sink/` e `./internal/app/` vão no mesmo comando,
+ou os dois pacotes em paralelo pisam um no outro.
+
+Receita (portas da rodada de 2026-11-07; troque `redis:7.4-alpine`/`redis-*`
+por `valkey/valkey:{7.2,8.1,9.0}-alpine`/`valkey-*`):
+
+```bash
+docker run -d --rm --name slstd-redis -p 127.0.0.1:38301:6379 redis:7.4-alpine redis-server --save ""
+docker run -d --rm --name slstd-redis-lru -p 127.0.0.1:38302:6379 redis:7.4-alpine \
+  redis-server --save "" --maxmemory 64mb --maxmemory-policy allkeys-lru
+# Sentinel num contêiner só, cada porta igual dentro e fora, tudo anunciado
+# como 127.0.0.1 para o go test do host (macOS) alcançar:
+docker run -d --rm --name slstd-redis-sn -p 127.0.0.1:38303-38305:38303-38305 redis:7.4-alpine sh -c '
+  redis-server --port 38303 --save "" --daemonize yes &&
+  redis-server --port 38304 --save "" --replicaof 127.0.0.1 38303 --replica-announce-ip 127.0.0.1 --daemonize yes &&
+  printf "port 38305\nsentinel announce-ip 127.0.0.1\nsentinel monitor mymaster 127.0.0.1 38303 1\nsentinel down-after-milliseconds mymaster 2000\nsentinel failover-timeout mymaster 5000\n" > /tmp/s.conf &&
+  exec redis-sentinel /tmp/s.conf'
+# Cluster de um nó (Valkey 9 com bancos: acrescente --cluster-databases 16):
+docker run -d --rm --name slstd-redis-cl -p 127.0.0.1:38351:38351 redis:7.4-alpine \
+  redis-server --port 38351 --cluster-enabled yes --cluster-announce-ip 127.0.0.1 --save ""
+docker exec slstd-redis-cl redis-cli -p 38351 CLUSTER ADDSLOTSRANGE 0 16383
+
+SLSTD_TEST_REDIS_ADDR=127.0.0.1:38301 SLSTD_TEST_REDIS_LRU_ADDR=127.0.0.1:38302 \
+SLSTD_TEST_REDIS_SENTINEL_ADDR=127.0.0.1:38305 SLSTD_TEST_REDIS_SENTINEL_MASTER=mymaster \
+SLSTD_TEST_REDIS_CLUSTER_ADDR=127.0.0.1:38351 \
+  go test -p 1 -race -count=1 -timeout 600s -run Redis ./internal/sink/ ./internal/app/
+```
+
+O Sentinel do Valkey é `valkey-sentinel`. A replicação é assíncrona: o teste de
+failover só escreve depois de o primário antigo virar réplica, porque uma
+escrita que ele confirmasse entre a promoção e a rebaixa se perderia (SPEC
+§10.3; no servidor, `min-replicas-to-write` fecha essa janela).
+
+**Resultado de 2026-11-07** (macOS, Docker Desktop, `-race`): verde nos quatro
+servidores, 50 testes `PASS`, nenhum `SKIP` fora do cluster nas rodadas sem a
+variável dele.
+
+| Servidor (imagem) | Identidade lida | sink + app | Sentinel failover | Cluster `db=1` |
+|---|---|---|---|---|
+| `redis:7.4-alpine` | `redis 7.4.12` | ok | ok (`38303 → 38304`) | fatal `SELECT is not allowed in cluster mode`; `db=0` ok |
+| `valkey/valkey:7.2-alpine` | `valkey 7.2.15` | ok | ok | — |
+| `valkey/valkey:8.1-alpine` | `valkey 8.1.11` | ok | ok | fatal `SELECT is not allowed…`; `db=0` ok |
+| `valkey/valkey:9.0-alpine` | `valkey 9.0.7` | ok | ok | fatal `DB index is out of range`; com `--cluster-databases 16`, `db=1` ok |
+
+A rodada contra o cluster achou um defeito na porta da checagem de política
+(e no irmão de onde ela veio): o rueidis entra em `panic` ("Mixing no-slot and
+cross slot commands in DoMulti is prohibited") quando o pipeline da sonda mistura
+`INFO`/`CONFIG GET` com `XLEN`/`XADD`. Em cluster a política vai numa ida e
+volta própria (SPEC §10.3); `TestRedisIntegrationClusterDB` trava a regra.
+
+Verificado **à mão** antes da suíte (2026-09), com a combinação de referência,
+contra um Redis 7.4 real:
 
 ```bash
 cd docker
@@ -123,14 +188,38 @@ backpressure contabilizados, RSS máximo de 329 MiB contra `GOMEMLIMIT=512MiB`
 e limite de 768M no contêiner, sem OOM, dreno em 3 s ao despausar. Os 12
 compose sobem sem o aviso de `GOMEMLIMIT` (§14.4).
 
-**Ainda não há suíte automatizada contra Redis** como a do irmão. É a §8, item 1.
+Os compose `compose.<ring>-valkey.yml` (desde 2026-11-07) passam em
+`docker compose config` e em `TestComposeValkeyFiles`; não subiram em
+contêiner nesta rodada.
 
 ### 6.2 PostgreSQL
 
 Os testes de unidade cobrem a classificação de SQLSTATE (`TestClassifySQLState`,
 com o `23502` fatal desde 2026-10-14), o saneamento de UTF-8,
-o `reset` do pool de argumentos e o parse de UUID. **Nada roda contra um
-PostgreSQL real.** É a §8, item 2.
+o `reset` do pool de argumentos, o parse de UUID e o ambiente libpq escondido
+(`TestPostgresIgnoresTheLibpqEnvironment`, com `PGSSLMODE=bogus`,
+`PGPORT` inválida, `PGCHANNELBINDING`, `PGTARGETSESSIONATTRS` e
+`PGCONNECT_TIMEOUT`).
+
+Desde 2026-11-07 há uma suíte opt-in contra PostgreSQL real
+(`internal/sink/postgres_integration_test.go`), que cria a tabela de
+`docker/postgres/schema.sql` num esquema próprio por teste:
+
+```bash
+docker run -d --rm --name slstd-pg -p 127.0.0.1:38360:5432 -e POSTGRES_USER=slstd \
+  -e POSTGRES_PASSWORD=slstd -e POSTGRES_DB=slstd_test postgres:18-alpine
+SLSTD_TEST_PG_DSN='postgres://slstd:slstd@127.0.0.1:38360/slstd_test?sslmode=disable' \
+  go test -race -count=1 -run Postgres ./internal/sink/
+```
+
+| Teste | Prova |
+|---|---|
+| `TestPostgresIntegrationRefusesAnExtraRequiredColumn` | coluna extra `NOT NULL` sem default é fatal no boot, nomeada; com default, identidade ou anulável passa e o lote grava (pendência 9) |
+| `TestPostgresIntegrationValidationOutlivesTheHealthTimeout` | com um proxy que segura cada pedaço 10 ms e `health_timeout` de 50 ms, a validação termina (pendência 10) |
+
+Verde contra `postgres:18-alpine` em 2026-11-07. O `unnest` do lote e o
+`pg_is_in_recovery()` passam pelo caminho de escrita do primeiro teste; a
+detecção de réplica em si continua sem teste (§8, item 2).
 
 ### 6.3 MySQL
 
@@ -139,10 +228,10 @@ cria a própria tabela a partir de `docker/mysql/schema.sql` e a apaga no fim.
 
 ```bash
 docker run --rm -d -p 13306:3306 -e MYSQL_ROOT_PASSWORD=sls -e MYSQL_DATABASE=sls_test \
-  --name sls-test-mysql mysql:8.4
+  --name slstd-test-mysql mysql:8.4
 SYSLOG_TEST_MYSQL_DSN='root:sls@tcp(127.0.0.1:13306)/sls_test' \
   go test -race -timeout 600s -run MySQL ./internal/sink/ ./internal/app/
-docker rm -f sls-test-mysql
+docker rm -f slstd-test-mysql
 ```
 
 | Pacote | Teste | O que prova |
@@ -256,13 +345,14 @@ de moldura e nos transportes TCP e RELP (`framing.go`, `tcp.go`, `relp.go`,
 
 Registradas por honestidade, não por esquecimento.
 
-1. **Sem suíte automatizada contra Redis.** A §6.1 foi verificada à mão. Falta o
-   equivalente do `SYSLOG_TEST_REDIS_ADDR` do irmão: escrita em lote, retry que
-   reconstrói comandos, `OOM` fatal ponta a ponta, Sentinel e TLS.
-2. **Nada contra um PostgreSQL real.** A validação de esquema, o `unnest` com
-   dezessete arrays, o `ON CONFLICT` e a detecção de `pg_is_in_recovery()` estão
-   escritos mas nunca executaram contra um servidor. Cópia direta do irmão, onde
-   rodam, mas a tabela aqui é outra.
+1. ~~Sem suíte automatizada contra Redis~~ — **fechada em 2026-11-07** (§6.1):
+   escrita, `OOM`, política, réplica, Sentinel e cluster contra Redis 7.4 e
+   Valkey 7.2/8.1/9.0. Continuam sem teste: TLS do Redis e o retry que
+   reconstrói comandos contra um servidor que cai no meio do lote.
+2. **PostgreSQL real só em parte.** Desde 2026-11-07 a validação de colunas
+   obrigatórias, a validação sob `op_timeout` e o `unnest` de um lote rodam
+   contra PostgreSQL 18 (§6.2). A detecção de `pg_is_in_recovery()`, o índice
+   único ausente e o `ON CONFLICT` com duplicatas continuam sem teste aqui.
 3. **RELP com corte do servidor no meio do fluxo.** O cenário 4 de §17.4 — matar
    o servidor com transações em voo e provar que o rsyslog retransmite tudo que
    não foi confirmado — **não existe**. É o único teste que prova a promessa
@@ -321,21 +411,18 @@ Registradas por honestidade, não por esquecimento.
     termina); o guarda é defesa em profundidade, lido, não exercitado.
 
 14. **`tcp.max_conns` e `relp.max_conns` em `0` deixam o custo fixo por conexão
-    sem teto.** Cada conexão ociosa custa cerca de 128 KiB (o primeiro bloco de
-    64 KiB da moldura mais o `bufio` de 64 KiB) — 130 vezes menos que antes da
-    correção de 2026-09-14, mas ainda sem limite com 65535 descritores; os
-    padrões ficaram em `0` por decisão. Um primeiro bloco menor é o
-    endurecimento pendente.
+    sem teto**, por decisão. *Atualizado em 2026-11-07:* o custo caiu para o
+    `bufio` de 4 KiB mais um primeiro bloco de 2 KiB (SPEC §5.5), provado por
+    `TestConnectionReadBufferIsSmall` e `TestCountedReadStartsSmall`; não foi
+    medido o RSS de milhares de conexões ociosas reais.
 
-15. **A recusa por IP é invisível.** Nenhuma métrica ou log conta uma conexão
-    recusada por `max_conns_per_ip` (o irmão tem um contador); o operador não
-    distingue "ninguém conecta" de "um IP é recusado o tempo todo". Exige mudar
-    a spec antes do código.
+15. ~~A recusa por IP é invisível~~ — **fechada em 2026-11-07**:
+    `syslog_conns_refused_total{transport}` (`TestPerIPRefusalIsCounted`).
 
-16. **O heartbeat do `sink=sqlite` espera o mutex do escritor sem contexto.**
-    Um lote que dure mais que `sink.health_timeout` (1 s) faz a sonda falhar
-    por prazo com o banco íntegro — um ciclo DOWN por lentidão. A sonda em si
-    custa milissegundos; a janela é a do lote, e não há teste que a meça.
+16. ~~O heartbeat do `sink=sqlite` espera o mutex do escritor sem contexto~~ —
+    **fechada em 2026-11-07**: a trava é tomada no prazo da sonda e a escritora
+    ocupada conta como saudável (`TestSQLiteHealthDoesNotWaitOutABusyWriter`).
+    Não há teste com um disco lento de verdade.
 
 17. **A quarentena do `ring.db` não tem teto nem limpeza automática** (§9.4 da
     spec diz como inspecionar), e o `FuzzFrame` usa um teto de 4096 bytes que
@@ -376,6 +463,49 @@ Registradas por honestidade, não por esquecimento.
     trava da checagem de pausa e reconfere depois de discar o upstream, então
     um `Pause` durante a discagem corta o par. A família webhook tinha a mesma
     corrida no seu proxy (`lifecycle_test.go`) e recebeu a forma do S.
+
+23. **As suítes de MySQL e NATS ainda leem `SYSLOG_TEST_MYSQL_DSN` e
+    `SYSLOG_TEST_NATS_URL`**, os mesmos nomes do `go-syslog-server`: rodar as
+    duas pastas no mesmo shell aponta as duas para o mesmo servidor. As novas
+    (Redis, PostgreSQL) usam `SLSTD_TEST_`; renomear as antigas fica para quando
+    elas forem tocadas.
+
+24. **Um segundo sinal no meio do dump conta como perdidas mensagens que podem
+    voltar** (SPEC §12.3): o arquivo cortado é reingerido até o último registro
+    íntegro. Erro para o lado de contar perda a mais; o `go-syslog-server`
+    abandona o dump nesse caso (`emergency.Store.SetAbandon`), esta referência
+    não.
+
+### 8.2 Rodada de 2026-11-07: todas as pendências abertas de §21.1 e Valkey
+
+Itens 1, 2, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 e 20, mais a paridade
+Redis/Valkey (SPEC §10.3, §15.2). Cada teste abaixo volta a falhar com só a
+correção revertida (mutação por script, 26 mutantes, todos mortos).
+
+| Item | Teste(s) | Mutação |
+|---|---|---|
+| 1 custo fixo | `TestConnectionReadBufferIsSmall`, `TestCountedReadStartsSmall`, `TestFramerDropsALargeBufferBetweenFrames` | `bufio` de 64 KiB; primeiro bloco de 64 KiB; buffer grande mantido |
+| 2 cópias RELP | `TestBudgetWaitsAndClamps`, `TestRELPWaitsForTheInflightBudget`, `TestRELPInflightBudgetMustHoldOneFrame` | sem `Acquire` no `serve`; sem a validação teto ≥ frame |
+| 4 `sink.nats.urls` | `TestNATSURLsValidation`, `TestNATSURLsAreRedactedInTheDump` | sem `validateNATSURLs`; sem a redação no dump |
+| 5 eco | `TestINIErrorsDoNotEchoTheLine`, `TestFlagErrorsDoNotEchoTheValue` | INI com `%q` da linha; flag mostrando o valor |
+| 9 coluna obrigatória | `TestPostgresIntegrationRefusesAnExtraRequiredColumn` | sem a recusa |
+| 10 prazo da validação | `TestValidationContextOutlivesTheHealthDeadline`, `TestPostgresIntegrationValidationOutlivesTheHealthTimeout` | validação no contexto da sonda |
+| 11 libpq | `TestPostgresIgnoresTheLibpqEnvironment` | `ParseConfig("")` de volta |
+| 12 `database` | `TestMySQLDatabaseNameIsValidated`, `TestMySQLConstructorRefusesAQuotedDatabase` | sem a validação (config e construtor, cada um) |
+| 13 política | `TestEvictionVerdict`, `TestRedisIntegrationAllkeysPolicyIsFatalAtBoot`, `TestRedisIntegrationPolicyIsRecheckedByEveryProbe` | sem a leitura na sonda |
+| 14 gauges | `TestEmergencyGaugesCountWhatIsLeftOnDisk` | `Set(0)` de volta |
+| 15 abort | `TestSecondSignalDuringTheDumpCountsEverything` | abort contando só o ring |
+| 16 sonda sqlite | `TestSQLiteHealthDoesNotWaitOutABusyWriter` | `Lock()` sem contexto |
+| 17 prazo único | `TestSinkBootHasOneDeadline` | `WaitReady` com `boot_timeout` inteiro |
+| 18 recusa por IP | `TestPerIPRefusalIsCounted` | sem o `Inc` |
+| 20 nomes | `TestRELPAdvertisesItsOwnName`, `TestEmergencyGaugesCountWhatIsLeftOnDisk` (o `emg-*` do S intocado), `TestComposeNamesAreThisServers`, `TestComposeValkeyFiles` | `relp_software` antigo; prefixo `emg-` |
+| alias `valkey` | `TestValkeyAliasEverySource`, `TestValkeySinkTypeNormalises`, `TestValkeyAliasConflict`, `TestUsageNamesTheValkeyAlias` | conflito ignorado; `sink.type=valkey` sem normalizar |
+| cluster | `TestClassifyClusterDBRepliesAreFatal`, `TestRedisIntegrationClusterDB` | sem a classificação; sem o `Do` separado em cluster (`panic`) |
+
+Servidores: Redis 7.4.12, Valkey 7.2.15/8.1.11/9.0.7 (§6.1), PostgreSQL 18,
+MySQL 8.4 (`SYSLOG_TEST_MYSQL_DSN`, 34 testes `PASS`), `nats-server` v2.14.6
+(`SYSLOG_TEST_NATS_URL`, 21 `PASS`). `gofmt -l`, `go vet ./...` e
+`go test -race -count=1 ./...` limpos.
 
 ### 8.1 Rodada de 2026-10-14: seis pendências de §21.1 da spec
 
