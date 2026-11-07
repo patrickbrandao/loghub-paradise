@@ -91,6 +91,7 @@ type config struct {
 	verifyURL, verifySQLite   string
 	verifyStream, verifyTable string
 	verifyTimeout             time.Duration
+	verifyCA                  string
 
 	reportFmt string
 	progress  string
@@ -145,6 +146,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.verifySQLite, "verify-sqlite", "", "after the run, check the delivery in this SQLite `file` (sink=sqlite)")
 	fs.DurationVar(&c.verifyTimeout, "verify-timeout", 30*time.Second, "wait at most this long for every accepted request to show up at the destination")
 	fs.StringVar(&c.verifyStream, "verify-stream", "", "NATS stream or Redis stream key `name` (default: automatic)")
+	fs.StringVar(&c.verifyCA, "verify-tls-ca", "", "PEM `file` of the CAs that verify a tls:// or rediss:// (valkeys://) destination (default: system roots)")
 	fs.StringVar(&c.verifyTable, "verify-table", "", "PostgreSQL or SQLite `table` (default: loghub.inbox, inbox)")
 
 	fs.StringVar(&c.reportFmt, "report", "text", "final report on stdout: `text` or json")
@@ -386,8 +388,8 @@ func build(c *config, fs map[string]bool) (*runner, error) {
 // flags given on the command line: a default is not a request.
 func verifyConfig(c *config, set map[string]bool) (*verify.Config, error) {
 	if c.verifyURL == "" && c.verifySQLite == "" {
-		if set["verify-timeout"] || c.verifyStream != "" || c.verifyTable != "" {
-			return nil, errors.New("--verify-timeout, --verify-stream and --verify-table need --verify-url or --verify-sqlite")
+		if set["verify-timeout"] || c.verifyStream != "" || c.verifyTable != "" || c.verifyCA != "" {
+			return nil, errors.New("--verify-timeout, --verify-stream, --verify-table and --verify-tls-ca need --verify-url or --verify-sqlite")
 		}
 		return nil, nil
 	}
@@ -406,6 +408,10 @@ func verifyConfig(c *config, set map[string]bool) (*verify.Config, error) {
 	}
 	switch kind {
 	case "postgres", "sqlite":
+		if c.verifyCA != "" {
+			// PostgreSQL takes its CA in the URL (sslrootcert=); a file has no TLS.
+			return nil, errors.New("--verify-tls-ca is for NATS and Redis/Valkey; PostgreSQL takes sslrootcert= in the URL")
+		}
 		if c.verifyStream != "" {
 			return nil, errors.New("--verify-stream is for NATS and Redis; PostgreSQL and SQLite take --verify-table")
 		}
@@ -420,8 +426,19 @@ func verifyConfig(c *config, set map[string]bool) (*verify.Config, error) {
 			return nil, errors.New("--verify-stream: no spaces or line breaks")
 		}
 	}
-	return &verify.Config{URL: c.verifyURL, SQLite: c.verifySQLite, Stream: c.verifyStream, Table: c.verifyTable,
-		Timeout: c.verifyTimeout}, nil
+	vc := &verify.Config{URL: c.verifyURL, SQLite: c.verifySQLite, Stream: c.verifyStream, Table: c.verifyTable,
+		Timeout: c.verifyTimeout}
+	if c.verifyCA != "" {
+		pem, err := os.ReadFile(c.verifyCA)
+		if err != nil {
+			return nil, fmt.Errorf("--verify-tls-ca: %w", err)
+		}
+		vc.TLSRoots = x509.NewCertPool()
+		if !vc.TLSRoots.AppendCertsFromPEM(pem) {
+			return nil, errors.New("--verify-tls-ca: no PEM certificate")
+		}
+	}
+	return vc, nil
 }
 
 // parseURL splits --url into the dialed part and the request-target template.

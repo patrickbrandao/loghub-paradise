@@ -460,13 +460,31 @@ func TestVerifyUsageErrors(t *testing.T) {
 		{"--verify-sqlite", "x.db", "--verify-table", "Bad;Name"},
 		{"--verify-url", "nats://h", "--verify-timeout", "0s"},
 		{"--pcap-flows"},
+		// Round of 2026-11-07: a malformed URL, or list element, is a usage
+		// error that never quotes it; --verify-tls-ca needs a TLS-capable
+		// destination and a PEM file.
+		{"--verify-url", "nats://u:pw@[bad"},
+		{"--verify-url", "nats://n1:4222,nats://u:pw @n2:4222"},
+		{"--verify-url", "postgres://u:pw @h/db"},
+		{"--verify-tls-ca", "ca.pem"},
+		{"--verify-url", "postgres://u:pw@h/db", "--verify-tls-ca", "ca.pem"},
+		{"--verify-url", "rediss://u:pw@h", "--verify-tls-ca", "/nonexistent/ca.pem"},
 	} {
 		code, _, errs := runMain(t, args...)
 		if code != ExitUsage {
 			t.Errorf("%v: exit %d", args, code)
 		}
-		if strings.Contains(errs, "pw@") {
+		if strings.Contains(errs, "pw") {
 			t.Errorf("%v: the URL was echoed: %q", args, errs)
 		}
+	}
+	// PostgreSQL takes its CA in the URL: refused for that, even with a
+	// PEM file that reads.
+	pem := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(pem, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errs := runMain(t, "--verify-url", "postgres://h/db", "--verify-tls-ca", pem); code != ExitUsage || !strings.Contains(errs, "sslrootcert") {
+		t.Fatalf("exit %d %q", code, errs)
 	}
 }

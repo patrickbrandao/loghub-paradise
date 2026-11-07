@@ -381,10 +381,19 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 
 // runFlows is Run with one connection per captured flow (SPEC §6.9): every
 // flow gets its own worker, dialed at its first message and closed when the
-// source marks its end. At most p.Workers flows are open; a new one past the
-// cap closes the flow idle the longest.
+// source marks its end. At most p.Workers flows hold a connection: a new one
+// past the cap closes the flow idle the longest among those with nothing
+// queued, and waits for a slot.
+//
+// A slot is free only when its worker has returned (review of 2026-11-07):
+// freed at the end of the flow, it let a new worker dial while the old one
+// still drained up to 64 queued jobs -- more connections than --concurrency,
+// two workers on one shard, and, for a flow split at the cap, its next
+// requests on a new connection ahead of the old one's (reordered). A message
+// of a flow whose old worker has not returned yet waits for it.
 func runFlows(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *report.Report) Stats {
 	type flow struct {
+		id   uint64
 		jobs chan job
 		last time.Time
 		slot int
@@ -397,48 +406,107 @@ func runFlows(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *
 		cancelDial()
 	}()
 	// One shard per slot, not per flow: a capture has many more flows than
-	// connections open at once, and a shard holds a 16 KiB histogram.
+	// connections open at once, and a shard holds a 16 KiB histogram. A slot
+	// has one worker at a time, so its shard too.
 	shards := make([]*report.Shard, p.Workers)
 	free := make([]int, 0, p.Workers)
 	for i := p.Workers - 1; i >= 0; i-- {
 		free = append(free, i)
 	}
-	active := map[uint64]*flow{}
+	// returned gets the flow of every worker that returned; buffered for
+	// all the slots, so a worker never blocks on it.
+	returned := make(chan *flow, p.Workers)
+	active := map[uint64]*flow{}  // flows open: they take messages
+	closing := map[uint64]*flow{} // flows ended whose worker has not returned
+	reap := func(f *flow) {
+		free = append(free, f.slot)
+		if closing[f.id] == f {
+			delete(closing, f.id)
+		}
+	}
+	// collect takes the workers that returned, without waiting.
+	collect := func() {
+		for {
+			select {
+			case f := <-returned:
+				reap(f)
+			default:
+				return
+			}
+		}
+	}
+	// await waits for one worker to return, or for tick; false when ctx ends.
+	await := func(tick <-chan time.Time) bool {
+		select {
+		case f := <-returned:
+			reap(f)
+		case <-tick:
+		case <-ctx.Done():
+			return false
+		}
+		return true
+	}
 	end := func(id uint64) {
 		if f, ok := active[id]; ok {
 			close(f.jobs)
 			delete(active, id)
-			free = append(free, f.slot)
+			closing[id] = f
 		}
 	}
 	queue := func(m *source.Message) chan<- job {
-		f := active[m.Flow]
-		if f == nil {
-			if len(active) >= p.Workers {
-				var lru uint64
-				var at time.Time
-				for id, g := range active {
-					if at.IsZero() || g.last.Before(at) {
-						lru, at = id, g.last
-					}
-				}
-				end(lru)
-				rep.Event("flow split (concurrency cap)")
-			}
-			slot := free[len(free)-1]
-			free = free[:len(free)-1]
-			if shards[slot] == nil {
-				shards[slot] = rep.NewShard()
-			}
-			f = &flow{jobs: make(chan job, 64), slot: slot}
-			active[m.Flow] = f
-			wg.Add(1)
-			go func(jobs <-chan job, sh *report.Shard) {
-				defer wg.Done()
-				worker(stopDial, jobs, dial, sh, rep, p.Drain)
-			}(f.jobs, shards[slot])
+		if f := active[m.Flow]; f != nil {
+			f.last = time.Now()
+			return f.jobs
 		}
-		f.last = time.Now()
+		// The same flow split at the cap: its old worker still sends what it
+		// took; the new connection opens after it, or the flow reorders.
+		for closing[m.Flow] != nil {
+			if !await(nil) {
+				return nil // a nil channel: produce sees ctx end
+			}
+		}
+		collect()
+		split := false
+		for len(free) == 0 {
+			// Close the flow idle the longest among those with nothing
+			// queued: one with queued jobs would hold its slot until they
+			// drain anyway, and closing it would only add a wait.
+			// Only when no closed flow is still returning its slot: one
+			// slot is wanted, not one per round of the wait.
+			var lru *flow
+			for _, g := range active {
+				if len(closing) == 0 && len(g.jobs) == 0 && (lru == nil || g.last.Before(lru.last)) {
+					lru = g
+				}
+			}
+			if lru != nil {
+				end(lru.id)
+				split = true
+			}
+			// Wait for a worker to return; a queue may empty meanwhile.
+			t := time.NewTimer(5 * time.Millisecond)
+			ok := await(t.C)
+			t.Stop()
+			if !ok {
+				return nil
+			}
+		}
+		if split {
+			rep.Event("flow split (concurrency cap)")
+		}
+		slot := free[len(free)-1]
+		free = free[:len(free)-1]
+		if shards[slot] == nil {
+			shards[slot] = rep.NewShard()
+		}
+		f := &flow{id: m.Flow, jobs: make(chan job, 64), slot: slot, last: time.Now()}
+		active[m.Flow] = f
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker(stopDial, f.jobs, dial, shards[slot], rep, p.Drain)
+			returned <- f
+		}()
 		return f.jobs
 	}
 	st := produce(ctx, p, src, queue, end)

@@ -305,18 +305,51 @@ func (s *Stream) dropAndResync() {
 // pipelined request follows its predecessor's body with no separator, so a
 // capture that began inside that body finds the next request mid-line.
 func (s *Stream) sync(final bool) bool {
+	// lf is the next LF at or after the candidate (len(buf) when there is
+	// none), blank the LF that starts the next blank line (len(buf): none
+	// up to the end). Every candidate between two LFs shares them, so the
+	// search for each is not redone from every candidate: 1 MiB without an
+	// LF, a candidate every few bytes, was quadratic (7.7 s; 3 MiB 34.6 s;
+	// review of 2026-11-07).
+	lf, blank := -1, -1
 	for i := 0; i < len(s.buf); i++ {
 		if !isUpper(s.buf[i]) || i > 0 && isUpper(s.buf[i-1]) || i == 0 && s.midWord {
 			continue
 		}
 		// The candidate at the start keeps its search state; any other one
-		// starts fresh.
+		// starts fresh, from the shared LF positions.
 		var p partial
 		if i == 0 {
 			p = s.p
 		}
+		if lf < i {
+			// The candidate at the start already searched up to its scan.
+			from := i + min(p.lineScan, len(s.buf)-i)
+			if j := bytes.IndexByte(s.buf[from:], '\n'); j >= 0 {
+				lf = from + j
+				lfScanned += j + 1
+			} else {
+				lf = len(s.buf)
+				lfScanned += len(s.buf) - from
+			}
+		}
+		p.lineScan = max(p.lineScan, lf-i)
 		switch lineKind(s.buf[i:], &p.lineScan) {
 		case lkRequest:
+			if blank < i {
+				if j := headEnd(s.buf, i); j >= 0 {
+					blank = j - 2 // the LF of "\n\n" or of "\n\r\n"
+					if s.buf[blank] != '\n' {
+						blank--
+					}
+				} else {
+					blank = len(s.buf)
+				}
+			}
+			if p.head == 0 {
+				// headEnd keeps the last three bytes in view, as parse does.
+				p.headScan = max(p.headScan, min(blank, len(s.buf)-3)-i)
+			}
 			_, _, need, err := parse(s.buf[i:], &p)
 			if err == nil || (errors.Is(err, errIncomplete) && !final) {
 				s.st.SkippedBytes += uint64(i)
@@ -382,6 +415,15 @@ const (
 	lkOther
 )
 
+// lfScanned counts the bytes searched for the LF of a request line, for the
+// test that proves the resynchronization is linear (TestResyncLinear). A
+// stream is parsed by one goroutine, the source's.
+var lfScanned int
+
+// headParses counts the heads given to net/http, for the same test: the
+// candidates inside one long line must not each parse it.
+var headParses int
+
 // lineKind classifies the first line: "METHOD SP target SP HTTP/1.x". scan
 // remembers how far the LF was searched for, so a long line arriving in
 // pieces is not rescanned.
@@ -416,23 +458,41 @@ func lineKind(b []byte, scan *int) lk {
 	from := min(*scan, len(b))
 	end := bytes.IndexByte(b[from:], '\n')
 	if end < 0 {
+		lfScanned += len(b) - from
 		*scan = len(b)
 		if len(b) > maxHead {
 			return lkOther
 		}
 		return lkNeed
 	}
+	lfScanned += end + 1
 	end += from
 	if end > maxHead {
 		return lkOther
 	}
 	line := bytes.TrimSuffix(b[:end], []byte("\r"))
-	sp := bytes.LastIndexByte(line, ' ')
-	if sp <= i {
+	// The version is the word after the last space: the line ends in
+	// " HTTP/1.x". Looked at from the end only -- a search for the last
+	// space ran over the whole line for each candidate inside it
+	// (quadratic resynchronization, review of 2026-11-07).
+	const v = len(" HTTP/1.1")
+	if len(line) < v || len(line)-v <= i || line[len(line)-v] != ' ' {
 		return lkOther
 	}
-	proto := line[sp+1:]
-	if string(proto) != "HTTP/1.1" && string(proto) != "HTTP/1.0" {
+	if proto := string(line[len(line)-v+1:]); proto != "HTTP/1.1" && proto != "HTTP/1.0" {
+		return lkOther
+	}
+	// One target between the method and the version, with no space: net/http
+	// refuses any other line. Searched from the method on, the search stops
+	// at the next word, so the candidates of one long line ("A A A ... /x
+	// HTTP/1.1") cost their own words only, not a parse of the line each.
+	j := bytes.IndexByte(line[i+1:], ' ')
+	if j < 0 {
+		lfScanned += len(line) - i - 1
+		return lkOther
+	}
+	lfScanned += j + 1
+	if i+1+j != len(line)-v || j == 0 {
 		return lkOther
 	}
 	return lkRequest
@@ -562,6 +622,7 @@ func parse(b []byte, p *partial) (req *Request, n, need int, err error) {
 			// Refused whole as it would be in pieces (SPEC §6.6).
 			return nil, 0, 0, errors.New("request head too large")
 		}
+		headParses++
 		hr, err := http.ReadRequest(bufio.NewReaderSize(bytes.NewReader(b[:h]), 4096))
 		if err != nil {
 			return nil, 0, 0, err

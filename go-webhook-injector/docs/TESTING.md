@@ -82,8 +82,14 @@ não produz.
 | `app.TestRetryAfterAcrossConnections` | `429` com `Retry-After: 1` e `--requests-per-conn 1`: o reenvio sai ≥ 0,9 s depois (antes, em ~3 ms); `503` sempre com `--retries 2`: exatamente 3 tentativas por requisição (antes, ~700 por requisição até o dreno) (SPEC §4.5) |
 | `app.TestNoKeepAliveAdapts`, `TestNoKeepAliveAdaptsBack` | servidor que fecha toda conexão, pipeline 32: evento `adapted`, 2000 exatamente uma vez, < 200 escritas atrás de um fechamento (sem a adaptação, 62 944); servidor que passa a manter a conexão: a sonda acha e a adaptação acaba (SPEC §4.6) |
 | `app.TestVerifySQLite` | servidor falso que grava numa `inbox` SQLite: tudo achado (saída 0, `complete`); 10 perdidas + 1 processada duas vezes (saída 1, `lost_seqs` com as 10); gravada mas respondida `500` (`unexpected` 3, saída 1 pelo `500`); arquivo sem `inbox`: saída 4 e **nada enviado** (SPEC §8.6) |
-| `app.TestVerifyUsageErrors` | 10 combinações recusadas com 2, sem ecoar a URL |
+| `app.TestVerifyUsageErrors` | 16 combinações recusadas com 2, sem ecoar a senha: as de antes, mais URL e elemento de lista malformados, `--verify-tls-ca` sem destino, com PostgreSQL e com arquivo inexistente |
 | `verify.TestAccounting`, `TestWaitsForTheSink`, `TestNoUUID`, `TestFinalReadCatchesLateDuplicate`, `TestRanges`, `TestMarker`, `TestUUIDFloor`, `TestNoSecretsEchoed` | a contagem de SPEC §8.6.4 com tudo errado de uma vez; a espera; a leitura extra depois da completa; o marcador (`"seq":"12"` entre aspas não conta); a janela por UUIDv7; nenhuma credencial no texto |
+| `verify.TestMalformedURLNeverEchoed`, `TestReadErrorRetried`, `TestNothingEverAppears` (revisão de 2026-11-07) | URL malformada e lista NATS com o 2º elemento malformado (espaço na senha, `[` sem `]`, esquema `http`, sem host) recusadas sem citar a senha, por `Kind` e por `Open`; erro de driver com a senha de qualquer elemento (ou o token) trocada, `*url.Error` genérico; leitura que falha 2 vezes e depois passa = completa, falha até o fim = `error` sem senha e impossível; destino em que nada aparece = `lost`, saída 1 (SPEC §8.6.1, §8.6.4) |
+| `transport.TestIdleCloseHandsOnRetry` | `429` com `Retry-After: 3` e o servidor fechando a conexão ociosa: o reenvio é passado adiante com `Tries` 1, `Last` `429` e o prazo restante, sem desfecho (antes terminava como `429`; SPEC §4.5) |
+| `httpx.TestH2ContinuationChainLinear`, `TestH2HeaderBlockCapped`, `TestH2StreamsCapped`, `TestH2BufferedCapped` | 40 000 `CONTINUATION` de 1 byte, um quadro por segmento: ~2 cabeçalhos de quadro olhados por quadro (sem a retomada, 613 milhões para 35 000 quadros); bloco de 1,2 MB e `CONTINUATION` declarando 2 MiB encerram a direção; 1001 *streams* abertos = 1000 reproduzidos e 1 perdido, sem os *trailers* do perdido virarem requisição; teto do corpo somado derruba só o *stream* que passaria (SPEC §6.8) |
+| `httpx.TestResyncLinear` | 1,5 MiB de `A ` (um candidato a cada 2 bytes), com e sem LF antes da requisição verdadeira, em segmentos de 4 KiB e inteiro: a requisição é achada, ≤ 8 bytes procurados por byte e ≤ 4 cabeçalhos entregues ao `net/http` (antes, quadrático: 7,7 s por MiB; SPEC §6.6) |
+| `sched.TestFlowsCapAndOrder`, `TestFlowsEvictOnlyEmptyQueue` | `--pcap-flows` com 12 fluxos intercalados em 3 vagas e servidor lento: nunca mais de 3 conexões abertas, nenhuma requisição fora de ordem no fluxo; no teto, o fluxo mais ocioso **com fila** fica, o sem fila é fechado (SPEC §6.9) |
+| `pcap.TestTCPPendingBoundCountsEverySegment`, `TestTCPDrainManySegments` (os mesmos do SI e do RI) | 100 000 segmentos esvaziados pelo *snaplen* atrás de um buraco declaram a lacuna (antes, sem teto); 30 000 segmentos em ordem inversa e o buraco: saem inteiros, em ordem, em O(n log n) (SPEC §6.4) |
 | `verify.TestSQLiteReader` | sempre roda: janela pelo `uuid`, leitura seguinte só depois do último `rowid`, tabela ausente recusada |
 | `verify.TestPGReader`, `TestRedisReader`, `TestValkeyReader`, `TestNATSReader` | opt-in, contra os servidores reais (abaixo): janela (PostgreSQL); nos streams, o que já estava lá na checagem não é lido e o stream que nasce depois é lido inteiro (SPEC §8.6.3, mutação: partir do início faz `TestNATSReader` ler 2503 e `TestRedisReader` achar a entrada velha); cursor, o mesmo envelope adicionado duas vezes (Redis, NATS), chave que não é stream, stream ausente |
 
@@ -107,6 +113,17 @@ com 4. Um sobreviveu, e é esperado: o teto de 4 KiB da linha de chunked
 inteira já era garantido pelo `httputil.NewChunkedReader` (a guarda nova é
 redundante; o comportamento era coerente antes).
 
+Mutação da revisão de 2026-11-07 (todas derrubam o seu teste): `Close` sem
+passar adiante o reenvio na conexão ociosa; `wholeFrames` recomeçando do
+início do bloco; teto do bloco, de *streams* e do corpo somado desligados;
+*trailer* de *stream* perdido aceito como novo; ressincronização sem dividir
+o LF, sem retomar o candidato do início e sem exigir alvo de uma palavra;
+vaga do `--pcap-flows` devolvida no fechamento (passa de 3 conexões); fluxo
+com fila escolhido no teto; segmento segurado sem o custo fixo. Uma sobreviveu, e é esperado: a espera pelo worker
+antigo de um fluxo que reaparece fechando (`closing`) é defensiva — com a
+vaga devolvida só no retorno do worker, um fluxo dividido só reabre depois
+de o antigo terminar, e a fonte nunca repete o id de um fluxo encerrado.
+
 ## 2. Fuzz
 
 ```bash
@@ -119,7 +136,19 @@ requisições extraídas. Achou o corte da janela de ressincronização no meio 
 uma palavra maiúscula (SPEC §6.6; a entrada fica no corpus). Depois da correção,
 2 min e 10,7 milhões de execuções limpas (2026-10-31). Em 2026-11-07, com as
 sementes h2c (prefácio e *upgrade*) e a procura incremental: 60 s, 2 milhões de
-execuções limpas.
+execuções limpas. Na revisão de 2026-11-07, com as sementes novas (cadeia de
+`CONTINUATION`, *trailers* de um *stream* cancelado, linha longa de
+candidatos): `FuzzStream` 45 s, 1,38 milhão de execuções limpas;
+`FuzzReader` (o `tcp.go` mudou) 30 s, 2,1 milhões.
+
+Contra destino real na revisão (2026-11-07, contêineres `fxf-*`): NATS 2.12
+com JetStream e usuário/senha — `TestNATSReader` com
+`WI_TEST_NATS_URL` = lista de dois servidores (o 2º fechado) passa; o
+binário com senha errada (saída 4, `Authorization Violation`), lista com o 1º
+fechado e senha errada no 2º (4), elemento com espaço na senha (2, `server 2
+of the list is not a URL`), `[` sem `]` no 1º (2): a senha não aparece em
+nenhuma saída. PostgreSQL 18: `TestPGReader` passa com a folga de 10 min.
+Redis/Valkey e `--verify-tls-ca` contra um servidor TLS real não rodaram.
 
 ## 3. Prova contra os servidores reais (2026-10-31)
 

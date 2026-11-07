@@ -2,6 +2,8 @@ package verify
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -29,16 +31,21 @@ type natsReader struct {
 	cons   jetstream.Consumer
 }
 
-func openNATS(ctx context.Context, rawURL, stream string, timeout time.Duration) (*natsReader, error) {
-	nc, err := nats.Connect(rawURL, nats.Name("go-webhook-injector verify"), nats.Timeout(timeout),
-		nats.MaxReconnects(-1))
+func openNATS(ctx context.Context, t *target, stream string, timeout time.Duration, roots *x509.CertPool) (*natsReader, error) {
+	opts := []nats.Option{nats.Name("go-webhook-injector verify"), nats.Timeout(timeout), nats.MaxReconnects(-1)}
+	if roots != nil {
+		opts = append(opts, nats.Secure(&tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}))
+	}
+	// The list was parsed element by element (parseTarget): nats.go never
+	// meets a URL it would quote in a parse error.
+	nc, err := nats.Connect(t.raw, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("--verify-url nats: %v", err)
+		return nil, t.wrap("--verify-url nats", err)
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("--verify-url nats: %v", err)
+		return nil, t.wrap("--verify-url nats", err)
 	}
 	var st jetstream.Stream
 	if stream == "" {
@@ -48,7 +55,7 @@ func openNATS(ctx context.Context, rawURL, stream string, timeout time.Duration)
 				found, st = append(found, s), x
 			} else if !errors.Is(err, jetstream.ErrStreamNotFound) {
 				nc.Close()
-				return nil, fmt.Errorf("--verify-url nats: stream %s: %v", s, err)
+				return nil, t.wrap("--verify-url nats: stream "+s, err)
 			}
 		}
 		if len(found) != 1 {
@@ -59,7 +66,7 @@ func openNATS(ctx context.Context, rawURL, stream string, timeout time.Duration)
 		stream = found[0]
 	} else if st, err = js.Stream(ctx, stream); err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("--verify-url nats: stream %s: %v", stream, err)
+		return nil, t.wrap("--verify-url nats: stream "+stream, err)
 	}
 	// This runs before the first request: everything of the run lands
 	// after the stream's last sequence now. Starting there reads nothing
@@ -69,7 +76,7 @@ func openNATS(ctx context.Context, rawURL, stream string, timeout time.Duration)
 	info, err := st.Info(ctx)
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("--verify-url nats: stream %s: %v", stream, err)
+		return nil, t.wrap("--verify-url nats: stream "+stream, err)
 	}
 	// An ordered consumer is ephemeral, unacknowledged, and resumes where
 	// it stopped: each read continues the last one.
@@ -77,7 +84,7 @@ func openNATS(ctx context.Context, rawURL, stream string, timeout time.Duration)
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy, OptStartSeq: info.State.LastSeq + 1})
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("--verify-url nats: consumer on %s: %v", stream, err)
+		return nil, t.wrap("--verify-url nats: consumer on "+stream, err)
 	}
 	return &natsReader{nc: nc, stream: stream, cons: cons}, nil
 }
@@ -119,10 +126,10 @@ type pgReader struct {
 	floor string
 }
 
-func openPG(ctx context.Context, rawURL, table string, since time.Time) (*pgReader, error) {
-	c, err := pgx.Connect(ctx, rawURL)
+func openPG(ctx context.Context, t *target, table string, since time.Time) (*pgReader, error) {
+	c, err := pgx.Connect(ctx, t.raw)
 	if err != nil {
-		return nil, fmt.Errorf("--verify-url postgres: %v", err)
+		return nil, t.wrap("--verify-url postgres", err)
 	}
 	var ok bool
 	if err := c.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", table).Scan(&ok); err != nil || !ok {
@@ -130,7 +137,7 @@ func openPG(ctx context.Context, rawURL, table string, since time.Time) (*pgRead
 		if err == nil {
 			err = errors.New("does not exist, or this role cannot see it")
 		}
-		return nil, fmt.Errorf("--verify-url postgres: table %s: %v", table, err)
+		return nil, t.wrap("--verify-url postgres: table "+table, err)
 	}
 	q := fmt.Sprintf(`SELECT uuid::text, coalesce(payload #>> '{content,encoding}', ''), coalesce(payload #>> '{content,body}', '') FROM %s WHERE uuid >= $1::uuid`,
 		pgx.Identifier(strings.Split(table, ".")).Sanitize())
@@ -177,7 +184,8 @@ type redisReader struct {
 	last map[string]string // stream key -> last ID read (or there at open)
 }
 
-func openRedis(ctx context.Context, rawURL, key string) (*redisReader, error) {
+func openRedis(ctx context.Context, t *target, key string, roots *x509.CertPool) (*redisReader, error) {
+	rawURL := t.raw
 	// valkey:// is redis:// (the protocol is the same, SPEC §8.6.1).
 	switch {
 	case strings.HasPrefix(rawURL, "valkey://"):
@@ -190,25 +198,28 @@ func openRedis(ctx context.Context, rawURL, key string) (*redisReader, error) {
 		return nil, errors.New("--verify-url redis: the URL does not parse")
 	}
 	opt.DisableCache = true
+	if roots != nil && opt.TLSConfig != nil {
+		opt.TLSConfig.RootCAs = roots
+	}
 	c, err := rueidis.NewClient(opt)
 	if err != nil {
-		return nil, fmt.Errorf("--verify-url redis: %v", err)
+		return nil, t.wrap("--verify-url redis", err)
 	}
 	// The stream is born at the server's first XADD: before the run only
 	// the connection, and the type of a key that already exists, are checked.
 	if key != "" {
-		t, err := c.Do(ctx, c.B().Type().Key(key).Build()).ToString()
+		typ, err := c.Do(ctx, c.B().Type().Key(key).Build()).ToString()
 		if err != nil {
 			c.Close()
-			return nil, fmt.Errorf("--verify-url redis: %v", err)
+			return nil, t.wrap("--verify-url redis", err)
 		}
-		if t != "none" && t != "stream" {
+		if typ != "none" && typ != "stream" {
 			c.Close()
-			return nil, fmt.Errorf("--verify-url redis: key %s is a %s, not a stream", key, t)
+			return nil, fmt.Errorf("--verify-url redis: key %s is a %s, not a stream", key, typ)
 		}
 	} else if err := c.Do(ctx, c.B().Ping().Build()).Error(); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("--verify-url redis: %v", err)
+		return nil, t.wrap("--verify-url redis", err)
 	}
 	r := &redisReader{c: c, key: key, last: map[string]string{}}
 	// As with NATS: every stream is read after its last entry now, before
@@ -216,13 +227,13 @@ func openRedis(ctx context.Context, rawURL, key string) (*redisReader, error) {
 	keys, err := r.keys(ctx)
 	if err != nil {
 		c.Close()
-		return nil, fmt.Errorf("--verify-url redis: scan: %v", err)
+		return nil, t.wrap("--verify-url redis: scan", err)
 	}
 	for _, k := range keys {
 		es, err := c.Do(ctx, c.B().Xrevrange().Key(k).End("+").Start("-").Count(1).Build()).AsXRange()
 		if err != nil && !rueidis.IsRedisNil(err) {
 			c.Close()
-			return nil, fmt.Errorf("--verify-url redis: %s: %v", k, err)
+			return nil, t.wrap("--verify-url redis: "+k, err)
 		}
 		if len(es) == 1 {
 			r.last[k] = es[0].ID
