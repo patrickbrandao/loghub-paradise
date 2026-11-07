@@ -89,6 +89,7 @@ type HTTP struct {
 
 	proxyLog *obs.Sampler
 	errLog   *obs.Sampler
+	tlsLog   *obs.Sampler
 
 	bufs sync.Pool // *[]byte for bodies
 	docs sync.Pool // *[]byte for decompressed documents
@@ -130,7 +131,7 @@ func newHTTP(ctx context.Context, t item.Transport, cfg HTTPConfig, tc *tls.Conf
 	}
 	h := &HTTP{transport: t, obsT: obsTransport(t), in: in, m: m, log: lg, cfg: cfg,
 		done: make(chan struct{}), proxyLog: obs.NewSampler(30 * time.Second),
-		errLog: obs.NewSampler(30 * time.Second)}
+		errLog: obs.NewSampler(30 * time.Second), tlsLog: obs.NewSampler(30 * time.Second)}
 	l, err := listenStream(ctx, cfg.Addr, false)
 	if err != nil {
 		return nil, fmt.Errorf("receiver %s: %s: %w", t, cfg.Addr, err)
@@ -160,15 +161,63 @@ func newHTTP(ctx context.Context, t item.Transport, cfg HTTPConfig, tc *tls.Conf
 			return context.WithValue(ctx, connKey{}, c)
 		},
 		// The stdlib logs a TLS handshake failure or a malformed request per
-		// connection; a scanner on the port would flood the log. Discarded:
-		// the handshake failures are counted instead (ConnState cannot see
-		// them, so this is a known gap, SPEC §22.1).
-		ErrorLog: log.New(io.Discard, "", 0),
+		// connection; a scanner on the port would flood the log. Nothing is
+		// logged as is: serverLog counts the handshake failures of https in
+		// gelf_tls_handshake_errors_total{transport="https"} (with a sampled
+		// WARN, as the tls transport does) and discards every other line
+		// (SPEC §4.7, §14.1). ConnState cannot see a failed handshake: it
+		// reports StateNew before the handshake and StateClosed after, the
+		// same as a client that connected and sent nothing.
+		ErrorLog: log.New(serverLog{h}, "", 0),
 	}
 	return h, nil
 }
 
 type connKey struct{}
+
+// handshakeErrorPrefix is how net/http reports a failed or timed-out TLS
+// handshake, including a client that speaks plain HTTP to the HTTPS port
+// (net/http answers it 400 itself). The line has carried this text since Go
+// 1.x; TestHTTPSHandshakeErrorsAreCounted breaks if a toolchain changes it.
+//
+// Why the ErrorLog and not the handshake in our own listener (SPEC §4.7): the
+// listener's Accept is one goroutine, so a handshake there serializes every
+// new connection behind the slowest client (a slowloris that never finishes
+// the ClientHello holds the port), and moving it to a goroutine per connection
+// means a second accept queue with its own shutdown bookkeeping, outside
+// net/http's ConnState and its handshake deadline. A wrapper conn that counts
+// in HandshakeContext works only with toolchains whose net/http recognizes TLS
+// by interface rather than by *tls.Conn; the module's go directive is older.
+var handshakeErrorPrefix = []byte("http: TLS handshake error from ")
+
+// serverLog is the http.Server's ErrorLog (log.Logger serializes its Writes,
+// and with no prefix and no flags each Write is one line).
+type serverLog struct{ h *HTTP }
+
+func (l serverLog) Write(p []byte) (int, error) {
+	if l.h.transport == item.TransportHTTPS && bytes.HasPrefix(p, handshakeErrorPrefix) {
+		l.h.handshakeFailed(bytes.TrimRight(p[len(handshakeErrorPrefix):], "\n"))
+	}
+	return len(p), nil
+}
+
+// handshakeFailed counts one https handshake failure; rest is "<peer>: <why>".
+// A shutdown cuts the handshakes in flight: that is not the peer's fault and
+// is not counted, as in the tls transport (Stream.handshake).
+func (h *HTTP) handshakeFailed(rest []byte) {
+	if h.closing.Load() || (h.ctx != nil && h.ctx.Err() != nil) {
+		return
+	}
+	h.m.TLSHandshakeErrorsTotal[h.obsT].Inc()
+	if ok, suppressed := h.tlsLog.Allow(); ok {
+		peer, why := string(rest), ""
+		if i := bytes.Index(rest, []byte(": ")); i >= 0 {
+			peer, why = string(rest[:i]), string(rest[i+2:])
+		}
+		h.log.Warn("TLS handshake failed", "transport", h.transport.String(), "peer", peer,
+			"error", why, "suppressed", suppressed)
+	}
+}
 
 // Addr reports the bound address, for the boot log.
 func (h *HTTP) Addr() string { return h.ln.Addr().String() }

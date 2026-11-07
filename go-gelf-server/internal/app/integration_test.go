@@ -832,6 +832,7 @@ var labelSets = map[string]map[string][]string{
 	"gelf_conns_active":               {"transport": {"tcp", "tls", "http", "https"}},
 	"gelf_conns_total":                {"transport": {"tcp", "tls", "http", "https"}},
 	"gelf_conns_refused_total":        {"transport": {"tcp", "tls", "http", "https"}, "limit": {"global", "per_ip"}},
+	"gelf_tls_handshake_errors_total": {"transport": {"tls", "https"}},
 	"gelf_proxy_headers_total":        {"result": {"v1", "v2", "local", "absent", "invalid"}},
 	"gelf_backpressure_seconds_total": {"transport": {"tcp", "tls"}},
 	"gelf_sink_errors_total":          {"kind": {"network", "logic", "fatal", "timeout"}},
@@ -846,7 +847,7 @@ var labelSets = map[string]map[string][]string{
 // included (as their _count).
 var unlabelled = []string{
 	"gelf_message_bytes_count", "gelf_convert_duration_seconds_count",
-	"gelf_tls_handshake_errors_total", "gelf_confirm_duration_seconds_count",
+	"gelf_confirm_duration_seconds_count",
 	"gelf_udp_receive_errors_total", "gelf_udp_read_buffer_bytes",
 	"gelf_udp_reassembly_bytes", "gelf_udp_chunk_duplicates_total",
 	"gelf_ring_items", "gelf_ring_bytes", "gelf_ring_capacity_items", "gelf_ring_capacity_bytes",

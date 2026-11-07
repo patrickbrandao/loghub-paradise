@@ -459,7 +459,12 @@ cru, então o documento é `malformed` e o `raw` vai como string com `\u0000`)
 sai na cópia da fila em base64. A regra do oráculo "`raw` UTF-8 nunca em
 base64" (§18.2) vale para o JLH, não para esta cópia: os testes da fila
 reconvertem o `raw` antes de passar a linha pelo oráculo, e um consumidor da
-`loghub.inbox` decodifica o `raw` pelo `raw-encoding`, sempre (§22.1).
+`loghub.inbox` decodifica o `raw` pelo `raw-encoding`, sempre. É decisão
+(registrada em 2026-11-07, antes §22.1 item 5): o `jsonb` não guarda U+0000, e
+trocar o NUL do `raw` por U+FFFD, como no resto da cópia, faria o `raw` deixar
+de ser o documento que chegou — o único campo cuja razão de existir é ser
+exato. O base64 com `raw-encoding` já é a forma que o contrato tem para um
+`raw` que não cabe como texto.
 
 #### 3.7.2 Tabela `inbox_gelf` (`sink=clickhouse`)
 
@@ -506,6 +511,13 @@ SETTINGS non_replicated_deduplication_window = 1000;
   `env`: quem precisa do tipo lê o JLH de outro destino, ou converte
   (`toFloat64OrNull`). A cópia só existe quando o payload tem `fields` ou
   `extra`; sem eles, o `payload` é o sub-slice do JLH, sem cópia.
+- **Perder o tipo do número é decisão, não defeito** (registrada em
+  2026-11-07, antes §22.1 item 4): `Map(String, String)` é o que mantém as
+  chaves literais e o texto exato; um consumidor que precise do tipo neste
+  destino converte na consulta. Se aparecer o caso de um campo que precise de
+  coluna tipada, o caminho é um segundo *hint* tipado para **nomes conhecidos**
+  (declarado pelo administrador na DDL), nunca a inferência do ClickHouse, que
+  reescreve o texto e recusa o pedaço com `1e400` (acima).
 - O tipo `JSON` descarta objeto vazio: uma linha sem `fields` volta com
   `"fields":{}`, que este servidor nunca escreve (omissão). `{}` é ausente.
 - A inferência de datas e números a partir de strings é desligada em todo
@@ -744,6 +756,35 @@ Como S §4.5: `tls.cert_file`/`tls.key_file` obrigatórios quando `listen.tls` o
 `idle_timeout`, `max_conns`, `max_conns_per_ip`, `backpressure_timeout` e
 `handshake_timeout` do transporte `tls`; o `https` usa os de `[http]`.
 
+**Falha de handshake do `https`** (2026-11-07, §22.1 item 2). O `net/http` faz o
+handshake na goroutine da conexão, sob o menor dos prazos de `[http]`, e
+relata a falha só no `ErrorLog` do servidor, com a linha `http: TLS handshake
+error from <par>: <motivo>` — inclusive o cliente que fala HTTP em claro na
+porta HTTPS (a stdlib responde `400` sozinha). O `ErrorLog` deste servidor é
+um escritor próprio que **não loga nada**: conta cada linha com esse prefixo em
+`gelf_tls_handshake_errors_total{transport="https"}` (§14.1), com o mesmo aviso
+amostrado do transporte `tls` (`TLS handshake failed`, um a cada 30 s, §14.2),
+e descarta toda outra linha da stdlib, como antes (um scanner na porta
+inundaria o log). Com o listener fechando (shutdown) a falha não conta: o corte
+não é culpa do par, a mesma regra do `tls`. Decisão, contra as duas
+alternativas:
+
+- **Handshake no listener, antes de entregar a conexão ao `http.Server`:** o
+  `Accept` é uma goroutine só, e um handshake ali enfileira toda conexão nova
+  atrás do cliente mais lento (um slowloris que nunca termina o ClientHello
+  segura a porta). Levá-lo a uma goroutine por conexão é uma segunda fila de
+  accept, com contabilidade de shutdown própria, fora do `ConnState` e do prazo
+  de handshake do `net/http`.
+- **Conexão embrulhada que conta no `HandshakeContext`:** só funciona com um
+  `net/http` que reconhece TLS por interface e não por `*tls.Conn`; com o
+  `go` do `go.mod` (1.25) não é garantido, e o `payload.tls` sumiria em
+  silêncio.
+
+O texto da linha é da stdlib e o mesmo desde o Go 1.x; se um toolchain o mudar,
+`TestHTTPSHandshakeErrorsAreCounted` quebra (certificado de cliente de outra
+CA, cliente que não confia no servidor, HTTP em claro: três falhas, zero no
+`tls`, zero numa conexão boa).
+
 ---
 
 ## 5. Moldura, remontagem e descompressão
@@ -802,7 +843,37 @@ descarte contado.
   para a descompressão (§5.4) com a amostra de relógio do **último** chunk e
   `chunks = count`. Um documento que chega num chunk só (`count = 1`) também
   tem `chunks: 1`.
-- O estado é um mapa sob um mutex compartilhado pelos `udp_listeners`.
+- **O estado é dividido em 64 shards** (2026-11-07, §22.1 item 1), escolhidos
+  por um hash com semente por processo (`hash/maphash`) de `(src-ip, src-port,
+  id)`; cada shard é um mapa sob o seu mutex, e uma mensagem vive inteira num
+  shard só. Os **dois tetos continuam globais**: `max_bytes` e `max_messages`
+  são contadores atômicos compartilhados, reservados por CAS (nunca
+  soma-e-desfaz: dois chunks que cabem sozinhos não são recusados por terem
+  passado juntos por um instante). Um teto por shard deixaria um shard quente
+  recusar com os outros vazios, ou a soma passar do configurado. A semente
+  impede que um emissor mire todas as suas mensagens num shard (o id é dele).
+  O `Sweep` passa um shard de cada vez, e o gauge lê o contador atômico (antes,
+  uma segunda aquisição do mutex por chunk).
+- **A medida que decidiu** (2026-11-07, Apple M2, 8 núcleos, macOS, Go 1.27.3,
+  máquina carregada por outras suítes, load 4–10; `BenchmarkUDPChunkFlood`,
+  TESTING §4): N listeners, cada um com o seu socket e o seu emissor sem
+  pausa, chunks de 1 408 B, 8 por mensagem, a leitura e o `Add` como o
+  `udpLoop`. Chunks por segundo (3 rodadas, faixa):
+
+  | listeners | um mutex (antes) | 64 shards (agora) | um remontador por listener (teto) |
+  |---|---|---|---|
+  | 1 | 150–155 k | 98–148 k | 155–160 k |
+  | 2 | 121–210 k | 183–242 k | 240–255 k |
+  | 4 | 155–189 k | 225–243 k | 270–326 k |
+  | 8 | 106–146 k | 210–291 k | 280–346 k |
+
+  Com um mutex a vazão parava na de 1–2 listeners; com os shards cresce até
+  ~2× com 8, perto do teto sem compartilhamento (o resto é o alocador e os
+  contadores atômicos dos tetos, compartilhados por desenho). Sem socket
+  (`BenchmarkReassemblerParallelInterleaved`, 64 mensagens abertas por
+  emissor): 338→188 ns/chunk com 4 núcleos. A varredura de um mapa cheio
+  (16 384 mensagens) custa ~0,16 ms nos dois arranjos; com os shards um
+  listener espera no máximo a passada de um shard.
 
 ### 5.3 Moldura `\0` (TCP e TLS)
 
@@ -1092,6 +1163,24 @@ aceita  <=>  level <= filter.min_level
   (`warn`, `error` são recusados no boot).
 - A varredura só roda quando o filtro pode recusar algo (`min_level < 7` ou
   `levels` não vazio); sem isso, a recepção não lê o documento.
+- **O preço da validação dupla, medido** (2026-11-07, §22.1 item 3; Apple M2,
+  macOS, Go 1.27.3, máquina carregada, load 15–20). Com o filtro ativo o
+  documento é validado na recepção (`LevelOf`) e de novo no dreno (a
+  conversão). `TestMeasureFilterDoubleValidation` (TESTING §4) manda 200 000
+  documentos do driver do Docker (444 B, `level` 6) por uma conexão TCP, ring
+  `memory`, `sink=none`, com `min_level=debug` (inativo) e `min_level=info`
+  (ativo, todos passam): 540–650 k docs/s e 6,0–6,6 µs de CPU por documento
+  sem filtro, 390–440 k docs/s e 7,4–7,7 µs com ele (+1,1 a +1,6 µs, ~20–25 %
+  de CPU; ~30 % de vazão numa conexão só, porque a goroutine da conexão é o
+  estágio serial e é nela que a varredura roda; com várias conexões a perda
+  de vazão é menor que a de CPU). Isolada, a varredura custa 0,53–0,56 µs
+  contra 2,0–2,1 µs da conversão completa (`BenchmarkLevelOf`,
+  `BenchmarkConvertDocker`). **Fica como está**: é o preço de o `level`
+  filtrado ser por construção o emitido (o mesmo parser) e de o descarte
+  acontecer antes do ring; um `level` lido por atalho divergiria da conversão
+  em documentos estranhos, e guardar o resultado da varredura no cabeçalho
+  mudaria o formato do item em todos os rings e no dump para economizar menos
+  de um terço da conversão, só com filtro.
 - Descarte: `gelf_messages_dropped_total{reason="filter"}`; no HTTP, `202`.
 - **Recarregável por `SIGHUP`**.
 
@@ -3053,7 +3142,7 @@ distribuição por nível é pergunta para o destino, onde é coluna indexada.
 | `gelf_convert_duration_seconds` | histogram | — (a conversão de um documento no worker de dreno) |
 | `gelf_conns_active`, `gelf_conns_total` | gauge, counter | `transport` (tcp, tls, http, https) |
 | `gelf_conns_refused_total` | counter | `transport` (tcp, tls, http, https), `limit` (global, per_ip); `global` conta cada vez que o accept estaciona no teto, um limite inferior, porque o teto global bloqueia em vez de recusar |
-| `gelf_tls_handshake_errors_total` | counter | — (do transporte `tls`; as falhas de handshake do `https` não são contadas, §22.1) |
+| `gelf_tls_handshake_errors_total` | counter | `transport` (tls, https): handshakes que falharam ou venceram o prazo; o `https` é contado pelo `ErrorLog` próprio do `http.Server` (§4.7, desde 2026-11-07; antes o label não existia e o `https` não era contado) |
 | `gelf_proxy_headers_total` | counter | `result` (v1, v2, local, absent, invalid) |
 | `gelf_backpressure_seconds_total` | counter | `transport` (tcp, tls): o HTTP não segura, responde `503` |
 | `gelf_udp_receive_errors_total` | counter | — (erros do próprio socket; o descarte do kernel por `SO_RCVBUF` pequeno não aparece aqui) |
@@ -3684,9 +3773,30 @@ assumiria os contêineres e os volumes da pilha do outro, sem aviso.
 
 **O que GP e GN copiam literalmente** (a menos do module path): `internal/convert`
 inteiro, os arquivos GELF de `internal/receiver` (`chunks.go`, `decompress.go`,
-`framing.go`, `http.go`) e `internal/item`. Uma correção num deles vale para os
-três servidores, e é portada no mesmo dia; uma divergência entre as cópias é
-bug.
+`framing.go`) e `internal/item`. O `http.go` é o de G sem o HTTPS. Uma correção
+num deles vale para os três servidores, e é portada no mesmo dia; uma
+divergência entre as cópias que não seja o HTTPS é bug.
+
+**Roteiro de porte G → GP/GN** (decisão de 2026-11-07, antes GN §22.1 item 4).
+`chunks.go`, `decompress.go`, `framing.go`, `internal/convert` e
+`internal/item` (com os testes, `chunks_bench_test.go` e `chunks_shard_test.go`
+inclusive) são cópia literal: o porte é copiar e trocar o module path, e a
+conferência é um `diff` vazio com o path normalizado. O `http.go` dos cortes é
+o de G **sem o HTTPS** (`NewHTTPS`, o `tls.Config`, a sessão TLS, o `ErrorLog`
+que conta handshakes): uma mudança no `http.go` de G é portada **à mão**, e a
+conferência é o mesmo `diff`, em que só podem sobrar os trechos do HTTPS:
+
+```bash
+# a partir de go-gelf-<corte>-server/
+for f in chunks decompress framing http; do
+  diff <(sed 's#go-gelf-server/#M/#' ../go-gelf-server/internal/receiver/$f.go) \
+       <(sed 's#go-gelf-[a-z]*-server/#M/#' internal/receiver/$f.go)
+done
+```
+
+Fica assim, e não um `http.go` literal com o HTTPS morto nos cortes: o corte
+sem TLS é a regra do GP e do GN (DESIGN §1), e o código de TLS morto puxaria
+`crypto/tls` e a configuração de `[tls]` para módulos que não a têm.
 
 ### 17.2 Layout interno
 
@@ -4107,7 +4217,6 @@ Nada disto entra antes de a v1 estar em produção e §18.8 ter sido medido.
 |---|---|
 | GELF por AMQP ou Kafka | Transportes do Graylog sem uso nos emissores alvo; um consumidor de fila é outro software (§1.2) |
 | HTTP/2 | HTTP/1.1 com keep-alive (§4.5) basta; só com um emissor que precise dele |
-| Remontagem UDP em shards | Hoje é um mapa sob um mutex (§5.2, §22.1); só com medida de contenção |
 | Importação de arquivo GELF (`transport=file`, um documento por linha) | Fora da v1 |
 | `space` por listener ou rede | Multi-tenant numa instância; fora da v1 |
 | Resposta a sonar, ping e pong | Até existir um `go-loghub-driver` |
@@ -4141,34 +4250,13 @@ os subjects por facility) não vieram.
 
 ### 22.1 Pendências conhecidas
 
-Abertas em 2026-10-31:
+Abertas em 2026-10-31, todas fechadas em 2026-11-07:
 
-1. **A remontagem UDP é um mapa sob um mutex só**, compartilhado pelos
-   `listen.udp_listeners` (§5.2). Com vários listeners e chunks em massa ele é o
-   ponto de contenção; nada foi medido. Direção: shards por hash de
-   `(src-ip, src-port, id)` com o teto global num contador atômico, quando
-   houver medida (§21; DECISOES §3).
-2. **Falhas de handshake do HTTPS não são contadas.** O `net/http` faz o
-   handshake dentro do servidor e o reporta só no `ErrorLog`, que aqui é
-   descartado (senão um scanner inundaria o log); `gelf_tls_handshake_errors_total`
-   conta só o transporte `tls` (§14.1). Consequência: um cliente HTTPS com
-   certificado errado só aparece como conexão aceita sem requisição. Direção:
-   um `ErrorLog` próprio que conte as linhas de handshake (sem logá-las), ou o
-   handshake feito pelo próprio listener antes de entregar a conexão ao
-   `http.Server`.
-3. **Com o filtro ativo o documento é validado duas vezes** (recepção e
-   dreno, §2.2, §7). É o preço de o `level` filtrado ser o emitido por
-   construção; `BenchmarkLevelOf` mede a varredura, mas o efeito ponta a ponta
-   não foi medido (DECISOES §3).
-4. **`fields`/`extra` no ClickHouse perdem o tipo do número** (viram o texto,
-   §3.7.2): é decisão, não defeito, mas um consumidor que precise do tipo não o
-   tem nesse destino. Direção, se aparecer o caso: um segundo *hint* tipado
-   para nomes conhecidos, nunca a inferência.
-5. **A cópia da `loghub.inbox` pode levar `raw` em base64 de um UTF-8 válido**
-   (§3.7.1): é a exceção, só na cópia da fila, à regra do oráculo "`raw` UTF-8
-   nunca em base64". Os testes reconvertem antes de passar a linha pelo
-   oráculo; um consumidor da fila precisa decodificar o `raw` pelo
-   `raw-encoding`, sempre.
+1. *Corrigido em 2026-11-07:* a remontagem UDP era um mapa sob um mutex só; a medida mostrou contenção com 4 e 8 listeners, e agora são 64 shards com os tetos globais atômicos; regra e números em §5.2.
+2. *Corrigido em 2026-11-07:* as falhas de handshake do HTTPS não eram contadas; o `ErrorLog` próprio conta-as em `gelf_tls_handshake_errors_total{transport="https"}`; regra em §4.7 e §14.1.
+3. *Medido em 2026-11-07:* a validação dupla com o filtro ativo custa +1,1 a +1,6 µs de CPU por documento (~20–25 %); fica, por decisão; números e motivo em §7.
+4. *Decidido em 2026-11-07:* `fields`/`extra` no ClickHouse sem o tipo do número é decisão; texto em §3.7.2.
+5. *Decidido em 2026-11-07:* o `raw` em base64 de um UTF-8 válido na cópia da `loghub.inbox` é decisão; texto em §3.7.1.
 
 O que os testes ainda não provam está em `docs/TESTING.md` §8.
 

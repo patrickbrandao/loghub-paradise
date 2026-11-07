@@ -454,7 +454,7 @@ func (s *Stream) handshake(ctx context.Context, c net.Conn, tc *tls.Conn, a conn
 	if s.closing.Load() || ctx.Err() != nil {
 		return false // shutdown, not the peer's fault
 	}
-	s.m.TLSHandshakeErrorsTotal.Inc()
+	s.m.TLSHandshakeErrorsTotal[s.obsT].Inc()
 	if ok, suppressed := s.tlsLog.Allow(); ok {
 		s.log.Warn("TLS handshake failed", "peer", a.peer.String(),
 			"error", err, "suppressed", suppressed)

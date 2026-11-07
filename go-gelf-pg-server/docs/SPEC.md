@@ -540,7 +540,12 @@ Regras, e por que cada uma:
   string com `\u0000`) sai na cópia da fila em base64. A regra do oráculo
   "`raw` UTF-8 nunca em base64" (§18.2) vale para o JLH, não para esta cópia:
   os testes da fila a toleram só nesse caso (`queueJLH`), e um consumidor da
-  `loghub.inbox` decodifica o `raw` pelo `raw-encoding`, sempre (§22.1).
+  `loghub.inbox` decodifica o `raw` pelo `raw-encoding`, sempre. É decisão
+  (registrada em 2026-11-07, antes §22.1 item 3, a mesma de G §3.7.1): o
+  `jsonb` não guarda U+0000, e trocar o NUL do `raw` por U+FFFD faria o `raw`
+  deixar de ser o documento que chegou, o único campo cuja razão de existir é
+  ser exato; o base64 com `raw-encoding` é a forma que o contrato já tem para
+  um `raw` que não cabe como texto.
 - **As CHECKs da tabela são contrato, não opção.** Todo envelope `type=gelf`
   daqui tem `level` ≤ 7 e `from` UUIDv7 (`go-loghub-ident`), e nenhum é
   `beacon`; a CHECK `inbox_syslog_ck` só olha `type=syslog`: nenhuma CHECK
@@ -806,7 +811,12 @@ descarte contado.
   para a descompressão (§5.4) com a amostra de relógio do **último** chunk e
   `chunks = count`. Um documento que chega num chunk só (`count = 1`) também
   tem `chunks: 1`.
-- O estado é um mapa sob um mutex compartilhado pelos `udp_listeners`.
+- **O estado é dividido em 64 shards** (2026-11-07, porte de G §5.2, onde
+  estão a medida e os números): hash com semente de `(src-ip, src-port, id)`,
+  um mutex por shard, e os **dois tetos globais** em contadores atômicos
+  reservados por CAS. A medida de G mostrou contenção do mutex único com 4 e 8
+  listeners; o pacote é cópia literal (§17.1), com `chunks_bench_test.go` e
+  `chunks_shard_test.go`.
 
 ### 5.3 Moldura `\0` (TCP)
 
@@ -2535,6 +2545,36 @@ Módulo independente. Nada é importado de outro módulo do monorepo, nem do pai
 compartilhar pacotes faria os módulos evoluírem amarrados. Tags
 `go-gelf-pg-server/vX.Y.Z`.
 
+**Roteiro de porte G → GP/GN** (decisão de 2026-11-07, antes GN §22.1 item 4).
+`chunks.go`, `decompress.go`, `framing.go`, `internal/convert` e
+`internal/item` (com os testes, `chunks_bench_test.go` e `chunks_shard_test.go`
+inclusive) são cópia literal: o porte é copiar e trocar o module path, e a
+conferência é um `diff` vazio com o path normalizado. O `http.go` dos cortes é
+o de G **sem o HTTPS** (`NewHTTPS`, o `tls.Config`, a sessão TLS, o `ErrorLog`
+que conta handshakes): uma mudança no `http.go` de G é portada **à mão**, e a
+conferência é o mesmo `diff`, em que só podem sobrar os trechos do HTTPS:
+
+```bash
+# a partir de go-gelf-<corte>-server/
+for f in chunks decompress framing http; do
+  diff <(sed 's#go-gelf-server/#M/#' ../go-gelf-server/internal/receiver/$f.go) \
+       <(sed 's#go-gelf-[a-z]*-server/#M/#' internal/receiver/$f.go)
+done
+```
+
+Fica assim, e não um `http.go` literal com o HTTPS morto nos cortes: o corte
+sem TLS é a regra do GP e do GN (DESIGN §1), e o código de TLS morto puxaria
+`crypto/tls` e a configuração de `[tls]` para módulos que não a têm.
+
+**O `internal/item` fica literal, com o que este corte não usa** (decisão de
+2026-11-07, antes §22.1 item 5): o codec do cabeçalho
+(`EncodeHead`/`DecodeHead`, só exercido pelo `FuzzHead` e pelos testes), o
+canal `done`, `RowID`, `StreamID`, `TLS` e os transportes `tls`/`https`. Custa
+32 B de `ItemOverhead` (288 contra os 256 de SP, §9.2) e a caixa `*[]byte`
+que SP economiza (§15.1). Fica, pela regra da família (DESIGN §1: os pacotes
+GELF são idênticos em G, GP e GN): uma divergência futura tem de ser escolha
+registrada aqui, mudando §17.1 nos três, nunca deriva.
+
 ### 17.2 Layout interno
 
 ```
@@ -2915,24 +2955,12 @@ sai daqui e a regra vai para a seção que ele cita, spec primeiro. As pendênci
 fechadas de SP (2026-10-14) e de G (2026-10-31) que valem aqui já estão no
 código copiado e nas seções citadas; as abertas de G que valem aqui seguem.
 
-Abertas em 2026-10-31:
+Abertas em 2026-10-31, todas fechadas:
 
-1. **A remontagem UDP é um mapa sob um mutex só** (G, item 1), compartilhado
-   pelos `listen.udp_listeners` (§5.2). Com vários listeners e chunks em massa
-   ele é o ponto de contenção; nada foi medido. Direção: shards por hash de
-   `(src-ip, src-port, id)`, em G primeiro (o pacote é cópia literal).
-2. *(fechada em 2026-10-31: `http.bulk`, §4.5.1, porte de G.)*
-3. **A cópia da `loghub.inbox` pode levar `raw` em base64 de um UTF-8 válido**
-   (G, item 6; §3.7.1): exceção, só na cópia da fila, à regra do oráculo. Um
-   consumidor da fila precisa decodificar o `raw` pelo `raw-encoding`, sempre.
-4. *(fechada em 2026-10-31: G recebeu `jsonbHolds`, e a correção da mantissa
-   zero voltou de G para cá, §3.7.1.)*
-5. **O `internal/item` copiado de G carrega código morto** (§3.4, §9.2): o
-   codec do cabeçalho, o canal `done`, `RowID`, `StreamID` e `TLS`. Custa 32 B
-   de `ItemOverhead` a mais que SP (288 contra 256; o GN também é 288 desde
-   2026-10-31) e a alocação da caixa
-   `*[]byte` que SP economiza (§15.1). É decisão (DESIGN §1: os pacotes GELF
-   são idênticos nos três), não defeito; registrado para que uma futura
-   divergência seja escolha, não deriva.
+1. *Corrigido em 2026-11-07:* a remontagem UDP era um mapa sob um mutex só; porte dos 64 shards de G, tetos globais atômicos; regra em §5.2 (números em G §5.2).
+2. *Corrigido em 2026-10-31:* `http.bulk`, porte de G; regra em §4.5.1.
+3. *Decidido em 2026-11-07:* o `raw` em base64 de um UTF-8 válido na cópia da `loghub.inbox` é decisão; texto em §3.7.1.
+4. *Corrigido em 2026-10-31:* G recebeu `jsonbHolds`, e a correção da mantissa zero voltou de G para cá; regra em §3.7.1.
+5. *Decidido em 2026-11-07:* o `internal/item` copiado de G com código morto fica; texto em §17.1 (e §3.4).
 
 O que os testes ainda não provam está em `docs/TESTING.md` §8.

@@ -693,7 +693,12 @@ descarte contado.
   para a descompressão (§5.4) com a amostra de relógio do **último** chunk e
   `chunks = count`. Um documento que chega num chunk só (`count = 1`) também
   tem `chunks: 1`.
-- O estado é um mapa sob um mutex compartilhado pelos `udp_listeners`.
+- **O estado é dividido em 64 shards** (2026-11-07, porte de G §5.2, onde
+  estão a medida e os números): hash com semente de `(src-ip, src-port, id)`,
+  um mutex por shard, e os **dois tetos globais** em contadores atômicos
+  reservados por CAS. A medida de G mostrou contenção do mutex único com 4 e 8
+  listeners; o pacote é cópia literal (§17.1), com `chunks_bench_test.go` e
+  `chunks_shard_test.go`.
 
 ### 5.3 Moldura `\0` (TCP)
 
@@ -2598,6 +2603,36 @@ sem o HTTPS (`NewHTTPS`, o `tls.Config`, a sessão), o mesmo corte do GP. Mudou
 um deles em G, a mudança vem para cá no mesmo dia, ou fica registrada como "a
 portar" (§22.1). Tags `go-gelf-nats-server/vX.Y.Z`.
 
+**Roteiro de porte G → GP/GN** (decisão de 2026-11-07, antes GN §22.1 item 4).
+`chunks.go`, `decompress.go`, `framing.go`, `internal/convert` e
+`internal/item` (com os testes, `chunks_bench_test.go` e `chunks_shard_test.go`
+inclusive) são cópia literal: o porte é copiar e trocar o module path, e a
+conferência é um `diff` vazio com o path normalizado. O `http.go` dos cortes é
+o de G **sem o HTTPS** (`NewHTTPS`, o `tls.Config`, a sessão TLS, o `ErrorLog`
+que conta handshakes): uma mudança no `http.go` de G é portada **à mão**, e a
+conferência é o mesmo `diff`, em que só podem sobrar os trechos do HTTPS:
+
+```bash
+# a partir de go-gelf-<corte>-server/
+for f in chunks decompress framing http; do
+  diff <(sed 's#go-gelf-server/#M/#' ../go-gelf-server/internal/receiver/$f.go) \
+       <(sed 's#go-gelf-[a-z]*-server/#M/#' internal/receiver/$f.go)
+done
+```
+
+Fica assim, e não um `http.go` literal com o HTTPS morto nos cortes: o corte
+sem TLS é a regra do GP e do GN (DESIGN §1), e o código de TLS morto puxaria
+`crypto/tls` e a configuração de `[tls]` para módulos que não a têm.
+
+**O `internal/item` fica literal, com o que este corte não usa** (decisão de
+2026-11-07, antes §22.1 item 3): o codec do cabeçalho
+(`EncodeHead`/`DecodeHead`, só exercido pelo `FuzzHead` e pelos testes), o
+canal `done`, `RowID`, `StreamID`, `TLS` e os transportes `tls`/`https`. Custa
+32 B de `ItemOverhead` (288 contra os 256 de SN, §9.2) e a caixa `*[]byte`
+que SN economiza (§15.1). Fica, pela regra da família (DESIGN §1: os pacotes
+GELF são idênticos em G, GP e GN): uma divergência futura tem de ser escolha
+registrada aqui, mudando §17.1 nos três, nunca deriva.
+
 ### 17.2 Layout interno
 
 ```
@@ -2925,7 +2960,6 @@ Nada disto entra antes de a v1 estar em produção e §18.8 ter sido medido.
 |---|---|
 | GELF por AMQP ou Kafka | Transportes do Graylog sem uso nos emissores alvo; um consumidor de fila é outro software (§1.2) |
 | HTTP/2 | HTTP/1.1 com keep-alive (§4.5) basta; só com um emissor que precise dele. O keep-alive saiu do roteiro em 2026-10-31 (porte de G) |
-| Remontagem UDP em shards | Hoje é um mapa sob um mutex (§5.2, §22.1); só com medida de contenção |
 | Importação de arquivo GELF (`transport=file`, um documento por linha) | Fora da v1 |
 | `space` por listener ou rede | Multi-tenant numa instância; fora da v1 |
 | Resposta a sonar, ping e pong | Até existir um `go-loghub-driver` |
@@ -2949,30 +2983,12 @@ onde vale, com a data e a origem no texto.
 
 ### 22.1 Pendências conhecidas
 
-Abertas em 2026-10-31:
+Abertas em 2026-10-31, todas fechadas:
 
-1. **A remontagem UDP é um mapa sob um mutex só**, compartilhado pelos
-   `listen.udp_listeners` (§5.2). Com vários listeners e chunks em massa ele é o
-   ponto de contenção; nada foi medido. Direção: shards por hash de
-   `(src-ip, src-port, id)` com o teto global num contador atômico, quando
-   houver medida (§21). Herdado de G (G §22.1 item 1).
-2. ~~Um `POST /gelf` com vários documentos separados por `\n`~~ — **fechado
-   em 2026-10-31** pelo porte de `http.bulk` de G (§4.5.1; desligado por
-   padrão, como o Graylog).
-3. **O pacote `internal/item` traz o que GN não usa.** É cópia literal de G
-   (§17.1): o codec do cabeçalho (`EncodeHead`/`DecodeHead`, só exercido pelo
-   `FuzzHead` e pelos testes), os campos `RowID`, `StreamID`, `done` e `TLS`, e
-   os transportes `tls`/`https`. Consequência: `ItemOverhead` = 288 B em vez dos
-   256 B de SN (§9.2), um oitavo a mais de *overhead* por item no teto
-   `ring.max_bytes`; e o `obsTransport` da recepção mapeia por nome, não por
-   posição, `tls`→`tcp` e `https`→`http` só para ser total, a mesma função do
-   GP (`TestTransportEnumsAgree`). Direção, se a medida pedir: decidir na
-   família se `item` deixa de ser cópia literal em GP/GN (o corte de SN apagou o
-   codec), mudando §17.1 nos três.
-4. **`receiver/http.go` não é cópia literal de G**: é o de G sem o HTTPS, o
-   mesmo corte de GP (§17.1). Uma mudança em G precisa ser portada à mão nos
-   dois cortes; a comparação (`diff` com o module path normalizado) fica no
-   roteiro de porte.
+1. *Corrigido em 2026-11-07:* a remontagem UDP era um mapa sob um mutex só; porte dos 64 shards de G, tetos globais atômicos; regra em §5.2 (números em G §5.2).
+2. *Corrigido em 2026-10-31:* `POST /gelf` com vários documentos por `\n`, pelo porte de `http.bulk` de G; regra em §4.5.1.
+3. *Decidido em 2026-11-07:* o `internal/item` copiado de G com o que GN não usa fica; texto em §17.1.
+4. *Decidido em 2026-11-07:* o `receiver/http.go` é o de G sem o HTTPS, portado à mão; roteiro de porte em §17.1.
 
 O que os testes ainda não provam está em `docs/TESTING.md` §8.
 
