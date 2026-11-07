@@ -250,3 +250,36 @@ var removedParams = map[string]bool{
 	"tls.max_conns_per_ip":              true,
 	"tls.min_version":                   true,
 }
+
+// The parent's valkey aliases (go-gelf-server SPEC §16.2.1, 2026-11-07): there,
+// [sink.valkey] and [ring.valkey] are the same keys as [sink.redis] and
+// [ring.redis] under a second name (--sink.valkey.addrs,
+// GELF_SINK_VALKEY_ADDRS). This server has neither, so each alias gets the same
+// refusal as the key it stands for -- the env WARN, the flag/INI error naming
+// the parent, the known section -- instead of a bare "unknown parameter" that
+// would not say where the name comes from. Derived from the redis entries
+// above, so the two lists cannot drift.
+func init() {
+	swap := map[string]string{"sink.redis": "sink.valkey", "ring.redis": "ring.valkey"}
+	for sec, alias := range swap {
+		if removedSections[sec] {
+			removedSections[alias] = true
+		}
+	}
+	for name := range removedParams {
+		for sec, alias := range swap {
+			if strings.HasPrefix(name, sec+".") {
+				removedParams[alias+strings.TrimPrefix(name, sec)] = true
+			}
+		}
+	}
+	var env []string
+	for _, k := range removedEnv {
+		for _, part := range []string{"_SINK_REDIS_", "_RING_REDIS_"} {
+			if strings.Contains(k, part) {
+				env = append(env, strings.Replace(k, part, strings.Replace(part, "REDIS", "VALKEY", 1), 1))
+			}
+		}
+	}
+	removedEnv = append(removedEnv, env...)
+}

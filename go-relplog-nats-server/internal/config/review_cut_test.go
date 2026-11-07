@@ -199,6 +199,16 @@ func TestRemovedEnvIsTheParentMinusThis(t *testing.T) {
 		"SYSLOG_SD_MAX_ELEMENTS",
 		"SYSLOG_SD_MAX_PARAMS",
 	}
+	// The parent also reads every [sink.redis]/[ring.redis] key under its
+	// valkey alias (go-relplog-server SPEC §16.2.1, 2026-11-07).
+	for _, k := range append([]string(nil), parent...) {
+		for _, part := range []string{"_SINK_REDIS_", "_RING_REDIS_"} {
+			if strings.Contains(k, part) {
+				parent = append(parent, strings.Replace(k, part, strings.Replace(part, "REDIS", "VALKEY", 1), 1))
+			}
+		}
+	}
+	sort.Strings(parent)
 	ours := map[string]bool{}
 	for _, p := range Registry(&Config{}) {
 		ours[p.Env()] = true
