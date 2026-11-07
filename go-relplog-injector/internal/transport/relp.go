@@ -72,7 +72,7 @@ func Dialer(o Options) (sched.Dialer, error) {
 	}, nil
 }
 
-// FlowDialer returns the dialer of o for --pcap-per-flow (SPEC §6.9): with a
+// FlowDialer returns the dialer of o for --pcap-flows (SPEC §6.9): with a
 // PROXY header, src and dst (the flow's captured addresses) are announced
 // where --proxy-src/--proxy-dst did not fix them; zero values announce the
 // real ones.

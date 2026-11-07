@@ -98,8 +98,11 @@ func TestTally(t *testing.T) {
 	}
 	acked := []uint64{1<<1 | 1<<2 | 1<<4} // 1, 2, 4 acknowledged
 	v := tl.result(acked, false)
-	if v.Expected != 5 || v.Acked != 3 || v.Found != 3 || v.Lost != 1 || v.LostSeqs[0] != "4" || v.MissingUnacked != 1 ||
-		v.FoundUnacked != 1 || v.Duplicated != 2 || v.ExtraCopies != 2 || v.ExtraSameUUID != 1 || v.Unexpected != 1 || v.EntriesRead != 7 || v.OK {
+	// The SI's names and meanings (SPEC §8.5, decision 6 of 2026-11-07):
+	// expected = acked (1, 2, 4); duplicated = copies past the first (2 and
+	// 3 once each); unexpected = records of seqs not acked (3 twice, 9).
+	if v.Expected != 3 || v.Found != 2 || v.Lost != 1 || v.LostSeqs[0] != "4" || v.MissingUnacked != 1 ||
+		v.Duplicated != 2 || v.DuplicatedSameUUID != 1 || v.Unexpected != 3 || v.EntriesRead != 7 || v.OK {
 		t.Fatalf("%+v", v)
 	}
 }

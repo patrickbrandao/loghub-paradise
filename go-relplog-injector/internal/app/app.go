@@ -82,6 +82,7 @@ type config struct {
 	verifySpace, verifyKey  string
 	verifyTimeout           time.Duration
 	verifyAllowDup          bool
+	verifyCA                string
 
 	reportFmt string
 	progress  string
@@ -140,6 +141,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.verifySQLite, "verify-sqlite", "", "after sending, count lost/duplicated messages in the sink=sqlite events `file`")
 	fs.DurationVar(&c.verifyTimeout, "verify-timeout", 30*time.Second, "how long to wait for the destination to hold every acknowledged message")
 	fs.BoolVar(&c.verifyAllowDup, "verify-allow-duplicates", false, "duplicates at the destination do not change the exit code (still counted)")
+	fs.StringVar(&c.verifyCA, "verify-tls-ca", "", "PEM `file` of the CAs that verify the destination of tls://, rediss:// and valkeys:// (default: system roots; or ca= in the URL)")
 
 	fs.StringVar(&c.reportFmt, "report", "text", "final report on stdout: `text` or json")
 	fs.StringVar(&c.progress, "progress", "auto", "progress line on stderr every `interval`; 0 = off; auto = 1s on a terminal")
@@ -262,6 +264,11 @@ func build(c *config) (*runner, error) {
 	}
 	if c.pcapFlows && c.pcapFile == "" {
 		return nil, errors.New("--pcap-flows needs --pcap")
+	}
+	if c.pcapFlows && (c.proxySrc != "" || c.proxyDst != "") {
+		// Each session announces its flow's captured addresses (SPEC §6.9):
+		// one override for all of them would undo what --pcap-flows is for.
+		return nil, errors.New("--proxy-src/--proxy-dst cannot be given with --pcap-flows: each flow announces its captured addresses")
 	}
 	switch c.pcapDedup {
 	case "auto", "on", "off":
@@ -431,13 +438,13 @@ func (r *runner) buildVerify(c *config, finite bool) error {
 	case c.verifyURL != "" && c.verifySQLite != "":
 		return errors.New("--verify-url and --verify-sqlite are exclusive")
 	case c.verifyURL == "" && c.verifySQLite == "":
-		if c.set["verify-timeout"] || c.set["verify-allow-duplicates"] || c.set["verify-space"] || c.set["verify-key"] {
-			return errors.New("--verify-timeout, --verify-allow-duplicates, --verify-space and --verify-key need --verify-url or --verify-sqlite")
+		if c.set["verify-timeout"] || c.set["verify-allow-duplicates"] || c.set["verify-space"] || c.set["verify-key"] || c.set["verify-tls-ca"] {
+			return errors.New("--verify-timeout, --verify-allow-duplicates, --verify-space, --verify-key and --verify-tls-ca need --verify-url or --verify-sqlite")
 		}
 		return nil
 	}
-	if c.verifySQLite != "" && (c.verifySpace != "" || c.verifyKey != "") {
-		return errors.New("--verify-space and --verify-key do not apply to --verify-sqlite")
+	if c.verifySQLite != "" && (c.verifySpace != "" || c.verifyKey != "" || c.verifyCA != "") {
+		return errors.New("--verify-space, --verify-key and --verify-tls-ca do not apply to --verify-sqlite")
 	}
 	if finite {
 		return errors.New("--verify-* needs the run marker: --file and --pcap have none (SPEC §8.5)")
@@ -454,6 +461,9 @@ func (r *runner) buildVerify(c *config, finite bool) error {
 		return err
 	}
 	if err := t.Override(c.verifySpace, c.verifyKey); err != nil {
+		return err
+	}
+	if err := t.SetCA(c.verifyCA); err != nil {
 		return err
 	}
 	r.verify = t
@@ -510,8 +520,12 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 		// The destination is reached before anything is sent: a check that
 		// cannot run is not a run (SPEC §8.5).
 		pctx, pcancel := context.WithTimeout(ctx, r.c.timeout)
-		err := verify.Probe(pctx, r.verify, r.c.run)
+		err := verify.Probe(pctx, r.verify, r.c.run, r.matcher)
 		pcancel()
+		if errors.Is(err, verify.ErrRunPresent) {
+			fmt.Fprintf(stderr, "%s: %s: %v\n", Name, r.verify.Display, err)
+			return ExitUsage // nothing sent (SPEC §8.5)
+		}
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: destination check impossible: %s: %v\n", Name, r.verify.Display, err)
 			rep.Start = time.Now()

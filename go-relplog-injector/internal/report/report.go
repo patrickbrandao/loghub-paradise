@@ -299,25 +299,28 @@ type Summary struct {
 }
 
 // Verify is the result of the destination check (SPEC §8.5).
+// The names and meanings are the SI's (SPEC §8.5, decision 6 of
+// 2026-11-07): expected = the successes (acked), duplicated = the copies past
+// the first, unexpected = the records whose seq is not a success (it never
+// changes the exit code). MissingUnacked, DuplicatedSameUUID and EntriesRead
+// are the RI's own.
 type Verify struct {
-	Destination    string   `json:"destination"`
-	OK             bool     `json:"ok"`
-	Complete       bool     `json:"complete"` // every acknowledged message was found before --verify-timeout
-	Expected       uint64   `json:"expected"`
-	Acked          uint64   `json:"acked"`
-	Found          uint64   `json:"found"`
-	Lost           uint64   `json:"lost"`
-	MissingUnacked uint64   `json:"missing_unacked"`
-	FoundUnacked   uint64   `json:"found_unacked"`
-	Duplicated     uint64   `json:"duplicated"`
-	ExtraCopies    uint64   `json:"extra_copies"`
-	ExtraSameUUID  uint64   `json:"extra_copies_same_uuid"`
-	Unexpected     uint64   `json:"unexpected"`
-	EntriesRead    uint64   `json:"entries_read"`
-	LostSeqs       []string `json:"lost_seqs,omitempty"` // up to 20 ranges, "a-b" or "a"
-	WaitedSec      float64  `json:"waited"`
-	Error          string   `json:"error,omitempty"`
-	// Unreadable: the destination could not be read at all (exit 5).
+	Destination        string   `json:"destination"`
+	OK                 bool     `json:"ok"`
+	Complete           bool     `json:"complete"` // every acknowledged message was found before --verify-timeout
+	Expected           uint64   `json:"expected"`
+	Found              uint64   `json:"found"`
+	Lost               uint64   `json:"lost"`
+	Duplicated         uint64   `json:"duplicated"`
+	Unexpected         uint64   `json:"unexpected"`
+	MissingUnacked     uint64   `json:"missing_unacked"`
+	DuplicatedSameUUID uint64   `json:"duplicated_same_uuid"`
+	EntriesRead        uint64   `json:"entries_read"`
+	LostSeqs           []string `json:"lost_seqs,omitempty"` // up to 20 ranges, "a-b" or "a"
+	WaitedSec          float64  `json:"waited"`
+	Error              string   `json:"error,omitempty"`
+	// Unreadable: the last read failed, or the destination was never read
+	// (exit 4).
 	Unreadable bool `json:"unreadable,omitempty"`
 }
 
@@ -442,10 +445,9 @@ func (r *Report) WriteText(w io.Writer) error {
 			k string
 			v uint64
 		}{
-			{"expected", v.Expected}, {"acked", v.Acked}, {"found", v.Found}, {"lost", v.Lost},
-			{"missing_unacked", v.MissingUnacked}, {"found_unacked", v.FoundUnacked},
-			{"duplicated", v.Duplicated}, {"extra_copies", v.ExtraCopies},
-			{"extra_copies_same_uuid", v.ExtraSameUUID}, {"unexpected", v.Unexpected},
+			{"expected", v.Expected}, {"found", v.Found}, {"lost", v.Lost},
+			{"duplicated", v.Duplicated}, {"unexpected", v.Unexpected},
+			{"missing_unacked", v.MissingUnacked}, {"duplicated_same_uuid", v.DuplicatedSameUUID},
 			{"entries_read", v.EntriesRead},
 		} {
 			if f.v != 0 || f.k == "lost" || f.k == "duplicated" {

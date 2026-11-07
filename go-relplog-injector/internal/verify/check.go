@@ -62,23 +62,20 @@ type Options struct {
 	Poll, Settle time.Duration
 }
 
-// tally counts the copies of each seq.
+// tally counts the copies of each seq: a vector indexed by seq (SPEC §8.5).
 type tally struct {
-	sent       uint64
-	copies     []uint8  // saturating, index seq
-	first      []uint32 // hash of the uuid of the first copy
-	extra      uint64
-	sameUUID   uint64
-	unexpected uint64
-	entries    uint64
-	matched    uint64
+	sent     uint64
+	copies   []uint16 // saturating, index seq
+	first    []uint32 // hash of the uuid of the first copy
+	sameUUID uint64   // copies past the first that repeat its uuid
+	beyond   uint64   // records of the run with a seq outside 1..sent
+	entries  uint64
+	matched  uint64
 }
 
 func newTally(sent uint64) *tally {
-	return &tally{sent: sent, copies: make([]uint8, sent+1), first: make([]uint32, sent+1)}
+	return &tally{sent: sent, copies: make([]uint16, sent+1), first: make([]uint32, sent+1)}
 }
-
-func (t *tally) reset() { *t = *newTally(t.sent) }
 
 func uuidHash(s string) uint32 {
 	h := fnv.New32a()
@@ -94,19 +91,16 @@ func (t *tally) add(m *Matcher, e Entry) {
 	}
 	t.matched++
 	if seq == 0 || seq > t.sent {
-		t.unexpected++
+		t.beyond++
 		return
 	}
 	u := uuidHash(e.UUID)
 	if t.copies[seq] == 0 {
 		t.first[seq] = u
-	} else {
-		t.extra++
-		if t.first[seq] == u {
-			t.sameUUID++
-		}
+	} else if t.first[seq] == u {
+		t.sameUUID++
 	}
-	if t.copies[seq] < 255 {
+	if t.copies[seq] < 0xFFFF {
 		t.copies[seq]++
 	}
 }
@@ -129,8 +123,12 @@ func (t *tally) allAcked(acked []uint64) bool {
 // MaxLostRanges bounds lost_seqs.
 const MaxLostRanges = 20
 
+// result is the count with the names and meanings of the SI (SPEC §8.5,
+// decision 6 of 2026-11-07): expected = the successes (acked), duplicated =
+// the copies past the first, unexpected = the records whose seq is not a
+// success (informative only).
 func (t *tally) result(acked []uint64, allowDup bool) *report.Verify {
-	v := &report.Verify{Expected: t.sent, ExtraCopies: t.extra, ExtraSameUUID: t.sameUUID, Unexpected: t.unexpected, EntriesRead: t.entries}
+	v := &report.Verify{DuplicatedSameUUID: t.sameUUID, Unexpected: t.beyond, EntriesRead: t.entries}
 	var lo, hi uint64 // the open range of lost seqs
 	closeRange := func() {
 		if lo == 0 || len(v.LostSeqs) >= MaxLostRanges {
@@ -143,12 +141,13 @@ func (t *tally) result(acked []uint64, allowDup bool) *report.Verify {
 		v.LostSeqs = append(v.LostSeqs, r)
 	}
 	for s := uint64(1); s <= t.sent; s++ {
-		a, n := isAcked(acked, s), t.copies[s]
-		if a {
-			v.Acked++
-		}
+		a, n := isAcked(acked, s), uint64(t.copies[s])
 		switch {
-		case n == 0 && a:
+		case a && n > 0:
+			v.Expected++
+			v.Found++
+		case a:
+			v.Expected++
 			v.Lost++
 			if lo != 0 && hi == s-1 {
 				hi = s
@@ -158,14 +157,11 @@ func (t *tally) result(acked []uint64, allowDup bool) *report.Verify {
 			}
 		case n == 0:
 			v.MissingUnacked++
-		case !a:
-			v.FoundUnacked++
-		}
-		if n > 0 {
-			v.Found++
+		default:
+			v.Unexpected += n
 		}
 		if n > 1 {
-			v.Duplicated++
+			v.Duplicated += n - 1
 		}
 	}
 	closeRange()
@@ -173,10 +169,15 @@ func (t *tally) result(acked []uint64, allowDup bool) *report.Verify {
 	return v
 }
 
+// openReader opens the reader of a check (a variable for the tests).
+var openReader = open
+
 // Check reads the destination until every acknowledged message of the run
 // is there and nothing new appeared for Settle, or until Timeout (SPEC
 // §8.5). sent is the number of seqs the producer released (1..sent); acked
-// the bitmap of the acknowledged ones.
+// the bitmap of the acknowledged ones. A read error is retried until the
+// deadline; when the last read failed, the count is not the destination's:
+// Unreadable (exit 4).
 func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint64, o Options) *report.Verify {
 	if o.Poll <= 0 {
 		o.Poll = 250 * time.Millisecond
@@ -191,30 +192,33 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 	tl := newTally(sent)
 	var r reader
 	var lastErr error
-	readOK, complete := false, false
+	lastOK, complete := false, false
 	lastNew := start
 	var lastMatched uint64
 	for {
 		if r == nil {
 			var err error
-			if r, err = open(ctx, t, o.Since, o.Run, false); err != nil {
-				r, lastErr = nil, err
+			if r, err = openReader(ctx, t, o.Since, o.Run, false); err != nil {
+				r, lastErr, lastOK = nil, err, false
 			}
 		}
 		if r != nil {
+			into := tl
 			if !r.Incremental() {
-				tl.reset()
+				// A full read counts afresh, and replaces the count only
+				// when it ends: one cut short left a false "lost"
+				// (review finding 5 of 2026-11-07).
+				into = newTally(sent)
 			}
 			before := lastMatched
-			if err := r.Read(ctx, func(e Entry) { tl.add(m, e) }); err != nil {
-				lastErr = err
+			if err := r.Read(ctx, func(e Entry) { into.add(m, e) }); err != nil {
+				lastErr, lastOK = err, false
 				if !r.Incremental() {
-					// A full read cut short is not a count: restart it.
 					r.Close()
 					r = nil
 				}
 			} else {
-				readOK, lastErr = true, nil
+				tl, lastOK, lastErr = into, true, nil
 			}
 			// Incremental readers count up; a full one recounts: either
 			// way, a different total means something new arrived.
@@ -222,7 +226,7 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 				lastNew = time.Now()
 			}
 		}
-		if readOK && tl.allAcked(acked) && time.Since(lastNew) >= o.Settle {
+		if lastOK && tl.allAcked(acked) && time.Since(lastNew) >= o.Settle {
 			complete = true
 			break
 		}
@@ -244,7 +248,7 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 	v.Destination = t.Display
 	v.Complete = complete
 	v.WaitedSec = time.Since(start).Seconds()
-	if !readOK {
+	if !lastOK {
 		v.OK = false
 		v.Unreadable = true
 		if lastErr != nil {
@@ -252,8 +256,6 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 		} else {
 			v.Error = "the destination was not read within --verify-timeout"
 		}
-	} else if lastErr != nil {
-		v.Error = lastErr.Error()
 	}
 	return v
 }

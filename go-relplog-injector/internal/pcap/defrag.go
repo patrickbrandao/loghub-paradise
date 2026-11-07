@@ -45,9 +45,40 @@ type fragDgram struct {
 
 type defrag struct {
 	open map[fragKey]*fragDgram
+	// done remembers the datagrams completed in the last DedupWindow, with
+	// their fragments: a late -i any copy of one of them (same key, no NAT)
+	// is a copy, not the first fragment of an orphan that expires as lost
+	// (SPEC §6.3, review finding 9 of 2026-11-07).
+	done map[fragKey]*doneDgram
 }
 
-func newDefrag() *defrag { return &defrag{open: make(map[fragKey]*fragDgram)} }
+type doneDgram struct {
+	at    time.Time
+	parts [][2]int // offset, length
+}
+
+func newDefrag() *defrag {
+	return &defrag{open: make(map[fragKey]*fragDgram), done: make(map[fragKey]*doneDgram)}
+}
+
+// lateCopy reports whether a fragment of no open datagram repeats one of a
+// datagram k completed within DedupWindow; one that does not means a new
+// datagram on the key, which forgets the old one.
+func (d *defrag) lateCopy(k fragKey, off, n int, ts time.Time) bool {
+	g := d.done[k]
+	if g == nil {
+		return false
+	}
+	if ts.Sub(g.at) <= DedupWindow && g.at.Sub(ts) <= DedupWindow {
+		for _, p := range g.parts {
+			if p[0] == off && p[1] == n {
+				return true
+			}
+		}
+	}
+	delete(d.done, k)
+	return false
+}
 
 // add stores one fragment. done is true when the datagram is complete; lost is
 // the number of fragments dropped by this call (expired datagrams, overlaps,
@@ -56,6 +87,9 @@ func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (
 	lost += d.expire(ts)
 	g := d.open[k]
 	if g == nil {
+		if d.lateCopy(k, off, len(data), ts) {
+			return nil, false, lost
+		}
 		if len(d.open) >= maxFragDatagrams {
 			return nil, false, lost + 1
 		}
@@ -111,6 +145,13 @@ func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (
 	if end != g.total {
 		return nil, false, lost + len(g.parts)
 	}
+	if len(d.done) < maxFragDatagrams {
+		dd := &doneDgram{at: ts, parts: make([][2]int, len(g.parts))}
+		for i, p := range g.parts {
+			dd.parts[i] = [2]int{p.off, len(p.data)}
+		}
+		d.done[k] = dd
+	}
 	return buf, true, lost
 }
 
@@ -142,6 +183,7 @@ func (d *defrag) flush() int {
 		lost += len(g.parts)
 		delete(d.open, k)
 	}
+	clear(d.done)
 	return lost
 }
 
@@ -151,6 +193,11 @@ func (d *defrag) expire(now time.Time) int {
 		if now.Sub(g.first) > FragTimeout {
 			lost += len(g.parts)
 			delete(d.open, k)
+		}
+	}
+	for k, g := range d.done {
+		if now.Sub(g.at) > DedupWindow {
+			delete(d.done, k)
 		}
 	}
 	return lost

@@ -54,6 +54,22 @@ regra: a mutação indicada (a correção removida) o derruba — conferido.
 | `TestVantage` (pcap) | §6.8: SLL2 com o tipo do pacote (o loopback, enviado e recebido na mesma interface), SLL, pcapng | tirar o tipo do SLL2 |
 | `TestNATSStartsAfterLast`, `TestRedisStartsAfterLast` (verify; opt-in `RI_TEST_VERIFY_NATS`, `RI_TEST_VERIFY_REDIS` com Redis e Valkey) | §8.5: o que já estava no stream na sonda não é lido; o stream que nasce depois é lido inteiro; 1500 mensagens em mais de um `Fetch` | partir da sequência 1 ou do `-`; a sonda não anotar o ponto |
 
+Revisão independente dos injetores (2026-11-07; SPEC §9 item 9), cada teste
+conferido por mutação (a correção tirada, o teste falha):
+
+| Teste | Regra | Mutação que ele pega |
+|---|---|---|
+| `TestFlowsIdleLaneGivesSlot` (sched) | §6.9: com 1 vaga, a sessão ociosa do fluxo 1 cede a vaga quando o fluxo 2 passa a esperar | bloquear na fila sem olhar o aviso (trava; o teste falha em 15 s) |
+| `TestPcapPerFlow` (app, estendido) | §6.9: `--proxy-src`/`--proxy-dst` com `--pcap-flows` → 2 | aceitar |
+| `TestFragmentLateCopy`, `TestSnaplenUDPDatagramIsLostFrame`, `TestTCPPendingBoundCountsEverySegment`, `TestTCPDrainManySegments` (pcap; `review_test.go`, o mesmo arquivo do SI) | §6.3, §6.4: cópia tardia de fragmento; UDP condenado contado; teto com custo por segmento; drenagem de 30 000 segmentos em ordem inversa | não lembrar o datagrama completado; custo 0 por segmento (a reordenação a cada retirada foi medida no SI: 59 s) |
+| `TestParseURLLists`, `TestClean` (verify), `TestVerifyUsage`, `TestVerifyUnreachableList` (app) | §8.5: cada elemento da lista NATS analisado, parâmetros em qualquer um, uma vez; `*url.Error` nunca repassado; segredos apagados no stderr e no relatório; destino com todos os hosts | analisar só o 1º elemento; repassar o `*url.Error`; não anotar os segredos |
+| `TestSetCA` (verify) | §8.5: `--verify-tls-ca` só com TLS, com PEM, e não junto do `ca=` | aceitar os dois |
+| `TestCheckExtraRead` (verify) | §8.5: a calma de 1 s depois de completo vê a cópia que chega logo atrás | completar sem a calma |
+| `TestCheckFreshTally` (verify) | §8.5: leitura inteira que falha no meio não troca a conta; última leitura com erro → `unreadable` (4); erro repetido até dar certo | zerar antes de ler (o defeito: `lost 2`); não marcar `unreadable` |
+| `TestTally`, `TestTallyCopiesAndRecords` (verify) | §8.5: os campos do SI — `expected` = confirmadas, `duplicated` = cópias a mais, `unexpected` = registros não confirmados | contar `seq` em vez de cópias e de registros |
+| `TestVerifySQLiteReusedRun` (app) | §8.5: o SQLite é lido depois do `max(rowid)` da sonda; uma execução repetida com o sink perdendo tudo dá `lost 20`, saída 1 | ler desde o `rowid` 0 (passava com saída 0) |
+| `TestNATSFacilitySeverity`, `TestNATSForeignTraffic`, `TestPostgresRunPresent` (verify; opt-in `RI_TEST_VERIFY_NATS`, `RI_TEST_VERIFY_PG`) | §8.5: publicação abaixo de `.syslog.>`; leitura que termina sob tráfego alheio; `--run` já presente no PostgreSQL → `ErrRunPresent` | **não rodados nesta rodada**: o disco do host encheu e a VM do Docker ficou somente leitura no meio da rodada. Os testes equivalentes do SI rodaram contra NATS e PostgreSQL reais, com as mesmas mutações mortas; o leitor NATS do RI tem a mesma regra |
+
 A regra de pular as sequências do stream NATS já contadas (consumidor
 ordenado que se recria) não tem teste que a trave: exige um NATS real e a
 recriação do consumidor no meio da leitura. Está provada só pela ausência de

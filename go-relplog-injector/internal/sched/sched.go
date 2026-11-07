@@ -68,7 +68,7 @@ type Plan struct {
 	// (librelp retransmits without limit; 0 = never retransmit).
 	Retries int
 	// PerFlow gives each original flow of the source its own session
-	// (--pcap-per-flow, SPEC §6.9), at most Workers open at a time, dialed
+	// (--pcap-flows, SPEC §6.9), at most Workers open at a time, dialed
 	// by FlowDial (the dialer given to Run when nil).
 	PerFlow  bool
 	FlowDial FlowDialer
@@ -216,10 +216,19 @@ func produce(ctx context.Context, p Plan, src source.Source, route func(*source.
 // answer (SPEC §8.2).
 const Unanswered = "unanswered"
 
-// worker owns one session at a time. idle, when set, is asked when the
-// worker has nothing queued: true closes the session to give its slot away
-// (PerFlow, SPEC §6.9).
-func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard, rep *report.Report, p Plan, idle func() bool) {
+// idler is the slots of PerFlow, as a worker sees them (SPEC §6.9).
+type idler interface {
+	// contended: a lane waits for a slot.
+	contended() bool
+	// wake is closed when a lane starts waiting; take it before asking
+	// contended.
+	wake() <-chan struct{}
+}
+
+// worker owns one session at a time. idle, when set (PerFlow, SPEC §6.9),
+// is watched while the worker has nothing queued: a lane waiting for a slot
+// closes the session to give the slot away.
+func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard, rep *report.Report, p Plan, idle idler) {
 	var c Conn
 	var retry []*Msg      // unanswered messages, resent first and in order
 	var closeBy time.Time // zero: a Close gets the whole --drain-timeout
@@ -313,12 +322,24 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 					closeConn(err, false)
 					continue
 				}
-				if idle != nil && idle() {
-					closeConn(nil, false)
-					continue
-				}
 			}
-			j, ok = <-jobs
+			if c == nil || idle == nil {
+				j, ok = <-jobs
+				break
+			}
+			// Idle with a session: wait for the queue, or for a lane that
+			// needs the slot (wake taken before contended, so a wait that
+			// starts in between closes the channel we hold).
+			w := idle.wake()
+			if idle.contended() {
+				closeConn(nil, false)
+				continue
+			}
+			select {
+			case j, ok = <-jobs:
+			case <-w:
+				continue // look again: the queue, or give the slot away
+			}
 		}
 		if !ok {
 			break
