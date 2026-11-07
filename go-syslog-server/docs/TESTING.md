@@ -247,8 +247,10 @@ docker rm -f t-sn
 `-p 1`: os dois pacotes fazem `SENTINEL FAILOVER` na mesma topologia, e um
 failover no meio do outro teste perderia o que a réplica ainda não tinha. Os
 testes esperam a réplica alcançar o offset do primário antes do failover (o
-`SENTINEL FAILOVER` não espera) e provam boot, escrita, política, failover e
-escrita depois sem perda.
+`SENTINEL FAILOVER` não espera) e, depois dele, o primário antigo virar
+réplica (até lá ele ainda aceita escritas e as perde ao ressincronizar: é a
+replicação assíncrona do Redis/Valkey, não este servidor; ~10 s), e provam
+boot, escrita, política, failover e escrita depois sem perda.
 
 **Cluster com `db != 0`** (opt-in). Um nó, anunciando `127.0.0.1` na porta
 mapeada igual:
@@ -257,7 +259,7 @@ mapeada igual:
 docker run -d --name t-cl -p 127.0.0.1:26390:26390 valkey/valkey:9.0-alpine \
   valkey-server --port 26390 --cluster-enabled yes --cluster-announce-ip 127.0.0.1
 docker exec t-cl valkey-cli -p 26390 CLUSTER ADDSLOTSRANGE 0 16383
-SYSLOG_TEST_REDIS_CLUSTER_ADDR=127.0.0.1:26390 go test -race -count=1 -run ClusterDB ./internal/rediscli/
+SYSLOG_TEST_REDIS_CLUSTER_ADDR=127.0.0.1:26390 go test -race -count=1 -run Cluster ./internal/rediscli/ ./internal/sink/ ./internal/ring/
 # Valkey 9 com --cluster-databases 16: db=1 grava
 #   ... valkey-server ... --cluster-databases 16
 #   SYSLOG_TEST_REDIS_CLUSTER_ADDR=... SYSLOG_TEST_REDIS_CLUSTER_DBS=16 go test ...
@@ -266,7 +268,10 @@ docker rm -f t-cl
 
 Redis 7.4 e Valkey 7.2/8.1 respondem `SELECT is not allowed in cluster mode`,
 Valkey 9 sem `cluster-databases` responde `DB index is out of range`: FATAL em
-milissegundos, com a dica de `cluster-databases`.
+milissegundos, com a dica de `cluster-databases`. Os testes de `sink` e `ring`
+no mesmo cluster usam `db=0` e provam sonda, releitura da política (um `Do` à
+parte num cluster: o rueidis entra em pânico num pipeline que mistura comando
+sem chave com comandos de chave) e escrita.
 
 ### 6.2 PostgreSQL (`loghub.inbox`)
 

@@ -2168,7 +2168,20 @@ logs, métricas, `--dump-config`). Vale para o sink e para o ring Redis (§9.5).
   rueidis chega sem ele.
 - **Sentinel:** `sentinel_master` funciona com `redis-sentinel` e
   `valkey-sentinel` (failover com escrita depois sem perda, provado nas quatro
-  versões; teste opt-in, `docs/TESTING.md` §6.1a).
+  versões; teste opt-in, `docs/TESTING.md` §6.1a). **A replicação é
+  assíncrona:** entre a promoção da réplica e o rebaixamento do primário
+  antigo, este ainda aceita escritas (e responde `OK` ao `XADD` e ao script do
+  ring), que ele descarta ao ressincronizar do novo primário. Não é um erro que
+  este servidor veja nem possa reverter: quem precisa fechar a janela configura
+  no Redis/Valkey `min-replicas-to-write 1` (com `min-replicas-max-lag`), que
+  faz o primário isolado recusar escrita (`NOREPLICAS`, retentado como
+  `network`) em vez de aceitá-la para perder.
+- **Cluster e pipeline:** o cliente de cluster do rueidis entra em pânico
+  ("Mixing no-slot and cross slot commands") num `DoMulti` que mistura comando
+  sem chave (`INFO`, `CONFIG GET`) com comandos de chave em slots diferentes.
+  Num cluster a releitura da política é um `Do` à parte (uma ida e volta a
+  mais); standalone e Sentinel mantêm um pipeline só. Achado da rodada de W/F
+  de 2026-11-07, provado aqui por um teste opt-in de cluster com `db=0`.
 - **Compose:** cada `compose.*redis*.yml` tem um irmão Valkey
   (`compose.<ring>-valkey.yml`, `compose.valkey-nats.yml`,
   `compose.valkey-postgres.yml`) com `SYSLOG_VALKEY_IMAGE` (padrão

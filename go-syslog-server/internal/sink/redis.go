@@ -230,7 +230,8 @@ func (r *Redis) Health(ctx context.Context) error {
 	// The policy reading rides in the same pipeline: one round trip, the
 	// one sink.health_timeout bounds.
 	pcmd, readPolicy := r.policy.Cmd(client)
-	if readPolicy {
+	inline := readPolicy && rediscli.Inline(client) // never on a cluster
+	if inline {
 		cmds = append(cmds, pcmd)
 	}
 	ops := [2]string{"xlen", "writeprobe"}
@@ -254,7 +255,13 @@ func (r *Redis) Health(ctx context.Context) error {
 	if !readPolicy {
 		return nil
 	}
-	return r.checkEviction(ctx, client, resps[2])
+	presp := rueidis.RedisResult{}
+	if inline {
+		presp = resps[2]
+	} else {
+		presp = client.Do(ctx, pcmd)
+	}
+	return r.checkEviction(ctx, client, presp)
 }
 
 // checkEviction refuses a server whose maxmemory-policy is allkeys-* (SPEC

@@ -159,6 +159,7 @@ func sentinelFailover(t *testing.T, ctx context.Context, sentinel, master string
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Logf("failover %s -> %s", old, addr())
+	waitDemoted(t, ctx, old)
 	return old
 }
 
@@ -180,4 +181,28 @@ func replicaCaughtUp(info string) bool {
 		}
 	}
 	return false
+}
+
+// waitDemoted waits until the old primary reports role:slave. Between the
+// promotion and that moment the old primary still accepts writes, and loses
+// them when it resyncs from the new one: Redis/Valkey asynchronous
+// replication, not this server. Writing "after the failover" means after it.
+func waitDemoted(t *testing.T, ctx context.Context, addr string) {
+	t.Helper()
+	c, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{addr},
+		DisableCache: true, ForceSingleClient: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for {
+		info, err := c.Do(ctx, c.B().Info().Section("replication").Build()).ToString()
+		if err == nil && strings.Contains(info, "role:slave") {
+			return
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("the old primary %s was never demoted", addr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

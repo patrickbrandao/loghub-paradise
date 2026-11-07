@@ -154,6 +154,15 @@ func (w *PolicyWatch) Cmd(c rueidis.Client) (rueidis.Completed, bool) {
 	return rueidis.Completed{}, false
 }
 
+// Inline reports whether the policy command may ride in the probe's
+// pipeline. Not on a Redis Cluster: rueidis's cluster client panics ("Mixing
+// no-slot and cross slot commands") on a DoMulti that mixes a keyless command
+// (INFO, CONFIG GET) with keyed ones (XLEN, XADD, GET) -- found by the
+// go-webhook-server round of 2026-11-07, where every cluster crashed the
+// probe, db 0 included. There the reading is a Do of its own, one round trip
+// more; standalone and Sentinel keep one pipeline.
+func Inline(c rueidis.Client) bool { return c.Mode() != rueidis.ClientModeCluster }
+
 // Judge reads the reply of Cmd. It returns what CheckEviction returns: nil,
 // an ErrEvictionPolicy error (fatal), an ErrPolicyUnknown error (WARN, see
 // FirstUnknown), or another error (the connection, a transient reply). When

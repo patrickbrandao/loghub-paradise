@@ -1145,7 +1145,8 @@ func (r *RedisRing) RefreshStats(ctx context.Context) error {
 	// changes it on a live server, and under allkeys-* the stream is evicted
 	// whole with the ring UP. One round trip still.
 	pcmd, readPolicy := r.policy.Cmd(r.client)
-	if readPolicy {
+	inline := readPolicy && rediscli.Inline(r.client) // never on a cluster
+	if inline {
 		cmds = append(cmds, pcmd)
 	}
 	resps := r.client.DoMulti(ctx, cmds...)
@@ -1169,7 +1170,13 @@ func (r *RedisRing) RefreshStats(ctx context.Context) error {
 		return err
 	}
 	if readPolicy {
-		if err := r.judgePolicy(ctx, resps[3]); err != nil {
+		presp := rueidis.RedisResult{}
+		if inline {
+			presp = resps[3]
+		} else {
+			presp = r.client.Do(ctx, pcmd)
+		}
+		if err := r.judgePolicy(ctx, presp); err != nil {
 			r.down.Store(true)
 			return err
 		}
