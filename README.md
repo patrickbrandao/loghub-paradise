@@ -55,6 +55,17 @@ não tem TLS e faz o dump de emergência em JSON Lines. O
 `go-syslog-standard-server` é o servidor syslog antigo, anterior ao LogHub.
 Fica no repositório como referência de código, não como produto.
 
+**Redis e Valkey.** Onde aparece `redis` (sink, ring), o servidor fala com
+**Redis 7.4 e Valkey 7.2, 8.1 e 9.0** no mesmo nível: as suítes de integração
+rodam contra os quatro (`scripts/test-redis-valkey.sh`), com Sentinel e
+cluster em testes opt-in. `redis` continua o nome canônico (designa o
+protocolo) e `valkey` é alias exato em todo lugar: `sink.type=valkey`,
+`ring.mode=valkey`, `[sink.valkey]`/`[ring.valkey]`, `--sink.valkey.*`,
+`<PREFIXO>_SINK_VALKEY_*` e, na `LOGHUB_EB_URL`, `valkey://`/`valkeys://`. O
+mesmo valor pelos dois nomes passa; valores diferentes são erro. Cada
+`docker/` tem compose `*-valkey.yml` próprios (`valkey-server`, sem root).
+Detalhes em `docs/SPEC.md` de cada módulo (S/R/G §10.3.1, W/F §8.2.6).
+
 ### Ferramentas cliente (injetores)
 
 | Módulo | Fala com | Transportes | Conteúdo |
@@ -66,9 +77,15 @@ Fica no repositório como referência de código, não como produto.
 
 Os injetores servem para teste funcional e de carga. Aceitam `--count`,
 `--duration`, `--rate` e `--concurrency`. Ao fim imprimem um relatório (texto
-ou JSON) com desfechos, vazão e latência. O código de saída diz o resultado:
-`0` ok, `1` alguma falha, `2` uso, `3` alvo inalcançável, `130` interrompido.
-Não têm dependência fora da biblioteca padrão.
+ou JSON) com desfechos, vazão e latência. Com `--verify-url` (nats, tls,
+postgres, redis/rediss, valkey/valkeys) ou `--verify-sqlite`, conferem no
+destino que cada mensagem aceita foi gravada uma vez (perdidas e duplicadas
+pelo `seq` da execução). O código de saída diz o resultado: `0` ok, `1` alguma
+falha (inclusive perda ou duplicata no destino), `2` uso, `3` alvo
+inalcançável, `4` conferência impossível (destino inalcançável ou ilegível;
+nada é enviado), `130` interrompido. O envio e o pcap só usam a biblioteca
+padrão; a conferência usa os mesmos clientes e versões dos servidores (e o WI
+usa `x/net/http2` para o replay de h2c).
 
 ### Que injetor usar com cada servidor
 
@@ -487,7 +504,7 @@ flowchart LR
 
 ### 3.28 Sink redis: Redis Streams
 
-Uma fila no Redis (`XADD`). Padrão da família webhook.
+Uma fila no Redis ou no Valkey (`XADD`). Padrão da família webhook.
 
 ```mermaid
 flowchart LR

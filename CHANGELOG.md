@@ -20,6 +20,114 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-11-07 — Valkey ao lado do Redis; todas as pendências conhecidas fechadas
+
+Pedido: Valkey suportado no mesmo nível do Redis em todo lugar onde o Redis
+aparece, com alias `valkey` em URLs e variáveis, e uma rodada sobre **todas** as
+"Pendências conhecidas" das SPECs. Levantamento antes do código: as suítes Redis
+existentes passaram sem mudança contra Valkey 7.2.15, 8.1.11 e 9.0.7 (as mesmas
+contagens do Redis 7.4.12), Sentinel com failover também; as diferenças eram de
+borda, de compose e de docs. Entrevista: escopo = todas as pendências dos 18
+módulos; alias completo (URL, valores, INI, flags, ambiente); mesma chave pelos
+dois nomes é erro só com valores diferentes; standard com paridade completa e
+renome; GELF "medir e corrigir"; os quatro grupos de pendências dos injetores;
+compose Valkey em arquivos próprios; Valkey 7.2, 8.1 e 9.0 declarados; commit,
+push e release. Oito agentes por área, cada um numa worktree, depois seis
+revisões independentes só leitura e uma rodada de correção por área.
+
+**Valkey (S, R, G, W, F, STD; cortes recusam as variantes).**
+- Decisão: `redis` segue canônico (o protocolo); `valkey` é alias exato:
+  `sink.type`/`ring.mode=valkey`, `[sink.valkey]`/`[ring.valkey]`,
+  `--sink.valkey.*`, `<PREFIXO>_SINK_VALKEY_*`, `valkey://`/`valkeys://` (TLS).
+  Dump, logs e métricas só canônicos. O conflito compara o último valor de cada
+  grafia no fim de cada fonte (a 1ª versão comparava a cada atribuição e recusava
+  `--sink.valkey.db=1 --sink.redis.db=2 --sink.valkey.db=2`).
+- **Bug (W/F, antigo):** a sonda de saúde dava *panic* do rueidis contra
+  **qualquer** Redis Cluster: um `DoMulti` misturava o `INFO` (sem chave) com
+  `XLEN`/`XADD` de slots diferentes. O panic só existe com chaves de slots
+  diferentes; um comando sem chave junto de comandos de **um** slot vai ao
+  primário desse slot — e é assim que a política e a identidade passam a ser
+  lidas no primário do stream (antes iam a um nó qualquer, réplica inclusive).
+  Travado sem servidor por um cliente falso em modo cluster.
+- **Correção (S/R/G):** política `allkeys-*` em execução deixava o ring Redis
+  "indisponível" só no `/readyz` (piscando): o `Enqueue` seguia gravando. Agora
+  `policyBad` recusa o `Enqueue` até uma leitura boa; o dreno (`Commit`) segue,
+  porque cada entrada apagada é uma a menos para o despejo levar. S/R/G também
+  passam a reler a política em toda sonda, como W/F.
+- Correção: cluster com `db != 0` (`SELECT is not allowed in cluster mode`,
+  `DB index is out of range`) era retentado até `boot_timeout`; agora FATAL na
+  hora com a dica de `cluster-databases` (Valkey 9 aceita bancos em cluster).
+  Ring sem Lua é FATAL. O boot loga `server`/`server_version`
+  (`valkey_version` — o Valkey reporta `redis_version:7.2.4` fixo; nunca decidir
+  recurso por ele).
+- Correção: trocar a imagem do compose para Valkey rodava o servidor como
+  **root** (`command: redis-server` não passa pelo rebaixamento do entrypoint do
+  Valkey). Compose `*-valkey.yml` próprios com `valkey-server`.
+- Novo: `scripts/test-redis-valkey.sh` (matriz S/R/G/W/F × Redis 7.4 e Valkey
+  7.2/8.1/9.0, com o gêmeo `allkeys-lru`); testes opt-in de Sentinel e cluster.
+- Lição: o erro de handshake do `NewClient` do rueidis chega sem o `ERR `;
+  case o texto. Lição: no failover do Sentinel o primário antigo aceita e perde
+  escritas até ser rebaixado (replicação assíncrona); teste escreve depois do
+  rebaixamento, e quem precisa fechar a janela usa `min-replicas-to-write`.
+- Erros de configuração nunca citam o valor (inteiros, enums, endereços,
+  nomes de banco/tabela, CIDR) em S, R, G, W, F, STD e cortes.
+
+**go-syslog-standard-server (STD).** As 15 pendências de §21.1 fechadas,
+portadas de S/R/W: custo fixo por conexão de ~128 KiB para 4 KiB; cópias RELP
+em voo sob `relp.inflight_max_bytes` (64 MiB), cobradas pelo `DATALEN` antes do
+payload e em fila FIFO (a 1ª versão cobrava depois de ler o frame — porte do R,
+que tinha o mesmo defeito e também foi corrigido, com RP/RN); credencial em
+`sink.nats.urls` redigida; sem eco de segredo; coluna `NOT NULL` extra recusada
+no boot; validação com prazo próprio; ambiente `PG*` escondido; nome do banco
+MySQL validado; política Redis; gauges de emergência recontados em fluxo (a 1ª
+versão decodificava o dump inteiro de novo); perda do 2º sinal contada; sonda
+sqlite com prazo; um `boot_timeout` só; `syslog_conns_refused_total`. Decisão:
+renome para `go-syslog-standard-server`/`slstd-*` (imagem `SLSTD_IMAGE`,
+dumps `slstd-emg-*`), sem colisão com o S.
+
+**Família GELF (G, GP, GN).** Correção: falhas de handshake HTTPS contadas em
+`gelf_tls_handshake_errors_total{transport="https"}` (a métrica ganhou o rótulo
+`transport`), sem contar a recusa do PROXY (achado da revisão). Medida: o mapa
+da remontagem UDP sob um mutex só segurava 4–8 listeners na vazão de 1–2; virou
+64 shards com tetos globais por CAS (~2× com 8 listeners; empate com 1, o hash
+custa 12–16 ns). A validação dupla com filtro custa ~20–25 % de CPU por
+documento: fica. Quatro pendências que eram decisões saíram da lista.
+Lição: gauge lido sob o mesmo mutex a cada chunk dobrava as aquisições.
+
+**Injetores (SI, RI, WI, GI).** Conferência no destino (`--verify-url`
+nats/tls/postgres/redis(s)/valkey(s), `--verify-sqlite`, `--verify-tls-ca`):
+perdidas e duplicadas pelo `seq`/`uuid` da execução; o destino é aberto antes do
+envio e, inalcançável, dá a nova saída **4** sem enviar nada; `--run` já presente
+no destino é recusado (2). Provado contra os servidores reais (NATS, PG 18,
+Redis 7.4, Valkey 8.1, SQLite e os cortes) e pegou 3019 confirmadas perdidas
+num SIGKILL com `ring=memory`. Replay: `--pcap-dedup` (cópias do `-i any` só de
+outro ponto de captura), `--pcap-flows` (uma conexão por fluxo, PROXY da
+origem), fragmento cortado pelo snaplen contado, último quadro de conexão
+fechada, ressincronização com candidato acima de 64 KiB e custo linear. WI:
+replay de h2c (`x/net/http2`), ordem dos cabeçalhos, chunked incremental,
+`Retry-After` entre conexões, adaptação a servidor sem keep-alive. GI:
+`--http-chunked`, adaptação a servidor que fecha, fragmentos IP provados numa
+captura real; HTTP/2 não (o G não aceita). Bugs achados: o consumidor ordenado
+do nats.go relê do início a cada `FetchNoWait`; PKTAP lia o enlace de
+`pth_type_next` em vez de `pth_dlt`; `--retries` do WI recomeçava a cada conexão;
+o httpx quebrava um método longo em segmentos de 1 byte (fuzz). Revisão:
+facility-severity perdia tudo no SI; leitura NATS não terminava com tráfego
+alheio (SI/RI); senha vazava por erro de URL do nats.go (os quatro); `--pcap-flows`
+do RI travava com mais fluxos que o teto; o do WI/GI reordenava um fluxo e
+passava do teto; h2c do WI sem teto de CONTINUATION (quadrático: 40 000 quadros
+de 1 B = 30 s) nem de streams abertos; `429` perdido quando o servidor fechava a
+conexão ociosa (WI/GI); ressincronização HTTP do WI 64× mais lenta; GI não
+deduplicava as cópias TCP do `-i any`; remontagem TCP com ordenação por
+segmento (heap nos quatro); `--run` reutilizado passava com perda total
+(SI/RI/GI); campos do relatório alinhados ao SI; o desfragmentador IP do WI
+alinhado ao dos irmãos (snaplen, fim de passada, cópia tardia, `pth_dlt`).
+Decisão: a conferência usa as bibliotecas dos servidores; envio e pcap seguem
+só na biblioteca padrão.
+
+Lição da rodada: oito agentes em paralelo encheram o disco do host (cache de
+build do Go e Docker) e a VM do Docker ficou só leitura no meio dos testes ao
+vivo; conferir o espaço livre antes de uma rodada larga.
+
 ## 2026-10-31 — G, GP, GN, GI: família GELF; `--loop` em SI/RI/WI; fechamento de conexão no WI
 
 Pedido: versões GELF de todos os softwares de ingestão e injeção de syslog e
