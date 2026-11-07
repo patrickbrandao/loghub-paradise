@@ -61,12 +61,12 @@ func Validate(c *Config) (warnings []string, err error) {
 	// Any other value asks for a feature that is not here, and starting
 	// without it would be the silent surprise these checks exist to prevent.
 	if c.Ring.Mode != RingMemory {
-		return nil, fmt.Errorf("ring.mode: %q is not available: go-webhook-pg-server has only the "+
-			"memory ring (SPEC §0); use go-webhook-fast-server for sqlite or none", c.Ring.Mode)
+		return nil, fmt.Errorf("ring.mode: the value is not available: go-webhook-pg-server has only the " +
+			"memory ring (SPEC §0); use go-webhook-fast-server for sqlite or none")
 	}
 	if c.Sink.Type != SinkPostgresType {
-		return nil, fmt.Errorf("sink.type: %q is not available: go-webhook-pg-server writes only to "+
-			"PostgreSQL (SPEC §0); use go-webhook-fast-server for other destinations", c.Sink.Type)
+		return nil, fmt.Errorf("sink.type: the value is not available: go-webhook-pg-server writes only to " +
+			"PostgreSQL (SPEC §0); use go-webhook-fast-server for other destinations")
 	}
 	if c.RateLimit.Enabled {
 		return nil, fmt.Errorf("ratelimit.enabled=true: go-webhook-pg-server has no rate limiter " +
@@ -77,12 +77,12 @@ func Validate(c *Config) (warnings []string, err error) {
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
-		return nil, fmt.Errorf("log.level: %q is not one of debug, info, warn, error", c.Log.Level)
+		return nil, fmt.Errorf("log.level: the value is not one of debug, info, warn, error")
 	}
 	switch c.Log.Format {
 	case "json", "text":
 	default:
-		return nil, fmt.Errorf("log.format: %q is not one of json, text", c.Log.Format)
+		return nil, fmt.Errorf("log.format: the value is not one of json, text")
 	}
 
 	// --- ranges -------------------------------------------------------------
@@ -230,7 +230,7 @@ func Validate(c *Config) (warnings []string, err error) {
 		// error, and net.Listen then picked a random one -- with ":" on every
 		// interface, the exposure the empty bind was refused for (W 40).
 		if _, port, err := net.SplitHostPort(c.Admin.Bind); err != nil || !validPort(port) {
-			return nil, fmt.Errorf("admin.bind: %q is not host:port with a port 1..65535", c.Admin.Bind)
+			return nil, fmt.Errorf("admin.bind: the value is not host:port with a port 1..65535")
 		}
 	}
 
@@ -264,8 +264,8 @@ func validatePostgres(c *Config, warn func(string, ...any)) error {
 		return fmt.Errorf("sink.postgres.database: cannot be empty")
 	}
 	if !pgIdent.MatchString(pg.Table) {
-		return fmt.Errorf("sink.postgres.table: %q is not a plain identifier "+
-			"(name or schema.name; lowercase letters, digits and _; up to 63 chars each)", pg.Table)
+		return fmt.Errorf("sink.postgres.table: the value is not a plain identifier " +
+			"(name or schema.name; lowercase letters, digits and _; up to 63 chars each)")
 	}
 	if pg.TLSCA != "" && !pg.TLS {
 		// Someone who points at a CA believes TLS is on. Silently connecting
@@ -323,19 +323,19 @@ func validatePostgresAddr(addr string) error {
 		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
 		// which pgx then tries as a list: refused like "h1,h2" below.
 		if strings.ContainsAny(addr, ",\t ") {
-			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
-				"with no comma or blank", addr)
+			return fmt.Errorf("sink.postgres.addr: a socket directory names one server, " +
+				"with no comma or blank")
 		}
 		if err != nil {
 			return nil // a bare socket directory: port 5432
 		}
 		if !validPort(port) {
-			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
-				"must be 1..65535", addr)
+			return fmt.Errorf("sink.postgres.addr: the port after the socket directory " +
+				"must be 1..65535")
 		}
 	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
-		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
-			"1..65535) nor a unix socket directory starting with /", addr)
+		return fmt.Errorf("sink.postgres.addr: the value is neither host:port (one server, port " +
+			"1..65535) nor a unix socket directory starting with /")
 	}
 	return nil
 }
@@ -387,7 +387,7 @@ func MaxEventBytes(c *Config) int64 {
 // Addresses are unmapped first, so "::ffff:10.0.0.5" and "10.0.0.5" agree.
 func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(list))
-	for _, raw := range list {
+	for i, raw := range list {
 		s := strings.TrimSpace(raw)
 		if s == "" {
 			continue
@@ -395,7 +395,8 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		if strings.Contains(s, "/") {
 			p, err := netip.ParsePrefix(s)
 			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR %q: %w", raw, err)
+				// netip's error quotes the entry: not wrapped (SPEC §13.2).
+				return nil, fmt.Errorf("entry %d is not a valid CIDR", i+1)
 			}
 			// Masked() drops host bits so "10.0.0.5/24" behaves as "10.0.0.0/24"
 			// instead of never matching.
@@ -404,7 +405,7 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		}
 		a, err := netip.ParseAddr(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid address %q: %w", raw, err)
+			return nil, fmt.Errorf("entry %d is not a valid address or CIDR", i+1)
 		}
 		a = a.Unmap()
 		out = append(out, netip.PrefixFrom(a, a.BitLen()))

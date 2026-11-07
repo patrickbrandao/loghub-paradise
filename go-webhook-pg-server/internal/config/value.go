@@ -69,24 +69,24 @@ func parseBytes(s string) (int64, error) {
 			num := strings.TrimSpace(t[:len(t)-len(bs.suffix)])
 			n, err := strconv.ParseInt(num, 10, 64)
 			if err != nil {
-				return 0, fmt.Errorf("invalid byte size %q: %w", s, err)
+				return 0, fmt.Errorf("invalid byte size: the number before the unit is not an integer")
 			}
 			if n < 0 {
-				return 0, fmt.Errorf("invalid byte size %q: negative", s)
+				return 0, fmt.Errorf("invalid byte size: negative")
 			}
 			// Overflow guard: n*mult must stay in int64.
 			if bs.mult != 0 && n > (1<<62)/bs.mult {
-				return 0, fmt.Errorf("invalid byte size %q: overflow", s)
+				return 0, fmt.Errorf("invalid byte size: overflow")
 			}
 			return n * bs.mult, nil
 		}
 	}
 	n, err := strconv.ParseInt(t, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid byte size %q: want an integer or a KiB/MiB/GiB suffix", s)
+		return 0, fmt.Errorf("invalid byte size: want an integer or a KiB/MiB/GiB suffix")
 	}
 	if n < 0 {
-		return 0, fmt.Errorf("invalid byte size %q: negative", s)
+		return 0, fmt.Errorf("invalid byte size: negative")
 	}
 	return n, nil
 }
@@ -114,7 +114,7 @@ func parseBool(s string) (bool, error) {
 	case "0", "f", "false", "n", "no", "off":
 		return false, nil
 	}
-	return false, fmt.Errorf("invalid bool %q: want true/false, yes/no, on/off or 1/0", s)
+	return false, fmt.Errorf("invalid bool: want true/false, yes/no, on/off or 1/0")
 }
 
 // parseList splits on commas, trims each entry and drops empty ones, so
@@ -177,7 +177,7 @@ func setValue(kind Kind, ptr any, raw string) error {
 		}
 		v, err := strconv.Atoi(strings.TrimSpace(raw))
 		if err != nil {
-			return fmt.Errorf("invalid integer %q", raw)
+			return fmt.Errorf("invalid integer: want a decimal integer")
 		}
 		*p = v
 
@@ -188,7 +188,7 @@ func setValue(kind Kind, ptr any, raw string) error {
 		}
 		v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 		if err != nil {
-			return fmt.Errorf("invalid integer %q", raw)
+			return fmt.Errorf("invalid integer: want a decimal integer")
 		}
 		*p = v
 
@@ -199,7 +199,7 @@ func setValue(kind Kind, ptr any, raw string) error {
 		}
 		v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
 		if err != nil {
-			return fmt.Errorf("invalid number %q", raw)
+			return fmt.Errorf("invalid number: want a decimal number")
 		}
 		// ParseFloat accepts NaN and ±Inf, and NaN passes every range check
 		// (every comparison with it is false): ring.high_water=NaN never
@@ -207,7 +207,7 @@ func setValue(kind Kind, ptr any, raw string) error {
 		// (SPEC §13.5; port of go-webhook-server, W 24; the parser of the
 		// syslog family).
 		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return fmt.Errorf("invalid number %q: must be finite", raw)
+			return fmt.Errorf("invalid number: must be finite")
 		}
 		*p = v
 
@@ -218,10 +218,10 @@ func setValue(kind Kind, ptr any, raw string) error {
 		}
 		v, err := time.ParseDuration(strings.TrimSpace(raw))
 		if err != nil {
-			return fmt.Errorf("invalid duration %q: want a unit suffix such as 5s, 100ms or 1h", raw)
+			return fmt.Errorf("invalid duration: want a unit suffix such as 5s, 100ms or 1h")
 		}
 		if v < 0 {
-			return fmt.Errorf("invalid duration %q: negative", raw)
+			return fmt.Errorf("invalid duration: negative")
 		}
 		*p = v
 
