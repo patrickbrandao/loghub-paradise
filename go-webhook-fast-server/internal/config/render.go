@@ -52,6 +52,8 @@ Every parameter below has three equivalent spellings:
   ini         [sink.redis]
               addrs = 10.0.0.5:6379
 
+Valkey: [sink.valkey], --sink.valkey.* and WHS_SINK_VALKEY_* are aliases of [sink.redis], and sink.type=valkey is redis.
+
 Switches:
   --config FILE     read this ini file (also WHS_CONFIG)
   --dump-config     print the effective configuration and exit

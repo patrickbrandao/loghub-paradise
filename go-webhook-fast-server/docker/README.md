@@ -43,6 +43,40 @@ As vinte e uma combinações abaixo são todas as que o software suporta.
 
 ---
 
+## Redis e Valkey
+
+O destino `redis` fala o **protocolo** Redis e serve igual a Redis e a Valkey
+(`docs/SPEC.md` §8.2.6): Redis 7.4 e Valkey 7.2, 8.1 e 9.0 testados. Cada
+`compose.<ring>-redis.yml` tem um `compose.<ring>-valkey.yml` ao lado:
+
+```bash
+docker compose -f compose.memory-valkey.yml up -d --build
+docker compose -f compose.sqlite-valkey.yml up -d --build
+docker compose -f compose.none-valkey.yml up -d --build
+```
+
+- imagem `${WHS_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}` (no `.env.example`);
+- `command: valkey-server …`: só com esse primeiro argumento o *entrypoint*
+  da imagem rebaixa o privilégio para o usuário `valkey` e ajusta o dono de
+  `/data` — apontar o `WHS_REDIS_IMAGE` de um compose Redis para uma imagem
+  Valkey funciona (a imagem tem `redis-server` e `redis-cli` como *symlinks*),
+  mas o servidor roda como `root`;
+- healthcheck `valkey-cli ping`;
+- projeto, contêineres e volume próprios (`whf-<ring>-valkey`,
+  `whf-<ring>-valkey-valkey`, `valkey-data`) e portas padrão próprias
+  (HTTP 8101–8103, admin 9131–9133, Valkey 6390–6392 com `WHS_VALKEY_PORT`),
+  para subir ao lado da variante Redis;
+- o servidor recebe `WHS_SINK_TYPE: valkey` (alias de `redis`: o dump e os
+  logs mostram `redis`) e as mesmas `WHS_SINK_REDIS_*` do `.env`.
+
+O log `sink ready` diz contra o quê o servidor conectou (`server=valkey
+server_version=8.1.11`, do `INFO server`). Sentinel (`valkey-sentinel`)
+funciona igual ao do Redis; em cluster, `sink.redis.db` diferente de 0 só
+existe num Valkey 9 com `cluster-databases` — nos outros o boot sai com 3 na
+hora, explicando.
+
+---
+
 ## As combinações
 
 `compose.<ring>-<sink>.yml`

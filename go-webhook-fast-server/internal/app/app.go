@@ -525,8 +525,13 @@ func (a *App) buildSink(ctx context.Context) int {
 			cancel()
 			if err == nil {
 				a.sink = s
+				// Which server answered, by INFO server and never by
+				// redis_version alone (SPEC §8.2.6): the first question of an
+				// incident is whether it is Redis 7.4 or Valkey 8.1.
+				server, version := s.Identity()
 				a.log.Info("sink ready", "type", "redis",
-					"addrs", a.cfg.SinkRedis.Addrs, "stream", a.cfg.SinkRedis.Stream)
+					"addrs", a.cfg.SinkRedis.Addrs, "stream", a.cfg.SinkRedis.Stream,
+					"server", server, "server_version", version)
 				return ExitOK
 			}
 			if sink.IsFatal(err) {
