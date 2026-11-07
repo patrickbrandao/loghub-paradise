@@ -2377,6 +2377,14 @@ momento: um arquivo deixado para trás (ilegível, ou com a remoção ou a
 quarentena falha) conta como um, e um alerta sobre `> 0` dispara. As mensagens
 de um arquivo ilegível são desconhecíveis e contam como zero.
 
+**A recontagem não decodifica o dump** (corrigido em 2026-11-07, revisão
+independente; porte do `countFile` do `go-syslog-server`). `Count` lê cada
+arquivo em fluxo: decodifica o cabeçalho de cada registro (a contagem é de
+mensagens que voltarão de fato) e **pula** a linha crua com `Discard`, sem
+alocá-la. Ler o dump inteiro com `Read` logo depois de escrevê-lo dobrava o pico
+de heap justamente no shutdown com backlog, e alargava a janela do abort de
+§12.3.
+
 ### 11.3 Falha do próprio dump
 
 Se o dump falhar (disco cheio, sem permissão, `emergency.enabled = false`): log
@@ -2562,7 +2570,10 @@ segundo sinal que chegava enquanto o dump era escrito lia o ring quase vazio e
 contava uma fração de uma perda que era o dump inteiro — o `exit 130` corta a
 escrita. Agora a fase 4 registra, sob uma trava, quantas mensagens recolheu e
 ainda não despejou, e o abort soma esse número ao que o ring ainda conta; o
-dump concluído (ou contado como `emergency_failed`) zera o registro. Um dump
+dump concluído (ou contado como `emergency_failed`) zera o registro. O zero vem
+**logo depois de o arquivo estar durável** (ou de a escrita falhar), antes da
+recontagem dos gauges de §11.2: um segundo sinal durante a recontagem não conta
+como perdido o que já está no disco. Um dump
 cortado pelo abort pode deixar um arquivo truncado, que o boot seguinte
 reingere até o último registro íntegro (§11.2): essas mensagens foram contadas
 como perdidas e voltam — erro para o lado de contar perda a mais, nunca a
@@ -3590,3 +3601,4 @@ correção, e um trecho portado leva a correção junto, não o defeito.
     `natsio/nats-box:0.20.0` nos três compose de NATS e no `.env.example`,
     conferido por `TestComposeNATSBoxIsPinned`; regra em §17.5.
 20. *Corrigido em 2026-11-07:* nomes próprios — imagem e binário `go-syslog-standard-server`, prefixo `slstd-` nos compose, `relp_software` e `--version` com o nome, dumps `slstd-emg-*` (os `emg-*` do go-syslog-server não são lidos); regra em §4.5, §11.1 e §17.5.
+21. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a recontagem dos gauges depois do dump lia o arquivo inteiro com `Read`; agora conta em fluxo, pulando o cru, e o registro do abort é zerado assim que o arquivo é durável, antes da recontagem; regra em §11.2 e §12.3.

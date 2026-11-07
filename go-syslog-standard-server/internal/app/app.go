@@ -175,6 +175,10 @@ type App struct {
 	// beforeDump, when set, runs right before the shutdown's emergency dump.
 	// It is nil in the binary; a test lands a second signal there.
 	beforeDump func()
+	// beforeRecount, when set, runs after the dump file is durable and right
+	// before the gauges are recounted. Nil in the binary; a test reads what
+	// an abort would count there.
+	beforeRecount func()
 
 	// abort replaces the OS signal channel that shutdown watches for a second
 	// interrupt. It is nil in the binary; the integration tests set it.

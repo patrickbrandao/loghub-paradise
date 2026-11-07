@@ -221,6 +221,14 @@ func (a *App) dumpEmergency(items []*envelope.Item) bool {
 		return false
 	}
 	path, err := a.emg.Write(items)
+	// The file is durable (or the write failed and is counted just below):
+	// either way these messages are no longer the abort's to count. Cleared
+	// HERE, before the gauge recount reads the directory, so a second signal
+	// during the recount does not count as lost what is already on disk
+	// (SPEC §12.3).
+	a.lossMu.Lock()
+	a.collected = 0
+	a.lossMu.Unlock()
 	if err != nil {
 		a.log.Error("EMERGENCY DUMP FAILED; these messages are lost",
 			"count", len(items), "dir", a.emg.Dir(), "error", err)
@@ -232,6 +240,9 @@ func (a *App) dumpEmergency(items []*envelope.Item) bool {
 		"count", len(items), "path", path)
 	// The dump adds to whatever an earlier boot left on disk: recounted, not
 	// set to this dump alone.
+	if a.beforeRecount != nil {
+		a.beforeRecount()
+	}
 	a.refreshEmergencyGauges()
 	return true
 }
