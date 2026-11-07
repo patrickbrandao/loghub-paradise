@@ -16,6 +16,7 @@ docker compose -f compose.sqlite-postgres.yml up -d --build
 | `compose.sqlite-{...}.yml` | `ring.db` com `fsync` | o do nome |
 | `compose.none-{...}.yml` | sem ring (escrita síncrona) | o do nome |
 | `compose.redis-nats.yml`, `compose.redis-postgres.yml` | stream Redis **compartilhado** entre réplicas | o do nome |
+| `compose.{memory,none,sqlite}-valkey.yml`, `compose.valkey-{nats,postgres}.yml` | os mesmos com Valkey no lugar do Redis ([abaixo](#redis-e-valkey)) | o do nome |
 
 Os `*-none.yml` são **benchmark**: `sink=none` converte, serializa e descarta
 tudo (§10.8, §19). Não guardam nada.
@@ -239,7 +240,7 @@ chave de um serviço que usa `extends`, e todos estes usam.
 | Esquema | Sink | Chaves donas (env) |
 |---|---|---|
 | `nats://`, `tls://` (lista com vírgula = cluster) | `nats` | `SYSLOG_SINK_NATS_URLS`, `_TLS`, `_USERNAME`, `_PASSWORD`, `_TOKEN` |
-| `redis://`, `rediss://` | `redis` | `SYSLOG_SINK_REDIS_ADDRS`, `_USERNAME`, `_PASSWORD`, `_DB`, `_TLS` |
+| `redis://`, `rediss://`, `valkey://`, `valkeys://` | `redis` | `SYSLOG_SINK_REDIS_ADDRS`, `_USERNAME`, `_PASSWORD`, `_DB`, `_TLS` |
 | `postgres://`, `postgresql://` | `postgres` | `SYSLOG_SINK_POSTGRES_ADDR`, `_USERNAME`, `_PASSWORD`, `_DATABASE`, `_TLS` |
 
 As regras:
@@ -281,6 +282,45 @@ A `server.key` precisa ser legível pelo **uid 65532**, o usuário da imagem;
 `SYSLOG_TLS_CLIENT_AUTH=optional` (padrão) pede o certificado do cliente e, com
 `SYSLOG_TLS_CLIENT_CA`, o verifica quando ele vem; `require` exige mTLS. O
 `payload.tls` registra versão, suíte, subject e fingerprint SHA-256.
+
+## Redis e Valkey
+
+Valkey 7.2, 8.1 e 9.0 e Redis 7.4 são suportados e testados (SPEC §10.3.1).
+Cada compose com Redis tem um irmão Valkey com projeto, contêineres, volumes e
+portas próprios (o cabeçalho de cada um diz as suas):
+
+| Redis | Valkey |
+|---|---|
+| `compose.memory-redis.yml` | `compose.memory-valkey.yml` |
+| `compose.none-redis.yml` | `compose.none-valkey.yml` |
+| `compose.sqlite-redis.yml` | `compose.sqlite-valkey.yml` |
+| `compose.redis-nats.yml` | `compose.valkey-nats.yml` |
+| `compose.redis-postgres.yml` | `compose.valkey-postgres.yml` |
+
+- Imagem: `SYSLOG_VALKEY_IMAGE` (padrão `valkey/valkey:8.1-alpine`; `.env.example`).
+  Não troque só a `SYSLOG_REDIS_IMAGE` de um compose Redis por uma imagem
+  Valkey: o `command` dele começa com `redis-server`, que na imagem Valkey é um
+  symlink, e o entrypoint só rebaixa para o usuário `valkey` (e ajusta o
+  `/data`) quando o primeiro argumento é `valkey-server` — com `redis-server` o
+  servidor roda como **root**. Os compose Valkey usam `valkey-server` e
+  `valkey-cli ping`.
+- Config: as chaves continuam `SYSLOG_SINK_REDIS_*`/`SYSLOG_RING_REDIS_*`
+  (`redis` designa o protocolo). `sink.type=valkey`, `ring.mode=valkey`,
+  `[sink.valkey]`, `--sink.valkey.*` e `SYSLOG_SINK_VALKEY_*` são aliases
+  exatos (SPEC §16.2.1); a mesma chave pelos dois nomes com valores diferentes
+  é exit 1. Na URL, `valkey://` = `redis://` e `valkeys://` = `rediss://`.
+- O log de boot diz contra o quê conectou: `"sink redis: server"` /
+  `"ring redis: server"` com `server` (`redis`|`valkey`|`unknown`) e
+  `server_version` (o `valkey_version`, não o `redis_version:7.2.4` fixo do
+  Valkey).
+- Cluster com `db != 0`: Redis Cluster e Valkey < 9 só têm o db 0; em Valkey 9
+  o db precisa existir (`cluster-databases`). Sem isso o boot sai com 3 na
+  hora, dizendo isso.
+- Sentinel: `sentinel_master` funciona com `redis-sentinel` e `valkey-sentinel`.
+- `maxmemory-policy` precisa ser `noeviction` (ou `volatile-*`) no boot **e
+  depois**: o servidor relê a política a cada sonda, e `allkeys-*` posto com
+  `CONFIG SET` (ou no painel de um serviço gerenciado) derruba o sink (FATAL,
+  dump) ou deixa o ring indisponível.
 
 ## Ring Redis compartilhado
 

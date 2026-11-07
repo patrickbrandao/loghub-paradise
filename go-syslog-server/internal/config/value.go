@@ -359,7 +359,9 @@ func setValue(p *Param, raw string) error {
 		if !ok {
 			panic("config: KEnum bound to non-*string: " + p.Name())
 		}
-		v, err := matchEnum(p.Enum, raw)
+		// sink.type=valkey and ring.mode=valkey are stored as redis
+		// (alias.go, SPEC §16.2.1).
+		v, err := matchEnum(p.Enum, canonicalValue(p, raw))
 		if err != nil {
 			return err
 		}

@@ -417,7 +417,7 @@ func Registry(c *Config) []*Param {
 		// ---------------------------------------------------------------- loghub
 		{Sec: "loghub", Key: "eb_url", Kind: KString, Def: "", Ptr: &c.LogHub.EBURL, Redact: RedactURL,
 			EnvName: loghubEnv("eb_url"),
-			Desc:    "LogHub eventbus URL; its scheme selects sink.type and the URL fills that sink's connection: nats:// tls:// redis:// rediss:// postgres:// postgresql://. An explicit conflicting sink key is an error (SPEC §10.9)"},
+			Desc:    "LogHub eventbus URL; its scheme selects sink.type and the URL fills that sink's connection: nats:// tls:// redis:// rediss:// valkey:// valkeys:// postgres:// postgresql://. An explicit conflicting sink key is an error (SPEC §10.9)"},
 		{Sec: "loghub", Key: "beacon_interval", Kind: KSeconds, Def: "15", Ptr: &c.LogHub.BeaconInterval,
 			EnvName: loghubEnv("beacon_interval"),
 			Desc:    "period of the heartbeat beacon (sink=nats only); a bare integer is seconds, as the skill defines it; at least 1s; 0 disables the periodic beacon, not the one on connect"},
@@ -516,6 +516,12 @@ func newIndex(params []*Param) *index {
 	for _, p := range params {
 		ix.byName[p.Name()] = p
 		ix.byEnv[p.Env()] = p
+		// The valkey alias of a [sink.redis]/[ring.redis] key is the same
+		// parameter under a second name (alias.go, SPEC §16.2.1).
+		if a := aliasName(p); a != "" {
+			ix.byName[a] = p
+			ix.byEnv[aliasEnv(p)] = p
+		}
 	}
 	return ix
 }
@@ -570,6 +576,9 @@ func (ix *index) knownSectionOf(name string) bool {
 }
 
 func (ix *index) knownSection(sec string) bool {
+	if c, ok := sectionAliases[sec]; ok {
+		sec = c
+	}
 	for _, p := range ix.byName {
 		if p.Sec == sec {
 			return true

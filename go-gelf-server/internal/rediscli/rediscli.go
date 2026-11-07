@@ -87,7 +87,11 @@ func New(cfg Config) (rueidis.Client, error) {
 			opt.Sentinel.TLSConfig = tc
 		}
 	}
-	return rueidis.NewClient(opt)
+	c, err := rueidis.NewClient(opt)
+	if err != nil {
+		return nil, explainNew(err)
+	}
+	return c, nil
 }
 
 // TLSConfig is verification on by default, against the system pool or the
@@ -141,6 +145,15 @@ func ClassifyReply(msg string) Class {
 		// The key is the wrong type, or the credentials cannot write. Neither
 		// changes on its own, and as `logic` they would discard a batch every
 		// few milliseconds, forever, in a process every probe calls healthy.
+		return Fatal
+	case dbUnavailable(upper):
+		// SELECT <db> refused by a cluster, or a db that does not exist
+		// (SPEC §10.3.1). Retried, it held the boot until boot_timeout over
+		// a configuration error.
+		return Fatal
+	case scriptingMissing(upper):
+		// EVAL/EVALSHA unknown: no Lua on this server, and the ring is made
+		// of scripts (SPEC §9.5). Never sent by the sink.
 		return Fatal
 	case transientReply(upper):
 		// Alive but temporarily unable: failover, a loading dataset.
@@ -261,31 +274,11 @@ func policyFromInfo(info string) (string, bool) {
 // The check reads one node. A Redis Cluster whose nodes disagree on the policy
 // is a configuration nobody runs on purpose, and checking every node would put
 // a fan-out in the boot of both users for it.
+//
+// It is one standalone reading; a user that probes periodically keeps a
+// PolicyWatch instead, which re-reads the policy at every probe.
 func CheckEviction(ctx context.Context, c rueidis.Client) (string, error) {
-	info, ierr := c.Do(ctx, c.B().Info().Section("memory").Build()).ToString()
-	if ierr == nil {
-		if policy, ok := policyFromInfo(info); ok {
-			return policy, verdict(policy)
-		}
-	} else if !replyRefused(ierr) {
-		return "", ierr
-	}
-	kv, cerr := c.Do(ctx, c.B().ConfigGet().Parameter("maxmemory-policy").Build()).AsStrMap()
-	if cerr == nil {
-		if policy, ok := kv["maxmemory-policy"]; ok {
-			return policy, verdict(policy)
-		}
-	} else if !replyRefused(cerr) {
-		return "", cerr
-	}
-	reason := "INFO memory has no maxmemory_policy line"
-	if ierr != nil {
-		reason = ierr.Error()
-	}
-	if cerr != nil {
-		reason += "; CONFIG GET: " + cerr.Error()
-	}
-	return "", fmt.Errorf("%w (%s)", ErrPolicyUnknown, reason)
+	return new(PolicyWatch).Check(ctx, c)
 }
 
 // verdict is the policy rule of CheckEviction.

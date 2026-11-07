@@ -193,7 +193,10 @@ reinicie só o `nats-server` de permissões (§6.4).
 Sem a infraestrutura do monorepo, cada serviço sobe sozinho, por exemplo:
 
 ```bash
-docker run --rm -d -p 16379:6379 --name gls-test-redis redis:7-alpine
+docker run --rm -d -p 16379:6379 --name gls-test-redis redis:7.4-alpine
+# o gêmeo allkeys-lru de GELF_TEST_REDIS_LRU_ADDR (faltava nesta receita até 2026-11-07)
+docker run --rm -d -p 16381:6379 --name gls-test-redis-lru redis:7.4-alpine \
+  redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
 docker run --rm -d -p 15432:5432 -e POSTGRES_USER=gls -e POSTGRES_PASSWORD=gls \
   -e POSTGRES_DB=gls_test --name gls-sink-pg postgres:18-alpine
 docker run --rm -d -p 13306:3306 -e MYSQL_ROOT_PASSWORD=gls -e MYSQL_DATABASE=gls_test \
@@ -210,6 +213,89 @@ GELF_TEST_CLICKHOUSE_DSN='clickhouse://gls:gls@127.0.0.1:19000/gls_test' \
 GELF_TEST_NATS_URL=nats://127.0.0.1:14222 GELF_TEST_NATS_NOJS_URL=nats://127.0.0.1:14223 \
   go test -race -timeout 1200s ./...
 ```
+
+#### 6.1a Valkey, Sentinel e cluster (rodada de 2026-11-07)
+
+**Valkey.** A mesma suíte, sem mudança, contra Valkey (SPEC §10.3.1): Redis
+7.4 e Valkey 7.2, 8.1 e 9.0 são as versões declaradas. O gêmeo `allkeys-lru`
+sobe igual:
+
+```bash
+docker run --rm -d -p 16379:6379 --name t-vk valkey/valkey:8.1-alpine valkey-server
+docker run --rm -d -p 16381:6379 --name t-vk-lru valkey/valkey:8.1-alpine \
+  valkey-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+GELF_TEST_REDIS_ADDR=127.0.0.1:16379 GELF_TEST_REDIS_LRU_ADDR=127.0.0.1:16381 \
+  go test -race -timeout 900s ./internal/rediscli/ ./internal/ring/ ./internal/sink/ ./internal/app/
+docker rm -f t-vk t-vk-lru
+```
+
+A matriz inteira (S, R, G, W, F; um par de servidores por imagem, módulos em
+série, porque as suítes usam portas fixas) é `scripts/test-redis-valkey.sh` na
+raiz do monorepo. `TestIdentifyLive` e `TestRedisLogsTheServerIdentity` logam
+contra o quê a rodada correu (`server under test: valkey 8.1.11`); a política é
+relida a cada sonda (`TestRedisPolicyIsReadAtEveryCheck`,
+`TestRedisRingPolicyIsReadAtEveryRefresh`: o cliente trocado para o servidor
+`allkeys-lru` faz o papel do `CONFIG SET`, que quebraria os pacotes em
+paralelo).
+
+**Sentinel** (opt-in). Primário, réplica e sentinel num contêiner só (um
+namespace de rede), todos em `127.0.0.1` com as mesmas portas dentro e fora:
+o que o Sentinel anuncia é alcançável do `go test` no macOS. Para Redis troque
+`valkey-server`/`valkey-sentinel` por `redis-server`/`redis-sentinel`:
+
+```bash
+docker run -d --name t-sn -p 127.0.0.1:26380-26382:26380-26382 valkey/valkey:8.1-alpine sh -c '
+  valkey-server --port 26380 --daemonize yes --save ""
+  valkey-server --port 26381 --replicaof 127.0.0.1 26380 --daemonize yes --save ""
+  printf "port 26382\nsentinel monitor mymaster 127.0.0.1 26380 1\nsentinel down-after-milliseconds mymaster 2000\nsentinel failover-timeout mymaster 5000\n" >/tmp/s.conf
+  exec valkey-sentinel /tmp/s.conf'
+GELF_TEST_REDIS_SENTINEL_ADDR=127.0.0.1:26382 GELF_TEST_REDIS_SENTINEL_MASTER=mymaster \
+  go test -race -p 1 -count=1 -run Sentinel ./internal/sink/ ./internal/ring/
+docker rm -f t-sn
+```
+
+`-p 1`: os dois pacotes fazem `SENTINEL FAILOVER` na mesma topologia, e um
+failover no meio do outro teste perderia o que a réplica ainda não tinha. Os
+testes esperam a réplica alcançar o offset do primário antes do failover (o
+`SENTINEL FAILOVER` não espera) e, depois dele, o primário antigo virar
+réplica (até lá ele ainda aceita escritas e as perde ao ressincronizar: é a
+replicação assíncrona do Redis/Valkey, não este servidor; ~10 s), e provam
+boot, escrita, política, failover e escrita depois sem perda.
+
+**Cluster com `db != 0`** (opt-in). Um nó, anunciando `127.0.0.1` na porta
+mapeada igual:
+
+```bash
+docker run -d --name t-cl -p 127.0.0.1:26390:26390 valkey/valkey:9.0-alpine \
+  valkey-server --port 26390 --cluster-enabled yes --cluster-announce-ip 127.0.0.1
+docker exec t-cl valkey-cli -p 26390 CLUSTER ADDSLOTSRANGE 0 16383
+GELF_TEST_REDIS_CLUSTER_ADDR=127.0.0.1:26390 go test -race -count=1 -run Cluster ./internal/rediscli/ ./internal/sink/ ./internal/ring/
+# Valkey 9 com --cluster-databases 16: db=1 grava
+#   ... valkey-server ... --cluster-databases 16
+#   GELF_TEST_REDIS_CLUSTER_ADDR=... GELF_TEST_REDIS_CLUSTER_DBS=16 go test ...
+docker rm -f t-cl
+```
+
+Redis 7.4 e Valkey 7.2/8.1 respondem `SELECT is not allowed in cluster mode`,
+Valkey 9 sem `cluster-databases` responde `DB index is out of range`: FATAL em
+milissegundos, com a dica de `cluster-databases`. Os testes de `sink` e `ring`
+no mesmo cluster usam `db=0` e provam sonda, releitura da política (um `Do` à
+parte num cluster: o rueidis entra em pânico num pipeline que mistura comando
+sem chave com comandos de chave) e escrita.
+
+**Resultado da rodada de 2026-11-07** (macOS, Docker Desktop, `-race`;
+`scripts/test-redis-valkey.sh` para a suíte, as receitas acima para Sentinel e
+cluster):
+
+| Servidor | `rediscli` `ring` `sink` `app` | Sentinel (sink + ring) | Cluster: db=1 / db=0 |
+|---|---|---|---|
+| Redis 7.4.12 | ok | ok | FATAL na hora / ok |
+| Valkey 7.2.15 | ok | ok | FATAL na hora / ok |
+| Valkey 8.1.11 | ok | ok | FATAL na hora / ok |
+| Valkey 9.0.7 | ok | ok | FATAL na hora (`DB index is out of range`) / ok |
+| Valkey 9.0.7 `--cluster-databases 16` | — | — | db=1 grava |
+
+Os mesmos 20 pares módulo × servidor (S, R, G, W, F) passaram no script.
 
 ### 6.2 O que cada destino prova
 

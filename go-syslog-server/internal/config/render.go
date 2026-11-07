@@ -65,6 +65,11 @@ fixed it: [syslog] keys are SYSLOG_<KEY> (SYSLOG_MAX_MESSAGE_BYTES), [loghub]
 keys are LOGHUB_<KEY> (LOGHUB_EB_URL) and server.data_dir is DATADIR. Each
 parameter shows its name.
 
+Valkey: [sink.valkey] and [ring.valkey] are aliases of [sink.redis] and
+[ring.redis], key by key (--sink.valkey.addrs, SYSLOG_SINK_VALKEY_ADDRS), and
+sink.type=valkey / ring.mode=valkey mean redis; the same key under both names
+with different values is an error. The dump shows the redis names.
+
 The identity (AGENT_UUID, AGENT_NAME, WORKSPACE, HOSTNAME, MACHINE_ID,
 MACHINE_ID_FILE) is read by go-loghub-ident from the environment, not from
 this table; --dump-config shows the resolved values.

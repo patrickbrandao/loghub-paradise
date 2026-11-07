@@ -83,7 +83,7 @@ var schemeRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]{0,31}$`)
 
 // parseEBURL reads the URL (SPEC §10.9). Every error names the scheme at most,
 // never the URL. Only NATS is an eventbus here: this server has no other sink,
-// and a postgres:// or redis:// URL left over from a sibling deployment must
+// and a postgres://, redis:// or valkey:// URL left over from a sibling deployment must
 // fail the boot, not be quietly ignored.
 func parseEBURL(raw string) (ebTarget, error) {
 	s := strings.TrimSpace(raw)
