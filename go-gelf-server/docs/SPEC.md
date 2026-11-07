@@ -747,6 +747,13 @@ conexão, nunca no laço de `Accept`), e o handler lê dela os endereços
 resolvidos. Um cabeçalho inválido ou ausente em `required` fecha a conexão sem
 resposta HTTP.
 
+No `https` o cabeçalho vem antes do TLS, e a recusa do PROXY chega ao
+`net/http` como um erro de leitura do handshake: a stdlib a relata na mesma
+linha `http: TLS handshake error from …` de uma falha de TLS (§4.7). Ela conta
+só em `gelf_proxy_headers_total` (e `reason="proxy"`), **nunca** em
+`gelf_tls_handshake_errors_total{transport="https"}`, como no transporte `tls`,
+que aplica o PROXY antes de começar o handshake (revisão de 2026-11-07).
+
 ### 4.7 TLS (TCP+TLS e HTTPS)
 
 Como S §4.5: `tls.cert_file`/`tls.key_file` obrigatórios quando `listen.tls` ou
@@ -766,7 +773,17 @@ um escritor próprio que **não loga nada**: conta cada linha com esse prefixo e
 amostrado do transporte `tls` (`TLS handshake failed`, um a cada 30 s, §14.2),
 e descarta toda outra linha da stdlib, como antes (um scanner na porta
 inundaria o log). Com o listener fechando (shutdown) a falha não conta: o corte
-não é culpa do par, a mesma regra do `tls`. Decisão, contra as duas
+não é culpa do par, a mesma regra do `tls`. **A recusa do PROXY também não
+conta** (revisão de 2026-11-07): com `proxy.protocol` ligado, a conexão que o
+PROXY recusa (§4.6) falha o handshake com o erro sentinela da recusa
+(`errProxyRefused`), e a linha que o carrega é descartada sem contar nem logar
+— o par não chegou a falar TLS, e a recusa já foi contada em
+`gelf_proxy_headers_total`. O teste é pelo texto do **nosso** erro dentro da
+linha, não por um sinal ao lado: o `ErrorLog` só recebe a linha, sem a
+conexão, e casar a linha com uma marca deixada pela conexão (por endereço do
+par) seria um mapa a mais que vaza quando a linha não vem (shutdown). A
+mensagem do sentinela é do módulo e o `crypto/tls` a repassa embrulhada; se
+uma versão deixar de repassá-la, o teste abaixo quebra. Decisão, contra as duas
 alternativas:
 
 - **Handshake no listener, antes de entregar a conexão ao `http.Server`:** o
@@ -782,8 +799,10 @@ alternativas:
 
 O texto da linha é da stdlib e o mesmo desde o Go 1.x; se um toolchain o mudar,
 `TestHTTPSHandshakeErrorsAreCounted` quebra (certificado de cliente de outra
-CA, cliente que não confia no servidor, HTTP em claro: três falhas, zero no
-`tls`, zero numa conexão boa).
+CA, cliente que não confia no servidor, HTTP em claro respondido com `400`: três
+falhas, zero no `tls`, zero numa conexão boa; e, com `proxy.protocol=required`,
+um par confiável sem cabeçalho conta `absent` e zero no `https`, enquanto um
+HTTP em claro depois de um cabeçalho válido conta um).
 
 ---
 
@@ -862,7 +881,7 @@ descarte contado.
 
   | listeners | um mutex (antes) | 64 shards (agora) | um remontador por listener (teto) |
   |---|---|---|---|
-  | 1 | 150–155 k | 98–148 k | 155–160 k |
+  | 1 | 150–155 k | 98–148 k (ruído; refeita: 156–178 k, abaixo) | 155–160 k |
   | 2 | 121–210 k | 183–242 k | 240–255 k |
   | 4 | 155–189 k | 225–243 k | 270–326 k |
   | 8 | 106–146 k | 210–291 k | 280–346 k |
@@ -874,6 +893,26 @@ descarte contado.
   emissor): 338→188 ns/chunk com 4 núcleos. A varredura de um mapa cheio
   (16 384 mensagens) custa ~0,16 ms nos dois arranjos; com os shards um
   listener espera no máximo a passada de um shard.
+- **A linha de 1 listener** (o padrão, `udp_listeners=1`), refeita na revisão
+  de 2026-11-07 (mesma máquina, load 9,8 → 6,3 durante a rodada, a mais baixa
+  do dia; `-cpu 1`, `onelock` e `sharded` na mesma execução). Com um listener
+  não há contenção, e os dois arranjos fazem o **mesmo** trabalho: o
+  `onelock` do benchmark é `newReassembler(cfg, 1)`, que também calcula o hash
+  (só a máscara é zero). Os números: `BenchmarkUDPChunkFlood` (5 rodadas)
+  `onelock` 156–182 k, `sharded` 156–178 k, `separate` 108–171 k chunks/s;
+  `BenchmarkReassemblerParallel` (8 rodadas) `onelock` 318–530 ns/chunk
+  (mediana ~343), `sharded` 326–368 (mediana ~337). Os 98–148 k da tabela e os
+  1 003–1 273 ns/op da primeira medida eram a carga da máquina: com load
+  13–15, rodadas alternadas dos dois arranjos oscilam 74–121 k chunks/s e
+  532–2 018 ns/chunk, ora um à frente, ora o outro. O único custo que o shard
+  acrescenta ao código anterior (um mapa sem hash) é o `maphash` da chave de
+  26 bytes: 12–16 ns por chunk medidos isolados, ~4 % da seção crítica sem
+  socket e ~0,2 % dos ~5,8 µs por chunk do caminho com socket, abaixo do ruído.
+  **Decisão: nenhuma mitigação.** Pular o hash com um shard só ajudaria um
+  arranjo que o servidor não usa; escolher 1 shard quando `udp_listeners=1`
+  amarraria a montagem do app ao número de shards em G, GP e GN para ganhar
+  menos que o ruído. O `chunks.go` fica com 64 shards fixos, idêntico nos três,
+  e os tetos continuam globais.
 
 ### 5.3 Moldura `\0` (TCP e TLS)
 
@@ -1173,7 +1212,11 @@ aceita  <=>  level <= filter.min_level
   sem filtro, 390–440 k docs/s e 7,4–7,7 µs com ele (+1,1 a +1,6 µs, ~20–25 %
   de CPU; ~30 % de vazão numa conexão só, porque a goroutine da conexão é o
   estágio serial e é nela que a varredura roda; com várias conexões a perda
-  de vazão é menor que a de CPU). Isolada, a varredura custa 0,53–0,56 µs
+  de vazão é menor que a de CPU). **Só o delta vale**: o µs de CPU por
+  documento é o do processo de teste inteiro, que inclui o cliente TCP em
+  processo que gera e manda os documentos, então os 6–7,7 µs absolutos não são
+  o custo do servidor por documento; o mesmo cliente nas duas rodadas faz da
+  diferença (+1,1 a +1,6 µs) o preço da varredura. Isolada, a varredura custa 0,53–0,56 µs
   contra 2,0–2,1 µs da conversão completa (`BenchmarkLevelOf`,
   `BenchmarkConvertDocker`). **Fica como está**: é o preço de o `level`
   filtrado ser por construção o emitido (o mesmo parser) e de o descarte

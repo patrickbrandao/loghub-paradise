@@ -214,6 +214,12 @@ As de G §9 (GELF) e as de SN §9 (corte) valem inteiras. As mais caras:
   PROXY v2, linha do dump).
 - **A remontagem UDP é estado compartilhado**, com teto global e prazo varrido
   por relógio próprio.
+- **Os tetos da remontagem são globais, nunca por shard** (SPEC §5.2, como G):
+  64 shards por hash com semente da chave `(src-ip, src-port, id)`, mas
+  `max_bytes` e `max_messages` são contadores atômicos compartilhados,
+  reservados por CAS, nunca soma-e-desfaz. Um teto por shard recusaria num
+  shard quente com os outros vazios, ou deixaria a soma passar do configurado
+  (`chunks_shard_test.go`, cópia literal de G).
 - **Números JSON nunca passam por `float64`**; o dump guarda o texto deles, e
   por isso a porta `ParseLine` aceita a gramática JSON inteira, não só inteiros
   (desvio de SN, SPEC §12.2). Não "simplifique" de volta: um dump legítimo

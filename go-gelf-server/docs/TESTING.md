@@ -158,8 +158,18 @@ Seção crítica sem socket, ns/chunk (`onelock` → `sharded`):
 `…Interleaved` 338→188 (`-cpu 4`), 398→360 (`-cpu 8`); 1 495 B e 2
 alocações por chunk nos dois (a cópia do chunk). `ReassemblerSweep`: 153–177 µs
 por varredura de 16 384 mensagens nos dois (com shards, a espera de um listener
-é a de um shard). Com `-cpu 1` os shards custam o hash a mais (~5–15 %, dentro do
-ruído desta rodada).
+é a de um shard). Com `-cpu 1` os dois arranjos fazem o mesmo trabalho (o
+`onelock` do benchmark também calcula o hash): a linha de 1 listener da tabela
+acima era ruído de carga, e a medida refeita (load 9,8 → 6,3, 2026-11-07) deu
+`ChunkFlood` 156–182 k (`onelock`) contra 156–178 k (`sharded`) e
+`ReassemblerParallel` mediana ~343 contra ~337 ns/chunk; o hash isolado custa
+12–16 ns por chunk. Números e decisão (nenhuma mitigação) em SPEC §5.2. Para
+refazer, compare os dois arranjos na mesma execução e anote o `uptime`:
+
+```bash
+go test -run XXX -bench 'ReassemblerParallel$' -benchmem -cpu 1 -count 8 ./internal/receiver
+go test -run XXX -bench 'ChunkFlood' -cpu 1 -count 5 ./internal/receiver
+```
 
 Validação dupla (SPEC §7): `BenchmarkConvertDocker` 1 973–2 131 ns/op,
 `BenchmarkLevelOf` 527–557 ns/op (0 alocação); ponta a ponta, 200 000
@@ -559,8 +569,10 @@ Registradas por honestidade, não por esquecimento.
    em produção.
 6. **Falhas de handshake do HTTPS** são contadas desde 2026-11-07 (SPEC §4.7),
    provadas no `receiver` (`TestHTTPSHandshakeErrorsAreCounted`: certificado
-   de outra CA, cliente que não confia no servidor, HTTP em claro); não há
-   teste no nível da app.
+   de outra CA, cliente que não confia no servidor, HTTP em claro com o `400`
+   da stdlib; e a recusa do `proxy.protocol=required`, que conta `absent` e
+   não conta no `https`, SPEC §4.6, com mutação: sem o filtro da linha o caso
+   cai); não há teste no nível da app.
 7. **A bomba de descompressão** é provada pelo `FuzzDecompress` e por testes do
    leitor com teto; não há teste de memória de pico (RSS) com um gzip de
    razão 1000:1 chegando em paralelo por vários listeners.
