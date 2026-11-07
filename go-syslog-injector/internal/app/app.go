@@ -25,6 +25,7 @@ import (
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-injector/internal/source"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-injector/internal/tmpl"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-injector/internal/transport"
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-injector/internal/verify"
 )
 
 // Exit codes (SPEC §3.3).
@@ -33,6 +34,7 @@ const (
 	ExitFailures    = 1
 	ExitUsage       = 2
 	ExitUnreachable = 3
+	ExitVerify      = 4 // the destination check could not be done (SPEC §8.5)
 	ExitInterrupted = 130
 )
 
@@ -71,6 +73,12 @@ type config struct {
 	pcapPorts, pcapProto     string
 	pcapTiming               string
 	pcapSpeed                float64
+	pcapFlows                bool
+	pcapDedup                string
+
+	verifyURL, verifySQLite string
+	verifyTimeout           time.Duration
+	verifySpace, verifyKey  string
 
 	reportFmt string
 	progress  string
@@ -116,6 +124,14 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.pcapProto, "pcap-proto", "udp,tcp", "protocols to replay from the capture: `udp,tcp`, udp or tcp")
 	fs.StringVar(&c.pcapTiming, "pcap-timing", "asap", "`asap` (paced by --rate) or original (the capture's own intervals)")
 	fs.Float64Var(&c.pcapSpeed, "pcap-speed", 1, "speed `factor` of --pcap-timing original (2 = twice as fast)")
+	fs.BoolVar(&c.pcapFlows, "pcap-flows", false, "one connection per captured flow; with --proxy-protocol, announce the captured addresses")
+	fs.StringVar(&c.pcapDedup, "pcap-dedup", "auto", "drop the copies of tcpdump -i any: `auto` (multi-interface captures), on or off")
+
+	fs.StringVar(&c.verifyURL, "verify-url", "", "after sending, check the destination: nats://, tls://, postgres://, postgresql://, redis://, rediss://, valkey://, valkeys:// `url`")
+	fs.StringVar(&c.verifySQLite, "verify-sqlite", "", "after sending, check the events.db (sink=sqlite) at this `path`")
+	fs.DurationVar(&c.verifyTimeout, "verify-timeout", 30*time.Second, "how long to wait for the messages in the destination")
+	fs.StringVar(&c.verifySpace, "verify-space", "default", "LogHub `space` of the server (subject, stream and filter)")
+	fs.StringVar(&c.verifyKey, "verify-key", "", "JetStream stream, Redis stream, PostgreSQL or SQLite table to read (default: per destination)")
 
 	fs.StringVar(&c.reportFmt, "report", "text", "final report on stdout: `text` or json")
 	fs.StringVar(&c.progress, "progress", "auto", "progress line on stderr every `interval`; 0 = off; auto = 1s on a terminal")
@@ -123,7 +139,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: %s [flags]\n\nSends syslog messages to a server, to test it or load it (docs/SPEC.md).\n\nFlags:\n", Name)
 		fs.PrintDefaults()
-		fmt.Fprintf(stderr, "\nExit: 0 all sent, 1 some failed, 2 usage, 3 target unreachable, 130 interrupted.\n")
+		fmt.Fprintf(stderr, "\nExit: 0 all sent, 1 some failed (or lost/duplicated at the destination), 2 usage, 3 target unreachable,\n4 destination check impossible, 130 interrupted.\n")
 	}
 	return fs
 }
@@ -162,6 +178,7 @@ type runner struct {
 	plan   sched.Plan
 	info   map[string]string
 	report string
+	verify *verify.Target // nil: no destination check
 }
 
 func build(c *config) (*runner, error) {
@@ -226,10 +243,31 @@ func build(c *config) (*runner, error) {
 	if c.loop && !finite {
 		return nil, errors.New("--loop applies to --file and --pcap")
 	}
-	r := &runner{c: c, report: c.reportFmt, info: map[string]string{}}
+	if c.pcapFile == "" && (c.pcapFlows || c.pcapDedup != "auto") {
+		return nil, errors.New("--pcap-flows and --pcap-dedup apply to --pcap")
+	}
+	var vt *verify.Target
+	if c.verifyURL != "" || c.verifySQLite != "" {
+		if finite {
+			return nil, errors.New("--verify-* checks the generator or a --template with seq={seq} and run={run}: --file and --pcap carry no markers of the run (SPEC §8.5)")
+		}
+		if c.template != "" && (!strings.Contains(c.template, "seq={seq}") || !strings.Contains(c.template, "run={run}")) {
+			return nil, errors.New("--verify-* needs seq={seq} and run={run} in the --template (SPEC §8.5)")
+		}
+		if c.verifyTimeout <= 0 {
+			return nil, errors.New("--verify-timeout must be > 0")
+		}
+		if vt, err = verify.Parse(c.verifyURL, c.verifySQLite, c.verifySpace, c.verifyKey, c.run); err != nil {
+			return nil, err
+		}
+	}
+	r := &runner{c: c, report: c.reportFmt, info: map[string]string{}, verify: vt}
 	switch {
 	case c.pcapFile != "":
-		opt := source.PcapOptions{Loop: c.loop, Header: h}
+		opt := source.PcapOptions{Loop: c.loop, Header: h, Flows: c.pcapFlows}
+		if opt.Dedup, err = source.ParseDedup(c.pcapDedup); err != nil {
+			return nil, err
+		}
 		if opt.Ports, err = ports(c.pcapPorts); err != nil {
 			return nil, err
 		}
@@ -337,6 +375,15 @@ func build(c *config) (*runner, error) {
 	if r.dial, err = transport.Dialer(o); err != nil {
 		return nil, err
 	}
+	if c.pcapFlows {
+		if r.plan.FlowDial, err = transport.FlowDialer(o); err != nil {
+			return nil, err
+		}
+		r.info["flows"] = "one connection per captured flow"
+	}
+	if vt != nil {
+		r.info["verify"] = vt.Destination()
+	}
 	r.info["injector"] = Name + " " + version
 	r.info["run"] = c.run
 	r.info["target"] = c.network + "://" + c.target
@@ -395,6 +442,22 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 		}
 	}()
 	rep.Start = time.Now()
+	var check *verify.Check
+	if r.verify != nil {
+		// Connect (and find the stream or table) before sending: an
+		// unreachable destination fails at once, with nothing sent.
+		r.verify.Since = rep.Start.Add(-verify.ClockSlack)
+		octx, ocancel := context.WithTimeout(ctx, r.c.timeout)
+		var err error
+		check, err = verify.Open(octx, r.verify)
+		ocancel()
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: verify: %v\n", Name, err)
+			return ExitVerify
+		}
+		defer check.Close()
+		rep.TrackSeqs = true
+	}
 	stopProg := make(chan struct{})
 	if every := r.progressEvery(stderr); every > 0 {
 		go rep.Progress(stderr, every, stopProg)
@@ -409,14 +472,24 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 	if st.SourceErr != nil {
 		rep.Event("source_error: " + st.SourceErr.Error())
 	}
-	r.write(rep, stdout)
 	ok, failed := rep.Totals()
+	if check != nil && !interrupted.Load() && !(ok+failed > 0 && rep.Dials() == 0) {
+		if every := r.progressEvery(stderr); every > 0 {
+			fmt.Fprintf(stderr, "%s: checking %s (up to %s)\n", Name, r.verify.Destination(), r.c.verifyTimeout)
+		}
+		rep.Verify = check.Wait(ctx, rep.OKSeqs(), r.c.verifyTimeout)
+	}
+	r.write(rep, stdout)
 	switch {
 	case interrupted.Load():
 		return ExitInterrupted
 	case ok+failed > 0 && rep.Dials() == 0:
 		return ExitUnreachable
+	case rep.Verify != nil && rep.Verify.Error != "":
+		return ExitVerify
 	case failed > 0 || st.SourceErr != nil:
+		return ExitFailures
+	case rep.Verify != nil && (rep.Verify.Lost > 0 || rep.Verify.Duplicated > 0):
 		return ExitFailures
 	}
 	return ExitOK

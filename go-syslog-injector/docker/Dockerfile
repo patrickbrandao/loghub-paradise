@@ -2,7 +2,8 @@
 #
 # go-syslog-injector -- imagem do injetor syslog (cliente de teste e carga).
 #
-# Binario estatico (CGO_ENABLED=0, so' a stdlib). Util para injetar de dentro
+# Binario estatico (CGO_ENABLED=0; a stdlib, mais os clientes puro Go da
+# conferencia no destino, --verify-*, SPEC 2.1). Util para injetar de dentro
 # da rede de um compose, onde o servidor e' alcancado pelo nome do servico:
 #
 #   docker build -f docker/Dockerfile -t go-syslog-injector:local .
@@ -16,13 +17,14 @@ ARG ALPINE_VERSION=3.22
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 ARG VERSION=dev
 ARG COMMIT=none
 ARG TARGETOS
 ARG TARGETARCH
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -tags osusergo,netgo \
       -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \

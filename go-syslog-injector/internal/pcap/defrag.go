@@ -42,15 +42,43 @@ type fragDgram struct {
 
 type defrag struct {
 	open map[fragKey]*fragDgram
+	// cut holds the datagrams that lost a fragment to the snaplen (SPEC
+	// §6.3), with the capture time of that fragment: their other fragments
+	// are dropped on arrival instead of waiting FragTimeout for a datagram
+	// that can never complete.
+	cut map[fragKey]time.Time
 }
 
-func newDefrag() *defrag { return &defrag{open: make(map[fragKey]*fragDgram)} }
+func newDefrag() *defrag {
+	return &defrag{open: make(map[fragKey]*fragDgram), cut: make(map[fragKey]time.Time)}
+}
+
+// truncated records a fragment cut by the snaplen. lost counts it and the
+// fragments of its datagram held so far; first is true the first time the
+// datagram is seen cut (count it once).
+func (d *defrag) truncated(k fragKey, ts time.Time) (lost int, first bool) {
+	lost = d.expire(ts) + 1
+	if g := d.open[k]; g != nil {
+		lost += len(g.parts)
+		delete(d.open, k)
+	}
+	if _, ok := d.cut[k]; ok {
+		return lost, false
+	}
+	if len(d.cut) < maxFragDatagrams {
+		d.cut[k] = ts
+	}
+	return lost, true
+}
 
 // add stores one fragment. done is true when the datagram is complete; lost is
 // the number of fragments dropped by this call (expired datagrams, overlaps,
 // over-limit).
 func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (whole []byte, done bool, lost int) {
 	lost += d.expire(ts)
+	if _, ok := d.cut[k]; ok {
+		return nil, false, lost + 1 // its datagram already lost a piece
+	}
 	g := d.open[k]
 	if g == nil {
 		if len(d.open) >= maxFragDatagrams {
@@ -114,6 +142,11 @@ func (d *defrag) expire(now time.Time) int {
 		if now.Sub(g.first) > FragTimeout {
 			lost += len(g.parts)
 			delete(d.open, k)
+		}
+	}
+	for k, t := range d.cut {
+		if now.Sub(t) > FragTimeout {
+			delete(d.cut, k)
 		}
 	}
 	return lost

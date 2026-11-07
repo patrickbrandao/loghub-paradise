@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync/atomic"
 	"syscall"
@@ -83,6 +84,37 @@ func Dialer(o Options) (sched.Dialer, error) {
 		}, nil
 	}
 	return nil, fmt.Errorf("unknown transport %q", o.Network)
+}
+
+// FlowDialer returns the dialer of one connection per captured flow (SPEC
+// §6.8): with a PROXY header, it announces the flow's captured source and
+// destination, unless --proxy-src/--proxy-dst override them.
+func FlowDialer(o Options) (sched.FlowDialer, error) {
+	plain, err := Dialer(o)
+	if err != nil {
+		return nil, err
+	}
+	if o.Proxy == nil || (o.Network != "tcp" && o.Network != "tls") {
+		return func(ctx context.Context, _, _ netip.AddrPort) (sched.Conn, error) { return plain(ctx) }, nil
+	}
+	return func(ctx context.Context, src, dst netip.AddrPort) (sched.Conn, error) {
+		fo := o
+		ph := *o.Proxy
+		if !ph.Src.IsValid() {
+			ph.Src = src
+		}
+		if !ph.Dst.IsValid() {
+			ph.Dst = dst
+		}
+		fo.Proxy = &ph
+		c, err := dialStream(ctx, fo)
+		if err != nil {
+			return nil, err
+		}
+		sc := &streamConn{c: c, framing: fo.Framing, timeout: fo.Timeout}
+		go sc.watch()
+		return sc, nil
+	}, nil
 }
 
 func dialStream(ctx context.Context, o Options) (net.Conn, error) {

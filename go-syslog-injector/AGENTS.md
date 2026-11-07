@@ -38,8 +38,10 @@ JLH, não tem identidade, não lê config.
   `go-relplog-injector` e do `go-webhook-injector`: uma correção aqui em
   `tmpl`, `pcap`, `extract`, `sched` ou `report` vale para eles — confira os
   irmãos e registre no `CHANGELOG.md` da raiz o que ficou "a portar".
-- **Zero dependências** fora da stdlib (DECISOES 6). Dependência nova exige
-  justificativa na spec.
+- **Zero dependências** fora da stdlib (DECISOES 6), **exceto** em
+  `internal/verify` (DECISOES 20, SPEC §2.1): `nats.go`, `pgx`, `rueidis` e
+  `modernc.org/sqlite`, nas versões do `go-syslog-server/go.mod`. Nenhum outro
+  pacote os importa. Dependência nova exige justificativa na spec.
 - Git (commit, branch, tag, remoto) é do nível do monorepo, e só com pedido
   explícito do usuário. Tags: `go-syslog-injector/vX.Y.Z`.
 
@@ -77,5 +79,9 @@ captura exige root.
 - **Ressincronizar não pode depender da divisão em segmentos**: um candidato
   pendente anterior segura a decisão (SPEC §6.6). O `FuzzStream` confere a
   invariância; não o enfraqueça.
+- **`FetchNoWait` do consumidor ordenado do `nats.go` relê do início** a cada
+  chamada: a conferência usa `Fetch` e pula a sequência já contada (SPEC §8.5).
+- **Um candidato pendente pode segurar até 16 MiB** (SPEC §6.6): o `need` do
+  `extract.Stream` evita reprocurar o buffer inteiro a cada segmento.
 - **`2026 is a year` é octet-counting** pela regra dos servidores (dígitos +
   espaço): o extrator segue a regra deles, não a intuição.

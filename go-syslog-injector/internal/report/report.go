@@ -108,21 +108,68 @@ func (h *Hist) Quantile(q float64) time.Duration {
 	return h.max
 }
 
+// SeqSet is a growable bit set of sequence numbers.
+type SeqSet struct {
+	w []uint64
+	n uint64
+}
+
+// Add sets seq (idempotent).
+func (b *SeqSet) Add(seq uint64) {
+	i := seq / 64
+	for uint64(len(b.w)) <= i {
+		b.w = append(b.w, 0)
+	}
+	if m := uint64(1) << (seq % 64); b.w[i]&m == 0 {
+		b.w[i] |= m
+		b.n++
+	}
+}
+
+// Has reports whether seq is set.
+func (b *SeqSet) Has(seq uint64) bool {
+	i := seq / 64
+	return i < uint64(len(b.w)) && b.w[i]&(1<<(seq%64)) != 0
+}
+
+// Len returns the number of seqs set.
+func (b *SeqSet) Len() uint64 { return b.n }
+
+// Max returns the largest seq the set can hold without growing.
+func (b *SeqSet) Max() uint64 { return uint64(len(b.w)) * 64 }
+
+// Union adds o into b.
+func (b *SeqSet) Union(o *SeqSet) {
+	for i, w := range o.w {
+		for w != 0 {
+			bit := uint64(bits.TrailingZeros64(w))
+			b.Add(uint64(i)*64 + bit)
+			w &= w - 1
+		}
+	}
+}
+
 // Shard is one worker's counters. Done may be called from any goroutine.
 type Shard struct {
 	r      *Report
 	mu     sync.Mutex
 	counts map[string]uint64
 	hist   Hist
+	okSeqs SeqSet // with Report.TrackSeqs
 }
 
-// Done records the outcome of one message. ok says whether the outcome is a
+// Done records the outcome of message seq. ok says whether the outcome is a
 // success for the exit code (SPEC §8.3); bytes is what was put on the wire.
-func (s *Shard) Done(outcome string, ok bool, lat time.Duration, bytes int) {
+// With Report.TrackSeqs the seq of a success is kept for the destination
+// check (SPEC §8.5).
+func (s *Shard) Done(seq uint64, outcome string, ok bool, lat time.Duration, bytes int) {
 	s.mu.Lock()
 	s.counts[outcome]++
 	if ok {
 		s.hist.Add(lat)
+		if s.r.TrackSeqs && seq > 0 {
+			s.okSeqs.Add(seq)
+		}
 	}
 	s.mu.Unlock()
 	if ok {
@@ -150,6 +197,37 @@ type Report struct {
 	End    time.Time
 	// OKOutcomes names the outcomes that count as success, in print order.
 	OKOutcomes []string
+	// TrackSeqs keeps the seq of every success (set before the run).
+	TrackSeqs bool
+	// Verify is the destination check (SPEC §8.5), filled after the run.
+	Verify *Verify
+}
+
+// Verify is the result of the destination check (SPEC §8.5).
+type Verify struct {
+	Destination string  `json:"destination"`
+	Expected    uint64  `json:"expected"`
+	Found       uint64  `json:"found"`
+	Lost        uint64  `json:"lost"`
+	Duplicated  uint64  `json:"duplicated"`
+	Unexpected  uint64  `json:"unexpected"`
+	LostSeqs    string  `json:"lost_seqs,omitempty"`
+	WaitedSec   float64 `json:"waited_sec"`
+	Complete    bool    `json:"complete"`
+	Error       string  `json:"error,omitempty"`
+}
+
+// OKSeqs returns the seqs of the successes of all shards.
+func (r *Report) OKSeqs() *SeqSet {
+	var out SeqSet
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.shards {
+		s.mu.Lock()
+		out.Union(&s.okSeqs)
+		s.mu.Unlock()
+	}
+	return &out
 }
 
 // New returns an empty report.
@@ -221,6 +299,7 @@ type Summary struct {
 	Conns      Conns             `json:"connections"`
 	Events     map[string]uint64 `json:"events,omitempty"`
 	Source     map[string]uint64 `json:"source,omitempty"`
+	Verify     *Verify           `json:"verify,omitempty"`
 }
 
 // Latency is in microseconds.
@@ -271,6 +350,7 @@ func (r *Report) Summarize() Summary {
 		Conns:      Conns{Opened: r.dials.Load(), DialErrors: r.dialErrs.Load(), Broken: r.broken.Load()},
 		Events:     ev,
 		Source:     r.Source,
+		Verify:     r.Verify,
 	}
 	s.Messages = s.OK + s.Failed
 	if el > 0 {
@@ -331,6 +411,23 @@ func (r *Report) WriteText(w io.Writer) error {
 		b.WriteString("source:\n")
 		for _, k := range sortedKeys(s.Source) {
 			fmt.Fprintf(&b, "  %-24s %d\n", k, s.Source[k])
+		}
+	}
+	if v := s.Verify; v != nil {
+		b.WriteString("verify:\n")
+		fmt.Fprintf(&b, "  %-24s %s\n", "destination", v.Destination)
+		fmt.Fprintf(&b, "  %-24s %d\n", "expected", v.Expected)
+		fmt.Fprintf(&b, "  %-24s %d\n", "found", v.Found)
+		fmt.Fprintf(&b, "  %-24s %d\n", "lost", v.Lost)
+		fmt.Fprintf(&b, "  %-24s %d\n", "duplicated", v.Duplicated)
+		fmt.Fprintf(&b, "  %-24s %d\n", "unexpected", v.Unexpected)
+		if v.LostSeqs != "" {
+			fmt.Fprintf(&b, "  %-24s %s\n", "lost_seqs", v.LostSeqs)
+		}
+		fmt.Fprintf(&b, "  %-24s %.3fs\n", "waited", v.WaitedSec)
+		fmt.Fprintf(&b, "  %-24s %v\n", "complete", v.Complete)
+		if v.Error != "" {
+			fmt.Fprintf(&b, "  %-24s %s\n", "error", v.Error)
 		}
 	}
 	_, err := io.WriteString(w, b.String())

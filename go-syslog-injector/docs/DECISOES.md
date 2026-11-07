@@ -18,7 +18,7 @@ relplog, e o usuário pediu: "criar injetor".
 | 1 | Empacotamento | **Um módulo por família**: `go-webhook-injector`, `go-syslog-injector`, `go-relplog-injector`. Espelha os servidores; o código comum é copiado (SI é o pai), e uma correção num vale para os outros | Um módulo com três subcomandos (recomendado); um `cmd/` dentro de cada um dos 11 servidores |
 | 2 | Alcance da v1 | **Funcional + carga**: N mensagens ou por duração, taxa alvo, concorrência; relatório com desfechos, vazão e latência p50/p90/p99 | Só funcional |
 | 3 | Conteúdo | **Todos**: gerador com `seq=`, modelo com marcadores, arquivo ou stdin, e — resposta livre do usuário — "replay de arquivos que armazenam captura de dados realizadas em servidores reais, principalmente arquivos PCAP obtidos pelo tcpdump" | Cada fonte isolada |
-| 4 | Conferência no destino | **Não na v1**: o relatório vem das respostas do servidor; a conferência de `seq` no destino fica em "Pendências conhecidas" | Subcomando `check` lendo NATS e PostgreSQL |
+| 4 | Conferência no destino | **Não na v1**: o relatório vem das respostas do servidor; a conferência de `seq` no destino fica em "Pendências conhecidas". *Trocada em 2026-11-07 pela decisão 20* | Subcomando `check` lendo NATS e PostgreSQL |
 
 A resposta livre da decisão 3 foi lida assim: o replay de pcap/pcapng é uma
 fonte de conteúdo como as outras, e é a principal; nos três injetores ele
@@ -34,7 +34,7 @@ trocados sabendo o custo.
 | # | Tema | Decisão | Por quê |
 |---|---|---|---|
 | 5 | Interface | Só flags (pacote `flag`), sem INI nem env; relatório no stdout, progresso no stderr; saída 0/1/2/3/130 | É ferramenta de linha de comando, usada em scripts e CI: o código de saída e o JSON são a interface |
-| 6 | Dependências | **Nenhuma** fora da stdlib, inclusive o leitor de pcap | O subconjunto necessário (dois formatos, oito enlaces, IP, UDP, TCP) é pequeno e fica sob teste e fuzz; o `gopacket` traria uma API grande, mantida por um fork, para usar 10% dela. Um binário estático, `CGO_ENABLED=0` |
+| 6 | Dependências | **Nenhuma** fora da stdlib, inclusive o leitor de pcap. *Exceção desde 2026-11-07 (decisão 20): os clientes de destino, só no pacote da conferência* | O subconjunto necessário (dois formatos, oito enlaces, IP, UDP, TCP) é pequeno e fica sob teste e fuzz; o `gopacket` traria uma API grande, mantida por um fork, para usar 10% dela. Um binário estático, `CGO_ENABLED=0` |
 | 7 | Padrões de alvo | SI: `tcp` em `127.0.0.1:1514`; RI: `127.0.0.1:20514`; WI: `http://127.0.0.1:8080/` | Os padrões dos servidores (portas altas, uid 65532) |
 | 8 | SI: transporte padrão | `tcp` com `octet` | TCP mostra erro de conexão (o UDP falha em silêncio) e octet não divide mensagens com LF |
 | 9 | Gerador | Corpo `seq={seq} run={run} injector=<nome>` (SI, RI) ou o JSON `{"seq":…,"run":…,"injector":…,"ts":…}` (WI); `--run` aleatório | O método do `demo.sh` do relplog: buraco é perda, repetido é retransmissão. No WI o corpo é JSON porque é o que um webhook leva |
@@ -76,3 +76,16 @@ extremo."
 Defeito achado nos três: `--duration` sem `--count` enviava **uma** mensagem (o
 padrão de 1 valia também ali), e os exemplos de carga do README publicado não
 faziam o que diziam. Corrigido nos três, com teste que falha sem a correção.
+
+## 5. Terceira rodada (2026-11-07): as pendências conhecidas
+
+Pedido do usuário (entrevista de 2026-11-07): fechar todas as "Pendências
+conhecidas" dos injetores; a conferência no destino, que a decisão 4 deixara
+fora da v1, passa a ser objetivo.
+
+| # | Tema | Decisão | Por quê |
+|---|---|---|---|
+| 20 | Conferência no destino (usuário) | Flags `--verify-url` (`nats://`, `tls://`, `postgres://`, `postgresql://`, `redis://`, `rediss://`, `valkey://`, `valkeys://`), `--verify-sqlite <arquivo>` e `--verify-timeout`; depois do envio, espera e conta perdidos e duplicados pelos marcadores da execução, no relatório e no código de saída. Os clientes são os dos servidores, nas mesmas versões (`nats.go`, `pgx`, `rueidis`, `modernc.org/sqlite`), e o formato lido é o que eles gravam | Sem isso o relatório do syslog para em "o kernel aceitou". SI: SPEC §8.5 |
+| 21 | SI: código de saída da conferência impossível | `4` (novo), abaixo de `130` e `3` e acima de `1` | "Não consegui ler o destino" não é "perdeu" (1) nem "chegou" (0); um script de CI precisa separar os três |
+| 22 | SI: o que se confere | Só o gerador e o modelo com `seq={seq}` e `run={run}`; `--file`/`--pcap` com `--verify-*` é erro de uso | As linhas e a captura não têm marcador da execução, e o destino mistura o tráfego de todos |
+| 23 | SI: fluxos e cópias no replay | `--pcap-flows` desligado por padrão (muda o número de conexões, que é o que a carga mede) e `--pcap-dedup auto` (liga sozinho em captura de várias interfaces, onde a cópia é certa) | SPEC §6.8 e §6.9 |

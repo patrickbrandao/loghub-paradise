@@ -156,6 +156,49 @@ func TestIPv4FragmentExpires(t *testing.T) {
 	}
 }
 
+// TestFragmentCutBySnaplen (SPEC §6.3, pendência 4 de 2026-11-07): a fragment
+// cut by the snaplen drops its datagram at once -- the fragments already held
+// and those that come later -- and the datagram is counted once. Before, the
+// others waited FragTimeout and the lost datagram was in no counter.
+func TestFragmentCutBySnaplen(t *testing.T) {
+	l4 := pcaptest.UDP(1, 514, []byte("<13>"+strings.Repeat("z", 4000)))
+	frags := pcaptest.Fragments4(cli4.Addr(), srv4.Addr(), 17, l4, 11, 1480)
+	if len(frags) != 3 {
+		t.Fatalf("%d fragments", len(frags))
+	}
+	d := pcap.NewDecoder()
+	dec := func(f []byte, snap int) bool {
+		data := pcaptest.Link(1, f)
+		trunc := false
+		if snap > 0 {
+			data, trunc = data[:snap], true
+		}
+		_, ok := d.Decode(pcap.Packet{TS: t0, LinkType: 1, Data: data, Truncated: trunc})
+		return ok
+	}
+	if dec(frags[0], 0) || dec(frags[1], 14+20+100) || dec(frags[2], 0) {
+		t.Fatal("datagram completed without the bytes the snaplen cut")
+	}
+	// The first one (held, then dropped), the cut one and the last one
+	// (dropped on arrival, not held for FragTimeout).
+	if d.Stats.FragmentsLost != 3 || d.Stats.DatagramsSnaplen != 1 {
+		t.Fatalf("stats %+v", d.Stats)
+	}
+	// A second cut copy (tcpdump -i any) is one more fragment, not one more
+	// datagram.
+	if dec(frags[1], 14+20+100) || d.Stats.FragmentsLost != 4 || d.Stats.DatagramsSnaplen != 1 {
+		t.Fatalf("stats %+v", d.Stats)
+	}
+	// Another datagram (another IP ID) still reassembles.
+	ok := false
+	for _, f := range pcaptest.Fragments4(cli4.Addr(), srv4.Addr(), 17, l4, 12, 1480) {
+		ok = dec(f, 0)
+	}
+	if !ok || d.Stats.Reassembled != 1 {
+		t.Fatalf("control datagram not reassembled: %+v", d.Stats)
+	}
+}
+
 // collector records what the assembler delivers.
 type collector struct {
 	data  bytes.Buffer

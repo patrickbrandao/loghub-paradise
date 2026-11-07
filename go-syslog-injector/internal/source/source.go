@@ -27,6 +27,14 @@ type Message struct {
 	At time.Duration
 	// Src and Dst are the addresses in the capture (pcap only).
 	Src, Dst netip.AddrPort
+	// Flow identifies the captured flow of the message (pcap with
+	// PcapOptions.Flows; 0 otherwise): one TCP direction, or one UDP
+	// (source, destination) pair (SPEC §6.8).
+	Flow uint64
+	// FlowEnd marks a control message without Data: the captured flow Flow
+	// ended (FIN, RST, idle, end of the capture). It is not a message of the
+	// run and takes no seq.
+	FlowEnd bool
 }
 
 // Source yields messages. Next returns io.EOF when a finite source ends.

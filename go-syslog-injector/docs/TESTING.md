@@ -20,6 +20,20 @@ O `-race` não é opcional. Leva cerca de 5 s; não precisa de nada externo.
 | `extract` | as três molduras em quatro divisões de segmentos; invariância da divisão (200 mensagens, 50 divisões aleatórias, três molduras); midstream; lacuna; tamanho inválido; quadro incompleto no fim; seleção de datagramas |
 | `app` | ponta a ponta contra servidores falsos: TCP octet com 4 conexões e `seq` 1..5000 exatas; LF e 3164 com PRI calculado; UDP e `too_large`; unix; TLS com CA própria e PROXY v2 byte a byte; PROXY v1; TLS sem CA → saída 3; alvo fechado → saída 3 dentro do `--drain-timeout`; servidor que fecha no meio (reconexão); `--rate` e `--duration`; `--duration` sem `--count` (enviava uma mensagem só antes de 2026-10-31, `TestDurationWithoutCount`); modelo com todos os marcadores; arquivo com `--loop`; 12 combinações recusadas; replay de captura com UDP, octet, LF midstream, RELP (e a direção `rsp`), DNS ignorado, pcapng com `--pcap-port`, `original` a 10x e `--loop`, `--format 5424` em volta da mensagem capturada; arquivo que não é captura |
 | `source` | `--loop` numa passada sem mensagem termina (`TestLoopBlankFileEnds`: arquivo só de linhas em branco; `TestLoopFileEmptiedBetweenPassesEnds`: arquivo esvaziado entre passadas). Antes de 2026-10-31 girava a 100 % de CPU para sempre (achado da revisão do GI) |
+| `verify` | marcadores `seq=`/`run=` como palavras; esquemas aceitos (`valkey://` → `redis://`, `valkeys://` → `rediss://`), recusas sem ecoar a URL, destino sem credenciais; só envelopes `syslog` do `space` e da execução contam; perdidas, duplicadas, inesperadas e faixas (`TestMarkers`, `TestParse`, `TestCountJLH`) |
+
+Testes da rodada de 2026-11-07 (SPEC §9), todos com checagem de mutação
+(remover a correção derruba o teste):
+
+| Teste | Regra | Mutação que ele pega |
+|---|---|---|
+| `extract` `TestResyncLargeCandidateHolds` | §6.6: candidato > 64 KiB segura a decisão | voltar o teto de 64 KiB |
+| `pcap` `TestFragmentCutBySnaplen` | §6.3: fragmento cortado descarta o datagrama na hora, conta uma vez | não descartar os fragmentos que chegam depois |
+| `app` `TestPcapDedupAnyCopies` | §6.9: captura SLL2 com cada pacote duas vezes (a cópia com DNAT) sai uma vez; repetição real (outro IP ID) fica; `off` manda as cópias | desligar a deduplicação |
+| `app` `TestPcapFlowsProxy` | §6.8: uma conexão por fluxo, PROXY v1 com a origem capturada, reuso da quádrupla = conexão nova, a conexão fecha no FIN (não no fim) | ignorar `FlowDial`; não trocar a origem; não emitir o fim do fluxo |
+| `app` `TestVerifySQLite` | §8.5: `events.db` com uma perdida, uma duplicada, outra execução, outro `space` e uma `seq` nunca enviada → código 1 e as contas; tudo uma vez → 0 sem esperar o prazo | não contar duplicadas; não dar código 1 por perda |
+| `app` `TestVerifyUnreachable` | §8.5: destino inalcançável (Redis, Valkey, PostgreSQL, NATS, SQLite inexistente) → 4, nada enviado, senha nunca impressa | seguir sem o destino |
+| `app` `TestPendingUsageErrors` | §3.2: as 12 recusas novas, sem ecoar a URL | — |
 
 ## 2. Fuzz
 
@@ -84,6 +98,50 @@ socat -u TCP-LISTEN:7000,reuseaddr,fork OPEN:out.txt,creat,append &
 sort out.txt | uniq -c | awk '$1 != 3'     # vazio
 ```
 
+### 3.3 Conferência no destino contra servidores reais (2026-11-07)
+
+`go-syslog-server` compilado deste worktree, um processo por destino
+(`--ring.mode=memory`, TCP e UDP em `127.0.0.1:38546`), e os cortes
+`go-syslog-pg-server` e `go-syslog-nats-server`; destinos em Docker:
+`nats:2.11-alpine -js` (stream `LOGHUB_SYSLOG` de `docker/nats/stream.json`),
+`postgres:18-alpine` (com `docker/postgres/inbox.sql`), `redis:7.4-alpine` e
+`valkey/valkey:8.1-alpine`, e o `events.db` do `sink=sqlite`. Quatro cenários
+por destino:
+
+1. TCP, 5000 mensagens em 4 conexões: `found 5000, lost 0, duplicated 0,
+   complete`, saída 0 (1,3 a 1,9 s de espera, o 1 s final incluso);
+2. a mesma execução de novo (mesmo `--run`): `found 5000, duplicated 5000`,
+   saída 1;
+3. UDP para uma porta sem ninguém: `expected 45` (5 `refused`), `lost 45`,
+   `lost_seqs 1,3-11,...`, saída 1;
+4. UDP, 20 000 na taxa máxima para o servidor: `found 20000, lost 0`, saída 0.
+
+Os sete conjuntos (S com nats, postgres, redis, valkey, sqlite; SP; SN) deram
+exatamente isso. O roteiro é a receita abaixo.
+
+Duas falhas que só o destino real mostrou: o `FetchNoWait` do consumidor
+ordenado do `nats.go` recomeçava do início a cada chamada (cada mensagem
+contada dezenas de vezes, `duplicated 536000`), e sem a leitura final de 1 s
+a segunda execução completava com as linhas da primeira e via 0 duplicadas
+no PostgreSQL (SPEC §8.5).
+
+Receita (portas da faixa da rodada; remova os contêineres pelo nome no fim):
+
+```sh
+docker run -d --name vke-si-nats -p 38540:4222 nats:2.11-alpine -js
+docker run --rm --network host -v "$PWD/../go-syslog-server/docker/nats/stream.json:/s.json:ro" \
+  natsio/nats-box:0.20.0 nats --server nats://host.docker.internal:38540 stream add LOGHUB_SYSLOG --config /s.json
+docker run -d --name vke-si-pg -p 38541:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_USER=syslog -e POSTGRES_DB=syslog postgres:18-alpine
+docker exec -i vke-si-pg psql -U syslog -d syslog -q < ../go-syslog-server/docker/postgres/inbox.sql
+docker run -d --name vke-si-redis  -p 38542:6379 redis:7.4-alpine
+docker run -d --name vke-si-valkey -p 38543:6379 valkey/valkey:8.1-alpine
+# um servidor por destino, p.ex.:
+LOGHUB_EB_URL=redis://127.0.0.1:38543/0 DATADIR=/tmp/d AGENT_NAME=go-syslog-server HOSTNAME=dev-mac \
+  ./go-syslog-server --listen.tcp=127.0.0.1:38546 --listen.udp=127.0.0.1:38546 --admin.bind=127.0.0.1:38545 &
+./go-syslog-injector --target 127.0.0.1:38546 --count 5000 --concurrency 4 --verify-url valkey://127.0.0.1:38543/0
+docker rm -f vke-si-nats vke-si-pg vke-si-redis vke-si-valkey
+```
+
 ## 4. O que ainda não está provado
 
 - TLS e PROXY contra o `go-syslog-server` real (só contra o servidor falso dos
@@ -92,6 +150,15 @@ sort out.txt | uniq -c | awk '$1 != 3'     # vazio
   seções: o código existe, mas só capturas sintéticas de Ethernet/SLL/SLL2/NULL
   passaram pelos testes, e as reais foram SLL2 e Ethernet.
 - Fragmentos IP numa captura real (no loopback não há fragmentação: MTU 64 KiB).
+- `--pcap-dedup` e `--pcap-flows` numa captura real: provados com capturas
+  sintéticas (SLL2 com cópias de DNAT; fluxos com PROXY v1 num servidor falso),
+  não com um `tcpdump -i any` de containers nem com o PROXY do
+  `go-syslog-server` real.
+- Conferência com Redis Sentinel/Cluster, NATS com TLS/credenciais e
+  PostgreSQL com TLS: os clientes aceitam pela URL, mas só o caminho sem TLS e
+  sem senha (NATS, Redis) ou com senha (PostgreSQL) foi exercitado.
+- Um candidato de ressincronização de vários MiB: o custo (memória e tempo)
+  foi medido só até 100 KiB (`TestResyncLargeCandidateHolds`).
 - Carga longa (horas): o injetor guarda tudo em memória por mensagem só até o
   envio, mas o replay de uma captura enorme com muitas direções abertas não foi
   medido.
