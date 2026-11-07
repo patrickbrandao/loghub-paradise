@@ -166,6 +166,7 @@ func (p *Pcap) step() error {
 			p.asm.Flush()
 			p.addAsm(p.asm.Stats)
 			p.asm = nil
+			p.dec.Flush() // fragments still waiting are lost (SPEC §6.3)
 			if len(p.queue) > 0 {
 				return nil
 			}
@@ -191,6 +192,7 @@ func (p *Pcap) reopen() error {
 	t.Fragments += d.Fragments
 	t.Reassembled += d.Reassembled
 	t.FragmentsLost += d.FragmentsLost
+	t.DatagramsSnaplen += d.DatagramsSnaplen
 	t.Truncated += d.Truncated
 	p.f.Close()
 	p.base = p.last + time.Millisecond
@@ -226,40 +228,41 @@ func (p *Pcap) Stats() map[string]uint64 {
 		a.Unterminated += c.Unterminated
 	}
 	return map[string]uint64{
-		"pcap_passes":             p.pass,
-		"pcap_cut_at_end":         p.cut,
-		"pcap_packets":            d.Packets + cur.Packets,
-		"pcap_not_ip":             d.NotIP + cur.NotIP,
-		"pcap_malformed":          d.Malformed + cur.Malformed,
-		"pcap_other_proto":        d.OtherProto + cur.OtherProto,
-		"pcap_snaplen_truncated":  d.Truncated + cur.Truncated,
-		"pcap_ip_fragments":       d.Fragments + cur.Fragments,
-		"pcap_ip_reassembled":     d.Reassembled + cur.Reassembled,
-		"pcap_ip_fragments_lost":  d.FragmentsLost + cur.FragmentsLost,
-		"tcp_directions":          a.Flows,
-		"tcp_midstream":           a.Midstream,
-		"tcp_directions_filtered": a.Ignored,
-		"tcp_flows_overflow":      a.Overflow,
-		"tcp_retransmitted_bytes": a.Retransmitted,
-		"tcp_out_of_order":        a.OutOfOrder,
-		"tcp_gaps":                a.Gaps,
-		"tcp_gap_bytes":           a.GapBytes,
-		"tcp_unterminated":        a.Unterminated,
-		"http_requests":           e.Requests,
-		"http_streams":            e.HTTPStreams,
-		"http_response_streams":   e.Responses,
-		"http_h2c_streams":        e.H2C,
-		"http_not_http_streams":   e.NotHTTP,
-		"http_resyncs":            e.Resyncs,
-		"http_skipped_bytes":      e.SkippedBytes,
-		"http_requests_lost":      e.Lost,
-		"http_requests_too_large": e.TooLarge,
-		"http2_requests":          e.H2Requests,
-		"http2_streams_reset":     e.H2Reset,
-		"http2_streams_lost":      e.H2Lost,
-		"http2_errors":            e.H2Errors,
-		"pcap_flows_ended":        p.flowEnds,
-		"messages_replayed":       p.sent,
+		"pcap_passes":               p.pass,
+		"pcap_cut_at_end":           p.cut,
+		"pcap_packets":              d.Packets + cur.Packets,
+		"pcap_not_ip":               d.NotIP + cur.NotIP,
+		"pcap_malformed":            d.Malformed + cur.Malformed,
+		"pcap_other_proto":          d.OtherProto + cur.OtherProto,
+		"pcap_snaplen_truncated":    d.Truncated + cur.Truncated,
+		"pcap_ip_fragments":         d.Fragments + cur.Fragments,
+		"pcap_ip_reassembled":       d.Reassembled + cur.Reassembled,
+		"pcap_ip_fragments_lost":    d.FragmentsLost + cur.FragmentsLost,
+		"pcap_ip_datagrams_snaplen": d.DatagramsSnaplen + cur.DatagramsSnaplen,
+		"tcp_directions":            a.Flows,
+		"tcp_midstream":             a.Midstream,
+		"tcp_directions_filtered":   a.Ignored,
+		"tcp_flows_overflow":        a.Overflow,
+		"tcp_retransmitted_bytes":   a.Retransmitted,
+		"tcp_out_of_order":          a.OutOfOrder,
+		"tcp_gaps":                  a.Gaps,
+		"tcp_gap_bytes":             a.GapBytes,
+		"tcp_unterminated":          a.Unterminated,
+		"http_requests":             e.Requests,
+		"http_streams":              e.HTTPStreams,
+		"http_response_streams":     e.Responses,
+		"http_h2c_streams":          e.H2C,
+		"http_not_http_streams":     e.NotHTTP,
+		"http_resyncs":              e.Resyncs,
+		"http_skipped_bytes":        e.SkippedBytes,
+		"http_requests_lost":        e.Lost,
+		"http_requests_too_large":   e.TooLarge,
+		"http2_requests":            e.H2Requests,
+		"http2_streams_reset":       e.H2Reset,
+		"http2_streams_lost":        e.H2Lost,
+		"http2_errors":              e.H2Errors,
+		"pcap_flows_ended":          p.flowEnds,
+		"messages_replayed":         p.sent,
 	}
 }
 

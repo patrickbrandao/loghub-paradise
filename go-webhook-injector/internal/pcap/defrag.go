@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// IP reassembly (SPEC §6.3). A syslog datagram above the path MTU travels in
-// fragments, and the capture only holds the whole message once they are
+// IP reassembly (SPEC §6.3). A packet above the path MTU travels in
+// fragments, and the capture only holds its TCP segment once they are
 // joined. Bounded: a datagram has at most 64 KiB and 128 fragments, at most
 // 1024 datagrams are open, and one not completed within FragTimeout of
 // capture time is dropped.
@@ -19,6 +19,13 @@ const (
 	// FragTimeout is the reassembly window, in capture time (RFC 791's
 	// suggested 15 s upper bound is far below what Linux keeps: 30 s).
 	FragTimeout = 30 * time.Second
+	// DedupWindow is how long, in capture time, a completed datagram is
+	// remembered so that a late tcpdump -i any copy of one of its fragments
+	// is taken as a copy (SPEC §6.3). The copies of a packet are
+	// microseconds apart (one skb crossing interfaces); the IP ID of a pair
+	// only comes round after 65 536 datagrams. Same value as the siblings'
+	// -i any copy window.
+	DedupWindow = 50 * time.Millisecond
 )
 
 type fragKey struct {
@@ -42,17 +49,78 @@ type fragDgram struct {
 
 type defrag struct {
 	open map[fragKey]*fragDgram
+	// cut holds the datagrams that lost a fragment to the snaplen (SPEC
+	// §6.3), with the capture time of that fragment: their other fragments
+	// are dropped on arrival instead of waiting FragTimeout for a datagram
+	// that can never complete.
+	cut map[fragKey]time.Time
+	// done remembers the datagrams completed in the last DedupWindow, with
+	// their fragments: a late -i any copy of one of them (same key, no NAT)
+	// is a copy, not the first fragment of an orphan that expires as lost
+	// (SPEC §6.3; finding 9 of the injectors' review of 2026-11-07, ported
+	// from go-syslog-injector).
+	done map[fragKey]*doneDgram
 }
 
-func newDefrag() *defrag { return &defrag{open: make(map[fragKey]*fragDgram)} }
+type doneDgram struct {
+	at    time.Time
+	parts [][2]int // offset, length
+}
+
+func newDefrag() *defrag {
+	return &defrag{open: make(map[fragKey]*fragDgram), cut: make(map[fragKey]time.Time), done: make(map[fragKey]*doneDgram)}
+}
+
+// lateCopy reports whether a fragment of no open datagram repeats one of a
+// datagram k completed within DedupWindow; one that does not means a new
+// datagram on the key, which forgets the old one.
+func (d *defrag) lateCopy(k fragKey, off, n int, ts time.Time) bool {
+	g := d.done[k]
+	if g == nil {
+		return false
+	}
+	if ts.Sub(g.at) <= DedupWindow && g.at.Sub(ts) <= DedupWindow {
+		for _, p := range g.parts {
+			if p[0] == off && p[1] == n {
+				return true
+			}
+		}
+	}
+	delete(d.done, k)
+	return false
+}
+
+// truncated records a fragment cut by the snaplen. lost counts it and the
+// fragments of its datagram held so far; first is true the first time the
+// datagram is seen cut (count it once).
+func (d *defrag) truncated(k fragKey, ts time.Time) (lost int, first bool) {
+	lost = d.expire(ts) + 1
+	if g := d.open[k]; g != nil {
+		lost += len(g.parts)
+		delete(d.open, k)
+	}
+	if _, ok := d.cut[k]; ok {
+		return lost, false
+	}
+	if len(d.cut) < maxFragDatagrams {
+		d.cut[k] = ts
+	}
+	return lost, true
+}
 
 // add stores one fragment. done is true when the datagram is complete; lost is
 // the number of fragments dropped by this call (expired datagrams, overlaps,
 // over-limit).
 func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (whole []byte, done bool, lost int) {
 	lost += d.expire(ts)
+	if _, ok := d.cut[k]; ok {
+		return nil, false, lost + 1 // its datagram already lost a piece
+	}
 	g := d.open[k]
 	if g == nil {
+		if d.lateCopy(k, off, len(data), ts) {
+			return nil, false, lost
+		}
 		if len(d.open) >= maxFragDatagrams {
 			return nil, false, lost + 1
 		}
@@ -105,7 +173,27 @@ func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (
 	if end != g.total {
 		return nil, false, lost + len(g.parts)
 	}
+	if len(d.done) < maxFragDatagrams {
+		dd := &doneDgram{at: ts, parts: make([][2]int, len(g.parts))}
+		for i, p := range g.parts {
+			dd.parts[i] = [2]int{p.off, len(p.data)}
+		}
+		d.done[k] = dd
+	}
 	return buf, true, lost
+}
+
+// flush drops every open datagram (end of a pass) and returns the fragments
+// they held; the datagrams condemned by the snaplen are forgotten too.
+func (d *defrag) flush() int {
+	lost := 0
+	for k, g := range d.open {
+		lost += len(g.parts)
+		delete(d.open, k)
+	}
+	clear(d.cut)
+	clear(d.done)
+	return lost
 }
 
 func (d *defrag) expire(now time.Time) int {
@@ -114,6 +202,16 @@ func (d *defrag) expire(now time.Time) int {
 		if now.Sub(g.first) > FragTimeout {
 			lost += len(g.parts)
 			delete(d.open, k)
+		}
+	}
+	for k, t := range d.cut {
+		if now.Sub(t) > FragTimeout {
+			delete(d.cut, k)
+		}
+	}
+	for k, g := range d.done {
+		if now.Sub(g.at) > DedupWindow {
+			delete(d.done, k)
 		}
 	}
 	return lost

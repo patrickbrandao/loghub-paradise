@@ -451,16 +451,59 @@ ela, só as direções para essas portas de destino. As direções de resposta
 pcap clássico (microssegundos ou nanossegundos, as duas ordens de bytes) e
 pcapng (seções, várias interfaces, `if_tsresol`, blocos EPB, SPB e PB). Enlaces:
 Ethernet (com 802.1Q/802.1ad), Linux cooked v1 e v2 (`-i any`), loopback BSD
-(`NULL`, `LOOP`), raw IPv4/IPv6 e PKTAP do macOS. Outro enlace é contado
-(`pcap_not_ip`) e pulado. Um arquivo cortado no meio de um registro reproduz
+(`NULL`, `LOOP`), raw IPv4/IPv6 e PKTAP do macOS. No PKTAP, o enlace de dentro
+é o `pth_dlt` do `pktap_header` (desde 2026-11-07, portado do SI/RI/GI: era
+lido do `pth_type_next`, que vale 1 em todo pacote, e o loopback `DLT_NULL` de
+um `-i any` no macOS não decodificava); registro com `pth_type_next` ≠ 1 não é
+pacote (`pcap_not_ip`). Outro enlace é contado (`pcap_not_ip`) e pulado. Um arquivo cortado no meio de um registro reproduz
 tudo até ali e conta `pcap_cut_at_end`.
 
 ### 6.3 IP
 
 IPv4 e IPv6 (com os cabeçalhos de extensão hop-by-hop, routing e destination),
 com remontagem de fragmentos (64 KiB e 128 fragmentos por datagrama, 1024
-abertos, 30 s de janela em tempo de captura; duplicata idêntica ignorada;
-sobreposição recusada, RFC 5722). Código herdado do SI.
+abertos, 30 s de janela em tempo de captura; o fragmento repetido idêntico — o
+`-i any` vê o quadro em duas interfaces — é ignorado; sobreposição recusada,
+RFC 5722). Código herdado do SI. O que se perde é contado
+(`pcap_ip_fragments_lost`), inclusive os fragmentos que ainda esperam o
+datagrama quando a passada acaba (desde 2026-11-07, portado do SI/RI/GI: antes
+sumiam sem contar).
+
+**Fragmento cortado pelo snaplen** (regra de 2026-11-07, portada do SI §6.3):
+o datagrama dele **não tem conserto** — os bytes que faltam não estão no
+arquivo, e nenhum outro fragmento os carrega (a cópia do `-i any` sai com o
+mesmo snaplen). O datagrama é descartado na hora em que o fragmento cortado
+chega — os fragmentos dele já guardados saem, e os que chegarem depois (dentro
+de `FragTimeout`) são descartados ao chegar, em vez de esperar a janela de
+30 s —, cada fragmento conta em `pcap_ip_fragments_lost`, e o datagrama, **uma
+vez**, em `pcap_ip_datagrams_snaplen`. Antes, só o fragmento cortado era
+contado; os outros ficavam abertos até vencer, e o datagrama perdido não
+aparecia em contador nenhum. A saída é capturar com `-s 0`.
+
+*O que um datagrama condenado é para o WI*: o WI só reproduz HTTP sobre TCP, e
+o relatório conta requisições, não quadros — não há `frames_lost`. Um
+datagrama condenado que é **TCP** é um segmento que falta: a direção fica com
+um buraco, que vira **lacuna** (§6.4, `tcp_gaps`, `tcp_gap_bytes`); a
+requisição que a lacuna corta conta em `http_requests_lost` (§6.6), e uma
+requisição que estava inteira dentro do segmento perdido (de fronteira a
+fronteira) some sem nada cortado para contar — só a lacuna a denuncia. Um
+datagrama condenado que é **UDP** (ou outro protocolo) é irrelevante para o
+WI, que não o reproduziria de qualquer jeito (`pcap_other_proto` para o
+inteiro): conta só nos dois contadores `pcap_ip_*` acima. Por isso o WI não
+tem o desdobramento por UDP do SI (`frames_lost`, alinhamento 8(c)).
+
+**Cópia tardia de um fragmento** (regra de 2026-11-07, achado 9 da revisão dos
+injetores, portada do SI): no `-i any` sem NAT as cópias de um fragmento têm a
+mesma chave de remontagem, e intercaladas (`f1` na veth, `f1` na eth0, `f2` na
+veth — que completa o datagrama —, `f2` na eth0) a última abria um datagrama
+órfão que vencia em 30 s e contava em `pcap_ip_fragments_lost`, sem nada
+perdido. O datagrama completado é lembrado por **50 ms** de captura
+(`DedupWindow`, a janela das cópias dos irmãos), com o deslocamento e o tamanho
+de cada fragmento: um fragmento dessa chave igual a um deles, nesse prazo, é
+cópia e é ignorado (como o fragmento repetido de um datagrama aberto);
+qualquer outro abre um datagrama novo. Os 50 ms bastam para as cópias
+(microssegundos uma da outra) e não confundem a reutilização do IP ID, que
+leva 65 536 datagramas do mesmo par.
 
 ### 6.4 Remontagem TCP
 
@@ -716,7 +759,8 @@ conexões abertas. `auto` liga só num terminal.
 ### 8.4 Contadores da fonte
 
 Arquivo: `file_bodies`, `file_empty_lines`, `file_long_bodies`, `file_passes`.
-Captura: `pcap_*` (como no SI), `tcp_*` (direções, midstream, filtradas,
+Captura: `pcap_*` (como no SI, com `pcap_ip_datagrams_snaplen` desde
+2026-11-07, §6.3), `tcp_*` (direções, midstream, filtradas,
 excedentes, bytes retransmitidos, fora de ordem, lacunas, `tcp_unterminated`),
 `http_requests`, `http_streams`, `http_response_streams`, `http_h2c_streams`,
 `http_not_http_streams`, `http_resyncs`, `http_skipped_bytes`,
@@ -913,3 +957,9 @@ capturas não têm.
     nem reordenar (§6.9); segurados do TCP com teto por segmento e ordenados
     uma vez (§6.4). `--proxy-src`/`--proxy-dst` com `--pcap-flows` (alinhamento
     8(a)): não se aplica, o WI não tem PROXY.
+13. *Corrigido em 2026-11-07 (porte do desfragmentador do SI/RI/GI):*
+    fragmento cortado pelo snaplen condena o datagrama na hora e conta em
+    `pcap_ip_datagrams_snaplen`; fragmentos à espera no fim da passada contam
+    como perdidos; cópia tardia do `-i any` de um fragmento de datagrama já
+    completado é ignorada (§6.3); enlace de dentro do PKTAP pelo `pth_dlt`
+    (§6.2).

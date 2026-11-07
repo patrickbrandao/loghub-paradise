@@ -90,6 +90,8 @@ não produz.
 | `httpx.TestResyncLinear` | 1,5 MiB de `A ` (um candidato a cada 2 bytes), com e sem LF antes da requisição verdadeira, em segmentos de 4 KiB e inteiro: a requisição é achada, ≤ 8 bytes procurados por byte e ≤ 4 cabeçalhos entregues ao `net/http` (antes, quadrático: 7,7 s por MiB; SPEC §6.6) |
 | `sched.TestFlowsCapAndOrder`, `TestFlowsEvictOnlyEmptyQueue` | `--pcap-flows` com 12 fluxos intercalados em 3 vagas e servidor lento: nunca mais de 3 conexões abertas, nenhuma requisição fora de ordem no fluxo; no teto, o fluxo mais ocioso **com fila** fica, o sem fila é fechado (SPEC §6.9) |
 | `pcap.TestTCPPendingBoundCountsEverySegment`, `TestTCPDrainManySegments` (os mesmos do SI e do RI) | 100 000 segmentos esvaziados pelo *snaplen* atrás de um buraco declaram a lacuna (antes, sem teto); 30 000 segmentos em ordem inversa e o buraco: saem inteiros, em ordem, em O(n log n) (SPEC §6.4) |
+| `pcap.TestFragmentCutBySnaplen`, `TestFragmentsWaitingAtEndAreLost`, `TestFragmentLateCopy`, `TestPKTAPInnerLinkType` (adaptados do SI, fragmentos de TCP) | fragmento cortado pelo snaplen: os 3 fragmentos do datagrama perdidos e o datagrama contado **uma** vez (IPv4 e IPv6), a 2ª cópia cortada é só mais um fragmento, outro IP ID remonta; `Flush` conta os 2 fragmentos à espera; cópias intercaladas do `-i any` = 1 datagrama e 0 perdidos, a mesma chave 50 ms depois (ou 1 s antes, relógio que volta) abre datagrama novo; PKTAP com `DLT_NULL` (loopback) decodifica e `pth_type_next` ≠ 1 é `pcap_not_ip` (SPEC §6.2, §6.3) |
+| `source.TestPcapFragmentCounters` | captura com o segmento de uma requisição fragmentado e um fragmento cortado: as outras duas requisições reproduzidas, `pcap_ip_datagrams_snaplen` 1, `tcp_gaps` 1 do tamanho do segmento, `http_requests_lost` 0 (a requisição estava inteira no segmento); 2 fragmentos de outro datagrama à espera no fim = `pcap_ip_fragments_lost` 5 (SPEC §6.3) |
 | `verify.TestSQLiteReader` | sempre roda: janela pelo `uuid`, leitura seguinte só depois do último `rowid`, tabela ausente recusada |
 | `verify.TestPGReader`, `TestRedisReader`, `TestValkeyReader`, `TestNATSReader` | opt-in, contra os servidores reais (abaixo): janela (PostgreSQL); nos streams, o que já estava lá na checagem não é lido e o stream que nasce depois é lido inteiro (SPEC §8.6.3, mutação: partir do início faz `TestNATSReader` ler 2503 e `TestRedisReader` achar a entrada velha); cursor, o mesmo envelope adicionado duas vezes (Redis, NATS), chave que não é stream, stream ausente |
 
@@ -112,6 +114,15 @@ leitura extra, sem ignorar a chave já vista, destino inalcançável com 2, perd
 com 4. Um sobreviveu, e é esperado: o teto de 4 KiB da linha de chunked
 inteira já era garantido pelo `httputil.NewChunkedReader` (a guarda nova é
 redundante; o comportamento era coerente antes).
+
+Mutação do porte do desfragmentador (2026-11-07, 13 de 13 derrubam o seu
+teste): datagrama cortado não lembrado, guardados não descartados no corte,
+datagrama contado a cada cópia cortada, corte ignorado no `add`, `flush` sem
+contar, cópia tardia desligada, janela da cópia tardia sem os dois sentidos
+(sobrevivia antes do caso do relógio que volta: o vencimento só olha para a
+frente), PKTAP lendo o `pth_type_next` e sem checá-lo, corte à moda antiga no
+IPv4 e no IPv6, fonte sem `dec.Flush` e sem o contador no relatório.
+`FuzzReader` 40 s limpo.
 
 Mutação da revisão de 2026-11-07 (todas derrubam o seu teste): `Close` sem
 passar adiante o reenvio na conexão ociosa; `wholeFrames` recomeçando do
