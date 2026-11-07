@@ -119,6 +119,35 @@ func TestValkeyAliasConflict(t *testing.T) {
 	}
 }
 
+// SPEC §13.2 (independent review of the Valkey round, 2026-11-07): the guard
+// compares the LAST value of each spelling, once, at the end of the source.
+// Checked at every line it depended on the order: the flags below ended with
+// 2 through both names and were refused. Repeated INI sections the same.
+func TestValkeyAliasComparesTheLastValueOfEachSpelling(t *testing.T) {
+	for name, o := range map[string]Options{
+		"flag": {Args: []string{"--sink.valkey.db=1", "--sink.redis.db=2", "--sink.valkey.db=2"},
+			LookupEnv: envMap(nil)},
+		"ini": {Args: []string{"--config", writeINI(t,
+			"[sink.valkey]\ndb = 1\n[sink.redis]\ndb = 2\n[sink.valkey]\ndb = 2\n")}, LookupEnv: envMap(nil)},
+	} {
+		l, err := Load(o)
+		if err != nil {
+			t.Errorf("%s: the last value of each spelling is 2, and it was refused: %v", name, err)
+			continue
+		}
+		if l.Config.SinkRedis.DB != 2 {
+			t.Errorf("%s: db = %d, want 2", name, l.Config.SinkRedis.DB)
+		}
+	}
+	// The last values still decide a refusal: an earlier agreement does not
+	// excuse a later disagreement.
+	_, err := Load(Options{Args: []string{"--config", writeINI(t,
+		"[sink.redis]\ndb = 1\n[sink.valkey]\ndb = 1\n[sink.redis]\ndb = 3\n")}, LookupEnv: envMap(nil)})
+	if err == nil || !strings.Contains(err.Error(), "[sink.redis] db") || !strings.Contains(err.Error(), "[sink.valkey] db") {
+		t.Errorf("repeated sections ending in disagreement: %v", err)
+	}
+}
+
 // The no-echo rules hold for the alias as for the canonical name: a name that
 // starts with an alias parameter and goes on is not shown, and a typo inside
 // [sink.valkey] is named, like one inside [sink.redis].

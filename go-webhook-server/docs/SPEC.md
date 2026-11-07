@@ -436,8 +436,12 @@ expressa — o MySQL confere a versão 7 de `uuid` e `from_uuid`, mas não a
 gramática de `space` nem `event_at >= epoch`; o SQLite, nenhuma das três. Nenhuma
 recusa o que este servidor escreve. Um
 consumidor escrito para a fila do PostgreSQL lê as três com o mesmo mapeamento
-(§3.6). Diferente da fila, o `payload` aqui é o texto do JLH, byte a byte (o
-SQLite guarda `TEXT`; o JSON do MySQL normaliza como o `jsonb`).
+(§3.6). Como na fila, o `payload` guarda **só o membro `payload` do JLH**
+(o objeto depois de `"payload":`), não o envelope inteiro: o cabeçalho está
+nas outras dez colunas. Diferente da fila, ele é o texto desse objeto como o
+servidor o escreveu, byte a byte (o SQLite guarda `TEXT`; o JSON do MySQL
+normaliza como o `jsonb`). Achado do agente do injetor de webhook
+(2026-11-07): o texto anterior ("o texto do JLH") parecia dizer o envelope.
 
 ```sql
 -- SQLite (criado pelo próprio servidor no events.db, §8.3)
@@ -1503,21 +1507,33 @@ um DOWN periódico. Agora:
 
 Assim a sonda fica sempre em uma ida e volta, salvo a checagem em que aprende.
 
-A política lida é a de um nó (o do cliente; com Sentinel, o primário). **Redis
-Cluster** (`addrs` com vários nós e sem Sentinel): o cliente de cluster do
-rueidis manda o `INFO memory` sem chave a um nó qualquer, então cada checagem
-confere a política de um nó só, e um nó isolado com `allkeys-*` só é pego
-quando é o sorteado. É uma limitação aceita: a conferência é uma precaução, e
-iterar sobre os primários a cada checagem multiplicaria o custo da sonda pelo
-número de nós (revisão independente de 2026-10-14, documentado). **Em cluster
-o comando da política sai fora do *pipeline*** (achado da rodada Valkey,
-2026-11-07): o cliente de cluster do rueidis entra em *panic* num `DoMulti`
-que mistura comandos com chave e um sem chave ("Mixing no-slot and cross slot
-commands"), então a primeira sonda derrubava o processo contra qualquer
-cluster, `db 0` inclusive. Em cluster a sonda é o `XLEN` + `XADD` num
-`DoMulti` e o `INFO memory` (ou o `CONFIG GET`) num `Do` à parte: uma ida e
-volta a mais, só nesse modo; standalone e Sentinel continuam com uma. O
-`TestRedisClusterSelectDB` (opt-in, §15.3) a cobre. **Um proxy
+A política lida é a do **primário que guarda o stream** da sonda (o do
+`sink.redis.workspace`, o mesmo do `XLEN`): standalone, o servidor; com
+Sentinel, o primário. **Redis Cluster** (`addrs` com vários nós e sem
+Sentinel; revisão independente da rodada Valkey, 2026-11-07): o cliente de
+cluster do rueidis manda um comando sem chave (`INFO`, `CONFIG GET`) num `Do`
+a um nó qualquer do mapa — réplicas incluídas, e outro a cada sonda —, então
+um shard do stream em `allkeys-*` passava enquanto o nó sorteado respondia
+`noeviction`. Agora, em cluster, o comando da política vai num `DoMulti`
+**junto do `XLEN <stream da sonda>`**, e o `XADD` da sonda (em
+`<stream>:healthprobe`, que cai em outro slot) num `Do` à parte. A mecânica é
+a do `_pickMulti` do rueidis: o *panic* ("Mixing no-slot and cross slot
+commands") só acontece quando um `DoMulti` com um comando sem chave tem
+comandos com chave de slots **diferentes**; um comando sem chave junto de
+comandos com chave de **um** slot é permitido e vai ao primário desse slot.
+Assim a política é sempre a do primário do stream da sonda, e o `CONFIG GET`
+de recuo (quando o `INFO` não respondeu) e o `INFO server` da identidade
+(§8.2.6) seguem o mesmo caminho. Standalone e Sentinel continuam com uma ida e
+volta; em cluster são duas (o par do slot do stream e o `XADD` da sonda). O
+que fica de fora: os streams de outros `space`/`type` (§3.3) podem estar em
+outros shards, e a política desses não é lida — iterar sobre os primários a
+cada checagem multiplicaria o custo da sonda pelo número de nós; a
+conferência é uma precaução, e o caso que importa é o do stream deste
+`workspace`. A divisão é travada sem servidor por
+`TestRedisClusterProbeRoutesThePolicyToTheStreamPrimary` (um cliente falso em
+modo cluster que aplica a regra do `_pickMulti`) e coberta contra um cluster
+real pelo `TestRedisClusterSelectDB` (opt-in, §15.3), que num cluster de um nó
+não distingue nós (`docs/TESTING.md` §5.1). **Um proxy
 que responde o `INFO` com um tipo inesperado** (array ou mapa no lugar de
 texto) dá um erro de leitura que não é resposta de erro do Redis: é tratado
 como transporte, retentado até `sink.boot_timeout`, e o boot sai com 3 e "not
@@ -1556,7 +1572,9 @@ Rodada Valkey de 2026-11-07 (decisão do usuário). O destino fala o
   presença do comando (`COMMAND INFO`) ou por `valkey_version` quando
   `server_name=valkey`.
 - **Identidade no boot.** Depois da primeira sonda boa, o boot roda `INFO
-  server` **uma vez** e o log `sink ready` traz `server` (`redis` \| `valkey`
+  server` **uma vez** (em cluster, no primário do stream da sonda, pelo mesmo
+  `DoMulti` com o `XLEN` de §8.2.5: num `Do` sem chave seria um nó qualquer,
+  réplica inclusive) e o log `sink ready` traz `server` (`redis` \| `valkey`
   \| `unknown`) e `server_version` (`valkey_version` quando
   `server_name=valkey`, senão `redis_version`). Uma ACL sem `INFO`, um proxy
   ou qualquer falha dessa leitura dá `unknown` e versão vazia, **sem erro**:
@@ -4002,6 +4020,27 @@ value'" ou, com o resto na forma `k = v`, injetava uma chave ou uma seção; na
 linha comentada de um valor derivado, a segunda linha deixava de ser
 comentário. O tab fica, porque o INI o aceita e o dump o relê (entre aspas).
 
+**Erros de validação sem eco do valor** (revisão independente de 2026-11-07,
+regra do projeto: "mensagens de erro de config nunca ecoam valores, que podem
+ser segredo"). Os erros de interpretação (`invalid integer`, número,
+duração, tamanho, booleano) e os de validação (`sink.type`, `ring.mode`,
+`log.level` e os outros enums; `sink.redis.addrs`, `admin.bind`,
+`sink.postgres.addr`, `sink.clickhouse.addrs`; nomes de tabela, de banco, de
+stream e de *subject*; `proxy.trusted` e `ratelimit.exempt`; e a cópia da
+regra do nome de banco nos construtores do MySQL e do ClickHouse) nomeiam **a
+chave** (a flag, a variável ou a linha do INI) e **o problema** — o valor
+esperado, a classe do caractere recusado (uma crase ou barra invertida, um
+byte de controle), a posição da entrada numa lista —, **nunca o valor**
+digitado, nem o texto de erro de `strconv`, `net` ou `netip`, que o repete.
+Um valor errado na chave vizinha da senha (a senha colada em `sink.redis.db`,
+um `addrs` com `user:senha@`) ia inteiro para o stderr e, na recarga por
+`SIGHUP`, para o log. Números já interpretados que a validação compara com um
+teto (`sink.workers: 5000 is above 4096`, uma duração, um tamanho) continuam
+na mensagem: um valor que chegou a ser número não carrega segredo; os
+`WARN` de `server.bind`/`admin.bind` fora do loopback também, porque o valor já
+passou como `host:porta`. Travado por `TestConfigErrorsNeverEchoTheValue` e
+`TestCheckQuotedNameNeverEchoesTheName`.
+
 **Alias `valkey`** (rodada Valkey de 2026-11-07, decisão do usuário; §8.2.6).
 A seção `[sink.valkey]`, as flags `--sink.valkey.<chave>` e as variáveis
 `WHS_SINK_VALKEY_<CHAVE>` são aliases exatos de cada chave de `[sink.redis]`:
@@ -4019,7 +4058,14 @@ enum). Regras:
   (`[sink.redis] db` e `[sink.valkey] db`, `WHS_SINK_REDIS_DB` e
   `WHS_SINK_VALKEY_DB`, `--sink.redis.db` e `--sink.valkey.db`), **nunca os
   valores**: um deles pode ser a senha. Repetir a mesma grafia continua como
-  sempre (a última vence).
+  sempre (a última vence). **O que se compara é o último valor de cada
+  grafia, uma vez, no fim da fonte** (revisão independente da rodada Valkey,
+  2026-11-07): a conferência a cada linha dependia da ordem, e
+  `--sink.valkey.db=1 --sink.redis.db=2 --sink.valkey.db=2` — a última de
+  cada grafia é `2` — saía com 1; agora passa. O mesmo vale para seções
+  repetidas no INI (`[sink.valkey] db = 1`, `[sink.redis] db = 2`,
+  `[sink.valkey] db = 2` passa). Um erro do INI nomeia o arquivo, sem linha:
+  são duas linhas, e as duas chaves estão na mensagem.
 - **`--help`** diz numa linha que o alias existe, sem duplicar a tabela;
   **`--dump-config`** mostra só os nomes canônicos (`[sink.redis]`,
   `sink.type = redis`), e o dump relido é igual. A recarga por `SIGHUP`

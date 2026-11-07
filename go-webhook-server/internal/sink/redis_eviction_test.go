@@ -123,7 +123,7 @@ func TestRedisAcceptsANonEvictingServer(t *testing.T) {
 	r := f.sink(f.cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	policy, err := checkRedisEviction(ctx, r.client)
+	policy, err := checkRedisEviction(ctx, r.client, r.stream.own)
 	if err != nil {
 		t.Fatalf("policy %q: %v (%s must not run allkeys-*)", policy, err, redisAddrEnv)
 	}
