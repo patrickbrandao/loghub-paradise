@@ -60,10 +60,13 @@ comentários: eles são o registro de por que cada decisão foi tomada. **Nada �
 importado de lá**, e nada é importado de nenhum outro módulo do monorepo.
 
 E o sentido inverso: `internal/convert`, os arquivos GELF de
-`internal/receiver` (`chunks.go`, `decompress.go`, `framing.go`, `http.go`) e
-`internal/item` são **copiados literalmente** por GP e GN (SPEC §17.1). Mudou um
-deles aqui, a mudança vai para os dois no mesmo dia, ou fica registrada como
-"a portar".
+`internal/receiver` (`chunks.go`, `decompress.go`, `framing.go`, com
+`chunks_bench_test.go` e `chunks_shard_test.go`) e `internal/item` são
+**copiados literalmente** por GP e GN (SPEC §17.1). O `http.go` **não** é
+cópia literal: nos cortes ele é o daqui sem o HTTPS, portado à mão, e a
+conferência é o `diff` do roteiro de porte da SPEC §17.1 (só podem sobrar os
+trechos do HTTPS). Mudou um deles aqui, a mudança vai para os dois no mesmo
+dia, ou fica registrada como "a portar".
 
 ## 4. Fronteira de responsabilidade
 
@@ -127,7 +130,8 @@ internal/
   item/       Item, codec do cabeçalho (compression, chunks), pools      [lógica pura, fuzz]
   rediscli/   cliente e classificação de erros comuns aos dois Redis
   jlhcheck/   oráculo de teste: schemas + regras semânticas             [só em teste]
-  receiver/   datagram.go (UDP, pktinfo), chunks.go (remontagem), decompress.go,
+  receiver/   datagram.go (UDP, pktinfo), chunks.go (remontagem: 64 shards,
+              tetos globais atômicos reservados por CAS), decompress.go,
               framing.go (\0), stream/tcp/tls.go, http.go (POST /gelf),
               proxy.go, limits.go, ingest.go                             [fuzz]
   filter/     level (min_level, levels); ratelimit/                      [lógica pura]
@@ -247,6 +251,14 @@ docker build -f docker/Dockerfile -t tmsoftbrasil/go-gelf-server:dev .
   é varrido por um **relógio próprio** (a cada 1 s), não pela chegada de chunks:
   senão uma mensagem órfã fica para sempre num servidor ocioso. A chave é
   `(src-ip, src-port, id)`: o id sozinho é do emissor e colide entre emissores.
+- **Os tetos da remontagem são globais, nunca por shard** (SPEC §5.2). O
+  estado é dividido em 64 shards (hash `maphash` com semente por processo da
+  chave; uma mensagem vive inteira num shard), mas `max_bytes` e
+  `max_messages` são contadores atômicos compartilhados, reservados por CAS
+  (`reserveSlot`, `reserveBytes`), nunca soma-e-desfaz. Um teto por shard
+  deixaria um shard quente recusar com os outros vazios, ou a soma passar do
+  configurado; soma-e-desfaz recusaria dois chunks que cabem sozinhos.
+  `chunks_shard_test.go` trava as duas coisas.
 - **Números JSON nunca passam por `float64`:** `1e400`, `0.1`, `-0`,
   `12345678901234567890` são o **texto** que chegou, validado pela gramática.
   O `timestamp` é aritmética decimal sobre o texto. Um `json.Unmarshal` num

@@ -69,17 +69,20 @@ func TestReassemblyCeilingsAreGlobalAcrossShards(t *testing.T) {
 }
 
 // Many listeners at once, every outcome mixed (complete, duplicate, too
-// large, overflow, expired): the byte charge never passes the ceiling at any
-// instant, and once everything completes or is swept both counters return to
-// zero. A leak in any path (the undo of the too_large chunk, a tombstone's
-// slot) or an add-then-check race shows here. Run with -race.
+// large, overflow, expired): neither the byte charge nor the open messages
+// ever pass their ceilings at any instant (the left-open messages fill
+// MaxMessages, so its CAS reservation is raced too), and once everything
+// completes or is swept both counters return to zero. A leak in any path (the
+// undo of the too_large chunk, a tombstone's slot) or an add-then-check race
+// shows here. Run with -race.
 func TestReassemblyConcurrentAccountingBalances(t *testing.T) {
 	const (
-		listeners = 8
-		perL      = 400
-		maxBytes  = 64 << 10
+		listeners   = 8
+		perL        = 400
+		maxBytes    = 64 << 10
+		maxMessages = 256
 	)
-	r := NewReassembler(ReassemblerConfig{MaxBytes: maxBytes, MaxMessages: 256, MaxMessageWire: 3000})
+	r := NewReassembler(ReassemblerConfig{MaxBytes: maxBytes, MaxMessages: maxMessages, MaxMessageWire: 3000})
 	data := bytes.Repeat([]byte("y"), 700)
 	big := bytes.Repeat([]byte("z"), 2000)
 	var wg sync.WaitGroup
@@ -105,6 +108,10 @@ func TestReassemblyConcurrentAccountingBalances(t *testing.T) {
 					r.Add(nil, src, c, t0)
 					if b := r.Bytes(); b > maxBytes || b < 0 {
 						errs <- "bytes out of range"
+						return
+					}
+					if o := r.Open(); o > maxMessages || o < 0 {
+						errs <- "open messages out of range"
 						return
 					}
 				}

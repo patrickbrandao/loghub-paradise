@@ -70,7 +70,7 @@ pacote é o mesmo:
 ```bash
 go test -run XXX -bench 'Reassembler|ChunkFlood' -benchmem -cpu 1,2,4,8 ./internal/receiver
 ```
- Nenhum número de GN foi registrado: os
+Nenhum número de GN foi registrado: os
 alvos de SPEC §18.8 continuam **não medidos** (§8).
 
 ## 5. Integração em processo (`internal/app`)
@@ -152,9 +152,10 @@ com `docker compose config`; não foi subido na rodada.
 
 1. **Desempenho nunca medido** (SPEC §18.8).
 2. **Sem TLS e sem HTTPS nos emissores**, por desenho; G os cobre.
-3. **O HTTP com vários documentos por corpo** (o output `http` do fluent-bit
-   com `Format gelf`) não é testado com emissor real: é a pendência SPEC §22.1
-   item 2, herdada de G.
+3. **A saída `http` do fluent-bit ao vivo** não é testada: o `http.bulk`
+   (SPEC §4.5.1, pendência §22.1 item 2 fechada) é provado pelos testes de
+   `receiver` (`TestHTTPBulk`), não por um fluent-bit rodando contra este
+   servidor.
 4. **O compose não foi subido** na rodada (só `config`), nem a imagem foi
    provada contra um NATS de verdade fora do processo de teste (`--version` sim).
 5. **Várias URLs NATS**: o veredito do boot pode depender da ordem em que o

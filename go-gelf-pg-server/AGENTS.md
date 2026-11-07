@@ -233,6 +233,12 @@ Novas do GELF (G, DESIGN §5):
 - **Nunca alocar pelo que o par declara:** `count` de chunks, `Content-Length`.
 - **Remontagem de chunks é estado compartilhado** com teto global; o prazo é
   varrido por um relógio próprio, não por chunk recebido.
+- **Os tetos da remontagem são globais, nunca por shard** (SPEC §5.2, como G):
+  64 shards por hash com semente da chave `(src-ip, src-port, id)`, mas
+  `max_bytes` e `max_messages` são contadores atômicos compartilhados,
+  reservados por CAS, nunca soma-e-desfaz. Um teto por shard recusaria num
+  shard quente com os outros vazios, ou deixaria a soma passar do configurado
+  (`chunks_shard_test.go`, cópia literal de G).
 - **Números JSON** nunca passam por `float64` (`1e400`, `0.1`, inteiros > 2^53),
   e na `loghub.inbox` um número fora do `numeric` vai como string na cópia
   (SPEC §3.7.1): sem isso, `1e1000000` num campo derrubava o pedaço inteiro.

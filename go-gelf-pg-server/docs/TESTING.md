@@ -80,7 +80,7 @@ G (SPEC §5.2, TESTING §4), e o pacote é o mesmo:
 ```bash
 go test -run XXX -bench 'Reassembler|ChunkFlood' -benchmem -cpu 1,2,4,8 ./internal/receiver
 ```
- **Nenhum número
+**Nenhum número
 foi registrado nesta rodada**; os alvos de SPEC §18.8 nunca foram medidos (§8).
 
 ---
