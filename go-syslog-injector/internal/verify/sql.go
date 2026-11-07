@@ -28,7 +28,7 @@ func openPostgres(ctx context.Context, t *Target) (reader, error) {
 	}
 	c, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: connect: %w", err)
+		return nil, t.clean("postgres: connect", err)
 	}
 	table := pgx.Identifier{"loghub", "inbox"}
 	if t.Key != "" {
@@ -41,18 +41,19 @@ func openPostgres(ctx context.Context, t *Target) (reader, error) {
 	// Prove the table and the columns now, before anything is sent.
 	if _, err := c.Exec(ctx, "SELECT 1 FROM "+table.Sanitize()+" WHERE type = 'syslog' AND space = $1 AND event_at >= $2 AND payload ? 'message' LIMIT 0", t.Space, t.Since); err != nil {
 		c.Close(context.Background())
-		return nil, fmt.Errorf("postgres: table %s: %w", table.Sanitize(), err)
+		return nil, t.clean("postgres: table "+table.Sanitize(), err)
 	}
 	return r, nil
 }
 
+func (r *pgReader) full() bool { return true }
+
 func (r *pgReader) poll(ctx context.Context, cnt *Counter) error {
 	rows, err := r.c.Query(ctx, r.query, r.t.Space, r.t.Since, "run="+r.t.Run)
 	if err != nil {
-		return fmt.Errorf("postgres: %w", err)
+		return r.t.clean("postgres", err)
 	}
 	defer rows.Close()
-	cnt.Reset()
 	for rows.Next() {
 		var msg, raw *string
 		if err := rows.Scan(&msg, &raw); err != nil {
@@ -75,8 +76,7 @@ func deref(s *string) string {
 	return *s
 }
 
-func (r *pgReader) final() error { return nil }
-func (r *pgReader) close()       { r.c.Close(context.Background()) }
+func (r *pgReader) close() { r.c.Close(context.Background()) }
 
 // sqliteReader reads the events.db of sink=sqlite (SPEC §8.5; the server's
 // SPEC §3.7), read-only, while the server writes it in WAL mode.
@@ -110,7 +110,6 @@ func (r *sqliteReader) poll(ctx context.Context, cnt *Counter) error {
 		return fmt.Errorf("sqlite: %w", err)
 	}
 	defer rows.Close()
-	cnt.Reset()
 	for rows.Next() {
 		var env string
 		if err := rows.Scan(&env); err != nil {
@@ -124,5 +123,5 @@ func (r *sqliteReader) poll(ctx context.Context, cnt *Counter) error {
 	return nil
 }
 
-func (r *sqliteReader) final() error { return nil }
-func (r *sqliteReader) close()       { r.db.Close() }
+func (r *sqliteReader) full() bool { return true }
+func (r *sqliteReader) close()     { r.db.Close() }

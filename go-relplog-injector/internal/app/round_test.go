@@ -111,9 +111,9 @@ func (k *sqliteSink) store(t *testing.T, msg string) {
 }
 
 // TestVerifySQLite: the destination check against the sink=sqlite table:
-// everything there (exit 0), one acknowledged message missing (exit 4, lost
-// 1, its seq in the sample), one stored twice (exit 4, or 0 with
-// --verify-allow-duplicates), and a destination that cannot be read (exit 5).
+// everything there (exit 0), one acknowledged message missing (exit 1, lost
+// 1, its seq in the sample), one stored twice (exit 1, or 0 with
+// --verify-allow-duplicates), and a destination that cannot be read (exit 4).
 func TestVerifySQLite(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -123,7 +123,7 @@ func TestVerifySQLite(t *testing.T) {
 		check func(v *report.Verify) bool
 	}{
 		{"all", func(k *sqliteSink, m string) { k.store(t, m) }, nil, ExitOK,
-			func(v *report.Verify) bool { return v.OK && v.Found == 200 && v.Acked == 200 && v.Lost == 0 }},
+			func(v *report.Verify) bool { return v.OK && v.Found == 200 && v.Expected == 200 && v.Lost == 0 }},
 		{"lost", func(k *sqliteSink, m string) {
 			if !strings.Contains(m, "seq=77 ") {
 				k.store(t, m)
@@ -139,7 +139,7 @@ func TestVerifySQLite(t *testing.T) {
 			}
 		}, nil, ExitFailures,
 			func(v *report.Verify) bool {
-				return !v.OK && v.Duplicated == 1 && v.ExtraCopies == 1 && v.ExtraSameUUID == 0
+				return !v.OK && v.Duplicated == 1 && v.DuplicatedSameUUID == 0
 			}},
 		{"dup-allowed", func(k *sqliteSink, m string) {
 			k.store(t, m)
@@ -198,6 +198,12 @@ func TestVerifyUsage(t *testing.T) {
 		{"--verify-url", "nats://h:4222", "--verify-timeout", "0s"},
 		{"--verify-url", "nats://h:4222", "--file", "/dev/null"},
 		{"--pcap-flows"}, {"--pcap-dedup", "maybe"}, {"--verify-space", "x"},
+		{"--verify-tls-ca", "/dev/null"},
+		{"--verify-sqlite", "x.db", "--verify-tls-ca", "/dev/null"},
+		{"--verify-url", "nats://h:4222", "--verify-tls-ca", "/dev/null"},
+		{"--verify-url", "tls://h:4222", "--verify-tls-ca", "/dev/null"},
+		{"--verify-url", "nats://user:s3cr3t@h1:4222,nats://user:s3cr3t@h2:4222/%zz"},
+		{"--verify-url", "nats://user:s3cr3t@h1:4222,redis://user:s3cr3t@h2"},
 	} {
 		code, _, errs := runMain(t, args...)
 		if code != ExitUsage || strings.Contains(errs, "s3cr3t") {
@@ -333,5 +339,41 @@ func TestPcapPerFlow(t *testing.T) {
 				t.Fatalf("concurrency %q: flow %s replayed %q, want %q", conc, src, got[src], w)
 			}
 		}
+	}
+	// One override for every session would undo --pcap-flows (alignment
+	// 8(a) of 2026-11-07): refused.
+	for _, f := range []string{"--proxy-src", "--proxy-dst"} {
+		if code, _, errs := runMain(t, "--target", "127.0.0.1:1", "--pcap", file, "--pcap-flows", "--proxy-protocol", "v1", f, "10.9.9.9:1"); code != ExitUsage || !strings.Contains(errs, "--pcap-flows") {
+			t.Fatalf("%s with --pcap-flows: exit %d %s", f, code, errs)
+		}
+	}
+}
+
+// TestVerifySQLiteReusedRun (SPEC §8.5, review finding 4): the SQLite table
+// is read after its max(rowid) at the Probe, so the rows of an earlier run
+// with the same --run do not pass for this one, which lost everything.
+func TestVerifySQLiteReusedRun(t *testing.T) {
+	k := newSQLiteSink(t)
+	s := newRELPServer(t, nil, false)
+	s.set(func(s *relpServer) { s.onAck = func(m string) { k.store(t, m) } })
+	if code, sum := runJSON(t, "--target", s.addr, "--count", "20", "--run", "again", "--verify-sqlite", k.path); code != ExitOK || sum.Verify.Found != 20 {
+		t.Fatalf("first run: exit %d %+v", code, sum.Verify)
+	}
+	s.set(func(s *relpServer) { s.onAck = func(string) {} }) // the sink now loses everything
+	code, sum := runJSON(t, "--target", s.addr, "--count", "20", "--run", "again", "--verify-sqlite", k.path, "--verify-timeout", "600ms")
+	if code != ExitFailures || sum.Verify.Lost != 20 || sum.Verify.Found != 0 {
+		t.Fatalf("reused run: exit %d %+v", code, sum.Verify)
+	}
+}
+
+// TestVerifyUnreachableList (SPEC §8.5, review finding 3): an unreachable
+// NATS list fails with code 4 before sending, and no password reaches the
+// report or stderr.
+func TestVerifyUnreachableList(t *testing.T) {
+	s := newRELPServer(t, nil, false)
+	code, out, errs := runMain(t, "--target", s.addr, "--count", "3", "--report", "json", "--timeout", "1s",
+		"--verify-url", "nats://user:s3cr3t@127.0.0.1:1,tls://t0ken@127.0.0.1:2")
+	if code != ExitVerify || strings.Contains(out+errs, "s3cr3t") || strings.Contains(out+errs, "t0ken") || !strings.Contains(out, "127.0.0.1:1,127.0.0.1:2") {
+		t.Fatalf("exit %d stdout %q stderr %q", code, out, errs)
 	}
 }

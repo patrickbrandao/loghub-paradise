@@ -1,6 +1,7 @@
 package pcap
 
 import (
+	"container/heap"
 	"net/netip"
 	"sort"
 	"time"
@@ -39,8 +40,14 @@ type NewStreamFunc func(k FlowKey, midstream bool) StreamHandler
 // Limits of the assembler.
 const (
 	// MaxPendingBytes is the out-of-order data held per direction while a
-	// hole waits to be filled; past it, the hole is declared a gap.
+	// hole waits to be filled; past it, the hole is declared a gap. Every
+	// held segment costs its captured bytes plus pendingCost, so segments
+	// the snaplen emptied are bounded too (SPEC §6.4).
 	MaxPendingBytes = 4 << 20
+	// pendingCost is what one held segment counts besides its bytes (about
+	// its bookkeeping): until 2026-11-07 a segment with no captured bytes
+	// counted 0 and the queue had no bound.
+	pendingCost = 64
 	// MaxFlows bounds the open directions; new ones beyond it are ignored.
 	MaxFlows = 1 << 17
 	// FlowIdle closes a direction with no segment for this long in capture
@@ -71,10 +78,29 @@ type pending struct {
 	ts   time.Time
 }
 
+// pendHeap holds the segments ahead of a hole as a min-heap by sequence
+// (SPEC §6.4): drain and skipToPending only need the lowest one. Until
+// 2026-11-07 the queue was sorted again at every segment taken out,
+// O(n² log n) behind a hole with many segments. seqLT is a strict order
+// here: every held segment is within 2³¹ of f.next.
+type pendHeap []pending
+
+func (h pendHeap) Len() int           { return len(h) }
+func (h pendHeap) Less(i, j int) bool { return seqLT(h[i].seq, h[j].seq) }
+func (h pendHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *pendHeap) Push(x any)        { *h = append(*h, x.(pending)) }
+func (h *pendHeap) Pop() any {
+	old := *h
+	p := old[len(old)-1]
+	old[len(old)-1] = pending{} // let the bytes go
+	*h = old[:len(old)-1]
+	return p
+}
+
 type flow struct {
 	h       StreamHandler
 	next    uint32
-	pend    []pending
+	pend    pendHeap
 	pendLen int
 	last    time.Time
 	id      uint64
@@ -178,8 +204,8 @@ func (a *Assembler) deliver(f *flow, seq uint32, data []byte, wire int, ts time.
 	if seqLT(f.next, seq) {
 		// Ahead of a hole: hold it.
 		a.Stats.OutOfOrder++
-		f.pend = append(f.pend, pending{seq: seq, data: append([]byte(nil), data...), wire: wire, ts: ts})
-		f.pendLen += len(data)
+		heap.Push(&f.pend, pending{seq: seq, data: append([]byte(nil), data...), wire: wire, ts: ts})
+		f.pendLen += len(data) + pendingCost
 		if f.pendLen > MaxPendingBytes {
 			a.skipToPending(f)
 		}
@@ -209,18 +235,16 @@ func (a *Assembler) take(f *flow, seq uint32, data []byte, wire int, ts time.Tim
 	f.next = end
 }
 
+// drain takes the held segments the stream has reached, lowest first.
 func (a *Assembler) drain(f *flow) {
-	for len(f.pend) > 0 {
-		sort.Slice(f.pend, func(i, j int) bool { return seqLT(f.pend[i].seq, f.pend[j].seq) })
-		p := f.pend[0]
-		if seqLT(f.next, p.seq) {
-			return
-		}
-		f.pend = f.pend[1:]
-		f.pendLen -= len(p.data)
+	for len(f.pend) > 0 && !seqLT(f.next, f.pend[0].seq) {
+		p := heap.Pop(&f.pend).(pending)
+		f.pendLen -= len(p.data) + pendingCost
 		a.take(f, p.seq, p.data, p.wire, p.ts)
 	}
-	f.pendLen = 0
+	if len(f.pend) == 0 {
+		f.pend, f.pendLen = nil, 0
+	}
 }
 
 // skipToPending declares the hole before the first held segment lost.
@@ -228,7 +252,6 @@ func (a *Assembler) skipToPending(f *flow) {
 	if len(f.pend) == 0 {
 		return
 	}
-	sort.Slice(f.pend, func(i, j int) bool { return seqLT(f.pend[i].seq, f.pend[j].seq) })
 	first := f.pend[0].seq
 	if seqLT(f.next, first) {
 		a.gap(f, int(first-f.next))

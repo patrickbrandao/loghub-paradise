@@ -49,6 +49,31 @@ Porte entre injetores (2026-11-07; SPEC §9 item 6), também com mutação:
 | `extract` `TestResyncLinearCost`, `TestResyncLargeRELPCandidate`, `TestResyncLargeOctetCandidateHolds` (do RI) | §6.6: sem candidato o buffer fica em 64 bytes e a busca não recomeça; um quadro de 6 MiB em 4300 segmentos pede no máximo 10 buscas | não aparar sem candidato; buscar a cada segmento; esquecer `from`/`need` |
 | `verify` `TestNATSStartsAfterLast`, `TestRedisStartsAfterLast` (opt-in: `SI_TEST_VERIFY_NATS`, `SI_TEST_VERIFY_REDIS` com Redis e Valkey) | §8.5: o que já estava no stream na abertura não é lido; o stream que nasce depois é lido inteiro; 1500 mensagens em mais de um `Fetch` | partir do início (sequência 1, `-`) |
 
+Revisão independente dos injetores (2026-11-07; SPEC §9 item 7). Cada teste
+foi conferido por mutação (a correção tirada, o teste falha); os opt-in rodaram
+contra `nats:latest -js`, `postgres:18-alpine`, `redis:7.4-alpine` e
+`valkey/valkey:8.1-alpine` em Docker (`SI_TEST_VERIFY_PG` é novo):
+
+| Teste | Regra | Mutação que ele pega |
+|---|---|---|
+| `verify` `TestNATSFacilitySeverity` (opt-in) | §8.5: stream com os dois subjects, publicação abaixo de `.syslog.>`; o filtro é sempre os dois | filtrar no subject que achou o stream (o defeito: 1 de 10) |
+| `verify` `TestNATSForeignTraffic` (opt-in) | §8.5: outra carga no mesmo subject sem parar; a leitura termina (`NumPending`, fatia de 2 s) e a espera completa | voltar só com o lote vazio (prazo vencido, `error`, 25 s) |
+| `verify` `TestRedisStartsAfterLast` (revisto) | §8.5: stream que nunca aparece = tudo perdido, sem `error` | — (a regra antiga foi apagada) |
+| `verify` `TestPostgresRunPresent` (opt-in), `app` `TestVerifyRunPresent` | §8.5: linhas da execução já na janela → código 2, nada enviado; outro `--run` (mesmo um prefixo) passa | não recusar |
+| `verify` `TestParseLists`, `TestClean`, `app` `TestPendingUsageErrors`, `TestVerifyUnreachable` | §8.5: cada elemento da lista NATS analisado antes, mensagem genérica; `*url.Error` nunca repassado; usuário/senha/token apagados; destino com todos os hosts | analisar só o 1º elemento; repassar o `*url.Error` (senha codificada de outro jeito escapa do apagamento) |
+| `verify` `TestWaitExtraRead` | §8.5: a leitura a mais depois de completo vê a cópia da rajada | tirar a leitura a mais |
+| `verify` `TestWaitRetriesErrors` | §8.5: erro repetido até o prazo; leitura inteira cortada não troca a conta; última leitura com erro → `error` | parar no 1º erro; trocar a conta por uma leitura cortada |
+| `verify` `TestTallyUnexpectedRecords` | §8.5: `unexpected` em registros; `duplicated` = cópias a mais | contar `seq` distintas |
+| `app` `TestPcapFlows` (estendido) | §6.8: `--proxy-src`/`--proxy-dst` com `--pcap-flows` → 2 | aceitar |
+| `pcap` `TestFragmentLateCopy` | §6.3: cópias intercaladas sem NAT não abrem órfão; passada a janela de 50 ms, é datagrama novo | não lembrar o datagrama completado |
+| `pcap` `TestSnaplenUDPDatagramIsLostFrame` | §6.3: UDP condenado pelo snaplen contado para `frames_lost` | não contar |
+| `pcap` `TestTCPPendingBoundCountsEverySegment` | §6.4: 100 000 segmentos sem bytes atrás de um buraco batem no teto | custo 0 por segmento |
+| `pcap` `TestTCPDrainManySegments` | §6.4: 30 000 segmentos em ordem inversa drenam em < 5 s (0,4 s) | reordenar a cada retirada (59 s) |
+
+Não coberto por teste: a soma de `DatagramsSnaplenUDP` em `frames_lost` no
+`source` (uma linha; o contador do decodificador é testado) e a folga de 10 min
+(constante).
+
 ## 2. Fuzz
 
 Antes de release, 10 min cada; 60 s no dia a dia:
@@ -170,7 +195,9 @@ docker rm -f vke-si-nats vke-si-pg vke-si-redis vke-si-valkey
   `go-syslog-server` real.
 - Conferência com Redis Sentinel/Cluster, NATS com TLS/credenciais e
   PostgreSQL com TLS: os clientes aceitam pela URL, mas só o caminho sem TLS e
-  sem senha (NATS, Redis) ou com senha (PostgreSQL) foi exercitado.
+  sem senha (NATS, Redis) ou com senha (PostgreSQL) foi exercitado; o
+  `--verify-tls-ca` (2026-11-07) só nas recusas de uso, sem um destino TLS
+  real.
 - Um candidato de ressincronização de vários MiB: o custo (memória e tempo)
   foi medido só até 100 KiB (`TestResyncLargeCandidateHolds`).
 - Carga longa (horas): o injetor guarda tudo em memória por mensagem só até o

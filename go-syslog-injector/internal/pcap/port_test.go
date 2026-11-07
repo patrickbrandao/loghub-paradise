@@ -135,3 +135,7 @@ func TestDedupRule(t *testing.T) {
 		t.Fatal("a NAT-rewritten copy was not dropped")
 	}
 }
+
+// lostUDP is the counter of the UDP datagrams the snaplen condemned (its name
+// differs between the injectors; review_test.go is shared).
+func lostUDP(d *pcap.Decoder) uint64 { return d.Stats.DatagramsSnaplenUDP }

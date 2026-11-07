@@ -68,7 +68,19 @@ type streamStart struct {
 	marked    bool
 	natsAfter uint64 // the stream's last sequence
 	redisFrom string // the XRANGE start: "(<last id>", or "-" for no entry
+	// sqliteAfter is the table's max(rowid): the run's rows come after it,
+	// and an earlier run with the same --run is not read (SPEC §8.5; it read
+	// from rowid 0 until 2026-11-07).
+	sqliteAfter int64
 }
+
+// ErrRunPresent: the PostgreSQL window already holds envelopes of --run
+// (SPEC §8.5); the run is refused before anything is sent (exit 2).
+var ErrRunPresent = errors.New("--run already present at the destination; use another one")
+
+// readSlice bounds one NATS read: a stream with constant foreign traffic on
+// the subject never gives an empty batch (SPEC §8.5).
+var readSlice = 2 * time.Second
 
 // open connects a reader; mark (Probe, before the send) records where the
 // streams are, the start of every later read.
@@ -81,7 +93,7 @@ func open(ctx context.Context, t *Target, since time.Time, run string, mark bool
 	case KindPostgres:
 		return openPostgres(ctx, t, since, run)
 	case KindSQLite:
-		return openSQLite(t, run)
+		return openSQLite(ctx, t, run, mark)
 	}
 	return nil, fmt.Errorf("unknown destination kind %q", t.Kind)
 }
@@ -101,6 +113,7 @@ func caPool(file string) (*x509.CertPool, error) {
 // --- NATS JetStream (go-relplog-server SPEC §3.8, §10.7) ---
 
 type natsReader struct {
+	t    *Target
 	nc   *nats.Conn
 	cons jetstream.Consumer
 	// last stream sequence counted: an ordered consumer that resets (it
@@ -125,23 +138,23 @@ func openNATS(ctx context.Context, t *Target, since time.Time, mark bool) (reade
 	}
 	nc, err := nats.Connect(t.url, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("nats: %w", cleanErr(err, t.url))
+		return nil, t.clean("nats", err)
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("nats: %w", err)
+		return nil, t.clean("nats", err)
 	}
 	if mark {
 		st, err := js.Stream(ctx, t.stream)
 		if err != nil {
 			nc.Close()
-			return nil, fmt.Errorf("nats stream %s: %w", t.stream, err)
+			return nil, t.clean("nats stream "+t.stream, err)
 		}
 		info, err := st.Info(ctx)
 		if err != nil {
 			nc.Close()
-			return nil, fmt.Errorf("nats stream %s: %w", t.stream, err)
+			return nil, t.clean("nats stream "+t.stream, err)
 		}
 		t.start = streamStart{marked: true, natsAfter: info.State.LastSeq}
 	}
@@ -149,9 +162,9 @@ func openNATS(ctx context.Context, t *Target, since time.Time, mark bool) (reade
 	cons, err := js.OrderedConsumer(ctx, t.stream, cfg)
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("nats stream %s: %w", t.stream, err)
+		return nil, t.clean("nats stream "+t.stream, err)
 	}
-	return &natsReader{nc: nc, cons: cons}, nil
+	return &natsReader{t: t, nc: nc, cons: cons}, nil
 }
 
 // natsStart is the consumer's start: after the sequence marked by Probe, or,
@@ -171,15 +184,18 @@ func (r *natsReader) Incremental() bool { return true }
 func (r *natsReader) Close()            { r.nc.Close() }
 
 func (r *natsReader) Read(ctx context.Context, fn func(Entry)) error {
+	until := time.Now().Add(readSlice)
 	for ctx.Err() == nil {
 		batch, err := r.cons.Fetch(1000, jetstream.FetchMaxWait(300*time.Millisecond))
 		if err != nil {
-			return fmt.Errorf("nats fetch: %w", err)
+			return r.t.clean("nats fetch", err)
 		}
 		n := 0
+		pending := uint64(1)
 		for m := range batch.Messages() {
 			n++
 			if md, err := m.Metadata(); err == nil {
+				pending = md.NumPending
 				if md.Sequence.Stream <= r.last {
 					continue
 				}
@@ -191,10 +207,14 @@ func (r *natsReader) Read(ctx context.Context, fn func(Entry)) error {
 				fn(Entry{})
 			}
 		}
-		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
-			return fmt.Errorf("nats fetch: %w", err)
+		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) {
+			return r.t.clean("nats fetch", err)
 		}
-		if n == 0 {
+		// Caught up: an empty batch, or the last message says nothing is
+		// left on the filter. Under constant foreign traffic neither may
+		// come, so a read also ends after readSlice; the next goes on from
+		// there (SPEC §8.5).
+		if n == 0 || pending == 0 || !time.Now().Before(until) {
 			return nil
 		}
 	}
@@ -204,6 +224,7 @@ func (r *natsReader) Read(ctx context.Context, fn func(Entry)) error {
 // --- Redis / Valkey stream (go-relplog-server SPEC §3.6) ---
 
 type redisReader struct {
+	t      *Target
 	c      rueidis.Client
 	stream string
 	next   string // XRANGE start
@@ -215,7 +236,7 @@ func openRedis(ctx context.Context, t *Target, since time.Time, mark bool) (read
 		return nil, errors.New("redis: the URL is not valid") // rueidis quotes it
 	}
 	opt.DisableCache = true // a read once; no RESP3 tracking needed
-	if t.tls && t.ca != "" {
+	if t.tls && t.ca != "" && opt.TLSConfig != nil {
 		pool, err := caPool(t.ca)
 		if err != nil {
 			return nil, err
@@ -224,14 +245,14 @@ func openRedis(ctx context.Context, t *Target, since time.Time, mark bool) (read
 	}
 	c, err := rueidis.NewClient(opt)
 	if err != nil {
-		return nil, fmt.Errorf("redis: %w", cleanErr(err, t.url))
+		return nil, t.clean("redis", err)
 	}
 	stream := t.redisStream()
 	if mark {
 		last, err := c.Do(ctx, c.B().Xrevrange().Key(stream).End("+").Start("-").Count(1).Build()).AsXRange()
 		if err != nil && !rueidis.IsRedisNil(err) {
 			c.Close()
-			return nil, fmt.Errorf("redis XREVRANGE: %w", cleanErr(err, t.url))
+			return nil, t.clean("redis XREVRANGE", err)
 		}
 		t.start = streamStart{marked: true, redisFrom: "-"} // a stream not born yet is read whole
 		if len(last) == 1 {
@@ -239,13 +260,13 @@ func openRedis(ctx context.Context, t *Target, since time.Time, mark bool) (read
 		}
 	}
 	if t.start.marked {
-		return &redisReader{c: c, stream: stream, next: t.start.redisFrom}, nil
+		return &redisReader{t: t, c: c, stream: stream, next: t.start.redisFrom}, nil
 	}
 	start := since.Add(-Margin).UnixMilli()
 	if start < 0 {
 		start = 0
 	}
-	return &redisReader{c: c, stream: stream, next: strconv.FormatInt(start, 10) + "-0"}, nil
+	return &redisReader{t: t, c: c, stream: stream, next: strconv.FormatInt(start, 10) + "-0"}, nil
 }
 
 func (r *redisReader) Incremental() bool { return true }
@@ -255,7 +276,7 @@ func (r *redisReader) Read(ctx context.Context, fn func(Entry)) error {
 	for ctx.Err() == nil {
 		res, err := r.c.Do(ctx, r.c.B().Xrange().Key(r.stream).Start(r.next).End("+").Count(1000).Build()).AsXRange()
 		if err != nil {
-			return fmt.Errorf("redis XRANGE: %w", err)
+			return r.t.clean("redis XRANGE", err)
 		}
 		for _, x := range res {
 			if e, ok := parseJLH([]byte(x.FieldValues["e"])); ok {
@@ -275,6 +296,7 @@ func (r *redisReader) Read(ctx context.Context, fn func(Entry)) error {
 // --- PostgreSQL loghub.inbox (go-relplog-server SPEC §3.7.1) ---
 
 type pgReader struct {
+	t     *Target
 	c     *pgx.Conn
 	query string
 	args  []any
@@ -287,7 +309,7 @@ func openPostgres(ctx context.Context, t *Target, since time.Time, run string) (
 	}
 	c, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: %w", cleanErr(err, t.url))
+		return nil, t.clean("postgres", err)
 	}
 	table := pgx.Identifier(strings.Split(t.table, ".")).Sanitize()
 	q := `SELECT uuid::text, coalesce(payload->>'message',''), coalesce(payload->>'raw',''), coalesce(payload->>'raw-encoding','')
@@ -299,7 +321,7 @@ func openPostgres(ctx context.Context, t *Target, since time.Time, run string) (
 		q += ` AND space = $3`
 		args = append(args, t.space)
 	}
-	return &pgReader{c: c, query: q, args: args}, nil
+	return &pgReader{t: t, c: c, query: q, args: args}, nil
 }
 
 func likeEscape(s string) string {
@@ -312,7 +334,7 @@ func (r *pgReader) Close()            { r.c.Close(context.Background()) }
 func (r *pgReader) Read(ctx context.Context, fn func(Entry)) error {
 	rows, err := r.c.Query(ctx, r.query, r.args...)
 	if err != nil {
-		return fmt.Errorf("postgres: %w", err)
+		return r.t.clean("postgres", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -348,7 +370,7 @@ func safeRun(run string) bool {
 	return run != ""
 }
 
-func openSQLite(t *Target, run string) (reader, error) {
+func openSQLite(ctx context.Context, t *Target, run string, mark bool) (reader, error) {
 	if _, err := os.Stat(t.file); err != nil {
 		return nil, fmt.Errorf("sqlite: %w", err)
 	}
@@ -358,7 +380,15 @@ func openSQLite(t *Target, run string) (reader, error) {
 		return nil, fmt.Errorf("sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	r := &sqliteReader{db: db}
+	if mark {
+		var last int64
+		if err := db.QueryRowContext(ctx, `SELECT coalesce(max(rowid), 0) FROM `+t.table).Scan(&last); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("sqlite: %w", err)
+		}
+		t.start = streamStart{marked: true, sqliteAfter: last}
+	}
+	r := &sqliteReader{db: db, last: t.start.sqliteAfter}
 	if safeRun(run) {
 		r.query = `SELECT rowid, env FROM ` + t.table + ` WHERE rowid > ? AND CAST(env AS TEXT) LIKE ? ORDER BY rowid LIMIT 5000`
 		pat := "%" + run + "%"
@@ -408,54 +438,54 @@ func (r *sqliteReader) Read(ctx context.Context, fn func(Entry)) error {
 }
 
 // Probe opens the destination and reads it once, before anything is sent
-// (SPEC §8.5): a check that cannot run makes the run pointless.
-func Probe(ctx context.Context, t *Target, run string) error {
+// (SPEC §8.5): a check that cannot run makes the run pointless. It marks
+// where the streams and the SQLite table are; a PostgreSQL window that
+// already holds envelopes of the run is ErrRunPresent.
+func Probe(ctx context.Context, t *Target, run string, m *Matcher) error {
 	r, err := open(ctx, t, time.Now(), run, true)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 	if p, ok := r.(prober); ok {
-		return p.probe(ctx)
+		return p.probe(ctx, m)
 	}
 	return nil
 }
 
 // prober is a cheap read that proves the destination answers.
 type prober interface {
-	probe(ctx context.Context) error
+	probe(ctx context.Context, m *Matcher) error
 }
 
-func (r *redisReader) probe(ctx context.Context) error {
+func (r *redisReader) probe(ctx context.Context, _ *Matcher) error {
 	if err := r.c.Do(ctx, r.c.B().Ping().Build()).Error(); err != nil {
-		return fmt.Errorf("redis: %w", err)
+		return r.t.clean("redis", err)
 	}
 	return nil
 }
 
-func (r *pgReader) probe(ctx context.Context) error {
-	rows, err := r.c.Query(ctx, r.query+" LIMIT 0", r.args...)
-	if err != nil {
-		return fmt.Errorf("postgres: %w", err)
+// probe reads the window once: rows of the run there are an earlier run with
+// the same --run, which would pass for this one (SPEC §8.5).
+func (r *pgReader) probe(ctx context.Context, m *Matcher) error {
+	found := false
+	if err := r.Read(ctx, func(e Entry) {
+		if _, ok := m.Seq(e); ok {
+			found = true
+		}
+	}); err != nil {
+		return err
 	}
-	rows.Close()
-	return rows.Err()
+	if found {
+		return ErrRunPresent
+	}
+	return nil
 }
 
-func (r *sqliteReader) probe(ctx context.Context) error {
+func (r *sqliteReader) probe(ctx context.Context, _ *Matcher) error {
 	rows, err := r.db.QueryContext(ctx, r.query, r.args(1<<62)...)
 	if err != nil {
 		return fmt.Errorf("sqlite: %w", err)
 	}
 	return rows.Close()
-}
-
-// cleanErr removes the URL from a library error, in case it quotes it (it
-// may carry a password).
-func cleanErr(err error, u string) error {
-	s := err.Error()
-	if u != "" && strings.Contains(s, u) {
-		return errors.New(strings.ReplaceAll(s, u, "<url>"))
-	}
-	return err
 }

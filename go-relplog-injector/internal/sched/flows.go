@@ -10,18 +10,37 @@ import (
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-injector/internal/source"
 )
 
-// One session per original flow (--pcap-per-flow, SPEC §6.9): every flow of
+// One session per original flow (--pcap-flows, SPEC §6.9): every flow of
 // the source gets its own lane -- a worker with its own queue and its own
 // sessions, dialed with the flow's captured addresses -- so its messages go
 // in capture order on its session, and flows run side by side. At most
 // p.Workers sessions are open at a time; a lane that waits for a slot makes
 // an idle lane (nothing queued) close its session and give the slot away, so
 // no flow waits forever for one that has nothing to send.
+//
+// The idle lane waits on its queue AND on the slots' wake signal: until
+// 2026-11-07 it looked at the waiters only when its queue ran empty, then
+// blocked on the queue holding the slot; a new flow waited for the slot, the
+// producer filled that flow's queue and blocked, and the run hung for good
+// (review finding 1, reproduced).
 
 // slots bound the open sessions.
 type slots struct {
 	ch      chan struct{}
 	waiting atomic.Int32
+	mu      sync.Mutex
+	wakeCh  chan struct{} // closed (and replaced) when a lane starts waiting
+}
+
+func newSlots(n int) *slots { return &slots{ch: make(chan struct{}, n), wakeCh: make(chan struct{})} }
+
+// wake is the channel closed at the next wait for a slot. An idle lane takes
+// it BEFORE it asks contended, so a wait that starts in between is not
+// missed.
+func (s *slots) wake() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wakeCh
 }
 
 func (s *slots) acquire(ctx context.Context) error {
@@ -32,6 +51,10 @@ func (s *slots) acquire(ctx context.Context) error {
 	}
 	s.waiting.Add(1)
 	defer s.waiting.Add(-1)
+	s.mu.Lock()
+	close(s.wakeCh)
+	s.wakeCh = make(chan struct{})
+	s.mu.Unlock()
 	select {
 	case s.ch <- struct{}{}:
 		return nil
@@ -73,7 +96,7 @@ func runFlows(ctx context.Context, p Plan, src source.Source, dial FlowDialer, r
 		<-ctx.Done()
 		cancelDial()
 	}()
-	sl := &slots{ch: make(chan struct{}, p.Workers)}
+	sl := newSlots(p.Workers)
 	shards := make([]*report.Shard, min(p.Workers, maxShards))
 	for i := range shards {
 		shards[i] = rep.NewShard()
@@ -113,7 +136,7 @@ func runFlows(ctx context.Context, p Plan, src source.Source, dial FlowDialer, r
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(stopDial, ch, laneDial, sh, rep, p, sl.contended)
+			worker(stopDial, ch, laneDial, sh, rep, p, sl)
 		}()
 		return ch
 	}

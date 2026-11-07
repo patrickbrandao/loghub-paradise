@@ -301,6 +301,7 @@ func (p *Pcap) accumulate() {
 	t.FragmentsLost += d.FragmentsLost
 	t.Truncated += d.Truncated
 	t.DatagramsSnaplen += d.DatagramsSnaplen
+	t.DatagramsSnaplenUDP += d.DatagramsSnaplenUDP
 	x := &p.extTotal
 	x.Datagrams += e.Datagrams
 	x.DatagramsSkip += e.DatagramsSkip
@@ -364,7 +365,7 @@ func (p *Pcap) Stats() map[string]uint64 {
 		"tcp_relp_other_commands":   e.RELPOther + ce.RELPOther,
 		"tcp_resyncs":               e.Resyncs + ce.Resyncs,
 		"tcp_skipped_bytes":         e.SkippedBytes + ce.SkippedBytes,
-		"frames_lost":               e.LostFrames + ce.LostFrames,
+		"frames_lost":               e.LostFrames + ce.LostFrames + d.DatagramsSnaplenUDP + cur.DatagramsSnaplenUDP,
 		"tcp_long_lines":            e.LongLines + ce.LongLines,
 		"tcp_closed_partial_frames": e.ClosedPartial + ce.ClosedPartial,
 		"messages_replayed":         p.sent,

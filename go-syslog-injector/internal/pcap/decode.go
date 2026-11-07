@@ -71,6 +71,9 @@ type Stats struct {
 	// was cut by the snaplen (SPEC §6.3): the missing bytes are not in the
 	// file, so the datagram cannot be rebuilt.
 	DatagramsSnaplen uint64
+	// DatagramsSnaplenUDP: those of them that were UDP. They count in
+	// frames_lost too, as a whole cut datagram (SPEC §6.3, alignment 8(c)).
+	DatagramsSnaplenUDP uint64
 }
 
 // Decoder turns packets into segments, rebuilding IP fragments.
@@ -358,6 +361,9 @@ func (d *Decoder) cutFragment(k fragKey, ts time.Time) {
 	d.Stats.FragmentsLost += uint64(lost)
 	if first {
 		d.Stats.DatagramsSnaplen++
+		if k.proto == 17 {
+			d.Stats.DatagramsSnaplenUDP++
+		}
 	}
 }
 
