@@ -56,7 +56,11 @@ type Stats struct {
 	Fragments     uint64 // fragments seen
 	Reassembled   uint64 // datagrams rebuilt from fragments
 	FragmentsLost uint64 // fragments dropped (incomplete, overlapping, too many)
-	Truncated     uint64 // packets cut by the snaplen
+	// DatagramsSnaplen counts datagrams lost because one of their fragments
+	// was cut by the snaplen (SPEC §6.3): the missing bytes are not in the
+	// file, so the datagram cannot be rebuilt.
+	DatagramsSnaplen uint64
+	Truncated        uint64 // packets cut by the snaplen
 }
 
 // Decoder turns packets into segments, rebuilding IP fragments.
@@ -89,6 +93,13 @@ func (d *Decoder) Decode(p Packet) (Segment, bool) {
 	}
 	seg.TS = p.TS
 	return seg, true
+}
+
+// Flush ends the pass: fragments still waiting for their datagram are lost
+// (SPEC §6.3; ported from go-syslog-injector, 2026-11-07: they vanished
+// uncounted).
+func (d *Decoder) Flush() {
+	d.Stats.FragmentsLost += uint64(d.frags.flush())
 }
 
 func (d *Decoder) count(err error) {
@@ -148,15 +159,23 @@ func linkPayload(lt uint16, b []byte) ([]byte, error) {
 		}
 		return etherIP(binary.BigEndian.Uint16(b[0:2]), b[20:])
 	case LinkPKTAP:
-		// struct pktap_header: pth_length (header size) then pth_type_next
-		// (the DLT of what follows), host order -- little-endian on every Mac.
-		if len(b) < 8 {
+		// xnu's struct pktap_header, host order (little-endian on every
+		// Mac): pth_length (header size), pth_type_next (1 = a packet
+		// follows), pth_dlt (the link type of what follows), pth_ifname[24].
+		// Ported from go-syslog-injector (2026-11-07): the inner link type
+		// was read from pth_type_next, always 1 (Ethernet), so the loopback
+		// (DLT_NULL) of a macOS -i any capture never decoded.
+		if len(b) < 12 {
 			return nil, errShort
 		}
 		hl := binary.LittleEndian.Uint32(b[0:4])
-		inner := binary.LittleEndian.Uint32(b[4:8])
-		if hl < 8 || int(hl) > len(b) || inner == LinkPKTAP {
+		next := binary.LittleEndian.Uint32(b[4:8])
+		inner := binary.LittleEndian.Uint32(b[8:12])
+		if hl < 12 || int(hl) > len(b) || inner == LinkPKTAP || inner > 0xffff {
 			return nil, errShort
+		}
+		if next != 1 {
+			return nil, errNotIP
 		}
 		return linkPayload(uint16(inner), b[hl:])
 	}
@@ -218,12 +237,12 @@ func (d *Decoder) ipv4(b []byte, ts time.Time, trunc bool) (Segment, error) {
 	body := b[ihl:]
 	wire := total - ihl
 	if more || off != 0 {
+		key := fragKey{src: src, dst: dst, id: uint32(binary.BigEndian.Uint16(b[4:6])), proto: proto}
 		d.Stats.Fragments++
 		if trunc {
-			d.Stats.FragmentsLost++
+			d.cutFragment(key, ts)
 			return Segment{}, errFragment
 		}
-		key := fragKey{src: src, dst: dst, id: uint32(binary.BigEndian.Uint16(b[4:6])), proto: proto}
 		whole, done, lost := d.frags.add(key, off, more, body, ts)
 		d.Stats.FragmentsLost += uint64(lost)
 		if !done {
@@ -269,15 +288,15 @@ func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
 				return Segment{}, errShort
 			}
 			d.Stats.Fragments++
-			if trunc {
-				d.Stats.FragmentsLost++
-				return Segment{}, errFragment
-			}
 			nh := body[0]
 			ff := binary.BigEndian.Uint16(body[2:4])
 			off := int(ff>>3) * 8
 			more := ff&1 != 0
 			key := fragKey{src: src, dst: dst, id: binary.BigEndian.Uint32(body[4:8]), proto: nh, v6: true}
+			if trunc {
+				d.cutFragment(key, ts)
+				return Segment{}, errFragment
+			}
 			whole, done, lost := d.frags.add(key, off, more, body[8:], ts)
 			d.Stats.FragmentsLost += uint64(lost)
 			if !done {
@@ -289,6 +308,15 @@ func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
 		default:
 			return l4(next, src, dst, body, wire, trunc)
 		}
+	}
+}
+
+// cutFragment drops the datagram of a fragment the snaplen cut (SPEC §6.3).
+func (d *Decoder) cutFragment(k fragKey, ts time.Time) {
+	lost, first := d.frags.truncated(k, ts)
+	d.Stats.FragmentsLost += uint64(lost)
+	if first {
+		d.Stats.DatagramsSnaplen++
 	}
 }
 
