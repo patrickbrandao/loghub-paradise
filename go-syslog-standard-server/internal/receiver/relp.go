@@ -212,8 +212,58 @@ func (r *RELP) serve(ctx context.Context, c net.Conn, listener string) {
 
 	for {
 		armDeadline(c, r.cfg.IdleTimeout, &r.closing)
-		f, err := rd.ReadFrame()
+		h, err := rd.ReadHead()
 		if err != nil {
+			r.logFrameError(err, addr)
+			return
+		}
+
+		// A slot in the window first, then the bytes of the copy in the
+		// process-wide budget, and only then the payload and its copy: both
+		// ceilings bound what this transaction will hold, and they are taken
+		// from the DECLARED length (already checked against
+		// relp.max_frame_bytes) BEFORE a byte of the payload is read (SPEC
+		// §4.5). Taking them after ReadFrame, as this code did until the
+		// independent review of 2026-11-07, left one full frame per waiting
+		// connection in the reader's buffer outside the ceiling -- with
+		// relp.max_conns = 0, unbounded. Copying before both, as it did
+		// before that, held relp.window + 1 copies per connection. Waiting on
+		// either one stops this reader, and the TCP window holds the emitter.
+		var charged int64
+		reserved := false
+		if h.Command == "syslog" && h.Len > 0 {
+			// A reader that parks on either ceiling first lets go of a large
+			// frame buffer: the previous frame is already copied, and a
+			// waiting connection holds nothing outside the budget but its
+			// reader (SPEC §4.5, §5.5).
+			select {
+			case sem <- struct{}{}:
+			default:
+				rd.DropBuffer()
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			var ok bool
+			charged, ok = r.cfg.Budget.AcquireWait(ctx, TxnCharge(int(h.Len)), rd.DropBuffer)
+			if !ok || ctx.Err() != nil {
+				r.cfg.Budget.Release(charged)
+				<-sem
+				return
+			}
+			reserved = true
+			// The wait may have outlasted relp.idle_timeout; the payload is
+			// read from now on, so the idle clock restarts here.
+			armDeadline(c, r.cfg.IdleTimeout, &r.closing)
+		}
+		f, err := rd.ReadBody(h)
+		if err != nil {
+			if reserved {
+				r.cfg.Budget.Release(charged)
+				<-sem
+			}
 			r.logFrameError(err, addr)
 			return
 		}
@@ -243,24 +293,8 @@ func (r *RELP) serve(ctx context.Context, c net.Conn, listener string) {
 				continue
 			}
 
-			// A slot in the window first, then the bytes of the copy in the
-			// process-wide budget, and only then the copy: the copy is what
-			// both ceilings bound (SPEC §4.5; pendência 2 de §21.1). Copying
-			// first, as this code once did, held relp.window + 1 copies per
-			// connection outside every ceiling during backpressure. Waiting
-			// on either one stops this reader, and the TCP window holds the
-			// emitter.
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			charged, ok := r.cfg.Budget.Acquire(ctx, TxnCharge(len(f.Data)))
-			if !ok || ctx.Err() != nil {
-				r.cfg.Budget.Release(charged)
-				<-sem
-				return
-			}
+			// The slot and the bytes were taken before the payload was read
+			// (above): reserved is true here.
 
 			// The frame buffer is reused by the next ReadFrame, so a transaction
 			// that outlives this iteration needs its own copy. It is the one

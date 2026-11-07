@@ -885,6 +885,23 @@ servidor 0 serverclose 0
   `syslog_relp_inflight_bytes` mostra o que está em voo. Antes de 2026-11-07 a
   cópia vinha antes da vaga: até `relp.window + 1` cópias de até
   `relp.max_frame_bytes` por conexão, cerca de 2 GiB com os padrões.
+- **A vaga e os bytes vêm antes do payload** (corrigido em 2026-11-07, revisão
+  independente). O leitor lê o cabeçalho do frame (`TXNR`, `COMMAND`,
+  `DATALEN`, já conferido contra `relp.max_frame_bytes`) e, num `syslog` com
+  dados, pega a vaga na janela e `2 × DATALEN + 8 KiB` do teto **antes** de ler
+  um byte do payload; depois rearma o `relp.idle_timeout` (a espera pode tê-lo
+  passado) e lê o payload. Adquirir depois do frame inteiro deixava o payload
+  de cada conexão em espera no buffer do leitor, fora do teto: N conexões ×
+  `relp.max_frame_bytes` com `relp.max_conns = 0`. Antes de estacionar numa das
+  duas esperas o leitor solta o buffer de frame acima de 16 KiB (§5.5): o frame
+  anterior já foi copiado. Um par que declara `DATALEN` e não manda o payload
+  segura a conta declarada até o `idle_timeout`, como seguraria a conexão.
+- **O teto é justo** (mesma revisão). As esperas são atendidas em **ordem de
+  chegada**: um recém-chegado não passa à frente de quem espera, mesmo que a
+  conta dele caiba na folga. Sem a ordem, uma conta reduzida ao teto (que
+  precisa dele vazio) morria de inanição atrás de uma sequência de contas
+  pequenas, cada uma cabendo no espaço que a liberação anterior deixou. Quem
+  desiste da espera (cancelamento) sai da fila e deixa o seguinte entrar.
 - `COMMAND` desconhecido recebe `500` e a conexão continua. Um `DATALEN` que não
   couber em `relp.max_frame_bytes`, ou uma moldura que não fecha, **fecha a
   conexão**: o fluxo está dessincronizado e não há como recuperar.
@@ -1027,9 +1044,22 @@ paradas a 64 KiB mais o bloco de 64 KiB da leitura contada levavam o contêiner
 ao OOM kill — e com `ring=memory` o backlog confirmado junto. O maior `Peek` do
 código é de um byte (a detecção da moldura); o resto é `ReadByte`, `ReadSlice`
 e a leitura contada, uma recarga por vez. E um buffer de frame que cresceu além
-de 16 KiB (uma mensagem grande) é largado antes do frame seguinte: o que uma
-conexão ociosa segura é limitado pelas mensagens pequenas, não pela maior que
-ela já mandou.
+de 16 KiB (uma mensagem grande) é largado **entre frames, com o leitor vazio**,
+antes da leitura que pode esperar: o que uma conexão ociosa segura é limitado
+pelas mensagens pequenas, não pela maior que ela já mandou.
+
+**Com o próximo frame já no leitor, o buffer fica** (corrigido em 2026-11-07,
+revisão independente; a regra do `go-syslog-server`, SPEC dele §5.4). Largar
+depois de todo frame acima de 16 KiB, como este código fazia, fazia um fluxo de
+frames de 20–64 KiB realocar o buffer umas cinco vezes por frame (a leitura
+contada dobra a partir de 2 KiB); o irmão mediu 9× o tempo e 60× a alocação
+com frames de 12 KiB. A soltura vale para as três molduras (octet, LF e RELP)
+e é conferida na entrada de cada leitura (`Framer.Next`, `RELPReader.ReadHead`)
+só com `Buffered() == 0`. O limite herdado do irmão vale aqui também: um par
+que manda um frame grande seguido de **um** byte do próximo e se cala segura o
+buffer grande até o `idle_timeout` (não é perda de dado, e soltar dentro do
+frame foi medido e recusado lá). O RELP solta o buffer também antes de esperar
+pela janela ou pelo teto (§4.5).
 
 ---
 
@@ -2766,6 +2796,10 @@ esconderia um estouro de uma delas atrás da folga da outra.
   coletor de lixo do Go não sabe do teto do contêiner e o OOM killer chega
   antes do GC. Os compose de `docker/` definem `GOMEMLIMIT` **e** o limite de
   memória do contêiner, o segundo acima do primeiro.
+- O RELP soma, fora de `ring.max_bytes`, as cópias das transações em voo, com
+  teto global em `relp.inflight_max_bytes` (§4.5), tomado antes da leitura do
+  payload; o que uma conexão em espera segura fora dele é o leitor de 4 KiB e um
+  buffer de frame de até 16 KiB (§5.5).
 - `GOGC` no padrão. Um valor mais alto troca memória por CPU e só faz sentido
   depois de medir.
 - `GOMAXPROCS` no padrão do runtime, que a partir do Go 1.25 respeita o limite
@@ -3614,3 +3648,5 @@ correção, e um trecho portado leva a correção junto, não o defeito.
 20. *Corrigido em 2026-11-07:* nomes próprios — imagem e binário `go-syslog-standard-server`, prefixo `slstd-` nos compose, `relp_software` e `--version` com o nome, dumps `slstd-emg-*` (os `emg-*` do go-syslog-server não são lidos); regra em §4.5, §11.1 e §17.5.
 21. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a recontagem dos gauges depois do dump lia o arquivo inteiro com `Read`; agora conta em fluxo, pulando o cru, e o registro do abort é zerado assim que o arquivo é durável, antes da recontagem; regra em §11.2 e §12.3.
 22. *Corrigido em 2026-11-07 (revisão independente):* em cluster a política (`INFO memory`/`CONFIG GET`) e a identidade (`INFO server`) eram lidas num `Do` solto, que vai a um nó arbitrário; agora num `DoMulti` com `XLEN` da stream, no primário do slot dela, e o `XADD` da sonda à parte; regra em §10.3.
+23. *Corrigido em 2026-11-07 (revisão independente):* o RELP pegava a vaga e os bytes de `relp.inflight_max_bytes` depois de ler o frame inteiro, e a espera não era justa; agora depois do `DATALEN` e antes do payload, com fila FIFO; regra em §4.5 e §14.4.
+24. *Corrigido em 2026-11-07 (revisão independente; regra do go-syslog-server):* o buffer de frame acima de 16 KiB era largado a cada frame; agora só entre frames com o leitor vazio; regra em §5.5.

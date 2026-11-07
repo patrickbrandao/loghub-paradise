@@ -78,6 +78,11 @@ func (f *Framer) Mode() envelope.Framing { return f.mode }
 //
 // The slice aliases an internal buffer and is valid only until the next call.
 func (f *Framer) Next() ([]byte, error) {
+	// The previous message is no longer anyone's (Ingest copied it), and the
+	// read below may park for the whole idle timeout: a buffer a large frame
+	// grew is let go here, before the wait, not kept for the connection's
+	// life (SPEC §5.5).
+	f.buf = keepSmall(f.buf, f.r)
 	if !f.decided {
 		if err := f.detect(); err != nil {
 			return nil, err
@@ -146,7 +151,7 @@ func (f *Framer) nextOctet() ([]byte, error) {
 	if digits == 0 {
 		return nil, ErrMalformedFrame
 	}
-	f.buf = keepSmall(f.buf)
+	f.buf = f.buf[:0]
 	if n == 0 {
 		// A declared length of zero is a legal empty message.
 		return f.buf[:0], nil
@@ -178,10 +183,19 @@ const minFrameCap = 2 << 10
 // it lives, outside every ceiling (SPEC §5.5).
 const frameKeepCap = 16 << 10
 
-// keepSmall drops a frame buffer that grew past frameKeepCap, so what an idle
-// connection holds is bounded by the small frames, not by its largest one.
-func keepSmall(buf []byte) []byte {
-	if cap(buf) > frameKeepCap {
+// keepSmall runs between frames, before the read that may park: it drops a
+// frame buffer that grew past frameKeepCap when the reader is EMPTY, so what
+// an idle connection holds is bounded by the small frames, not by its largest
+// one (SPEC §5.5; the rule of go-syslog-server's Framer.Next).
+//
+// Only before a wait: with bytes already in the reader the next frame is here
+// and the buffer is about to be needed again. Released after every frame
+// above 16 KiB, as this code did until the independent review of 2026-11-07,
+// a stream of 20-64 KiB frames reallocated the buffer about five times per
+// frame (readCounted doubles from minFrameCap); go-syslog-server measured the
+// same rule at 9x the time and 60x the allocation for 12 KiB frames.
+func keepSmall(buf []byte, r *bufio.Reader) []byte {
+	if cap(buf) > frameKeepCap && r.Buffered() == 0 {
 		return nil
 	}
 	return buf[:0]
@@ -228,7 +242,7 @@ func readCounted(r *bufio.Reader, buf *[]byte, n int) error {
 
 // nextLF reads up to the next newline.
 func (f *Framer) nextLF() ([]byte, error) {
-	f.buf = keepSmall(f.buf)
+	f.buf = f.buf[:0]
 	for {
 		chunk, err := f.r.ReadSlice('\n')
 		f.buf = append(f.buf, chunk...)

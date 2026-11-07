@@ -60,8 +60,85 @@ func TestFramerDropsALargeBufferBetweenFrames(t *testing.T) {
 	if err != nil || string(got) != "<13>" {
 		t.Fatalf("small frame: err = %v, %q", err, got)
 	}
+	// The release comes before the wait for the next frame, with the reader
+	// empty (SPEC §5.5): here, the read that finds the end of the stream.
+	if _, err := f.Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("end: err = %v", err)
+	}
 	if cap(f.buf) > frameKeepCap {
-		t.Fatalf("cap = %d after a small frame; the 200 KiB buffer was kept", cap(f.buf))
+		t.Fatalf("cap = %d while waiting for a frame; the 200 KiB buffer was kept", cap(f.buf))
+	}
+}
+
+// Revisão independente de 2026-11-07, STD item 8: frames above frameKeepCap
+// that arrive back to back reuse the buffer the first one grew. Releasing it
+// after every frame, as keepSmall did, reallocated it about five times per
+// frame (SPEC §5.5).
+func TestFramerKeepsTheBufferWhileFramesReuseIt(t *testing.T) {
+	const frames = 32
+	body := "<13>" + strings.Repeat("y", 20000)
+	var in strings.Builder
+	for i := 0; i < frames; i++ {
+		fmt.Fprintf(&in, "%d %s", len(body), body)
+	}
+	for _, tc := range []struct {
+		name string
+		next func(r *bufio.Reader) func() ([]byte, error)
+		in   string
+	}{
+		{"octet", func(r *bufio.Reader) func() ([]byte, error) {
+			return NewFramer(r, envelope.FramingOctet, false, 1<<20).Next
+		}, in.String()},
+		{"lf", func(r *bufio.Reader) func() ([]byte, error) {
+			return NewFramer(r, envelope.FramingLF, false, 1<<20).Next
+		}, strings.Repeat(body+"\n", frames)},
+		{"relp", func(r *bufio.Reader) func() ([]byte, error) {
+			rd := NewRELPReader(r, 1<<20)
+			return func() ([]byte, error) {
+				f, err := rd.ReadFrame()
+				return f.Data, err
+			}
+		}, strings.Repeat(fmt.Sprintf("1 syslog %d %s\n", len(body), body), frames)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := tc.next(bufio.NewReaderSize(strings.NewReader(tc.in), tcpReadBuffer))
+			var first *byte
+			reused := 0
+			for i := 0; i < frames; i++ {
+				got, err := next()
+				if err != nil || string(got) != body {
+					t.Fatalf("frame %d: err = %v, len = %d", i, err, len(got))
+				}
+				if i == 0 {
+					first = &got[0]
+				} else if &got[0] == first {
+					reused++
+				}
+			}
+			// The reader of 4 KiB rarely ends exactly at a frame boundary;
+			// when it does, the reader is empty and the release is the rule.
+			if reused < frames-4 {
+				t.Fatalf("the buffer was reused by %d of %d frames: it was released between frames already in the reader", reused, frames-1)
+			}
+		})
+	}
+}
+
+// Item 3 of the same review: the RELP reader lets go of a large frame
+// buffer before it parks on the budget.
+func TestRELPReaderDropsTheBufferBeforeAWait(t *testing.T) {
+	body := strings.Repeat("z", 40<<10)
+	in := fmt.Sprintf("1 syslog %d %s\n", len(body), body)
+	rd := NewRELPReader(bufio.NewReaderSize(strings.NewReader(in), tcpReadBuffer), 1<<20)
+	if _, err := rd.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if cap(rd.buf) <= frameKeepCap {
+		t.Fatalf("cap = %d: the frame did not grow the buffer", cap(rd.buf))
+	}
+	rd.DropBuffer()
+	if cap(rd.buf) > frameKeepCap {
+		t.Fatalf("cap = %d after DropBuffer", cap(rd.buf))
 	}
 }
 
