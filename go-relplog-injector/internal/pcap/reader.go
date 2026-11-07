@@ -39,6 +39,9 @@ type Packet struct {
 	// Truncated is true when the capture kept fewer bytes than were on the
 	// wire (snaplen): the tail of the frame is missing.
 	Truncated bool
+	// Iface is the pcapng interface the packet was captured on (0 for a
+	// classic pcap, which has one).
+	Iface uint32
 }
 
 // MaxPacket bounds a record: a larger captured length is a corrupt file, not a
@@ -320,5 +323,6 @@ func (pr *Reader) ngPacket(id uint32, ts uint64, capLen, origLen uint32, data []
 		LinkType:  ifc.linkType,
 		Data:      data[:capLen],
 		Truncated: origLen > capLen,
+		Iface:     id,
 	}, nil
 }

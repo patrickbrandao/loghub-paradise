@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	mrand "math/rand/v2"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -142,6 +143,42 @@ func marker(name string) (part, error) {
 // Static reports whether the template has no marker at all.
 func (t *Template) Static() bool {
 	return len(t.parts) == 0 || (len(t.parts) == 1 && t.parts[0].k == kLit)
+}
+
+// Pattern returns a regular expression that matches the expansions of t for
+// one run, with the first {seq} as its only group; ok is false when t has no
+// {seq} or no {run}, so its messages cannot be told apart (the destination
+// check, SPEC §8.5).
+func (t *Template) Pattern(run, host string) (re string, ok bool) {
+	var b strings.Builder
+	seq, hasRun := false, false
+	for _, p := range t.parts {
+		switch p.k {
+		case kLit:
+			b.WriteString(regexp.QuoteMeta(p.lit))
+		case kSeq:
+			if !seq {
+				b.WriteString(`([0-9]+)`)
+				seq = true
+			} else {
+				b.WriteString(`[0-9]+`)
+			}
+		case kRun:
+			b.WriteString(regexp.QuoteMeta(run))
+			hasRun = true
+		case kUUID:
+			b.WriteString(`[0-9a-f-]{36}`)
+		case kTS:
+			b.WriteString(`[0-9T:.+Z-]+`)
+		case kUnix, kUnixMS, kPID:
+			b.WriteString(`[0-9]+`)
+		case kHost:
+			b.WriteString(regexp.QuoteMeta(host))
+		case kRand:
+			b.WriteString(`[a-z0-9]+`) // RE2 repeats at most 1000 times
+		}
+	}
+	return b.String(), seq && hasRun
 }
 
 // String returns the source text.

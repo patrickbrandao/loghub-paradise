@@ -1,0 +1,114 @@
+package pcap
+
+import (
+	"encoding/binary"
+	"slices"
+	"time"
+)
+
+// Deduplication of the copies "tcpdump -i any" writes (SPEC §6.8): Linux
+// captures a packet on every interface it crosses (a container's veth, the
+// bridge, eth0), sometimes with NAT rewriting addresses and ports between
+// the copies. What stays equal is the content; what differs is the
+// interface. A packet whose key matches an original seen within DedupWindow
+// on another interface is a copy, and each original absorbs at most one copy
+// per interface, so a sender that really sent the same bytes twice is
+// replayed twice.
+
+const (
+	// DedupWindow is how far apart, in capture time, two copies can be.
+	DedupWindow = 100 * time.Millisecond
+	// maxDedup bounds the originals remembered; the oldest go first.
+	maxDedup = 1 << 16
+)
+
+type dedupEntry struct {
+	key    uint64
+	ts     time.Time
+	ifaces []uint64
+}
+
+// Dedup remembers the recent originals. The zero value is not usable: use
+// NewDedup.
+type Dedup struct {
+	byKey map[uint64][]*dedupEntry
+	fifo  []*dedupEntry
+	head  int
+}
+
+// NewDedup returns an empty deduplicator.
+func NewDedup() *Dedup { return &Dedup{byKey: make(map[uint64][]*dedupEntry)} }
+
+// Copy reports whether a packet with this key, captured on iface at ts, is a
+// copy of an original seen on another interface; if not, it becomes an
+// original.
+func (d *Dedup) Copy(key, iface uint64, ts time.Time) bool {
+	d.expire(ts)
+	for _, e := range d.byKey[key] {
+		if dt := ts.Sub(e.ts); dt > DedupWindow || dt < -DedupWindow {
+			continue
+		}
+		if slices.Contains(e.ifaces, iface) {
+			continue // same interface: not a copy of this one
+		}
+		e.ifaces = append(e.ifaces, iface)
+		return true
+	}
+	e := &dedupEntry{key: key, ts: ts, ifaces: []uint64{iface}}
+	d.byKey[key] = append(d.byKey[key], e)
+	d.fifo = append(d.fifo, e)
+	return false
+}
+
+func (d *Dedup) expire(now time.Time) {
+	for d.head < len(d.fifo) {
+		e := d.fifo[d.head]
+		if len(d.fifo)-d.head <= maxDedup && now.Sub(e.ts) <= DedupWindow {
+			break
+		}
+		d.fifo[d.head] = nil
+		d.head++
+		list := d.byKey[e.key]
+		if i := slices.Index(list, e); i >= 0 {
+			list = slices.Delete(list, i, i+1)
+		}
+		if len(list) == 0 {
+			delete(d.byKey, e.key)
+		} else {
+			d.byKey[e.key] = list
+		}
+	}
+	if d.head > 1024 && d.head*2 > len(d.fifo) {
+		d.fifo = append(d.fifo[:0], d.fifo[d.head:]...)
+		d.head = 0
+	}
+}
+
+func fnv64(h uint64, b []byte) uint64 {
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= 1099511628211
+	}
+	return h
+}
+
+const fnvOffset = 14695981039346656037
+
+// KeyUDP is the dedup key of a UDP datagram: its payload and length.
+func KeyUDP(payload []byte) uint64 {
+	var n [9]byte
+	n[0] = 'u'
+	binary.BigEndian.PutUint64(n[1:], uint64(len(payload)))
+	return fnv64(fnv64(fnvOffset, n[:]), payload)
+}
+
+// KeyTCPOpen is the dedup key of the segment that opens a TCP direction: its
+// sequence number (random, and kept by NAT), flags and data.
+func KeyTCPOpen(s Segment) uint64 {
+	var n [14]byte
+	n[0] = 't'
+	binary.BigEndian.PutUint32(n[1:], s.Seq)
+	n[5] = s.Flags & (FlagSYN | FlagFIN | FlagRST)
+	binary.BigEndian.PutUint64(n[6:], uint64(s.WireLen))
+	return fnv64(fnv64(fnvOffset, n[:]), s.Payload)
+}

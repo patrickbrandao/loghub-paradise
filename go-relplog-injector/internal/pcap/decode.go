@@ -37,6 +37,10 @@ type Segment struct {
 	Truncated bool
 	// WireLen is the payload length on the wire (>= len(Payload)).
 	WireLen int
+	// Iface identifies the interface the packet was captured on: the
+	// pcapng interface, and the one the link header names (SPEC §6.2). The
+	// -i any deduplication only needs it to differ between interfaces.
+	Iface uint64
 }
 
 // Skip reasons counted by the Decoder (SPEC §6.3).
@@ -57,6 +61,11 @@ type Stats struct {
 	Reassembled   uint64 // datagrams rebuilt from fragments
 	FragmentsLost uint64 // fragments dropped (incomplete, overlapping, too many)
 	Truncated     uint64 // packets cut by the snaplen
+	// SnaplenDatagrams counts fragmented datagrams condemned because one of
+	// their fragments was cut by the snaplen (SPEC §6.3); SnaplenUDP, those
+	// of them that were UDP.
+	SnaplenDatagrams uint64
+	SnaplenUDP       uint64
 }
 
 // Decoder turns packets into segments, rebuilding IP fragments.
@@ -77,7 +86,7 @@ func (d *Decoder) Decode(p Packet) (Segment, bool) {
 	if p.Truncated {
 		d.Stats.Truncated++
 	}
-	ip, err := linkPayload(p.LinkType, p.Data)
+	ip, link, err := linkPayload(p.LinkType, p.Data)
 	if err != nil {
 		d.count(err)
 		return Segment{}, false
@@ -88,7 +97,14 @@ func (d *Decoder) Decode(p Packet) (Segment, bool) {
 		return Segment{}, false
 	}
 	seg.TS = p.TS
+	seg.Iface = uint64(p.Iface)<<32 | uint64(link)
 	return seg, true
+}
+
+// Flush ends the pass: fragments still waiting for their datagram are lost
+// (SPEC §6.3).
+func (d *Decoder) Flush() {
+	d.Stats.FragmentsLost += uint64(d.frags.flush())
 }
 
 func (d *Decoder) count(err error) {
@@ -103,64 +119,95 @@ func (d *Decoder) count(err error) {
 	}
 }
 
-// linkPayload strips the link header and returns the IP packet.
-func linkPayload(lt uint16, b []byte) ([]byte, error) {
+// linkPayload strips the link header and returns the IP packet and the
+// interface the link header names (0 when it names none).
+func linkPayload(lt uint16, b []byte) ([]byte, uint32, error) {
 	switch lt {
 	case LinkEthernet:
 		if len(b) < 14 {
-			return nil, errShort
+			return nil, 0, errShort
 		}
 		et := binary.BigEndian.Uint16(b[12:14])
 		b = b[14:]
 		for et == 0x8100 || et == 0x88a8 || et == 0x9100 {
 			if len(b) < 4 {
-				return nil, errShort
+				return nil, 0, errShort
 			}
 			et = binary.BigEndian.Uint16(b[2:4])
 			b = b[4:]
 		}
-		return etherIP(et, b)
+		ip, err := etherIP(et, b)
+		return ip, 0, err
 	case LinkNull:
 		if len(b) < 4 {
-			return nil, errShort
+			return nil, 0, errShort
 		}
 		// Host byte order of the writer: try both.
 		fam := binary.LittleEndian.Uint32(b[0:4])
 		if fam > 0xffff {
 			fam = binary.BigEndian.Uint32(b[0:4])
 		}
-		return bsdFamily(fam, b[4:])
+		ip, err := bsdFamily(fam, b[4:])
+		return ip, 0, err
 	case LinkLoop:
 		if len(b) < 4 {
-			return nil, errShort
+			return nil, 0, errShort
 		}
-		return bsdFamily(binary.BigEndian.Uint32(b[0:4]), b[4:])
+		ip, err := bsdFamily(binary.BigEndian.Uint32(b[0:4]), b[4:])
+		return ip, 0, err
 	case LinkRaw, LinkRawAlt12, LinkRawAlt14, LinkIPv4, LinkIPv6:
-		return b, nil
+		return b, 0, nil
 	case LinkSLL:
+		// Cooked v1 does not record the interface: the packet type and the
+		// link-layer address are the closest thing (SPEC §6.8).
 		if len(b) < 16 {
-			return nil, errShort
+			return nil, 0, errShort
 		}
-		return etherIP(binary.BigEndian.Uint16(b[14:16]), b[16:])
+		ip, err := etherIP(binary.BigEndian.Uint16(b[14:16]), b[16:])
+		return ip, 1 | hash32(b[0:2], b[6:14]), err
 	case LinkSLL2:
+		// Cooked v2: protocol, reserved, interface index, ...
 		if len(b) < 20 {
-			return nil, errShort
+			return nil, 0, errShort
 		}
-		return etherIP(binary.BigEndian.Uint16(b[0:2]), b[20:])
+		ip, err := etherIP(binary.BigEndian.Uint16(b[0:2]), b[20:])
+		return ip, binary.BigEndian.Uint32(b[4:8]), err
 	case LinkPKTAP:
-		// struct pktap_header: pth_length (header size) then pth_type_next
-		// (the DLT of what follows), host order -- little-endian on every Mac.
-		if len(b) < 8 {
-			return nil, errShort
+		// xnu's struct pktap_header, host order (little-endian on every
+		// Mac): pth_length, pth_type_next (1 = a packet follows), pth_dlt
+		// (the link type of what follows), pth_ifname[24].
+		if len(b) < 12 {
+			return nil, 0, errShort
 		}
 		hl := binary.LittleEndian.Uint32(b[0:4])
-		inner := binary.LittleEndian.Uint32(b[4:8])
-		if hl < 8 || int(hl) > len(b) || inner == LinkPKTAP {
-			return nil, errShort
+		next := binary.LittleEndian.Uint32(b[4:8])
+		inner := binary.LittleEndian.Uint32(b[8:12])
+		if hl < 12 || int(hl) > len(b) || inner == LinkPKTAP || inner > 0xffff {
+			return nil, 0, errShort
 		}
-		return linkPayload(uint16(inner), b[hl:])
+		if next != 1 {
+			return nil, 0, errNotIP
+		}
+		var name uint32
+		if hl >= 36 {
+			name = 1 | hash32(b[12:36])
+		}
+		ip, _, err := linkPayload(uint16(inner), b[hl:])
+		return ip, name, err
 	}
-	return nil, errNotIP
+	return nil, 0, errNotIP
+}
+
+// hash32 is FNV-1a over the parts.
+func hash32(parts ...[]byte) uint32 {
+	h := uint32(2166136261)
+	for _, p := range parts {
+		for _, c := range p {
+			h ^= uint32(c)
+			h *= 16777619
+		}
+	}
+	return h
 }
 
 func etherIP(et uint16, b []byte) ([]byte, error) {
@@ -219,11 +266,11 @@ func (d *Decoder) ipv4(b []byte, ts time.Time, trunc bool) (Segment, error) {
 	wire := total - ihl
 	if more || off != 0 {
 		d.Stats.Fragments++
+		key := fragKey{src: src, dst: dst, id: uint32(binary.BigEndian.Uint16(b[4:6])), proto: proto}
 		if trunc {
-			d.Stats.FragmentsLost++
+			d.cutFragment(key, ts)
 			return Segment{}, errFragment
 		}
-		key := fragKey{src: src, dst: dst, id: uint32(binary.BigEndian.Uint16(b[4:6])), proto: proto}
 		whole, done, lost := d.frags.add(key, off, more, body, ts)
 		d.Stats.FragmentsLost += uint64(lost)
 		if !done {
@@ -269,15 +316,15 @@ func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
 				return Segment{}, errShort
 			}
 			d.Stats.Fragments++
-			if trunc {
-				d.Stats.FragmentsLost++
-				return Segment{}, errFragment
-			}
 			nh := body[0]
 			ff := binary.BigEndian.Uint16(body[2:4])
 			off := int(ff>>3) * 8
 			more := ff&1 != 0
 			key := fragKey{src: src, dst: dst, id: binary.BigEndian.Uint32(body[4:8]), proto: nh, v6: true}
+			if trunc {
+				d.cutFragment(key, ts)
+				return Segment{}, errFragment
+			}
 			whole, done, lost := d.frags.add(key, off, more, body[8:], ts)
 			d.Stats.FragmentsLost += uint64(lost)
 			if !done {
@@ -288,6 +335,20 @@ func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
 			return l4(nh, src, dst, d.scratch, len(whole), false)
 		default:
 			return l4(next, src, dst, body, wire, trunc)
+		}
+	}
+}
+
+// cutFragment handles a fragment cut by the snaplen: it and the fragments
+// its datagram already held are lost, the datagram is condemned, and it is
+// counted once (SPEC §6.3).
+func (d *Decoder) cutFragment(k fragKey, ts time.Time) {
+	lost, first := d.frags.poison(k, ts)
+	d.Stats.FragmentsLost += uint64(lost) + 1
+	if first {
+		d.Stats.SnaplenDatagrams++
+		if k.proto == 17 {
+			d.Stats.SnaplenUDP++
 		}
 	}
 }

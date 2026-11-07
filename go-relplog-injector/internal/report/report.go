@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // Hist is a log-linear latency histogram: 32 sub-buckets per power of two,
@@ -114,15 +115,23 @@ type Shard struct {
 	mu     sync.Mutex
 	counts map[string]uint64
 	hist   Hist
+	acked  []uint64 // bitmap of the acknowledged seqs, with TrackAcked
 }
 
-// Done records the outcome of one message. ok says whether the outcome is a
+// Done records the outcome of message seq. ok says whether the outcome is a
 // success for the exit code (SPEC §8.3); bytes is what was put on the wire.
-func (s *Shard) Done(outcome string, ok bool, lat time.Duration, bytes int) {
+func (s *Shard) Done(seq uint64, outcome string, ok bool, lat time.Duration, bytes int) {
 	s.mu.Lock()
 	s.counts[outcome]++
 	if ok {
 		s.hist.Add(lat)
+		if s.r.track && seq > 0 {
+			w := int(seq / 64)
+			if w >= len(s.acked) {
+				s.acked = append(s.acked, make([]uint64, w+1-len(s.acked)+len(s.acked)/2)...)
+			}
+			s.acked[w] |= 1 << (seq % 64)
+		}
 	}
 	s.mu.Unlock()
 	if ok {
@@ -139,9 +148,11 @@ type Report struct {
 	dials, dialErrs   atomic.Uint64
 	broken            atomic.Uint64
 
-	mu     sync.Mutex
-	shards []*Shard
-	events map[string]uint64
+	mu       sync.Mutex
+	shards   []*Shard
+	events   map[string]uint64
+	rejTexts int // distinct "rejected: " texts so far (SPEC §8.2)
+	track    bool
 
 	// Filled by the caller before Write.
 	Info   map[string]string
@@ -150,6 +161,69 @@ type Report struct {
 	End    time.Time
 	// OKOutcomes names the outcomes that count as success, in print order.
 	OKOutcomes []string
+	// Verify is the destination check (SPEC §8.5), when one ran.
+	Verify *Verify
+}
+
+// TrackAcked makes the shards remember which seqs were acknowledged, for
+// the destination check. Call before the run.
+func (r *Report) TrackAcked() { r.track = true }
+
+// Acked returns the acknowledged seqs as a bitmap (bit seq%64 of word
+// seq/64), merged from the shards.
+func (r *Report) Acked() []uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []uint64
+	for _, s := range r.shards {
+		s.mu.Lock()
+		if len(s.acked) > len(out) {
+			out = append(out, make([]uint64, len(s.acked)-len(out))...)
+		}
+		for i, w := range s.acked {
+			out[i] |= w
+		}
+		s.mu.Unlock()
+	}
+	return out
+}
+
+// Rejection limits (SPEC §8.2): the text comes from the server.
+const (
+	MaxRejectTexts = 32
+	MaxRejectText  = 120
+	RejectOther    = "rejected: (other texts)"
+)
+
+// Rejected counts a non-200 answer by its text, with bounded cardinality.
+func (r *Report) Rejected(text string) {
+	key := "rejected: " + CleanText(text, MaxRejectText)
+	r.mu.Lock()
+	if _, ok := r.events[key]; !ok {
+		if r.rejTexts >= MaxRejectTexts {
+			key = RejectOther
+		} else {
+			r.rejTexts++
+		}
+	}
+	r.events[key]++
+	r.mu.Unlock()
+}
+
+// CleanText cuts s at max bytes without splitting a UTF-8 character and
+// replaces control bytes (and invalid UTF-8) by '?'.
+func CleanText(s string, max int) string {
+	var b strings.Builder
+	for _, c := range s {
+		if c < 0x20 || c == 0x7f || c == utf8.RuneError {
+			c = '?'
+		}
+		if b.Len()+utf8.RuneLen(c) > max {
+			break
+		}
+		b.WriteRune(c)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // New returns an empty report.
@@ -221,6 +295,29 @@ type Summary struct {
 	Conns      Conns             `json:"connections"`
 	Events     map[string]uint64 `json:"events,omitempty"`
 	Source     map[string]uint64 `json:"source,omitempty"`
+	Verify     *Verify           `json:"verify,omitempty"`
+}
+
+// Verify is the result of the destination check (SPEC §8.5).
+type Verify struct {
+	Destination    string   `json:"destination"`
+	OK             bool     `json:"ok"`
+	Sent           uint64   `json:"sent"`
+	Acked          uint64   `json:"acked"`
+	Found          uint64   `json:"found"`
+	Lost           uint64   `json:"lost"`
+	MissingUnacked uint64   `json:"missing_unacked"`
+	FoundUnacked   uint64   `json:"found_unacked"`
+	Duplicated     uint64   `json:"duplicated"`
+	ExtraCopies    uint64   `json:"extra_copies"`
+	ExtraSameUUID  uint64   `json:"extra_copies_same_uuid"`
+	Unexpected     uint64   `json:"unexpected"`
+	EntriesRead    uint64   `json:"entries_read"`
+	LostSample     []uint64 `json:"lost_sample,omitempty"`
+	WaitedSec      float64  `json:"waited_sec"`
+	Error          string   `json:"error,omitempty"`
+	// Unreadable: the destination could not be read at all (exit 5).
+	Unreadable bool `json:"unreadable,omitempty"`
 }
 
 // Latency is in microseconds.
@@ -271,6 +368,7 @@ func (r *Report) Summarize() Summary {
 		Conns:      Conns{Opened: r.dials.Load(), DialErrors: r.dialErrs.Load(), Broken: r.broken.Load()},
 		Events:     ev,
 		Source:     r.Source,
+		Verify:     r.Verify,
 	}
 	s.Messages = s.OK + s.Failed
 	if el > 0 {
@@ -331,6 +429,33 @@ func (r *Report) WriteText(w io.Writer) error {
 		b.WriteString("source:\n")
 		for _, k := range sortedKeys(s.Source) {
 			fmt.Fprintf(&b, "  %-24s %d\n", k, s.Source[k])
+		}
+	}
+	if v := s.Verify; v != nil {
+		verdict := "ok"
+		if !v.OK {
+			verdict = "FAILED"
+		}
+		fmt.Fprintf(&b, "%-14s %s %s (waited %.1fs)\n", "verify:", verdict, v.Destination, v.WaitedSec)
+		for _, f := range []struct {
+			k string
+			v uint64
+		}{
+			{"sent", v.Sent}, {"acked", v.Acked}, {"found", v.Found}, {"lost", v.Lost},
+			{"missing_unacked", v.MissingUnacked}, {"found_unacked", v.FoundUnacked},
+			{"duplicated", v.Duplicated}, {"extra_copies", v.ExtraCopies},
+			{"extra_copies_same_uuid", v.ExtraSameUUID}, {"unexpected", v.Unexpected},
+			{"entries_read", v.EntriesRead},
+		} {
+			if f.v != 0 || f.k == "lost" || f.k == "duplicated" {
+				fmt.Fprintf(&b, "  %-24s %d\n", f.k, f.v)
+			}
+		}
+		if len(v.LostSample) > 0 {
+			fmt.Fprintf(&b, "  %-24s %v\n", "lost_sample", v.LostSample)
+		}
+		if v.Error != "" {
+			fmt.Fprintf(&b, "  %-24s %s\n", "error", v.Error)
 		}
 	}
 	_, err := io.WriteString(w, b.String())

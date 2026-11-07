@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ type Msg struct {
 	Data  []byte
 	Done  DoneFunc
 	Tries int
+	Seq   uint64
 }
 
 // Conn is one RELP session.
@@ -47,6 +49,10 @@ type Conn interface {
 // Dialer opens a connection.
 type Dialer func(ctx context.Context) (Conn, error)
 
+// FlowDialer opens the connection of one original flow (SPEC §6.9); src and
+// dst are its captured addresses.
+type FlowDialer func(ctx context.Context, src, dst netip.AddrPort) (Conn, error)
+
 // Plan is what to send and how fast.
 type Plan struct {
 	Count    uint64        // 0 = no limit
@@ -61,6 +67,11 @@ type Plan struct {
 	// Retries is how many more sessions an unanswered message is sent on
 	// (librelp retransmits without limit; 0 = never retransmit).
 	Retries int
+	// PerFlow gives each original flow of the source its own session
+	// (--pcap-per-flow, SPEC §6.9), at most Workers open at a time, dialed
+	// by FlowDial (the dialer given to Run when nil).
+	PerFlow  bool
+	FlowDial FlowDialer
 }
 
 // Stats of the producer, for the report.
@@ -70,10 +81,13 @@ type Stats struct {
 	// Behind counts messages that left the producer late by more than 100 ms
 	// (the target or the workers could not keep the pace).
 	Behind uint64
+	// Flows counts the original flows replayed with PerFlow.
+	Flows uint64
 }
 
 type job struct {
 	data []byte
+	seq  uint64
 }
 
 // Backoff of a worker whose dial fails: 100 ms doubling up to 2 s.
@@ -89,6 +103,13 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 	if p.Workers < 1 {
 		p.Workers = 1
 	}
+	if p.PerFlow {
+		fd := p.FlowDial
+		if fd == nil {
+			fd = func(ctx context.Context, _, _ netip.AddrPort) (Conn, error) { return dial(ctx) }
+		}
+		return runFlows(ctx, p, src, fd, rep)
+	}
 	jobs := make(chan job, p.Workers*4)
 	var wg sync.WaitGroup
 	// Workers outlive ctx: they must drain what was produced. They stop on
@@ -103,10 +124,10 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(stopDial, jobs, dial, rep.NewShard(), rep, p)
+			worker(stopDial, jobs, dial, rep.NewShard(), rep, p, nil)
 		}()
 	}
-	st := produce(ctx, p, src, jobs)
+	st := produce(ctx, p, src, func(*source.Message) chan<- job { return jobs })
 	close(jobs)
 	// What is still queued gets Drain to find a connection; past it, a
 	// worker that cannot dial gives up and its messages are not_sent.
@@ -116,7 +137,9 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 	return st
 }
 
-func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) Stats {
+// produce feeds the plan; route picks the queue of each message (it runs on
+// the producer goroutine only).
+func produce(ctx context.Context, p Plan, src source.Source, route func(*source.Message) chan<- job) Stats {
 	var st Stats
 	start := time.Now()
 	var deadline time.Time
@@ -176,7 +199,7 @@ func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) St
 			}
 		}
 		select {
-		case jobs <- job{data: m.Data}:
+		case route(&m) <- job{data: m.Data, seq: seq}:
 			st.Produced++
 		case <-ctx.Done():
 			return st
@@ -193,7 +216,10 @@ func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) St
 // answer (SPEC §8.2).
 const Unanswered = "unanswered"
 
-func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard, rep *report.Report, p Plan) {
+// worker owns one session at a time. idle, when set, is asked when the
+// worker has nothing queued: true closes the session to give its slot away
+// (PerFlow, SPEC §6.9).
+func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard, rep *report.Report, p Plan, idle func() bool) {
 	var c Conn
 	var retry []*Msg      // unanswered messages, resent first and in order
 	var closeBy time.Time // zero: a Close gets the whole --drain-timeout
@@ -287,6 +313,10 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 					closeConn(err, false)
 					continue
 				}
+				if idle != nil && idle() {
+					closeConn(nil, false)
+					continue
+				}
 			}
 			j, ok = <-jobs
 		}
@@ -295,8 +325,9 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 		}
 		start := time.Now()
 		n := len(j.data)
-		m := &Msg{Data: j.data, Done: func(outcome string, ok bool) {
-			sh.Done(outcome, ok, time.Since(start), n)
+		seq := j.seq
+		m := &Msg{Data: j.data, Seq: seq, Done: func(outcome string, ok bool) {
+			sh.Done(seq, outcome, ok, time.Since(start), n)
 		}}
 		if !connect() {
 			m.Done("not_sent", false)

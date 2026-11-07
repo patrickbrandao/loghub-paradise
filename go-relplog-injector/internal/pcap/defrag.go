@@ -38,6 +38,9 @@ type fragDgram struct {
 	parts []frag
 	total int // -1 until the last fragment arrives
 	bytes int
+	// cut: a fragment was cut by the snaplen. The datagram cannot be
+	// rebuilt; its other fragments are dropped as they come (SPEC §6.3).
+	cut bool
 }
 
 type defrag struct {
@@ -58,6 +61,9 @@ func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (
 		}
 		g = &fragDgram{first: ts, total: -1}
 		d.open[k] = g
+	}
+	if g.cut {
+		return nil, false, lost + 1
 	}
 	if off+len(data) > maxDgramBytes || len(g.parts) >= maxFragsPerDgram {
 		lost += len(g.parts) + 1
@@ -106,6 +112,37 @@ func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (
 		return nil, false, lost + len(g.parts)
 	}
 	return buf, true, lost
+}
+
+// poison condemns the datagram of a fragment cut by the snaplen. first is
+// true the first time for this datagram; lost counts the fragments it held.
+func (d *defrag) poison(k fragKey, ts time.Time) (lost int, first bool) {
+	lost = d.expire(ts)
+	g := d.open[k]
+	if g == nil {
+		if len(d.open) >= maxFragDatagrams {
+			return lost, true // cannot remember it: count it every time
+		}
+		d.open[k] = &fragDgram{first: ts, total: -1, cut: true}
+		return lost, true
+	}
+	if g.cut {
+		return lost, false
+	}
+	lost += len(g.parts)
+	g.parts, g.cut = nil, true
+	return lost, true
+}
+
+// flush drops every open datagram (end of a pass) and returns the fragments
+// they held.
+func (d *defrag) flush() int {
+	lost := 0
+	for k, g := range d.open {
+		lost += len(g.parts)
+		delete(d.open, k)
+	}
+	return lost
 }
 
 func (d *defrag) expire(now time.Time) int {
