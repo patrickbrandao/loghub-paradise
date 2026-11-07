@@ -86,7 +86,7 @@ ordem das respostas numa janela seja determinística.
 | Moldura (§5.1–§5.3) | `TestRELPFrames`, `TestRELPZeroLengthBothSpellings`, `TestRELPHeaderAndTrailerAreNotTheMessage`, `TestRELPMalformed`, `TestRELPFrameCeiling`, `TestRELPTruncationKeepsSync`, `TestRELPFrameGrowsWithTheBytesNotTheCount`, `TestRELPReaderReleasesALargeBuffer`, `TestRELPMidFrameCloseIsUnexpectedEOF`, `TestRELPUnknownAndUppercaseCommandsAreUnknown`, `TestAppendRSPAndServerClose`, `FuzzFrame` | as duas grafias de `DATALEN = 0`; só `DATA` é a mensagem; o fusível antes de ler o corpo; o truncamento que mantém a sincronia; o buffer que cresce com os bytes que chegam e é solto acima de 16 KiB; `0 serverclose 0\n` sem o espaço que o `librelp` recusa |
 | Diálogo (§5.4) | `TestRELPSessionHappyPath`, `TestRELPOpenAdvertisesTheSoftware`, `TestOpenResponseOffers`, `TestRELPCommandOrder`, `TestRELPUnknownCommandKeepsTheConnection`, `TestRELPCloseWaitsForTransactionsInFlight`, `TestRELPFilteredAndEmptyAreAcknowledged`, `TestRELPConsumedIsAFinal500`, `TestRingNoneLogicRefusalIsFinal` | as ofertas no formato do `relpOffersToString`; `syslog` antes do `open` e o segundo `open`; o `close` que espera as transações em voo; `200` para filtrada e vazia; `500` só para a recusa `logic` final |
 | Garantia | `TestRELPAcknowledgesOnlyAfterTheRing`, `TestEndToEndEnvelopesAreValidJLH` | nenhum `200` antes do ring |
-| Janela e teto (§5.5, §5.6) | `TestRELPWindowAllowsConcurrentTransactions`, `TestRELPWindowStopsTheReader`, `TestRELPInflightBudgetIsGlobal`, `TestBudgetAcquireRelease`, `TestTxnChargeCoversTheTransaction` | transações em paralelo numa conexão; a janela cheia para o leitor; um teto para o processo inteiro; a conta `2 × classe + 8 KiB` |
+| Janela e teto (§5.5, §5.6) | `TestRELPWindowAllowsConcurrentTransactions`, `TestRELPWindowStopsTheReader`, `TestRELPInflightBudgetIsGlobal`, `TestBudgetAcquireRelease`, `TestTxnChargeCoversTheTransaction`, `TestRELPTakesTheBudgetBeforeThePayload`, `TestBudgetIsFIFO` | transações em paralelo numa conexão; a janela cheia para o leitor; um teto para o processo inteiro; a conta `2 × classe + 8 KiB` |
 | Backpressure (§5.7, §8) | `TestRELPFullRingIsHeldNotRefused`, `TestRELPBackpressureTimeoutClosesWithoutAnswering`, `TestRELPSinkDownIsHeld`, `TestRELPRateLimitedIsHeldUntilAToken`, `TestRELPHeldMessageIsChargedOnce`, `TestIngestRetryDecidesFilterAndRateLimitOnce`, `TestRELPVanishedPeerAbandonsHeldTransactions`, `TestReviewRetryAfterPeerLeft` | segurar, nunca `500`; o estouro fecha sem resposta; filtro e rate-limit uma vez por mensagem; par que sumiu nunca é enfileirado pelas costas da retransmissão |
 | Fim de sessão (§5.8) | `TestRELPShutdownWithTransactionsInFlight`, `TestRELPShutdownReleasesAHeldTransaction`, `TestRELPIdleTimeout`, `TestRELPMalformedFrameClosesAfterTheAnswers`, `TestStreamCloseForceClosesAfterGrace`, `TestArmReadDeadlineLeavesTheWriteSide`, `TestReviewUnansweredReasonOnServerEnd`, `TestReviewReconciliationAfterAbort` | as decididas saem antes do `serverclose`; o `Close` só vence o prazo de leitura; `closeGrace`; os motivos de `relp_unanswered_total` e a reconciliação de §5.4 depois de um aborto |
 | Conexões | `TestRELPPerIPLimit`, `TestRELPGlobalLimitParksAndCounts`, `TestConnLimitsAreSharedAcrossListeners`, `TestTCPListenersShareOneLimiter`, `TestBothCeilingsAreReleasedExactlyOnce` | tetos por transporte, não por listener |
@@ -656,3 +656,25 @@ arquivo liga (antes repetiam as do irmão Redis), com uma linha para os
 serviços de apoio. `registry.go`: o índice de env não grava mais a chave `""`.
 
 Rodadas (macOS, Docker Desktop, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem servidores: verdes. `rediscli`, `ring`, `sink` e `app` com `RELPLOG_TEST_REDIS_ADDR`/`RELPLOG_TEST_REDIS_LRU_ADDR` contra Redis 7.4, Valkey 8.1 e Valkey 9.0: verdes; contra Redis 7.4 uma falha por carga, `TestConcurrentTrafficEveryAcceptedMessageIsOneRow/ring=sqlite` ("698 rows for 960 messages", heartbeat do sqlite estourando com as suítes dos cortes rodando ao mesmo tempo), verde sozinho e no pacote `app` inteiro repetido. `-run Cluster` contra um cluster de um nó (Valkey 9.0): verde. Os 14 mutantes da tabela: mortos. Valkey 7.2 não rodou nesta rodada (a matriz completa é `scripts/test-redis-valkey.sh`).
+
+### Porte do orçamento RELP do `go-syslog-standard-server` (2026-11-07)
+
+Entrada: item 23 da §21.1 da SPEC do STD (commit `c6fa5b4`; os testes
+`TestRELPTakesTheBudgetBeforeThePayload` e `TestBudgetIsFIFO` de lá, portados).
+Regra em SPEC §5.6 (e §5.2, §5.4, §15.3a, invariante 24); testes em
+`internal/receiver/review20261107_test.go`. **Mutação:** cada parte revertida
+sozinha (`fxg/mutate.py` da rodada, o arquivo restaurado depois), com o teste da
+linha falhando pelo motivo certo (nenhum mutante morreu por compilação).
+
+| Parte | Mutante | Teste que o mata |
+|---|---|---|
+| Vaga e bytes pelo `DATALEN` antes do payload (`ReadHead`/`ReadBody`) | `ReadBody` antes do `reserve` | `TestRELPTakesTheBudgetBeforeThePayload` ("timed out waiting for the reader waiting for the budget before the payload arrived") |
+| Prazo de leitura rearmado depois da espera | sem o `armRead` depois do `reserve` | `TestRELPIdleClockRestartsAfterTheBudgetWait` (`serverclose` no lugar do `200 OK`) |
+| Teto FIFO | atalho sem olhar a fila | `TestBudgetIsFIFO` ("a small charge jumped ahead of the clamped one waiting") |
+| Quem desiste sai da fila e deixa o seguinte entrar | sem o `grantLocked` no cancelamento | `TestBudgetIsFIFO` ("the waiter behind a cancelled head was never granted") |
+| Buffer grande solto antes de estacionar | `DropBuffer` vazio | `TestRELPReaderDropsTheBufferBeforeAWait` |
+| A conta é a da linha que fica (`DATALEN` cortado em `syslog.max_message_bytes`) | `Kept` sem o corte | `TestRELPHeadChargeIsTheKeptLength` |
+
+Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...`
+sem servidores: verdes. `FuzzFrame` 35 s (o alvo de `relpframe.go`): limpo.
+`BenchmarkRELPReaderFrames`: 0 alocações por frame em 200 B a 60 KiB, como antes.

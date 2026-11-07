@@ -201,6 +201,10 @@ e, num rsyslog: `action(type="omrelp" target="127.0.0.1" port="20514")`.
   escrita de respostas no meio.
 - **A cópia da transação vem depois da vaga na janela e no teto em voo.** Copiar
   antes chega a `window + 1` cópias por conexão, fora de todo teto.
+  A vaga e a conta saem do `DATALEN` declarado, **antes** do payload
+  (`ReadHead`/`reserve`/`ReadBody`), e o teto atende em ordem de chegada (SPEC
+  §5.6): adquirir depois do frame inteiro deixava um payload por conexão em
+  espera fora do teto.
 - **Nunca alocar pelo `DATALEN` declarado**; o buffer cresce pelos bytes que
   chegam e é solto depois de um frame grande.
 - **Uma transação de um par que sumiu é abandonada**, nunca enfileirada depois:
