@@ -15,7 +15,12 @@ Injeta requisições HTTP num servidor de webhooks — para testar ou carregar o
   método, caminho, cabeçalhos e corpo, inclusive chunked e pipelining).
 - **Resposta:** cada requisição tem como desfecho o status recebido;
   `--retries` reenvia `429`/`503` seguindo o `Retry-After`; `--uuid-out` grava
-  o `X-LogHub-UUID` de cada uma, para conferir no destino.
+  o `X-LogHub-UUID` de cada uma.
+- **Conferência no destino:** `--verify-url` (NATS, PostgreSQL, Redis, Valkey)
+  ou `--verify-sqlite` lê o que o servidor gravou e conta perdidas e
+  repetidas pelo `uuid` e pelo `seq` do gerador.
+- **Replay fiel:** cabeçalhos na ordem capturada, h2c capturado, uma conexão
+  por fluxo (`--pcap-flows`).
 
 ```bash
 go build -o go-webhook-injector ./cmd/go-webhook-injector
@@ -38,10 +43,14 @@ go build -o go-webhook-injector ./cmd/go-webhook-injector
 tcpdump -i eth0 -s 0 -B 65536 -U -w prod.pcap 'tcp port 8080'
 ./go-webhook-injector --url http://127.0.0.1:8080 --pcap prod.pcap --pcap-timing original
 
-# conferir a entrega: cada uuid devolvido está na fila?
-./go-webhook-injector --url http://127.0.0.1:8080/x --count 100000 --concurrency 8 --uuid-out uuids.txt
+# conferir a entrega: toda requisição aceita está no destino, uma vez só?
+./go-webhook-injector --url http://127.0.0.1:8080/x --count 100000 --concurrency 8 \
+  --verify-url postgres://webhook:senha@127.0.0.1:5432/webhook
+./go-webhook-injector --url http://127.0.0.1:8080/x --count 100000 --verify-url valkey://127.0.0.1:6379
+./go-webhook-injector --url http://127.0.0.1:8080/x --count 100000 --verify-sqlite data/events.db
 ```
 
-Saída: `0` todas `2xx`, `1` alguma falha, `2` uso, `3` alvo inalcançável, `130`
-interrompido. Detalhes: `docs/SPEC.md`; testes e números medidos:
+Saída: `0` todas `2xx` (e nada perdido nem repetido no destino), `1` alguma
+falha ou perda/duplicata no destino, `2` uso, `3` alvo inalcançável, `4`
+conferência impossível, `130` interrompido. Detalhes: `docs/SPEC.md`; testes e números medidos:
 `docs/TESTING.md`.

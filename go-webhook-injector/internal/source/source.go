@@ -27,6 +27,12 @@ type Message struct {
 	At time.Duration
 	// Src and Dst are the addresses in the capture (pcap only).
 	Src, Dst netip.AddrPort
+	// Flow numbers the captured client direction the request came from
+	// (pcap only, from 1; new numbers on each --loop pass). FlowEnd marks
+	// a message that is no request at all: the capture showed that flow's
+	// end (SPEC §6.9). Only a source asked for flows yields them.
+	Flow    uint64
+	FlowEnd bool
 }
 
 // Source yields messages. Next returns io.EOF when a finite source ends.

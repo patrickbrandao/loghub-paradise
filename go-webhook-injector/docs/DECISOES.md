@@ -76,3 +76,17 @@ extremo."
 Defeito achado nos três: `--duration` sem `--count` enviava **uma** mensagem (o
 padrão de 1 valia também ali), e os exemplos de carga do README publicado não
 faziam o que diziam. Corrigido nos três, com teste que falha sem a correção.
+
+## 5. Terceira rodada (2026-11-07) — só o WI
+
+Entrevista do usuário de 2026-11-07 (todas as pendências conhecidas dos
+injetores). Duas decisões da tabela acima mudam; o texto delas fica como
+estava, para a história, e a regra que vale está aqui e na SPEC.
+
+| # | Tema | Decisão | Por quê |
+|---|---|---|---|
+| 4′ | Conferência no destino (revê a 4) | **Passa a ser objetivo**: `--verify-url` (`nats://`, `tls://`, `postgres://`, `postgresql://`, `redis://`, `rediss://`, `valkey://`, `valkeys://`) e `--verify-sqlite`, com `--verify-timeout`; depois do envio o injetor espera e conta perdidos e repetidos pelos marcadores `seq`/`run` e pelo `uuid` de cada `2xx`, no relatório e no código de saída (SPEC §8.6) | Pedido do usuário. A resposta `2xx` diz a garantia da combinação ring × sink, mas só a leitura do destino prova que nada sumiu nem dobrou no caminho |
+| 6′ | Dependências (revê a 6) | O envio, o pcap e a remontagem seguem só na stdlib. Entram as bibliotecas dos servidores, **nas mesmas versões** do `go-webhook-server/go.mod` (`nats.go`, `pgx/v5`, `rueidis`, `modernc.org/sqlite`), para ler os destinos, e `golang.org/x/net/http2` (`Framer` + `hpack`) para o replay de h2c (SPEC §2.1, §6.8) | Decisão do usuário. Ler o que o servidor grava com o mesmo cliente que o grava evita uma segunda interpretação do formato; o SQLite é puro Go e o binário continua `CGO_ENABLED=0` |
+| 20 | Código de saída da conferência | `4` = conferência impossível (destino inalcançável antes de enviar, ilegível, ou aceitas sem nada que as ache); perda ou duplicata = `1`; precedência `130`, `3`, `4`, `1` (SPEC §3.3) | Alinhado ao `go-syslog-injector` (SI) na mesma rodada: os injetores dizem o mesmo com o mesmo número |
+| 21 | `--pcap-flows` | Desligado por padrão (o comportamento de antes); ligado, uma conexão por fluxo capturado, `--concurrency` como teto de fluxos abertos, o mais ocioso fechado quando passa (SPEC §6.9). O nome é o do SI; o teto difere (o SI guarda até 256 conexões por worker) | O uso de carga não muda sem pedir; no HTTP o worker já é a unidade de conexão, e `--concurrency` é o teto que o usuário já conhece |
+| 22 | Servidor sem keep-alive | Adaptação automática depois de **2** conexões seguidas fechadas na 1ª resposta; sonda a cada **64** conexões adaptadas (SPEC §4.6) | Sugestão b do achado 3 da revisão do GI; dois evita reagir a um fechamento isolado, e a sonda deixa voltar se o servidor mudar |

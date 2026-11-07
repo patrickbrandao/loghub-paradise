@@ -146,6 +146,7 @@ type Report struct {
 	// Filled by the caller before Write.
 	Info   map[string]string
 	Source map[string]uint64
+	Verify *Verify
 	Start  time.Time
 	End    time.Time
 	// OKOutcomes names the outcomes that count as success, in print order.
@@ -221,7 +222,33 @@ type Summary struct {
 	Conns      Conns             `json:"connections"`
 	Events     map[string]uint64 `json:"events,omitempty"`
 	Source     map[string]uint64 `json:"source,omitempty"`
+	Verify     *Verify           `json:"verify,omitempty"`
 }
+
+// Verify is the delivery check at the destination (SPEC §8.6.4). The
+// names follow go-syslog-injector's where the meaning is the same.
+type Verify struct {
+	Destination  string   `json:"destination"`
+	Expected     uint64   `json:"expected"`
+	Found        uint64   `json:"found"`
+	Lost         uint64   `json:"lost"`
+	Duplicated   uint64   `json:"duplicated"`
+	Unexpected   uint64   `json:"unexpected"`
+	Unverifiable uint64   `json:"unverifiable"`
+	Records      uint64   `json:"records"`
+	LostSeqs     []string `json:"lost_seqs,omitempty"`
+	Waited       float64  `json:"waited"`
+	Complete     bool     `json:"complete"`
+	Error        string   `json:"error,omitempty"`
+}
+
+// Failed says whether the destination lost or doubled something (exit 1).
+func (v *Verify) Failed() bool { return v.Lost > 0 || v.Duplicated > 0 }
+
+// Impossible says whether the check could not be made (exit 4): the
+// destination could not be read, or accepted requests carry nothing that
+// finds them.
+func (v *Verify) Impossible() bool { return v.Error != "" || v.Unverifiable > 0 }
 
 // Latency is in microseconds.
 type Latency struct {
@@ -271,6 +298,7 @@ func (r *Report) Summarize() Summary {
 		Conns:      Conns{Opened: r.dials.Load(), DialErrors: r.dialErrs.Load(), Broken: r.broken.Load()},
 		Events:     ev,
 		Source:     r.Source,
+		Verify:     r.Verify,
 	}
 	s.Messages = s.OK + s.Failed
 	if el > 0 {
@@ -331,6 +359,24 @@ func (r *Report) WriteText(w io.Writer) error {
 		b.WriteString("source:\n")
 		for _, k := range sortedKeys(s.Source) {
 			fmt.Fprintf(&b, "  %-24s %d\n", k, s.Source[k])
+		}
+	}
+	if v := s.Verify; v != nil {
+		verdict := "ok"
+		switch {
+		case v.Impossible():
+			verdict = "IMPOSSIBLE"
+		case v.Failed():
+			verdict = "FAILED"
+		}
+		fmt.Fprintf(&b, "verify:        %s (%s, waited %.1fs, complete %v)\n", v.Destination, verdict, v.Waited, v.Complete)
+		fmt.Fprintf(&b, "  expected %d, found %d, lost %d, duplicated %d, unexpected %d, unverifiable %d, records %d\n",
+			v.Expected, v.Found, v.Lost, v.Duplicated, v.Unexpected, v.Unverifiable, v.Records)
+		if len(v.LostSeqs) > 0 {
+			fmt.Fprintf(&b, "  lost seqs: %s\n", strings.Join(v.LostSeqs, " "))
+		}
+		if v.Error != "" {
+			fmt.Fprintf(&b, "  error: %s\n", v.Error)
 		}
 	}
 	_, err := io.WriteString(w, b.String())

@@ -2,7 +2,7 @@
 #
 # go-webhook-injector -- imagem do injetor HTTP de webhooks (cliente de teste e carga).
 #
-# Binario estatico (CGO_ENABLED=0, so' a stdlib). Util para injetar de dentro
+# Binario estatico (CGO_ENABLED=0; o SQLite da conferencia e' puro Go). Util para injetar de dentro
 # da rede de um compose, onde o servidor e' alcancado pelo nome do servico:
 #
 #   docker build -f docker/Dockerfile -t go-webhook-injector:local .
@@ -16,7 +16,8 @@ ARG ALPINE_VERSION=3.22
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
 ARG VERSION=dev
 ARG COMMIT=none

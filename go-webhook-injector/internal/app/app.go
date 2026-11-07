@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +27,7 @@ import (
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-injector/internal/source"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-injector/internal/tmpl"
 	"github.com/patrickbrandao/loghub-paradise/go-webhook-injector/internal/transport"
+	"github.com/patrickbrandao/loghub-paradise/go-webhook-injector/internal/verify"
 )
 
 // Exit codes (SPEC §3.3).
@@ -36,6 +36,7 @@ const (
 	ExitFailures    = 1
 	ExitUsage       = 2
 	ExitUnreachable = 3
+	ExitVerify      = 4
 	ExitInterrupted = 130
 )
 
@@ -85,6 +86,11 @@ type config struct {
 	pcapSpeed                float64
 	pcapPath, pcapHost       string
 	pcapXFF                  bool
+	pcapFlows                bool
+
+	verifyURL, verifySQLite   string
+	verifyStream, verifyTable string
+	verifyTimeout             time.Duration
 
 	reportFmt string
 	progress  string
@@ -133,6 +139,13 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.pcapPath, "pcap-path", "keep", "request target of a replayed request: `keep` the captured one, or url (the path of --url)")
 	fs.StringVar(&c.pcapHost, "pcap-host", "keep", "Host of a replayed request: `keep` the captured one, or url")
 	fs.BoolVar(&c.pcapXFF, "pcap-xff", false, "add the captured client address to X-Forwarded-For (the server honors it only from a trusted proxy)")
+	fs.BoolVar(&c.pcapFlows, "pcap-flows", false, "replay every captured flow on a connection of its own (--concurrency: flows open at once)")
+
+	fs.StringVar(&c.verifyURL, "verify-url", "", "after the run, check the delivery at this destination `URL`: nats:// tls:// postgres:// postgresql:// redis:// rediss:// valkey:// valkeys://")
+	fs.StringVar(&c.verifySQLite, "verify-sqlite", "", "after the run, check the delivery in this SQLite `file` (sink=sqlite)")
+	fs.DurationVar(&c.verifyTimeout, "verify-timeout", 30*time.Second, "wait at most this long for every accepted request to show up at the destination")
+	fs.StringVar(&c.verifyStream, "verify-stream", "", "NATS stream or Redis stream key `name` (default: automatic)")
+	fs.StringVar(&c.verifyTable, "verify-table", "", "PostgreSQL or SQLite `table` (default: loghub.inbox, inbox)")
 
 	fs.StringVar(&c.reportFmt, "report", "text", "final report on stdout: `text` or json")
 	fs.StringVar(&c.progress, "progress", "auto", "progress line on stderr every `interval`; 0 = off; auto = 1s on a terminal")
@@ -140,7 +153,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: %s [flags]\n\nSends HTTP requests to a webhook server, to test it or load it (docs/SPEC.md).\n\nFlags:\n", Name)
 		fs.PrintDefaults()
-		fmt.Fprintf(stderr, "\nExit: 0 all answered 2xx, 1 some failed, 2 usage, 3 target unreachable, 130 interrupted.\n")
+		fmt.Fprintf(stderr, "\nExit: 0 all answered 2xx, 1 some failed, 2 usage, 3 target unreachable, 4 delivery check impossible, 130 interrupted.\n")
 	}
 	return fs
 }
@@ -163,7 +176,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%s %s (%s)\n", Name, version, commit)
 		return ExitOK
 	}
-	r, err := build(&c)
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	r, err := build(&c, set)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", Name, err)
 		return ExitUsage
@@ -174,6 +189,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 
 type runner struct {
 	c      *config
+	vcfg   *verify.Config
 	src    source.Source
 	opt    transport.Options
 	plan   sched.Plan
@@ -181,7 +197,7 @@ type runner struct {
 	report string
 }
 
-func build(c *config) (*runner, error) {
+func build(c *config, fs map[string]bool) (*runner, error) {
 	sources := 0
 	for _, s := range []string{c.template, c.file, c.pcapFile} {
 		if s != "" {
@@ -273,7 +289,7 @@ func build(c *config) (*runner, error) {
 	r := &runner{c: c, report: c.reportFmt, info: map[string]string{}}
 	switch {
 	case c.pcapFile != "":
-		opt := source.PcapOptions{Loop: c.loop}
+		opt := source.PcapOptions{Loop: c.loop, Flows: c.pcapFlows}
 		if opt.Ports, err = ports(c.pcapPorts); err != nil {
 			return nil, err
 		}
@@ -296,6 +312,15 @@ func build(c *config) (*runner, error) {
 		}
 	}
 	if err != nil {
+		return nil, err
+	}
+	if c.pcapFlows {
+		if c.pcapFile == "" {
+			return nil, errors.New("--pcap-flows needs --pcap")
+		}
+		r.plan.Flows = true
+	}
+	if r.vcfg, err = verifyConfig(c, fs); err != nil {
 		return nil, err
 	}
 	switch c.pcapTiming {
@@ -351,7 +376,52 @@ func build(c *config) (*runner, error) {
 		}
 	}
 	r.info["plan"] = planText(r.plan)
+	if r.plan.Flows {
+		r.info["plan"] += ", one connection per captured flow"
+	}
 	return r, nil
+}
+
+// verifyConfig validates the --verify-* flags (SPEC §3.2). set holds the
+// flags given on the command line: a default is not a request.
+func verifyConfig(c *config, set map[string]bool) (*verify.Config, error) {
+	if c.verifyURL == "" && c.verifySQLite == "" {
+		if set["verify-timeout"] || c.verifyStream != "" || c.verifyTable != "" {
+			return nil, errors.New("--verify-timeout, --verify-stream and --verify-table need --verify-url or --verify-sqlite")
+		}
+		return nil, nil
+	}
+	if c.verifyURL != "" && c.verifySQLite != "" {
+		return nil, errors.New("--verify-url and --verify-sqlite are exclusive")
+	}
+	if c.verifyTimeout <= 0 {
+		return nil, errors.New("--verify-timeout must be > 0")
+	}
+	kind := "sqlite"
+	if c.verifyURL != "" {
+		var err error
+		if kind, err = verify.Kind(c.verifyURL); err != nil {
+			return nil, err
+		}
+	}
+	switch kind {
+	case "postgres", "sqlite":
+		if c.verifyStream != "" {
+			return nil, errors.New("--verify-stream is for NATS and Redis; PostgreSQL and SQLite take --verify-table")
+		}
+		if c.verifyTable != "" && !verify.ValidTable(c.verifyTable) {
+			return nil, errors.New("--verify-table: want name or schema.name of [a-z_][a-z0-9_]*")
+		}
+	default:
+		if c.verifyTable != "" {
+			return nil, errors.New("--verify-table is for PostgreSQL and SQLite; NATS and Redis take --verify-stream")
+		}
+		if strings.ContainsAny(c.verifyStream, " \r\n") {
+			return nil, errors.New("--verify-stream: no spaces or line breaks")
+		}
+	}
+	return &verify.Config{URL: c.verifyURL, SQLite: c.verifySQLite, Stream: c.verifyStream, Table: c.verifyTable,
+		Timeout: c.verifyTimeout}, nil
 }
 
 // parseURL splits --url into the dialed part and the request-target template.
@@ -488,29 +558,33 @@ func (b *builder) build(seq uint64, m *source.Message) transport.Req {
 		if h := m.Req.Header.Get("Host"); h != "" && !b.pcapHost {
 			r.Host = h
 		}
-		keys := make([]string, 0, len(m.Req.Header))
-		for k := range m.Req.Header {
-			if !framing[k] {
-				keys = append(keys, k)
-			}
-		}
-		// Header order of the capture is lost in net/http's map; sorted, a
-		// replay is at least the same every time.
-		sort.Strings(keys)
-		for _, k := range keys {
-			if b.xff && k == "X-Forwarded-For" {
+		// The fields in capture order, names as written (SPEC §5.5).
+		xffAt := -1
+		for _, kv := range m.Req.Fields {
+			k := canonical(kv[0])
+			if framing[k] || strings.HasPrefix(kv[0], ":") {
 				continue
 			}
-			for _, v := range m.Req.Header[k] {
-				r.Header = append(r.Header, [2]string{k, v})
+			if b.xff && k == "X-Forwarded-For" {
+				// One field, where the first was, with every captured value
+				// and the client address at the end.
+				if xffAt < 0 {
+					xffAt = len(r.Header)
+					r.Header = append(r.Header, kv)
+				} else {
+					r.Header[xffAt][1] += ", " + kv[1]
+				}
+				continue
 			}
+			r.Header = append(r.Header, kv)
 		}
 		if b.xff && m.Src.IsValid() {
 			v := m.Src.Addr().Unmap().String()
-			if prev := m.Req.Header.Values("X-Forwarded-For"); len(prev) > 0 {
-				v = strings.Join(prev, ", ") + ", " + v
+			if xffAt >= 0 {
+				r.Header[xffAt][1] += ", " + v
+			} else {
+				r.Header = append(r.Header, [2]string{"X-Forwarded-For", v})
 			}
-			r.Header = append(r.Header, [2]string{"X-Forwarded-For", v})
 		}
 	} else if b.ctype != "" {
 		r.Header = append(r.Header, [2]string{"Content-Type", b.ctype})
@@ -595,6 +669,20 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 	rep.Info = r.info
 	rep.OKOutcomes = []string{"200", "201", "202", "204"}
 	r.opt.OnDial = rep.Dial
+	r.opt.OnEvent = rep.Event
+	var ver *verify.Verifier
+	if r.vcfg != nil {
+		// Before anything is sent: a check that cannot run would waste the
+		// load (SPEC §8.6.1).
+		r.vcfg.Since = time.Now()
+		var err error
+		if ver, err = verify.Open(context.Background(), *r.vcfg, r.c.run); err != nil {
+			// Nothing is sent: the check would be impossible (SPEC §3.3).
+			fmt.Fprintf(stderr, "%s: %v\n", Name, err)
+			return ExitVerify
+		}
+		defer ver.Close()
+	}
 	var ul *uuidLog
 	if r.c.uuidOut != "" {
 		f, err := os.Create(r.c.uuidOut)
@@ -604,6 +692,16 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 		}
 		ul = &uuidLog{f: f, w: bufio.NewWriterSize(f, 256<<10)}
 		r.opt.OnResponse = ul.add
+	}
+	if ver != nil {
+		if prev := r.opt.OnResponse; prev != nil {
+			r.opt.OnResponse = func(seq uint64, status int, uuid string) {
+				prev(seq, status, uuid)
+				ver.Accept(seq, status, uuid)
+			}
+		} else {
+			r.opt.OnResponse = ver.Accept
+		}
 	}
 	dial, err := transport.Dialer(r.opt)
 	if err != nil {
@@ -652,14 +750,23 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 			rep.Event("uuid_out_error: " + err.Error())
 		}
 	}
-	r.write(rep, stdout)
 	ok, failed := rep.Totals()
+	if ver != nil && !interrupted.Load() {
+		if every := r.progressEvery(stderr); every > 0 {
+			fmt.Fprintf(stderr, "%s: checking the delivery at the destination (up to %s)\n", Name, r.vcfg.Timeout)
+		}
+		res := ver.Check(ctx, r.vcfg.Timeout)
+		rep.Verify = &res
+	}
+	r.write(rep, stdout)
 	switch {
 	case interrupted.Load():
 		return ExitInterrupted
 	case ok+failed > 0 && rep.Dials() == 0:
 		return ExitUnreachable
-	case failed > 0 || st.SourceErr != nil:
+	case rep.Verify != nil && rep.Verify.Impossible():
+		return ExitVerify
+	case failed > 0 || st.SourceErr != nil || rep.Verify != nil && rep.Verify.Failed():
 		return ExitFailures
 	}
 	return ExitOK
