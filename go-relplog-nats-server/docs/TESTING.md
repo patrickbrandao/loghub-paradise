@@ -503,6 +503,30 @@ Registrados sem código: comentário do `Memory.Enqueue` (D1); URL única com v�
 
 Rodadas: `tasks/run2.sh go-relplog-nats-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh`), logs em `tasks/logs/go-relplog-nats-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*; e o pacote `sink` com `RELPLOG_TEST_NATS_URL=nats://127.0.0.1:24226`: **ok**. Fuzz: nenhum, por instrução da rodada.
 
+### 9.5 Porte do orçamento RELP do `go-syslog-standard-server` (2026-11-07)
+
+Entrada: item 23 da §21.1 da SPEC do STD (commit `c6fa5b4`; os testes
+`TestRELPTakesTheBudgetBeforeThePayload` e `TestBudgetIsFIFO` de lá, portados).
+Regra em SPEC §5.6 (e §5.2, §5.4, §15.3a, invariante 24); testes em
+`internal/receiver/review20261107_test.go`. **Mutação:** cada parte revertida
+sozinha (`fxg/mutate.py` da rodada, o arquivo restaurado depois), com o teste da
+linha falhando pelo motivo certo (nenhum mutante morreu por compilação).
+
+| Parte | Mutante | Teste que o mata |
+|---|---|---|
+| Vaga e bytes pelo `DATALEN` antes do payload (`ReadHead`/`ReadBody`) | `ReadBody` antes do `reserve` | `TestRELPTakesTheBudgetBeforeThePayload` ("timed out waiting for the reader waiting for the budget before the payload arrived") |
+| Prazo de leitura rearmado depois da espera | sem o `armRead` depois do `reserve` | `TestRELPIdleClockRestartsAfterTheBudgetWait` (`serverclose` no lugar do `200 OK`) |
+| Teto FIFO | atalho sem olhar a fila | `TestBudgetIsFIFO` ("a small charge jumped ahead of the clamped one waiting") |
+| Quem desiste sai da fila e deixa o seguinte entrar | sem o `grantLocked` no cancelamento | `TestBudgetIsFIFO` ("the waiter behind a cancelled head was never granted") |
+| Buffer grande solto antes de estacionar | `DropBuffer` vazio | `TestRELPReaderDropsTheBufferBeforeAWait` |
+| A conta é a da linha que fica (`DATALEN` cortado em `syslog.max_message_bytes`) | `Kept` sem o corte | `TestRELPHeadChargeIsTheKeptLength` |
+
+`TestDispatchAfterSessionEndStartsNothing` e `TestCopyComesAfterTheWindowAndTheBudget` (`review_cut_test.go`) passaram a chamar `reserve` e depois `dispatch`, a divisão nova; o primeiro confere também que uma reserva recusada não segura vaga nem bytes.
+
+Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...`
+sem servidores: verdes. `FuzzFrame` 35 s (o alvo de `relpframe.go`): limpo.
+`BenchmarkRELPReaderFrames`: 0 alocações por frame em 200 B a 60 KiB, como antes.
+
 ---
 
 ## 10. Resultado da rodada final (2026-10-13, depois do porte de §9.1)

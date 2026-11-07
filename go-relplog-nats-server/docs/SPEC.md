@@ -749,9 +749,14 @@ onde o oráculo para.
   de 2 KiB até o tamanho do frame, não pelas classes do pool: um frame de até
   16 KiB nunca passa do teto. Com `max_conns = 0`, o custo de N conexões
   caladas é cerca de N × 10 KiB mais as goroutines, fora de `ring.max_bytes`.
+- **Antes de esperar pela janela ou pelo teto, a soltura não olha o leitor**
+  (2026-11-07, §5.6): quem estaciona numa das duas esperas solta o buffer acima
+  de 16 KiB mesmo com bytes do próximo frame no `bufio.Reader`; o frame
+  anterior já foi copiado, e uma conexão em espera não segura nada fora do teto
+  além do leitor.
 - **Limite da soltura: vale entre frames, com o leitor vazio** (revisão
   independente de 2026-10-14, A5 e D4 do S; registrado, não corrigido). A
-  soltura acontece na entrada de `ReadFrame`, só com `Buffered() == 0`. Um par
+  soltura acontece na entrada de `ReadHead`, só com `Buffered() == 0`. Um par
   que manda um frame grande (o buffer dobra até 32 ou 64 KiB) seguido de **um**
   byte do cabeçalho do próximo e se cala passa por `ReadFrame` com
   `Buffered() == 1`: o buffer fica e o leitor estaciona no cabeçalho até o
@@ -880,8 +885,8 @@ Uma recusa `logic` do NATS depois do `200 OK` está do lado do servidor, em
 `relplog_events_dropped_total{reason="sink_logic"}`, fora desta conta.
 
 **Todo frame `syslog` lido entra na conta**, inclusive o que nunca ganhou
-goroutine: a sessão pode terminar entre a leitura do frame e a vaga na janela ou
-no teto de §5.6 (shutdown, aborto por backpressure de outra transação). Esse
+goroutine: a sessão pode terminar entre a leitura do cabeçalho do frame e a vaga
+na janela ou no teto de §5.6 (que vêm antes do payload desde 2026-11-07) (shutdown, aborto por backpressure de outra transação). Esse
 frame conta em `relplog_messages_total` e em `relp_unanswered_total` com o motivo
 da sessão; sem isso a igualdade acima furava a cada aborto (revisão
 independente do R, 2026-10-11, `TestReviewReconciliationAfterAbort`). O motivo é
@@ -957,6 +962,31 @@ justamente quando o ring está cheio que elas se acumulam. Por isso (decisão 9 
 - o teto precisa ser ≥ `syslog.max_message_bytes` (exit 1), para uma transação
   sempre caber; uma aquisição maior que o teto é reduzida a ele, para nunca
   esperar para sempre;
+- **a vaga e os bytes vêm antes do payload** (corrigido em 2026-11-07, porte da
+  revisão independente do `go-syslog-standard-server`, item 23 da §21.1 dele). O
+  leitor lê o cabeçalho do frame (`TXNR`, `COMMAND`, `DATALEN`, já conferido
+  contra `relp.max_frame_bytes`, `RELPReader.ReadHead`) e, num `syslog` de uma
+  sessão aberta, pega a vaga na janela e a conta `2 × classe + 8 KiB` da linha
+  que vai ficar (o `DATALEN` cortado em `syslog.max_message_bytes`, §5.3)
+  **antes** de ler um byte do payload; depois rearma o prazo de leitura (a espera
+  pode ter passado o `idle_timeout`) e lê o payload (`ReadBody`). Adquirir
+  depois do frame inteiro deixava o payload de cada conexão em espera no buffer
+  do leitor, fora do teto: N conexões × até `syslog.max_message_bytes` com
+  `max_conns = 0`. Antes de estacionar numa das duas esperas o leitor solta o
+  buffer de frame acima de 16 KiB (`DropBuffer`, §5.2): o frame anterior já foi
+  copiado. Um par que declara `DATALEN` e não manda o payload segura a vaga e a
+  conta declarada até o `idle_timeout`, como seguraria a conexão; um que some no
+  meio do payload as devolve, e o frame não conta (§5.4, meio frame). A
+  espera continua sendo **segurar, nunca `500`** (§5.7): o leitor para, o TCP
+  segura o emissor;
+- **o teto é justo** (mesma correção): as esperas são atendidas em **ordem de
+  chegada** (FIFO). Um recém-chegado não passa à frente de quem espera, mesmo que
+  a conta dele caiba na folga; sem a ordem, uma conta reduzida ao teto (que
+  precisa dele vazio) morria de inanição atrás de uma sequência de contas
+  pequenas, cada uma cabendo no espaço que a liberação anterior deixou. Quem
+  desiste da espera (fim da sessão) sai da fila e deixa o seguinte entrar
+  (`TestBudgetIsFIFO`, `TestRELPTakesTheBudgetBeforeThePayload`,
+  `TestRELPIdleClockRestartsAfterTheBudgetWait`);
 - `relplog_relp_inflight_bytes` e `relplog_relp_inflight_transactions` mostram o
   que está em voo. O termo soma na conta de memória do processo (§15).
 
@@ -2794,7 +2824,9 @@ Duas parcelas, as duas com teto:
   (64 MiB) para o processo inteiro, contadas pela capacidade real do buffer.
 - **Custo fixo por conexão** (§5.2): cerca de 10 KiB (leitor de 4 KiB, escritor
   de 4 KiB, o primeiro bloco do frame) mais as goroutines do leitor e do
-  escritor; um frame grande não deixa um buffer grande para trás. Com
+  escritor; um frame grande não deixa um buffer grande para trás, e uma
+  conexão que espera pela janela ou pelo teto já pegou a conta do frame
+  seguinte antes do payload dele (§5.6). Com
   `tcp.max_conns` em zero (padrão), esse termo cresce com o número de conexões; quem espera milhares de emissores fixa o teto.
 
 A conta de memória do processo é `ring.max_bytes + sink.workers ×
@@ -3549,7 +3581,8 @@ os que perderam o objeto ficam com a nota.
     uma sessão só fecha depois de o escritor entregar todas elas (ou de
     `closeGrace`).
 24. **As cópias das transações em voo têm teto global** (`relp.inflight_max_bytes`)
-    e são feitas só depois da vaga na janela e no teto.
+    e são feitas só depois da vaga na janela e no teto, ambos tomados pelo
+    `DATALEN` declarado antes do payload, em ordem de chegada (§5.6).
 25. Todo envelope tem `x-transport: "relp"`, `framing: "octet-counting"` e
     `transport: "tcp"`.
 26. **Uma perda é contada uma vez, e o que foi contado como perdido não
@@ -3631,3 +3664,4 @@ vale para R, S, SP e SN está em `tasks/port-to-R-S-SP-SN.md` da raiz.
 13. *Registrado em 2026-10-14 (revisão independente):* a soltura do buffer do leitor vale entre frames, com o leitor vazio: um frame grande seguido de alguns bytes do próximo segura o buffer grande até o idle; soltar no ponto de espera dentro do frame foi medido no S e recusado (A5 e D4 do S); regra em §5.2.
 14. *Registrado em 2026-10-14 (revisão independente):* *pool* NATS só de servidores que recusam o TLS nunca dá veredito (FATAL só pelos fusíveis; D2 do syslog), e uma URL única cujo nome resolve a vários IPs dá veredito pela recusa do IP sorteado (D3 do RELP); regra em §10.7.
 15. *Registrado em 2026-10-14 (revisão independente):* sobrecontagem transitória do aborto também por um `Enqueue` que reservou a vaga e recua por falta de bytes (D3 do syslog); e o comentário do `Memory.Enqueue` corrigido ("pelo menos um dos dois", D1 do RELP); regra em §13.4.
+16. *Corrigido em 2026-11-07 (porte da revisão independente do `go-syslog-standard-server`, item 23 da §21.1 dele):* o RELP pegava a vaga e os bytes de `relp.inflight_max_bytes` depois de ler o frame inteiro (um payload por conexão em espera fora do teto), e a espera do teto não era justa; agora depois do `DATALEN` e antes do payload, com o prazo de leitura rearmado depois da espera, o buffer grande solto antes de estacionar, e fila FIFO; regra em §5.6 (e §5.2, §5.4, §15.3a, invariante 24).
