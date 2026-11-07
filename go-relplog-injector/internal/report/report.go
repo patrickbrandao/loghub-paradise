@@ -302,7 +302,8 @@ type Summary struct {
 type Verify struct {
 	Destination    string   `json:"destination"`
 	OK             bool     `json:"ok"`
-	Sent           uint64   `json:"sent"`
+	Complete       bool     `json:"complete"` // every acknowledged message was found before --verify-timeout
+	Expected       uint64   `json:"expected"`
 	Acked          uint64   `json:"acked"`
 	Found          uint64   `json:"found"`
 	Lost           uint64   `json:"lost"`
@@ -313,8 +314,8 @@ type Verify struct {
 	ExtraSameUUID  uint64   `json:"extra_copies_same_uuid"`
 	Unexpected     uint64   `json:"unexpected"`
 	EntriesRead    uint64   `json:"entries_read"`
-	LostSample     []uint64 `json:"lost_sample,omitempty"`
-	WaitedSec      float64  `json:"waited_sec"`
+	LostSeqs       []string `json:"lost_seqs,omitempty"` // up to 20 ranges, "a-b" or "a"
+	WaitedSec      float64  `json:"waited"`
 	Error          string   `json:"error,omitempty"`
 	// Unreadable: the destination could not be read at all (exit 5).
 	Unreadable bool `json:"unreadable,omitempty"`
@@ -441,7 +442,7 @@ func (r *Report) WriteText(w io.Writer) error {
 			k string
 			v uint64
 		}{
-			{"sent", v.Sent}, {"acked", v.Acked}, {"found", v.Found}, {"lost", v.Lost},
+			{"expected", v.Expected}, {"acked", v.Acked}, {"found", v.Found}, {"lost", v.Lost},
 			{"missing_unacked", v.MissingUnacked}, {"found_unacked", v.FoundUnacked},
 			{"duplicated", v.Duplicated}, {"extra_copies", v.ExtraCopies},
 			{"extra_copies_same_uuid", v.ExtraSameUUID}, {"unexpected", v.Unexpected},
@@ -451,8 +452,8 @@ func (r *Report) WriteText(w io.Writer) error {
 				fmt.Fprintf(&b, "  %-24s %d\n", f.k, f.v)
 			}
 		}
-		if len(v.LostSample) > 0 {
-			fmt.Fprintf(&b, "  %-24s %v\n", "lost_sample", v.LostSample)
+		if len(v.LostSeqs) > 0 {
+			fmt.Fprintf(&b, "  %-24s %s\n", "lost_seqs", strings.Join(v.LostSeqs, " "))
 		}
 		if v.Error != "" {
 			fmt.Fprintf(&b, "  %-24s %s\n", "error", v.Error)

@@ -88,6 +88,11 @@ func caPool(file string) (*x509.CertPool, error) {
 type natsReader struct {
 	nc   *nats.Conn
 	cons jetstream.Consumer
+	// last stream sequence counted: an ordered consumer that resets (it
+	// recreates itself after a gap or a missed heartbeat) delivers again
+	// from its start; what was counted is skipped, not counted twice
+	// (found by the SI against a real NATS: FetchNoWait restarted every call).
+	last uint64
 }
 
 func openNATS(ctx context.Context, t *Target, since time.Time) (reader, error) {
@@ -137,6 +142,12 @@ func (r *natsReader) Read(ctx context.Context, fn func(Entry)) error {
 		n := 0
 		for m := range batch.Messages() {
 			n++
+			if md, err := m.Metadata(); err == nil {
+				if md.Sequence.Stream <= r.last {
+					continue
+				}
+				r.last = md.Sequence.Stream
+			}
 			if e, ok := parseJLH(m.Data()); ok {
 				fn(e)
 			} else {
@@ -182,7 +193,7 @@ func openRedis(ctx context.Context, t *Target, since time.Time) (reader, error) 
 	if start < 0 {
 		start = 0
 	}
-	return &redisReader{c: c, stream: t.stream, next: strconv.FormatInt(start, 10) + "-0"}, nil
+	return &redisReader{c: c, stream: t.redisStream(), next: strconv.FormatInt(start, 10) + "-0"}, nil
 }
 
 func (r *redisReader) Incremental() bool { return true }
@@ -214,8 +225,7 @@ func (r *redisReader) Read(ctx context.Context, fn func(Entry)) error {
 type pgReader struct {
 	c     *pgx.Conn
 	query string
-	since time.Time
-	like  string
+	args  []any
 }
 
 func openPostgres(ctx context.Context, t *Target, since time.Time, run string) (reader, error) {
@@ -232,7 +242,12 @@ func openPostgres(ctx context.Context, t *Target, since time.Time, run string) (
 	        FROM ` + table + `
 	       WHERE type = 'syslog' AND received_at >= $1
 	         AND (payload->>'message' LIKE $2 OR payload->>'raw' LIKE $2 OR payload->>'raw-encoding' = 'base64')`
-	return &pgReader{c: c, query: q, since: since.Add(-Margin), like: "%" + likeEscape(run) + "%"}, nil
+	args := []any{since.Add(-Margin), "%" + likeEscape(run) + "%"}
+	if t.spaceSet {
+		q += ` AND space = $3`
+		args = append(args, t.space)
+	}
+	return &pgReader{c: c, query: q, args: args}, nil
 }
 
 func likeEscape(s string) string {
@@ -243,7 +258,7 @@ func (r *pgReader) Incremental() bool { return false }
 func (r *pgReader) Close()            { r.c.Close(context.Background()) }
 
 func (r *pgReader) Read(ctx context.Context, fn func(Entry)) error {
-	rows, err := r.c.Query(ctx, r.query, r.since, r.like)
+	rows, err := r.c.Query(ctx, r.query, r.args...)
 	if err != nil {
 		return fmt.Errorf("postgres: %w", err)
 	}
@@ -338,6 +353,49 @@ func (r *sqliteReader) Read(ctx context.Context, fn func(Entry)) error {
 		}
 	}
 	return ctx.Err()
+}
+
+// Probe opens the destination and reads it once, before anything is sent
+// (SPEC §8.5): a check that cannot run makes the run pointless.
+func Probe(ctx context.Context, t *Target, run string) error {
+	r, err := open(ctx, t, time.Now(), run)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	if p, ok := r.(prober); ok {
+		return p.probe(ctx)
+	}
+	return nil
+}
+
+// prober is a cheap read that proves the destination answers.
+type prober interface {
+	probe(ctx context.Context) error
+}
+
+func (r *redisReader) probe(ctx context.Context) error {
+	if err := r.c.Do(ctx, r.c.B().Ping().Build()).Error(); err != nil {
+		return fmt.Errorf("redis: %w", err)
+	}
+	return nil
+}
+
+func (r *pgReader) probe(ctx context.Context) error {
+	rows, err := r.c.Query(ctx, r.query+" LIMIT 0", r.args...)
+	if err != nil {
+		return fmt.Errorf("postgres: %w", err)
+	}
+	rows.Close()
+	return rows.Err()
+}
+
+func (r *sqliteReader) probe(ctx context.Context) error {
+	rows, err := r.db.QueryContext(ctx, r.query, r.args(1<<62)...)
+	if err != nil {
+		return fmt.Errorf("sqlite: %w", err)
+	}
+	return rows.Close()
 }
 
 // cleanErr removes the URL from a library error, in case it quotes it (it

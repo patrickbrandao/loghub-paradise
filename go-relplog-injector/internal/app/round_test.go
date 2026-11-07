@@ -128,16 +128,16 @@ func TestVerifySQLite(t *testing.T) {
 			if !strings.Contains(m, "seq=77 ") {
 				k.store(t, m)
 			}
-		}, nil, ExitLost,
+		}, nil, ExitFailures,
 			func(v *report.Verify) bool {
-				return !v.OK && v.Lost == 1 && len(v.LostSample) == 1 && v.LostSample[0] == 77
+				return !v.OK && v.Lost == 1 && len(v.LostSeqs) == 1 && v.LostSeqs[0] == "77"
 			}},
 		{"dup", func(k *sqliteSink, m string) {
 			k.store(t, m)
 			if strings.Contains(m, "seq=5 ") {
 				k.store(t, m)
 			}
-		}, nil, ExitLost,
+		}, nil, ExitFailures,
 			func(v *report.Verify) bool {
 				return !v.OK && v.Duplicated == 1 && v.ExtraCopies == 1 && v.ExtraSameUUID == 0
 			}},
@@ -176,8 +176,12 @@ func TestVerifySQLite(t *testing.T) {
 	// Unreadable: no such file.
 	s2 := newRELPServer(t, nil, false)
 	code, sum = runJSON(t, "--target", s2.addr, "--count", "3", "--verify-sqlite", filepath.Join(t.TempDir(), "none.db"), "--verify-timeout", "600ms")
-	if code != ExitUnreadable || !sum.Verify.Unreadable || sum.Verify.Error == "" {
+	if code != ExitVerify || !sum.Verify.Unreadable || sum.Verify.Error == "" {
 		t.Fatalf("unreadable: exit %d %+v", code, sum.Verify)
+	}
+	// The destination is probed before sending: nothing went out.
+	if got, _ := s2.received(); len(got) != 0 || sum.Messages != 0 {
+		t.Fatalf("unreadable destination, yet %d messages sent", len(got))
 	}
 }
 
@@ -193,7 +197,7 @@ func TestVerifyUsage(t *testing.T) {
 		{"--verify-url", "nats://user:s3cr3t@h:4222?ca=/x"},
 		{"--verify-url", "nats://h:4222", "--verify-timeout", "0s"},
 		{"--verify-url", "nats://h:4222", "--file", "/dev/null"},
-		{"--pcap-per-flow"},
+		{"--pcap-flows"}, {"--pcap-dedup", "maybe"}, {"--verify-space", "x"},
 	} {
 		code, _, errs := runMain(t, args...)
 		if code != ExitUsage || strings.Contains(errs, "s3cr3t") {
@@ -237,9 +241,11 @@ func TestPcapDedupAnyCopies(t *testing.T) {
 		binary.BigEndian.PutUint32(f.Data[4:8], 7)
 		frames = append(frames, f)
 	}
+	var tcpCopies uint64
 	for _, f := range out.Frames(out.Split(body, 8), false, false) {
 		binary.BigEndian.PutUint32(f.Data[4:8], 2)
 		frames = append(frames, f)
+		tcpCopies++
 	}
 	sort.SliceStable(frames, func(i, j int) bool { return frames[i].TS.Before(frames[j].TS) })
 	file := filepath.Join(t.TempDir(), "any.pcapng")
@@ -255,12 +261,12 @@ func TestPcapDedupAnyCopies(t *testing.T) {
 	if want := "<13>t-1|<13>t-2|<13>u-1|<13>u-2|<13>u-2"; strings.Join(got, "|") != want {
 		t.Fatalf("replayed %q, want %q", got, want)
 	}
-	if sum.Source["udp_duplicates"] != 3 || sum.Source["tcp_duplicate_directions"] != 1 {
+	if sum.Source["pcap_duplicates"] != 3+tcpCopies {
 		t.Fatalf("source %v", sum.Source)
 	}
 
 	s2 := newRELPServer(t, nil, false)
-	if code, sum = runJSON(t, "--target", s2.addr, "--pcap", file, "--pcap-dedup=false"); code != ExitOK || sum.OK != 10 {
+	if code, sum = runJSON(t, "--target", s2.addr, "--pcap", file, "--pcap-dedup", "off"); code != ExitOK || sum.OK != 10 {
 		t.Fatalf("without dedup: exit %d, %d messages", code, sum.OK)
 	}
 }
@@ -297,7 +303,7 @@ func TestPcapPerFlow(t *testing.T) {
 
 	for _, conc := range []string{"", "1"} {
 		s := newRELPServer(t, nil, true)
-		args := []string{"--target", s.addr, "--pcap", file, "--pcap-per-flow", "--proxy-protocol", "v1"}
+		args := []string{"--target", s.addr, "--pcap", file, "--pcap-flows", "--proxy-protocol", "v1"}
 		if conc != "" {
 			args = append(args, "--concurrency", conc)
 		}

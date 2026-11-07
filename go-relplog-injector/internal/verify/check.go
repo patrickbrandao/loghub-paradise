@@ -126,11 +126,22 @@ func (t *tally) allAcked(acked []uint64) bool {
 	return true
 }
 
-// MaxLostSample bounds lost_sample.
-const MaxLostSample = 20
+// MaxLostRanges bounds lost_seqs.
+const MaxLostRanges = 20
 
 func (t *tally) result(acked []uint64, allowDup bool) *report.Verify {
-	v := &report.Verify{Sent: t.sent, ExtraCopies: t.extra, ExtraSameUUID: t.sameUUID, Unexpected: t.unexpected, EntriesRead: t.entries}
+	v := &report.Verify{Expected: t.sent, ExtraCopies: t.extra, ExtraSameUUID: t.sameUUID, Unexpected: t.unexpected, EntriesRead: t.entries}
+	var lo, hi uint64 // the open range of lost seqs
+	closeRange := func() {
+		if lo == 0 || len(v.LostSeqs) >= MaxLostRanges {
+			return
+		}
+		r := strconv.FormatUint(lo, 10)
+		if hi > lo {
+			r += "-" + strconv.FormatUint(hi, 10)
+		}
+		v.LostSeqs = append(v.LostSeqs, r)
+	}
 	for s := uint64(1); s <= t.sent; s++ {
 		a, n := isAcked(acked, s), t.copies[s]
 		if a {
@@ -139,8 +150,11 @@ func (t *tally) result(acked []uint64, allowDup bool) *report.Verify {
 		switch {
 		case n == 0 && a:
 			v.Lost++
-			if len(v.LostSample) < MaxLostSample {
-				v.LostSample = append(v.LostSample, s)
+			if lo != 0 && hi == s-1 {
+				hi = s
+			} else {
+				closeRange()
+				lo, hi = s, s
 			}
 		case n == 0:
 			v.MissingUnacked++
@@ -154,6 +168,7 @@ func (t *tally) result(acked []uint64, allowDup bool) *report.Verify {
 			v.Duplicated++
 		}
 	}
+	closeRange()
 	v.OK = v.Lost == 0 && (allowDup || v.Duplicated == 0)
 	return v
 }
@@ -176,7 +191,7 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 	tl := newTally(sent)
 	var r reader
 	var lastErr error
-	readOK := false
+	readOK, complete := false, false
 	lastNew := start
 	var lastMatched uint64
 	for {
@@ -208,6 +223,7 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 			}
 		}
 		if readOK && tl.allAcked(acked) && time.Since(lastNew) >= o.Settle {
+			complete = true
 			break
 		}
 		if !time.Now().Add(o.Poll).Before(deadline) {
@@ -226,6 +242,7 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 	}
 	v := tl.result(acked, o.AllowDup)
 	v.Destination = t.Display
+	v.Complete = complete
 	v.WaitedSec = time.Since(start).Seconds()
 	if !readOK {
 		v.OK = false

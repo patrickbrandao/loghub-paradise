@@ -35,7 +35,10 @@ captura do tcpdump. Não é parte do pipeline LogHub.
   `report` são cópias do `go-syslog-injector`: corrija lá **e** aqui, e registre
   no `CHANGELOG.md` da raiz o que ficou "a portar". `sched` difere do pai (a
   retransmissão) e `transport` é próprio (RELP).
-- **Zero dependências** fora da stdlib.
+- **Zero dependências** fora da stdlib, exceto em `internal/verify` (a
+  conferência no destino, SPEC §8.5, decisão 20): `nats.go`, `pgx`, `rueidis`
+  e `modernc.org/sqlite`, nas versões do `go-relplog-server/go.mod`. Mudou lá,
+  mude aqui.
 - Git só no nível do monorepo, com pedido explícito. Tags:
   `go-relplog-injector/vX.Y.Z`.
 

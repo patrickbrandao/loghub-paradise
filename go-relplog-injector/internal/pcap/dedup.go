@@ -17,7 +17,7 @@ import (
 
 const (
 	// DedupWindow is how far apart, in capture time, two copies can be.
-	DedupWindow = 100 * time.Millisecond
+	DedupWindow = 50 * time.Millisecond
 	// maxDedup bounds the originals remembered; the oldest go first.
 	maxDedup = 1 << 16
 )
@@ -94,21 +94,19 @@ func fnv64(h uint64, b []byte) uint64 {
 
 const fnvOffset = 14695981039346656037
 
-// KeyUDP is the dedup key of a UDP datagram: its payload and length.
-func KeyUDP(payload []byte) uint64 {
-	var n [9]byte
-	n[0] = 'u'
-	binary.BigEndian.PutUint64(n[1:], uint64(len(payload)))
-	return fnv64(fnv64(fnvOffset, n[:]), payload)
-}
-
-// KeyTCPOpen is the dedup key of the segment that opens a TCP direction: its
-// sequence number (random, and kept by NAT), flags and data.
-func KeyTCPOpen(s Segment) uint64 {
-	var n [14]byte
-	n[0] = 't'
-	binary.BigEndian.PutUint32(n[1:], s.Seq)
-	n[5] = s.Flags & (FlagSYN | FlagFIN | FlagRST)
-	binary.BigEndian.PutUint64(n[6:], uint64(s.WireLen))
+// Key is the dedup key of a decoded packet (after IP reassembly, before the
+// TCP assembler): protocol, IPv4 ID, source port, TCP sequence,
+// acknowledgement and flags, wire length and an FNV-1a of the content. The
+// addresses and the destination port stay out: NAT rewrites them between
+// the copies (the same key as the go-syslog-injector's).
+func Key(s Segment) uint64 {
+	var n [20]byte
+	n[0] = byte(s.Proto)
+	binary.BigEndian.PutUint16(n[1:], s.ID)
+	binary.BigEndian.PutUint16(n[3:], s.Src.Port())
+	binary.BigEndian.PutUint32(n[5:], s.Seq)
+	binary.BigEndian.PutUint32(n[9:], s.Ack)
+	n[13] = s.Flags
+	binary.BigEndian.PutUint32(n[14:], uint32(s.WireLen))
 	return fnv64(fnv64(fnvOffset, n[:]), s.Payload)
 }

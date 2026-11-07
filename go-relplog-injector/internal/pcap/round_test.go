@@ -1,9 +1,7 @@
 package pcap_test
 
 import (
-	"bytes"
 	"encoding/binary"
-	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -103,7 +101,7 @@ func TestFragmentsWaitingAtEndAreLost(t *testing.T) {
 
 func TestDedupRule(t *testing.T) {
 	d := pcap.NewDedup()
-	k := pcap.KeyUDP([]byte("<13>same"))
+	k := pcap.Key(pcap.Segment{Proto: pcap.ProtoUDP, Payload: []byte("<13>same")})
 	// A on veth (1), its copy on eth0 (2); the sender sends the same bytes
 	// again (B): B on 1 is new, B on 2 is B's copy.
 	steps := []struct {
@@ -121,65 +119,10 @@ func TestDedupRule(t *testing.T) {
 		t.Fatal("copy outside the window")
 	}
 	// The same interface never makes a copy.
-	k2 := pcap.KeyUDP([]byte("<13>other"))
+	k2 := pcap.Key(pcap.Segment{Proto: pcap.ProtoUDP, Payload: []byte("<13>other")})
 	for i := range 3 {
 		if d.Copy(k2, 0, t0.Add(time.Second+time.Duration(i))) {
 			t.Fatal("same interface taken as a copy")
 		}
-	}
-}
-
-// TestTCPDuplicateDirectionWithNAT: the copy of a connection with the
-// destination rewritten by NAT (another 4-tuple) on another interface is
-// ignored; a different connection with the same data is not.
-func TestTCPDuplicateDirectionWithNAT(t *testing.T) {
-	payload := []byte("<13>one\n<13>two\n")
-	in := pcaptest.Conn{Link: 1, Src: cli4, Dst: netip.MustParseAddrPort("10.0.0.2:1514"), ISN: 4242, T0: t0}
-	nat := pcaptest.Conn{Link: 1, Src: netip.MustParseAddrPort("172.17.0.1:40000"), Dst: netip.MustParseAddrPort("172.17.0.5:514"), ISN: 4242, T0: t0.Add(50 * time.Microsecond)}
-	other := pcaptest.Conn{Link: 1, Src: netip.MustParseAddrPort("10.0.0.9:40001"), Dst: srv4, ISN: 999, T0: t0.Add(100 * time.Microsecond)}
-	type fr struct {
-		ifc uint32
-		f   pcaptest.Frame
-	}
-	var frames []fr
-	for _, f := range in.Frames(in.Split(payload, 6), false, false) {
-		frames = append(frames, fr{1, f})
-	}
-	for _, f := range nat.Frames(nat.Split(payload, 6), false, false) {
-		frames = append(frames, fr{2, f})
-	}
-	for _, f := range other.Frames(other.Split(payload, 6), false, false) {
-		frames = append(frames, fr{2, f})
-	}
-	got := map[pcap.FlowKey]*collector{}
-	a := pcap.NewAssembler(func(k pcap.FlowKey, mid bool) pcap.StreamHandler {
-		c := &collector{mid: mid}
-		got[k] = c
-		return c
-	})
-	a.Dedup = pcap.NewDedup()
-	d := pcap.NewDecoder()
-	for _, x := range frames {
-		ip := x.f.Data[14:] // strip the Ethernet header Conn wrote
-		s, ok := d.Decode(pcap.Packet{TS: x.f.TS, LinkType: pcap.LinkSLL2, Data: sll2(x.ifc, ip)})
-		if ok {
-			a.Add(s)
-		}
-	}
-	a.Flush()
-	if a.Stats.Duplicates != 1 || a.Stats.Flows != 2 {
-		t.Fatalf("stats %+v", a.Stats)
-	}
-	var streams int
-	for _, c := range got {
-		if c.ended > 0 {
-			streams++
-			if !bytes.Equal(c.data.Bytes(), payload) {
-				t.Fatalf("stream %q", c.data.Bytes())
-			}
-		}
-	}
-	if streams != 2 {
-		t.Fatalf("%d streams delivered, want 2", streams)
 	}
 }

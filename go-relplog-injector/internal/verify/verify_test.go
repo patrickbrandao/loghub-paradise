@@ -24,7 +24,7 @@ func TestParseURL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", c.in, err)
 		}
-		if tg.Kind != c.kind || tg.Display != c.display || tg.url != c.url || tg.stream != c.stream || tg.tls != c.tls {
+		if tg.Kind != c.kind || tg.Display != c.display || tg.url != c.url || (tg.stream != c.stream && tg.redisStream() != c.stream) || tg.tls != c.tls {
 			t.Fatalf("%s: %+v", c.in, tg)
 		}
 	}
@@ -98,7 +98,7 @@ func TestTally(t *testing.T) {
 	}
 	acked := []uint64{1<<1 | 1<<2 | 1<<4} // 1, 2, 4 acknowledged
 	v := tl.result(acked, false)
-	if v.Sent != 5 || v.Acked != 3 || v.Found != 3 || v.Lost != 1 || v.LostSample[0] != 4 || v.MissingUnacked != 1 ||
+	if v.Expected != 5 || v.Acked != 3 || v.Found != 3 || v.Lost != 1 || v.LostSeqs[0] != "4" || v.MissingUnacked != 1 ||
 		v.FoundUnacked != 1 || v.Duplicated != 2 || v.ExtraCopies != 2 || v.ExtraSameUUID != 1 || v.Unexpected != 1 || v.EntriesRead != 7 || v.OK {
 		t.Fatalf("%+v", v)
 	}

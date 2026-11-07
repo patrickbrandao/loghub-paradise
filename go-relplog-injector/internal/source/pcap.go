@@ -60,7 +60,7 @@ type Pcap struct {
 	cut      uint64 // passes that ended at a truncated record
 
 	dedup   *pcap.Dedup
-	udpDups uint64
+	dups    uint64                       // packets dropped as -i any copies
 	flowIDs uint64                       // last flow id given
 	udpFlow map[[2]netip.AddrPort]uint64 // UDP flows of the pass
 	ends    []uint64                     // flows ended before the next message
@@ -110,7 +110,6 @@ func (p *Pcap) open() error {
 	p.dedup = nil
 	if p.opt.Dedup {
 		p.dedup = pcap.NewDedup()
-		p.asm.Dedup = p.dedup
 	}
 	p.udpFlow = map[[2]netip.AddrPort]uint64{}
 	p.first = time.Time{}
@@ -228,8 +227,7 @@ func (p *Pcap) step() error {
 		}
 		// After the port filter, so a copy it refuses does not shadow the
 		// one it keeps (NAT may rewrite the port between copies).
-		if p.dedup != nil && p.dedup.Copy(pcap.KeyUDP(seg.Payload), seg.Iface, seg.TS) {
-			p.udpDups++
+		if p.isCopy(seg) {
 			return nil
 		}
 		if seg.Truncated {
@@ -241,10 +239,25 @@ func (p *Pcap) step() error {
 		}
 	case pcap.ProtoTCP:
 		if p.opt.TCP {
+			if p.wantPort(seg.Dst.Port()) && p.isCopy(seg) {
+				return nil
+			}
 			p.asm.Add(seg)
 		}
 	}
 	return nil
+}
+
+// isCopy reports (and counts) a packet that copies one seen on another
+// interface within the window: tcpdump -i any (SPEC §6.8). Asked after the
+// port filter, so a copy it refuses does not shadow the one it keeps (NAT
+// may rewrite the port between copies).
+func (p *Pcap) isCopy(seg pcap.Segment) bool {
+	if p.dedup == nil || !p.dedup.Copy(pcap.Key(seg), seg.Iface, seg.TS) {
+		return false
+	}
+	p.dups++
+	return true
 }
 
 func (p *Pcap) reopen() error {
@@ -298,7 +311,7 @@ func (p *Pcap) addAsm(a pcap.AsmStats) {
 	t.Gaps += a.Gaps
 	t.GapBytes += a.GapBytes
 	t.Unterminated += a.Unterminated
-	t.Duplicates += a.Duplicates
+
 }
 
 // Stats implements Source.
@@ -331,7 +344,7 @@ func (p *Pcap) Stats() map[string]uint64 {
 		"tcp_skipped_bytes":         e.SkippedBytes + ce.SkippedBytes,
 		"frames_lost":               e.LostFrames + ce.LostFrames + d.SnaplenUDP + cur.SnaplenUDP,
 		"pcap_ip_datagrams_snaplen": d.SnaplenDatagrams + cur.SnaplenDatagrams,
-		"udp_duplicates":            p.udpDups,
+		"pcap_duplicates":           p.dups,
 		"tcp_long_lines":            e.LongLines + ce.LongLines,
 		"messages_replayed":         p.sent,
 	}
@@ -346,9 +359,9 @@ func (p *Pcap) Stats() map[string]uint64 {
 		a.Gaps += c.Gaps
 		a.GapBytes += c.GapBytes
 		a.Unterminated += c.Unterminated
-		a.Duplicates += c.Duplicates
+
 	}
-	m["tcp_duplicate_directions"] = a.Duplicates
+
 	m["tcp_directions"] = a.Flows
 	m["tcp_midstream"] = a.Midstream
 	m["tcp_directions_filtered"] = a.Ignored

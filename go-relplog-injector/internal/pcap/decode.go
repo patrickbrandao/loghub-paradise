@@ -25,12 +25,16 @@ const (
 
 // Segment is one UDP datagram or TCP segment with its addresses.
 type Segment struct {
-	TS      time.Time
-	Proto   Proto
-	Src     netip.AddrPort
-	Dst     netip.AddrPort
-	Seq     uint32 // TCP only
-	Flags   uint8  // TCP only
+	TS    time.Time
+	Proto Proto
+	Src   netip.AddrPort
+	Dst   netip.AddrPort
+	Seq   uint32 // TCP only
+	Ack   uint32 // TCP only
+	Flags uint8  // TCP only
+	// ID is the IPv4 identification (0 for IPv6): NAT keeps it, so it is
+	// part of the -i any dedup key (SPEC §6.8).
+	ID      uint16
 	Payload []byte
 	// Truncated: the capture cut the payload short (snaplen). For TCP the
 	// missing tail becomes a gap in the stream.
@@ -280,7 +284,9 @@ func (d *Decoder) ipv4(b []byte, ts time.Time, trunc bool) (Segment, error) {
 		d.scratch = append(d.scratch[:0], whole...)
 		body, wire = d.scratch, len(whole)
 	}
-	return l4(proto, src, dst, body, wire, trunc)
+	seg, err := l4(proto, src, dst, body, wire, trunc)
+	seg.ID = binary.BigEndian.Uint16(b[4:6])
+	return seg, err
 }
 
 func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
@@ -392,6 +398,7 @@ func l4(proto uint8, src, dst netip.Addr, b []byte, wire int, trunc bool) (Segme
 			Src:       netip.AddrPortFrom(src.Unmap(), binary.BigEndian.Uint16(b[0:2])),
 			Dst:       netip.AddrPortFrom(dst.Unmap(), binary.BigEndian.Uint16(b[2:4])),
 			Seq:       binary.BigEndian.Uint32(b[4:8]),
+			Ack:       binary.BigEndian.Uint32(b[8:12]),
 			Flags:     b[13],
 			Payload:   b[doff:],
 			Truncated: trunc && w > len(b)-doff,

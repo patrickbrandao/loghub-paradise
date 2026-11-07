@@ -36,8 +36,10 @@ type Target struct {
 	stream string
 	space  string
 	ca     string
-	table  string
-	file   string
+
+	spaceSet bool
+	table    string
+	file     string
 }
 
 // Defaults of the destinations (go-relplog-server SPEC §3.6, §3.7.1, §3.8).
@@ -94,9 +96,6 @@ func ParseURL(raw string) (*Target, error) {
 		}
 	}
 	if t.Kind == KindRedis {
-		if t.stream == "" {
-			t.stream = "loghub." + t.space + ".syslog"
-		}
 		// rueidis takes valkey:// and valkeys:// as redis:// and rediss://;
 		// say it in the canonical form anyway.
 		switch scheme {
@@ -116,6 +115,34 @@ func ParseURL(raw string) (*Target, error) {
 		t.Display += u.Path // the database name
 	}
 	return t, nil
+}
+
+// Override applies --verify-space and --verify-key (the NATS stream, the
+// Redis stream key or the PostgreSQL table); empty keeps the URL's or the
+// default.
+func (t *Target) Override(space, key string) error {
+	if space != "" {
+		t.space = space
+		t.spaceSet = true // PostgreSQL filters the space column only when asked
+	}
+	if key != "" {
+		switch t.Kind {
+		case KindPostgres:
+			t.table = key
+		default:
+			t.stream = key
+		}
+	}
+	return nil
+}
+
+// redisStream is the stream key: the given one, or the server's default
+// loghub.<space>.syslog.
+func (t *Target) redisStream() string {
+	if t.stream != "" {
+		return t.stream
+	}
+	return "loghub." + t.space + ".syslog"
 }
 
 // SQLite returns the target of --verify-sqlite.

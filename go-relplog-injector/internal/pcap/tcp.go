@@ -58,9 +58,6 @@ type AsmStats struct {
 	// without a FIN or RST: their tail may be missing without any visible
 	// hole -- a tcpdump stopped too early, or still behind on its buffer.
 	Unterminated uint64
-	// Duplicates counts directions that are copies of another one on
-	// another interface (tcpdump -i any with NAT, SPEC §6.8): ignored.
-	Duplicates uint64
 }
 
 type pending struct {
@@ -85,8 +82,6 @@ type flow struct {
 type Assembler struct {
 	New   NewStreamFunc
 	Stats AsmStats
-	// Dedup, when set, ignores directions that copy another one (SPEC §6.8).
-	Dedup *Dedup
 	flows map[FlowKey]*flow
 	sweep time.Time
 	ids   uint64
@@ -132,18 +127,8 @@ func (a *Assembler) Add(s Segment) {
 		}
 		a.ids++
 		f = &flow{h: a.New(k, mid), id: a.ids}
-		switch {
-		case f.h == nil:
+		if f.h == nil {
 			a.Stats.Ignored++
-		case a.Dedup != nil && a.Dedup.Copy(KeyTCPOpen(s), s.Iface, s.TS):
-			// Asked after the handler, so a copy the port filter refuses
-			// does not shadow the one it keeps.
-			f.h = nil
-			a.Stats.Flows--
-			if mid {
-				a.Stats.Midstream--
-			}
-			a.Stats.Duplicates++
 		}
 		f.next = s.Seq
 		if syn {
