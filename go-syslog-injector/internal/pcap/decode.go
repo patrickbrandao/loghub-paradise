@@ -25,12 +25,16 @@ const (
 
 // Segment is one UDP datagram or TCP segment with its addresses.
 type Segment struct {
-	TS      time.Time
-	Proto   Proto
-	Src     netip.AddrPort
-	Dst     netip.AddrPort
-	Seq     uint32 // TCP only
-	Flags   uint8  // TCP only
+	TS    time.Time
+	Proto Proto
+	Src   netip.AddrPort
+	Dst   netip.AddrPort
+	Seq   uint32 // TCP only
+	Ack   uint32 // TCP only
+	Flags uint8  // TCP only
+	// IPID is the IPv4 identification (0 for IPv6): NAT keeps it, so the
+	// copies tcpdump -i any captures of one packet share it (SPEC §6.9).
+	IPID    uint16
 	Payload []byte
 	// Truncated: the capture cut the payload short (snaplen). For TCP the
 	// missing tail becomes a gap in the stream.
@@ -57,6 +61,10 @@ type Stats struct {
 	Reassembled   uint64 // datagrams rebuilt from fragments
 	FragmentsLost uint64 // fragments dropped (incomplete, overlapping, too many)
 	Truncated     uint64 // packets cut by the snaplen
+	// DatagramsSnaplen counts datagrams lost because one of their fragments
+	// was cut by the snaplen (SPEC §6.3): the missing bytes are not in the
+	// file, so the datagram cannot be rebuilt.
+	DatagramsSnaplen uint64
 }
 
 // Decoder turns packets into segments, rebuilding IP fragments.
@@ -219,11 +227,11 @@ func (d *Decoder) ipv4(b []byte, ts time.Time, trunc bool) (Segment, error) {
 	wire := total - ihl
 	if more || off != 0 {
 		d.Stats.Fragments++
+		key := fragKey{src: src, dst: dst, id: uint32(binary.BigEndian.Uint16(b[4:6])), proto: proto}
 		if trunc {
-			d.Stats.FragmentsLost++
+			d.cutFragment(key, ts)
 			return Segment{}, errFragment
 		}
-		key := fragKey{src: src, dst: dst, id: uint32(binary.BigEndian.Uint16(b[4:6])), proto: proto}
 		whole, done, lost := d.frags.add(key, off, more, body, ts)
 		d.Stats.FragmentsLost += uint64(lost)
 		if !done {
@@ -233,7 +241,9 @@ func (d *Decoder) ipv4(b []byte, ts time.Time, trunc bool) (Segment, error) {
 		d.scratch = append(d.scratch[:0], whole...)
 		body, wire = d.scratch, len(whole)
 	}
-	return l4(proto, src, dst, body, wire, trunc)
+	seg, err := l4(proto, src, dst, body, wire, trunc)
+	seg.IPID = binary.BigEndian.Uint16(b[4:6])
+	return seg, err
 }
 
 func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
@@ -269,15 +279,15 @@ func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
 				return Segment{}, errShort
 			}
 			d.Stats.Fragments++
-			if trunc {
-				d.Stats.FragmentsLost++
-				return Segment{}, errFragment
-			}
 			nh := body[0]
 			ff := binary.BigEndian.Uint16(body[2:4])
 			off := int(ff>>3) * 8
 			more := ff&1 != 0
 			key := fragKey{src: src, dst: dst, id: binary.BigEndian.Uint32(body[4:8]), proto: nh, v6: true}
+			if trunc {
+				d.cutFragment(key, ts)
+				return Segment{}, errFragment
+			}
 			whole, done, lost := d.frags.add(key, off, more, body[8:], ts)
 			d.Stats.FragmentsLost += uint64(lost)
 			if !done {
@@ -289,6 +299,15 @@ func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
 		default:
 			return l4(next, src, dst, body, wire, trunc)
 		}
+	}
+}
+
+// cutFragment drops the datagram of a fragment the snaplen cut (SPEC §6.3).
+func (d *Decoder) cutFragment(k fragKey, ts time.Time) {
+	lost, first := d.frags.truncated(k, ts)
+	d.Stats.FragmentsLost += uint64(lost)
+	if first {
+		d.Stats.DatagramsSnaplen++
 	}
 }
 
@@ -331,6 +350,7 @@ func l4(proto uint8, src, dst netip.Addr, b []byte, wire int, trunc bool) (Segme
 			Src:       netip.AddrPortFrom(src.Unmap(), binary.BigEndian.Uint16(b[0:2])),
 			Dst:       netip.AddrPortFrom(dst.Unmap(), binary.BigEndian.Uint16(b[2:4])),
 			Seq:       binary.BigEndian.Uint32(b[4:8]),
+			Ack:       binary.BigEndian.Uint32(b[8:12]),
 			Flags:     b[13],
 			Payload:   b[doff:],
 			Truncated: trunc && w > len(b)-doff,

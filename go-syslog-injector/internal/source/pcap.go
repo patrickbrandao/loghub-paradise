@@ -21,6 +21,33 @@ type PcapOptions struct {
 	UDP, TCP bool
 	Loop     bool
 	Header   Header // FormatRaw by default: the captured message as is
+	// Flows tags each message with its captured flow and emits a FlowEnd
+	// control message when the flow ends (--pcap-flows, SPEC §6.8).
+	Flows bool
+	// Dedup drops the -i any copies (--pcap-dedup, SPEC §6.9).
+	Dedup DedupMode
+}
+
+// DedupMode is --pcap-dedup.
+type DedupMode uint8
+
+const (
+	DedupAuto DedupMode = iota // on for SLL, SLL2, PKTAP and multi-interface pcapng
+	DedupOn
+	DedupOff
+)
+
+// ParseDedup parses --pcap-dedup.
+func ParseDedup(s string) (DedupMode, error) {
+	switch s {
+	case "auto":
+		return DedupAuto, nil
+	case "on":
+		return DedupOn, nil
+	case "off":
+		return DedupOff, nil
+	}
+	return 0, fmt.Errorf("--pcap-dedup: want auto, on or off, got %q", s)
 }
 
 // Pcap replays the syslog messages of a capture, in capture order.
@@ -43,6 +70,11 @@ type Pcap struct {
 	// --loop (a capture rewritten empty between passes would spin forever).
 	passSent uint64
 	cut      uint64 // passes that ended at a truncated record
+
+	dedup    *pcap.Dedup
+	flowID   uint64 // last flow id given (SPEC §6.8)
+	udpFlows map[[2]netip.AddrPort]uint64
+	dupTotal uint64
 
 	// totals of the previous passes, so the report covers the whole run
 	decTotal pcap.Stats
@@ -78,21 +110,66 @@ func (p *Pcap) open() error {
 			return nil
 		}
 		src, dst := k.Src, k.Dst
-		return extract.NewStream(strict, mid, &p.ext, func(b []byte, ts time.Time) {
-			p.push(b, ts, src, dst)
+		var flow uint64
+		if p.opt.Flows {
+			p.flowID++
+			flow = p.flowID
+		}
+		s := extract.NewStream(strict, mid, &p.ext, func(b []byte, ts time.Time) {
+			p.push(b, ts, src, dst, flow)
 		})
+		if flow == 0 {
+			return s
+		}
+		return &flowStream{Stream: s, end: func() {
+			p.queue = append(p.queue, Message{At: -1, Src: src, Dst: dst, Flow: flow, FlowEnd: true})
+		}}
 	})
 	p.first = time.Time{}
 	p.pass++
 	p.passSent = 0
+	p.udpFlows = map[[2]netip.AddrPort]uint64{} // each pass has new flows
+	if p.dedup != nil {
+		p.dupTotal += p.dedup.Dropped
+	}
+	p.dedup = pcap.NewDedup()
 	return nil
+}
+
+// flowStream reports the end of a captured TCP direction after its last
+// message, so the connection of that flow closes when the original did.
+type flowStream struct {
+	*extract.Stream
+	end func()
+}
+
+func (f *flowStream) End() {
+	f.Stream.End()
+	f.end()
+}
+
+// copyOfPacket applies --pcap-dedup (SPEC §6.9).
+func (p *Pcap) copyOfPacket(pk pcap.Packet, seg pcap.Segment) bool {
+	switch p.opt.Dedup {
+	case DedupOff:
+		return false
+	case DedupAuto:
+		switch pk.LinkType {
+		case pcap.LinkSLL, pcap.LinkSLL2, pcap.LinkPKTAP:
+		default:
+			if p.rd.Interfaces() < 2 {
+				return false
+			}
+		}
+	}
+	return p.dedup.Copy(seg)
 }
 
 func (p *Pcap) wantPort(port uint16) bool {
 	return len(p.opt.Ports) == 0 || p.opt.Ports[port]
 }
 
-func (p *Pcap) push(b []byte, ts time.Time, src, dst netip.AddrPort) {
+func (p *Pcap) push(b []byte, ts time.Time, src, dst netip.AddrPort, flow uint64) {
 	at := time.Duration(-1)
 	if !ts.IsZero() {
 		if p.first.IsZero() {
@@ -106,7 +183,7 @@ func (p *Pcap) push(b []byte, ts time.Time, src, dst netip.AddrPort) {
 			p.last = at
 		}
 	}
-	p.queue = append(p.queue, Message{Data: append([]byte(nil), b...), At: at, Src: src, Dst: dst})
+	p.queue = append(p.queue, Message{Data: append([]byte(nil), b...), At: at, Src: src, Dst: dst, Flow: flow})
 }
 
 // Next implements Source.
@@ -127,6 +204,9 @@ func (p *Pcap) Next(_ uint64, now time.Time) (Message, error) {
 	m := p.queue[0]
 	p.queue[0] = Message{}
 	p.queue = p.queue[1:]
+	if m.FlowEnd {
+		return m, nil // control: not a message of the run
+	}
 	if p.opt.Header.Format != FormatRaw {
 		m.Data = p.opt.Header.Wrap(make([]byte, 0, len(m.Data)+96), m.Data, now)
 	}
@@ -162,6 +242,9 @@ func (p *Pcap) step() error {
 	if !ok {
 		return nil
 	}
+	if p.copyOfPacket(pk, seg) {
+		return nil
+	}
 	switch seg.Proto {
 	case pcap.ProtoUDP:
 		if !p.opt.UDP || !p.wantPort(seg.Dst.Port()) {
@@ -172,7 +255,16 @@ func (p *Pcap) step() error {
 			return nil
 		}
 		if extract.Datagram(seg.Payload, len(p.opt.Ports) == 0, &p.ext) {
-			p.push(seg.Payload, seg.TS, seg.Src, seg.Dst)
+			var flow uint64
+			if p.opt.Flows {
+				k := [2]netip.AddrPort{seg.Src, seg.Dst}
+				if flow = p.udpFlows[k]; flow == 0 {
+					p.flowID++
+					flow = p.flowID
+					p.udpFlows[k] = flow
+				}
+			}
+			p.push(seg.Payload, seg.TS, seg.Src, seg.Dst, flow)
 		}
 	case pcap.ProtoTCP:
 		if p.opt.TCP {
@@ -202,6 +294,7 @@ func (p *Pcap) accumulate() {
 	t.Reassembled += d.Reassembled
 	t.FragmentsLost += d.FragmentsLost
 	t.Truncated += d.Truncated
+	t.DatagramsSnaplen += d.DatagramsSnaplen
 	x := &p.extTotal
 	x.Datagrams += e.Datagrams
 	x.DatagramsSkip += e.DatagramsSkip
@@ -241,29 +334,32 @@ func (p *Pcap) Stats() map[string]uint64 {
 	ce := p.ext
 	a := p.asmTotal
 	m := map[string]uint64{
-		"pcap_passes":             p.pass,
-		"pcap_cut_at_end":         p.cut,
-		"pcap_packets":            d.Packets + cur.Packets,
-		"pcap_not_ip":             d.NotIP + cur.NotIP,
-		"pcap_malformed":          d.Malformed + cur.Malformed,
-		"pcap_other_proto":        d.OtherProto + cur.OtherProto,
-		"pcap_snaplen_truncated":  d.Truncated + cur.Truncated,
-		"pcap_ip_fragments":       d.Fragments + cur.Fragments,
-		"pcap_ip_reassembled":     d.Reassembled + cur.Reassembled,
-		"pcap_ip_fragments_lost":  d.FragmentsLost + cur.FragmentsLost,
-		"udp_datagrams":           e.Datagrams + ce.Datagrams,
-		"udp_not_syslog":          e.DatagramsSkip + ce.DatagramsSkip,
-		"tcp_messages":            e.Messages + ce.Messages,
-		"tcp_streams_octet":       e.Streams[extract.ModeOctet] + ce.Streams[extract.ModeOctet],
-		"tcp_streams_lf":          e.Streams[extract.ModeLF] + ce.Streams[extract.ModeLF],
-		"tcp_streams_relp":        e.Streams[extract.ModeRELP] + ce.Streams[extract.ModeRELP],
-		"tcp_streams_not_syslog":  e.Streams[extract.ModeIgnore] + ce.Streams[extract.ModeIgnore] + e.Streams[extract.ModeDetect] + ce.Streams[extract.ModeDetect],
-		"tcp_relp_other_commands": e.RELPOther + ce.RELPOther,
-		"tcp_resyncs":             e.Resyncs + ce.Resyncs,
-		"tcp_skipped_bytes":       e.SkippedBytes + ce.SkippedBytes,
-		"frames_lost":             e.LostFrames + ce.LostFrames,
-		"tcp_long_lines":          e.LongLines + ce.LongLines,
-		"messages_replayed":       p.sent,
+		"pcap_passes":               p.pass,
+		"pcap_cut_at_end":           p.cut,
+		"pcap_packets":              d.Packets + cur.Packets,
+		"pcap_not_ip":               d.NotIP + cur.NotIP,
+		"pcap_malformed":            d.Malformed + cur.Malformed,
+		"pcap_other_proto":          d.OtherProto + cur.OtherProto,
+		"pcap_snaplen_truncated":    d.Truncated + cur.Truncated,
+		"pcap_ip_fragments":         d.Fragments + cur.Fragments,
+		"pcap_ip_reassembled":       d.Reassembled + cur.Reassembled,
+		"pcap_ip_fragments_lost":    d.FragmentsLost + cur.FragmentsLost,
+		"pcap_ip_datagrams_snaplen": d.DatagramsSnaplen + cur.DatagramsSnaplen,
+		"pcap_any_duplicates":       p.dupTotal + p.dedup.Dropped,
+		"pcap_flows":                p.flowID,
+		"udp_datagrams":             e.Datagrams + ce.Datagrams,
+		"udp_not_syslog":            e.DatagramsSkip + ce.DatagramsSkip,
+		"tcp_messages":              e.Messages + ce.Messages,
+		"tcp_streams_octet":         e.Streams[extract.ModeOctet] + ce.Streams[extract.ModeOctet],
+		"tcp_streams_lf":            e.Streams[extract.ModeLF] + ce.Streams[extract.ModeLF],
+		"tcp_streams_relp":          e.Streams[extract.ModeRELP] + ce.Streams[extract.ModeRELP],
+		"tcp_streams_not_syslog":    e.Streams[extract.ModeIgnore] + ce.Streams[extract.ModeIgnore] + e.Streams[extract.ModeDetect] + ce.Streams[extract.ModeDetect],
+		"tcp_relp_other_commands":   e.RELPOther + ce.RELPOther,
+		"tcp_resyncs":               e.Resyncs + ce.Resyncs,
+		"tcp_skipped_bytes":         e.SkippedBytes + ce.SkippedBytes,
+		"frames_lost":               e.LostFrames + ce.LostFrames,
+		"tcp_long_lines":            e.LongLines + ce.LongLines,
+		"messages_replayed":         p.sent,
 	}
 	if p.asm != nil {
 		c := p.asm.Stats

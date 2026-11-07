@@ -10,6 +10,11 @@ Injeta mensagens syslog num servidor — para testar ou carregar o
   pcapng; UDP, TCP octet/LF e RELP; captura iniciada no meio da conexão).
 - Carga: `--count`, `--duration`, `--rate`, `--concurrency`; relatório com
   desfechos, vazão e latência (texto ou JSON) e código de saída.
+- Conferência no destino (`--verify-url` nats/postgres/redis/valkey,
+  `--verify-sqlite`): depois do envio, conta as `seq` perdidas e duplicadas
+  no que o servidor gravou.
+- Replay fiel: uma conexão por fluxo capturado com o PROXY da origem
+  (`--pcap-flows`), sem as cópias do `tcpdump -i any` (`--pcap-dedup`).
 
 ```bash
 go build -o go-syslog-injector ./cmd/go-syslog-injector
@@ -23,10 +28,13 @@ go build -o go-syslog-injector ./cmd/go-syslog-injector
 # UDP com modelo e severidade
 ./go-syslog-injector --transport udp --template 'login fail user={rand:6} id={uuid}' --severity warning --count 100
 
+# 10 000 mensagens e conferência no NATS JetStream do servidor
+./go-syslog-injector --target 127.0.0.1:1514 --count 10000 --concurrency 4 --verify-url nats://127.0.0.1:4222
+
 # replay de captura de produção, no ritmo original, só da porta 514
 tcpdump -i eth0 -s 0 -w prod.pcap 'port 514'
 ./go-syslog-injector --target 127.0.0.1:1514 --pcap prod.pcap --pcap-port 514 --pcap-timing original
 ```
 
-Saída: `0` tudo enviado, `1` alguma falha, `2` uso, `3` alvo inalcançável,
-`130` interrompido. Detalhes: `docs/SPEC.md`; testes: `docs/TESTING.md`.
+Saída: `0` tudo enviado, `1` alguma falha (ou perda/duplicata no destino), `2`
+uso, `3` alvo inalcançável, `4` conferência impossível, `130` interrompido. Detalhes: `docs/SPEC.md`; testes: `docs/TESTING.md`.

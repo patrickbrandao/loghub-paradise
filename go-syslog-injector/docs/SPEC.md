@@ -27,15 +27,21 @@ código, depois o teste.
   ao servidor o tráfego real de um servidor de produção.
 - Relatório final honesto: cada mensagem tem **um** desfecho (§8.2), e o código
   de saída diz se alguma falhou.
+- **Conferência no destino** (§8.5, decisão 20): depois do envio, ler o que o
+  servidor gravou — NATS JetStream, PostgreSQL (`loghub.inbox`), Redis/Valkey
+  (stream) ou SQLite (`syslog_events`) — e contar as `seq` da execução perdidas
+  e duplicadas, no relatório e no código de saída.
 
 ### 1.2 Não-objetivos (v1)
 
-- **Conferir a entrega no destino** (NATS, PostgreSQL...). O relatório vem do
-  que o transporte informa; no syslog isso é "o kernel aceitou", não "o
-  servidor gravou" (decisão 4; pendência 1).
+- Conferir a entrega de `--file` e `--pcap`: as mensagens não levam os
+  marcadores `seq=`/`run=` da execução, e o destino não tem como separá-las do
+  resto do tráfego (§8.5). Sem `--verify-*`, o relatório vem do que o
+  transporte informa ("o kernel aceitou", não "o servidor gravou").
 - Captura ao vivo de uma interface: a entrada do replay é sempre um arquivo.
 - Reproduzir o **IP de origem** da captura (exigiria socket cru e permissão de
-  root). O endereço original pode ser anunciado no PROXY protocol (§4.4).
+  root). O endereço original de cada fluxo pode ser anunciado no PROXY protocol,
+  numa conexão por fluxo (`--pcap-flows`, §6.8).
 - Decifrar TLS capturado (porta 6514): não há como recuperar as mensagens.
 - Arquivo de configuração: a ferramenta é de linha de comando, só flags.
 
@@ -87,10 +93,20 @@ internal/
               LF, RELP; detecção e ressincronização                [fuzz]
   sched/      produtor, workers, ritmo, interrupção
   transport/  UDP, unix, TCP, TLS, PROXY protocol
-  report/     contadores, histograma, texto/JSON, progresso
+  report/     contadores, histograma, texto/JSON, progresso, seq enviadas
+  verify/     conferência no destino: NATS, PostgreSQL, Redis/Valkey, SQLite
 ```
 
-Dependências: **nenhuma** fora da biblioteca padrão (decisão 6).
+Dependências: a biblioteca padrão em tudo, **exceto** `internal/verify`, que
+usa os clientes dos próprios servidores, nas mesmas versões do
+`go-syslog-server/go.mod` (decisão 20): `github.com/nats-io/nats.go` v1.53.1
+(com `jetstream`), `github.com/jackc/pgx/v5` v5.11.0,
+`github.com/redis/rueidis` v1.0.77 e `modernc.org/sqlite` v1.58.0 (puro Go: o
+binário continua estático, `CGO_ENABLED=0`). Ler o destino com outro cliente
+seria provar a entrega com um código que os servidores não usam; um cliente
+próprio de quatro protocolos seria um projeto à parte. O resto do injetor
+continua sem dependências (decisão 6): nada fora de `verify` importa esses
+pacotes.
 
 ---
 
@@ -134,6 +150,13 @@ go-syslog-injector [flags]
 | `--pcap-proto` | `udp,tcp` | protocolos da captura a reproduzir |
 | `--pcap-timing` | `asap` | `asap` (ritmo de `--rate`) ou `original` (os intervalos da captura) |
 | `--pcap-speed` | `1` | fator de `original` (`2` = duas vezes mais rápido) |
+| `--pcap-flows` | `false` | uma conexão (ou socket) por fluxo original da captura; com `--proxy-protocol`, o PROXY anuncia a origem e o destino capturados (§6.8) |
+| `--pcap-dedup` | `auto` | descarta as cópias do `-i any`: `auto` (só em captura de várias interfaces), `on`, `off` (§6.9) |
+| `--verify-url` | — | confere no destino, depois do envio (§8.5): `nats://`, `tls://`, `postgres://`, `postgresql://`, `redis://`, `rediss://`, `valkey://`, `valkeys://` |
+| `--verify-sqlite` | — | confere no `events.db` (`sink=sqlite`) deste caminho (§8.5) |
+| `--verify-timeout` | `30s` | quanto esperar pelas mensagens no destino |
+| `--verify-space` | `default` | o `space` do servidor (subject, stream e filtro) |
+| `--verify-key` | por destino | stream JetStream, stream Redis, tabela PostgreSQL ou tabela SQLite a ler (§8.5) |
 | `--report` | `text` | relatório final no stdout: `text` ou `json` |
 | `--progress` | `auto` | linha de progresso no stderr a cada intervalo; `0` desliga; `auto` = 1 s num terminal |
 | `--version` | | imprime a versão e sai |
@@ -148,17 +171,27 @@ não altera o que foi capturado); `--loop` sem `--file`/`--pcap`, ou com stdin;
 `--pcap-timing original` sem `--pcap` ou com `--rate`; `--framing lf` com TLS;
 `--proxy-protocol` fora de TCP/TLS; `--tls-*` sem `--transport tls`;
 `--transport unix` sem caminho; marcador desconhecido; captura que não é pcap
-nem pcapng. Todas são conferidas **antes** do primeiro envio.
+nem pcapng; `--pcap-flows` ou `--pcap-dedup` sem `--pcap`; `--verify-url` com
+`--verify-sqlite`; esquema de `--verify-url` desconhecido (a mensagem não
+repete a URL, que pode ter senha); `--verify-*` com `--file`/`--pcap`, ou com
+`--template` sem `seq={seq}` e `run={run}`; `--run` fora de `[A-Za-z0-9._:-]`
+com `--verify-*` (o marcador é procurado como texto, também dentro do JLH
+escapado); `--verify-key` que não é um nome; `--verify-timeout` ≤ 0. Todas são
+conferidas **antes** do primeiro envio.
 
 ### 3.3 Códigos de saída
 
 | Código | Quando |
 |---|---|
-| `0` | toda mensagem teve desfecho de sucesso |
-| `1` | ao menos uma falhou, ou a fonte deu erro no meio da execução |
+| `0` | toda mensagem teve desfecho de sucesso (e, com `--verify-*`, chegou ao destino uma vez) |
+| `1` | ao menos uma falhou, a fonte deu erro no meio da execução, ou a conferência achou perdidas ou duplicadas |
 | `2` | uso: flag inválida, combinação recusada, arquivo que não abre |
 | `3` | alvo inalcançável: houve mensagens e **nenhuma** conexão abriu |
-| `130` | interrompido (SIGINT/SIGTERM) |
+| `4` | a conferência não pôde ser feita: destino inalcançável, stream/tabela inexistente, erro de leitura (§8.5) |
+| `130` | interrompido (SIGINT/SIGTERM); a conferência não roda |
+
+A precedência é a da tabela de baixo para cima: `130`, `3`, `4`, `1`. Um `4`
+diz "não sei", e não pode ser lido como "perdeu" (`1`) nem como "chegou" (`0`).
 
 ---
 
@@ -314,6 +347,20 @@ quadro em duas interfaces) é ignorado; sobreposição é recusada (RFC 5722). O
 que se perde é contado (`pcap_ip_fragments_lost`). Pacote cortado pelo snaplen
 é marcado: um datagrama cortado **não** é reproduzido (`frames_lost`).
 
+**Fragmento cortado pelo snaplen** (regra de 2026-11-07, pendência 4): o
+datagrama dele **não tem conserto** — os bytes que faltam não estão no arquivo,
+e nenhum outro fragmento os carrega (a cópia do `-i any` sai com o mesmo
+snaplen). O que dá para fazer é contar certo e não segurar memória à toa: o
+datagrama é descartado na hora em que o fragmento cortado chega — os
+fragmentos dele já guardados saem, e os que chegarem depois (dentro de
+`FragTimeout`) são descartados ao chegar, em vez de esperar a janela de 30 s —,
+cada fragmento conta em `pcap_ip_fragments_lost`, e o datagrama, **uma vez**,
+em `pcap_ip_datagrams_snaplen`. Antes, só o fragmento cortado era contado; os
+outros ficavam abertos até vencer, e o datagrama perdido não aparecia em
+contador nenhum. Não se sabe se ele era syslog (a porta pode estar só no
+primeiro fragmento, o cortado), por isso não entra em `frames_lost`. A saída é
+capturar com `-s 0`.
+
 ### 6.4 Remontagem TCP
 
 Um fluxo de bytes por **direção** de conexão, em ordem de sequência (com a
@@ -373,12 +420,24 @@ Decididas **uma vez por fluxo**, nos primeiros bytes, como o servidor decide
     começa com um cabeçalho válido (estrito: seguido de `<`).
 
   Num fluxo midstream as três são buscadas, e vence a posição mais cedo. Um
-  candidato que ainda espera bytes **segura** a decisão enquanto declara até 64
-  KiB, mesmo que um candidato posterior já esteja comprovado: assim a escolha
-  não depende de como a captura dividiu o fluxo em segmentos (achado do fuzz,
-  `FuzzStream`, três entradas no corpus). Sem candidato, guarda só os últimos 64
-  bytes. Tudo o que foi pulado é contado (`tcp_skipped_bytes`, `tcp_resyncs`), e
-  o quadro perdido também (`frames_lost`).
+  candidato que ainda espera bytes **segura** a decisão, **qualquer** que seja o
+  tamanho que declara (até o teto de 16 MiB do quadro), mesmo que um candidato
+  posterior já esteja comprovado: assim a escolha não depende de como a captura
+  dividiu o fluxo em segmentos (achado do fuzz, `FuzzStream`, três entradas no
+  corpus). Até 2026-11-07 só segurava o candidato que declarava até 64 KiB
+  (pendência 5): um maior perdia para o posterior quando o seu quadro ainda não
+  tinha chegado, e ganhava quando chegava no mesmo segmento
+  (`TestResyncLargeCandidateHolds`). O custo é memória e atraso, não resultado:
+  um texto que parece cabeçalho (sem `--pcap-port`, um `LEN SP <`) segura até
+  16 MiB do fluxo antes de ser descartado, e a decisão sai a mesma, mais tarde.
+  Para isso não virar uma busca quadrática (o buffer inteiro relido a cada
+  segmento), a busca só se repete quando o buffer chega ao tamanho de que o
+  candidato pendente precisa (o fim do quadro que ele declara); antes disso, as
+  posições anteriores a ele já foram recusadas de vez e a resposta não muda.
+  Sem candidato, guarda só os últimos 64 bytes; com um candidato pendente,
+  guarda a partir dele (o buffer não passa de 16 MiB mais um cabeçalho). Tudo o
+  que foi pulado é contado (`tcp_skipped_bytes`, `tcp_resyncs`), e o quadro
+  perdido também (`frames_lost`).
 - Quadro acima de 16 MiB não é quadro (ressincroniza); linha LF acima disso é
   cortada (`tcp_long_lines`).
 
@@ -386,13 +445,73 @@ Decididas **uma vez por fluxo**, nos primeiros bytes, como o servidor decide
 
 - TLS capturado (porta 6514) — o conteúdo é cifrado. Fica em
   `tcp_streams_not_syslog`.
-- O IP de origem (§1.2); com `--proxy-protocol` dá para anunciar **um** endereço
-  por execução, não um por mensagem (pendência 3).
-- **Duplicatas do `-i any`**: no Linux, um pacote que atravessa duas interfaces
-  (eth0 e a veth de um container) é capturado duas vezes, às vezes com o
-  destino reescrito pelo NAT; o datagrama UDP repetido é reproduzido duas vezes.
-  Capture numa interface só (`-i eth0`) (pendência 2).
+- O IP de origem (§1.2): sai do endereço do injetor. Com `--pcap-flows` e
+  `--proxy-protocol`, cada fluxo anuncia o seu (§6.8); sem `--pcap-flows`, um
+  endereço por execução.
+- As cópias do `-i any` (§6.9), salvo as que o NAT mudou na porta de origem.
 - Direções de servidor e mensagens de outros protocolos na mesma porta.
+
+### 6.8 Uma conexão por fluxo original (`--pcap-flows`)
+
+Regra de 2026-11-07 (pendência 3). Sem a flag, o replay é como sempre foi:
+`--concurrency` conexões, mensagens de todos os fluxos da captura misturadas
+nelas, e um PROXY por conexão. Com `--pcap-flows`, o servidor vê os emissores
+como eram:
+
+- **Fluxo** é uma direção TCP remontada (uma conexão capturada: um SYN novo na
+  mesma quádrupla é outro fluxo, §6.4), ou o par (origem, destino) dos
+  datagramas UDP. Cada passada de `--loop` tem fluxos novos.
+- Cada fluxo tem **a sua** conexão (ou socket UDP/unix) até o alvo, aberta na
+  primeira mensagem e fechada quando a direção capturada termina (FIN, RST,
+  ociosa, fim da captura): as mensagens dele saem na ordem de captura, numa
+  conexão só.
+- Com `--proxy-protocol`, o cabeçalho de cada conexão anuncia a **origem e o
+  destino capturados** do fluxo, no lugar do par real; `--proxy-src` e
+  `--proxy-dst`, se dados, ainda valem para todos. É o que faz o servidor gravar
+  `host.src-ip`/`src-port` do emissor original (e o `sid` de cada um).
+- Os fluxos são repartidos entre os `--concurrency` workers por hash do fluxo,
+  então a ordem dentro de um fluxo se mantém e fluxos diferentes andam em
+  paralelo. O ritmo (`--rate`, `--pcap-timing`) é o mesmo de sempre: global.
+- **Teto**: 256 conexões abertas por worker. Passado ele, a usada há mais tempo
+  é fechada (evento `flow_conn_evicted`) e reaberta se o fluxo voltar a
+  mandar. Datagramas UDP não têm fim na captura: só o teto e o fim da execução
+  fecham os sockets deles.
+- Uma conexão de fluxo que quebra é fechada e rediscada para a próxima
+  mensagem do fluxo, com a espera de §2; cada abertura conta em
+  `connections.opened`. `pcap_flows` conta os fluxos.
+
+### 6.9 Duplicatas do `-i any` (`--pcap-dedup`)
+
+Regra de 2026-11-07 (pendência 2). No Linux, `tcpdump -i any` (SLL, SLL2) vê
+um pacote em **cada** interface que ele atravessa — a veth do container, a
+ponte, a eth0 —, às vezes com o destino (DNAT) ou a origem (SNAT) reescritos;
+no macOS, o PKTAP também. Sem tratamento, o datagrama UDP saía duas vezes, e a
+cópia TCP com outra quádrupla virava um segundo fluxo inteiro.
+
+- `--pcap-dedup auto` (padrão) liga a deduplicação quando o enlace é SLL, SLL2
+  ou PKTAP, ou quando a seção pcapng declara mais de uma interface; `on` liga
+  sempre, `off` nunca. Numa captura de uma interface só, um pacote repetido é
+  retransmissão de verdade, e a remontagem TCP já cuida dela.
+- **Chave**: protocolo, IP ID (IPv4; 0 no IPv6, que não tem), porta de
+  origem, no TCP o número de sequência, o de confirmação e as flags, o tamanho
+  no fio e um hash FNV-1a 64 do conteúdo capturado. **Endereços e porta de
+  destino ficam fora**, porque o NAT os troca; o IP ID, a sequência e a porta
+  de origem ele preserva.
+- Um pacote cuja chave apareceu até **50 ms** antes, em tempo de captura, é
+  cópia: descartado antes da remontagem TCP e contado em
+  `pcap_any_duplicates`. As cópias de um pacote estão a microssegundos uma da
+  outra (é o mesmo `skb` passando de interface em interface); uma
+  retransmissão TCP real leva outro IP ID e espera ao menos o RTO mínimo do
+  Linux (200 ms).
+- A deduplicação vem depois da remontagem IP: as cópias dos fragmentos de um
+  datagrama (que o NAT pôs em chaves de remontagem diferentes) viram dois
+  datagramas inteiros iguais, e o segundo sai como cópia.
+- **Limites, aceitos**: o masquerade que troca a porta de origem (só numa
+  colisão) faz a cópia passar; no IPv6, dois datagramas idênticos da mesma
+  porta em 50 ms numa captura de várias interfaces viram um. Se a ordem das
+  cópias variar entre pacotes de uma conexão TCP (ora a veth primeiro, ora a
+  eth0), os segmentos se dividem entre as duas quádruplas e aparecem como
+  lacunas nas duas.
 
 ---
 
@@ -429,8 +548,8 @@ execução, alvo, moldura, formato, fonte, plano), `start`, `elapsed_sec`,
 `messages`, `ok`, `failed`, `outcomes`, `bytes`, `rate_msgs_per_sec`,
 `rate_bytes_per_sec`, `latency` (µs: min, mean, p50, p90, p99, p99.9, max — só
 dos sucessos), `connections` (`opened`, `dial_errors`, `broken`), `events`
-(erros de discagem e quebras agrupados pelo texto final do erro) e `source`
-(contadores da fonte, §8.4).
+(erros de discagem e quebras agrupados pelo texto final do erro), `source`
+(contadores da fonte, §8.4) e, com `--verify-*`, `verify` (§8.5).
 
 ### 8.2 Desfechos
 
@@ -460,23 +579,108 @@ pelo snaplen, fragmentos vistos/remontados/perdidos, passadas, corte no fim),
 `udp_datagrams`, `udp_not_syslog`, `tcp_*` (direções, midstream, filtradas,
 excedentes, bytes retransmitidos, fora de ordem, lacunas e seus bytes,
 `tcp_unterminated`, fluxos por moldura, comandos RELP sem mensagem,
-ressincronizações, bytes pulados, linhas longas, mensagens), `frames_lost` e
-`messages_replayed`. São a prova de que o replay entregou tudo o que a captura
-tinha — ou do que faltou nela.
+ressincronizações, bytes pulados, linhas longas, mensagens), `frames_lost`,
+`messages_replayed`, e desde 2026-11-07 `pcap_ip_datagrams_snaplen` (§6.3),
+`pcap_any_duplicates` (§6.9) e `pcap_flows` (§6.8). São a prova de que o replay
+entregou tudo o que a captura tinha — ou do que faltou nela.
+
+### 8.5 Conferência no destino (`--verify-url`, `--verify-sqlite`)
+
+Decisão 20 (2026-11-07), que troca a decisão 4: o relatório deixa de parar no
+transporte. Depois do envio (e do dreno), o injetor lê o destino em que o
+servidor grava e conta as mensagens **desta** execução.
+
+**Quais mensagens.** Só o gerador e os modelos com `seq={seq}` e `run={run}`
+(§3.2): cada mensagem leva a sua `seq` e a execução. O injetor guarda a `seq` de
+cada mensagem com desfecho de sucesso (um bit por `seq`): são as
+**esperadas**. No destino, uma mensagem é da execução quando `payload.message`
+(ou, se ele não tiver os marcadores, `payload.raw`) tem as palavras
+`run=<run>` e `seq=<n>` — palavra é o trecho entre o início, o fim ou um
+espaço. O `--run` é restrito a `[A-Za-z0-9._:-]` para que o marcador seja o
+mesmo texto dentro do JLH escapado, onde os destinos o procuram.
+
+**Contas** (`verify` no JSON; seção "verify" no texto):
+
+| Campo | Significado |
+|---|---|
+| `destination` | esquema e host (nunca usuário, senha nem consulta), ou `sqlite <caminho>` |
+| `expected` | mensagens com desfecho de sucesso |
+| `found` | esperadas achadas no destino |
+| `lost` | esperadas que não estão lá (`expected − found`) |
+| `duplicated` | cópias além da primeira, somadas sobre todas as `seq` achadas |
+| `unexpected` | `seq` da execução achadas que não eram esperadas: um desfecho de falha que chegou mesmo assim (normal num `write_error` do TCP, cujo buffer pode ter sido entregue) ou uma `seq` nunca produzida |
+| `lost_seqs` | as primeiras 20 faixas perdidas (`"7-9,15"`) |
+| `waited_sec`, `complete` | quanto esperou; se achou todas as esperadas |
+| `error` | por que a conferência não terminou (código 4) |
+
+Todos os destinos deduplicam pelo `uuid` (o Redis stream, não), então uma
+duplicata aqui é o **servidor** recebendo a mensagem duas vezes — uma
+retransmissão no fio, ou o injetor mandando de novo —, não uma redelivery.
+
+**Antes do envio**, o injetor se conecta ao destino e confere o stream ou a
+tabela (o stream Redis pode ainda não existir: o primeiro `XADD` o cria). Um
+destino inalcançável sai com código 4 **sem mandar nada**: uma carga que não
+vai poder ser conferida não deveria ter rodado.
+
+**Espera.** Lê o destino a cada 250 ms até achar todas as esperadas ou vencer
+`--verify-timeout` (padrão 30 s): o servidor tem fila e sink, e "enviado" não é
+"gravado" ainda. Completa, lê **mais uma vez 1 s depois** (a cópia mandada na
+mesma rajada chega logo depois da primeira; na prova contra servidores reais,
+sem essa leitura a segunda execução com o mesmo `--run` completava com as
+linhas da primeira e não via as cópias); uma duplicata que chegue depois disso
+não é vista. `lost > 0` ou `duplicated > 0` → código 1; erro → código 4
+(§3.3). Interrompido (130), ou alvo inalcançável (3), não confere.
+
+**Destinos** — lidos a partir de **5 min antes do início** da execução, pelo
+relógio do destino (folga de relógio entre as máquinas; um destino atrasado
+mais que isso perde mensagens da leitura e as conta como perdidas):
+
+- **NATS** (`nats://`, `tls://`; a URL inteira vai ao `nats.go`, como o
+  `sink.nats.urls` do servidor, lista com vírgula). JetStream: o stream é
+  `--verify-key` ou o que tem o subject `loghub.<space>.syslog`
+  (`subjects=exact`) ou `loghub.<space>.syslog.>` (`facility-severity`),
+  achado pelo próprio servidor NATS. Um consumidor **ordenado** (efêmero: não
+  deixa nada no servidor) lê desse subject a partir da hora acima, de forma
+  incremental (com `Fetch`: o `FetchNoWait` do `nats.go` recomeça o consumidor
+  ordenado do início a cada chamada, e a primeira prova contou cada mensagem
+  dezenas de vezes; a sequência do stream já contada também é pulada); o
+  `Data` de cada mensagem é o JLH. `sink.nats.mode=core` não tem stream:
+  código 4.
+- **Redis e Valkey** (`redis://`, `rediss://`; `valkey://` = `redis://`,
+  `valkeys://` = `rediss://`; usuário, senha e banco pela URL, como o
+  `rueidis.ParseURL` lê). O stream é `--verify-key` ou `loghub.<space>.syslog`
+  (o padrão do `sink.redis.stream`); `XRANGE` desde a hora acima em páginas de
+  1000, incremental pelo último ID; o JLH está no campo `e` (SPEC do servidor
+  §3.6). Stream inexistente é código 4 (o sink grava em outro lugar).
+- **PostgreSQL** (`postgres://`, `postgresql://`, pelo `pgx`). A tabela é
+  `--verify-key` ou `loghub.inbox`; `SELECT payload->>'message',
+  payload->>'raw'` das linhas `type='syslog'` do `space`, com `event_at` desde a
+  hora acima e o marcador `run=` em uma das duas (`strpos`), relida inteira a
+  cada leitura. **A `loghub.inbox` é uma fila**: um worker que a consome faz as
+  linhas sumirem, e elas contam como perdidas. Confira com a fila parada.
+- **SQLite** (`--verify-sqlite <arquivo>`, `modernc.org/sqlite`, somente
+  leitura, `busy_timeout` de 5 s, enquanto o servidor escreve em WAL). A tabela é
+  `--verify-key` ou `syslog_events`; `CAST(env AS TEXT)` das linhas do `space`
+  com `ev_uts` desde a hora acima e o marcador `run=` (`instr`), relida inteira
+  a cada leitura. Com `sink.sqlite.rotate`, só o arquivo dado é lido.
+
+`--verify-key` é um nome (`[A-Za-z0-9_.:-]`; na tabela PostgreSQL,
+`[esquema.]tabela`, citado como identificador). A URL **nunca** aparece no
+relatório nem num erro (pode ter senha): `info.verify` mostra só esquema e
+host. Para outro `space` que não `default`, `--verify-space`.
 
 ---
 
 ## 9. Pendências conhecidas
 
-1. **Conferência no destino** (decisão 4): ler o NATS/PostgreSQL e contar as
-   `seq` da execução (perdidas, duplicadas). Hoje o relatório para no transporte.
-2. **Deduplicação das duplicatas do `-i any`** (§6.7): exigiria uma janela por
-   (origem, IP ID, hash do conteúdo), e o NAT entre as cópias atrapalha a chave.
-3. **Uma conexão por fluxo original** no replay, cada uma com o PROXY da origem
-   capturada, para que o servidor veja os emissores como eram.
-4. **Fragmentos com captura cortada pelo snaplen**: o datagrama é descartado
-   inteiro; não há como reconstruir o que faltou.
-5. **Candidato de ressincronização acima de 64 KiB** (§6.6): enquanto o quadro
-   não chegou, ele não segura a decisão, e a escolha pode depender da divisão
-   dos segmentos. Quadros syslog desse tamanho no meio de uma ressincronização
-   são raros; o fuzz não usa entradas tão grandes.
+1. *Corrigido em 2026-11-07:* conferência no destino (NATS, PostgreSQL,
+   Redis/Valkey, SQLite) — regra em §8.5, decisão 20.
+2. *Corrigido em 2026-11-07:* deduplicação das cópias do `-i any` — regra em
+   §6.9.
+3. *Corrigido em 2026-11-07:* uma conexão por fluxo original, com o PROXY da
+   origem capturada (`--pcap-flows`) — regra em §6.8.
+4. *Corrigido em 2026-11-07 (o possível):* fragmento cortado pelo snaplen
+   descarta o datagrama na hora e o conta (`pcap_ip_datagrams_snaplen`); a
+   reconstrução é impossível, e o motivo está em §6.3.
+5. *Corrigido em 2026-11-07:* candidato de ressincronização acima de 64 KiB
+   segura a decisão — regra em §6.6.

@@ -182,6 +182,28 @@ func TestDatagram(t *testing.T) {
 	}
 }
 
+// TestResyncLargeCandidateHolds (SPEC §6.6, pendência 5 de 2026-11-07): a
+// midstream octet candidate that declares more than 64 KiB holds the
+// decision while its frame is incomplete. Inside its message there is an LF
+// candidate ("\n<14>") that is verified at once; before the fix, a capture
+// split in small segments chose that one (and replayed lines of the big
+// message), while the same bytes in one segment chose the big frame.
+func TestResyncLargeCandidateHolds(t *testing.T) {
+	big := "<13>big " + strings.Repeat("y", 40<<10) + "\n<14>inner line\n" + strings.Repeat("z", 60<<10)
+	tail := []string{"<13>next", "<13>last"}
+	want := append([]string{big}, tail...)
+	in := "xx" + octet(want...)
+	for _, chunks := range [][]int{nil, {4096}, {1000, 7}, {1 << 16}} {
+		got, st, mode := run(t, in, true, true, chunks, -1)
+		if mode != ModeOctet || !reflect.DeepEqual(got, want) {
+			t.Fatalf("chunks %v: mode %v, %d messages (first diff at %d)", chunks, mode, len(got), firstDiff(got, want))
+		}
+		if st.SkippedBytes != 2 {
+			t.Fatalf("chunks %v: skipped %d, want 2", chunks, st.SkippedBytes)
+		}
+	}
+}
+
 func FuzzStream(f *testing.F) {
 	f.Add([]byte(octet("<13>a", "<13>b")), uint8(3), true, false)
 	f.Add([]byte(relp("<13>a")), uint8(1), true, true)

@@ -236,6 +236,11 @@ func (pr *Reader) nextNG() (Packet, error) {
 	}
 }
 
+// Interfaces returns the interfaces declared in the current pcapng section
+// (0 for classic pcap). More than one means a multi-interface capture, where
+// one packet can be recorded once per interface (SPEC §6.9).
+func (pr *Reader) Interfaces() int { return len(pr.ifaces) }
+
 func (pr *Reader) readSHB(h [8]byte) error {
 	var bom [4]byte
 	if _, err := io.ReadFull(pr.r, bom[:]); err != nil {
