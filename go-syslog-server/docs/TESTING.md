@@ -204,6 +204,70 @@ entrega de reivindicadas, `Quiesce`, disponibilidade pela escrita (ACL sem
 ring (cada mensagem uma vez, contador em zero), réplica viva não perde o lote
 para a outra, réplica parada perde.
 
+#### 6.1a Valkey, Sentinel e cluster (rodada de 2026-11-07)
+
+**Valkey.** A mesma suíte, sem mudança, contra Valkey (SPEC §10.3.1): Redis
+7.4 e Valkey 7.2, 8.1 e 9.0 são as versões declaradas. O gêmeo `allkeys-lru`
+sobe igual:
+
+```bash
+docker run --rm -d -p 16379:6379 --name t-vk valkey/valkey:8.1-alpine valkey-server
+docker run --rm -d -p 16381:6379 --name t-vk-lru valkey/valkey:8.1-alpine \
+  valkey-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+SYSLOG_TEST_REDIS_ADDR=127.0.0.1:16379 SYSLOG_TEST_REDIS_LRU_ADDR=127.0.0.1:16381 \
+  go test -race -timeout 900s ./internal/rediscli/ ./internal/ring/ ./internal/sink/ ./internal/app/
+docker rm -f t-vk t-vk-lru
+```
+
+A matriz inteira (S, R, G, W, F; um par de servidores por imagem, módulos em
+série, porque as suítes usam portas fixas) é `scripts/test-redis-valkey.sh` na
+raiz do monorepo. `TestIdentifyLive` e `TestRedisLogsTheServerIdentity` logam
+contra o quê a rodada correu (`server under test: valkey 8.1.11`); a política é
+relida a cada sonda (`TestRedisPolicyIsReadAtEveryCheck`,
+`TestRedisRingPolicyIsReadAtEveryRefresh`: o cliente trocado para o servidor
+`allkeys-lru` faz o papel do `CONFIG SET`, que quebraria os pacotes em
+paralelo).
+
+**Sentinel** (opt-in). Primário, réplica e sentinel num contêiner só (um
+namespace de rede), todos em `127.0.0.1` com as mesmas portas dentro e fora:
+o que o Sentinel anuncia é alcançável do `go test` no macOS. Para Redis troque
+`valkey-server`/`valkey-sentinel` por `redis-server`/`redis-sentinel`:
+
+```bash
+docker run -d --name t-sn -p 127.0.0.1:26380-26382:26380-26382 valkey/valkey:8.1-alpine sh -c '
+  valkey-server --port 26380 --daemonize yes --save ""
+  valkey-server --port 26381 --replicaof 127.0.0.1 26380 --daemonize yes --save ""
+  printf "port 26382\nsentinel monitor mymaster 127.0.0.1 26380 1\nsentinel down-after-milliseconds mymaster 2000\nsentinel failover-timeout mymaster 5000\n" >/tmp/s.conf
+  exec valkey-sentinel /tmp/s.conf'
+SYSLOG_TEST_REDIS_SENTINEL_ADDR=127.0.0.1:26382 SYSLOG_TEST_REDIS_SENTINEL_MASTER=mymaster \
+  go test -race -p 1 -count=1 -run Sentinel ./internal/sink/ ./internal/ring/
+docker rm -f t-sn
+```
+
+`-p 1`: os dois pacotes fazem `SENTINEL FAILOVER` na mesma topologia, e um
+failover no meio do outro teste perderia o que a réplica ainda não tinha. Os
+testes esperam a réplica alcançar o offset do primário antes do failover (o
+`SENTINEL FAILOVER` não espera) e provam boot, escrita, política, failover e
+escrita depois sem perda.
+
+**Cluster com `db != 0`** (opt-in). Um nó, anunciando `127.0.0.1` na porta
+mapeada igual:
+
+```bash
+docker run -d --name t-cl -p 127.0.0.1:26390:26390 valkey/valkey:9.0-alpine \
+  valkey-server --port 26390 --cluster-enabled yes --cluster-announce-ip 127.0.0.1
+docker exec t-cl valkey-cli -p 26390 CLUSTER ADDSLOTSRANGE 0 16383
+SYSLOG_TEST_REDIS_CLUSTER_ADDR=127.0.0.1:26390 go test -race -count=1 -run ClusterDB ./internal/rediscli/
+# Valkey 9 com --cluster-databases 16: db=1 grava
+#   ... valkey-server ... --cluster-databases 16
+#   SYSLOG_TEST_REDIS_CLUSTER_ADDR=... SYSLOG_TEST_REDIS_CLUSTER_DBS=16 go test ...
+docker rm -f t-cl
+```
+
+Redis 7.4 e Valkey 7.2/8.1 respondem `SELECT is not allowed in cluster mode`,
+Valkey 9 sem `cluster-databases` responde `DB index is out of range`: FATAL em
+milissegundos, com a dica de `cluster-databases`.
+
 ### 6.2 PostgreSQL (`loghub.inbox`)
 
 ```bash
@@ -473,8 +537,8 @@ Registradas por honestidade, não por esquecimento.
       `BenchmarkTCPReceive` e o fuzz de 60 s de `FuzzFrame`, `FuzzFrameOracle` e
       `FuzzProxy` rodaram com a máquina sob carga alta (poucas execuções):
       repetir com ela livre (soma-se à lacuna 1).
-    - Política de despejo do Redis lida de um nó só e só no boot; um
-      `CONFIG SET` com o servidor no ar não é visto.
+    - Política de despejo do Redis lida de um nó só (um Redis Cluster cujos nós
+      discordam não é visto). *Corrigido em 2026-11-07:* o "só no boot" — a política é relida a cada sonda (SPEC §9.5, §10.3).
     - O `withLifetime` e o `validationContext` estão provados cada um no seu
       pacote; não há teste de app de um `SIGTERM` durante uma validação longa.
     - Sonda MySQL: linhas `unix` de um ring persistente drenadas numa vida sem

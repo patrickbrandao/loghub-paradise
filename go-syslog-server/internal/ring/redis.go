@@ -222,6 +222,12 @@ type RedisRing struct {
 	m      *obs.Metrics
 	client rueidis.Client
 
+	// policy re-reads maxmemory-policy at every RefreshStats, pipelined with
+	// the write probe (rediscli.PolicyWatch, SPEC §9.5); the boot's reading
+	// taught it which command works.
+	policy    *rediscli.PolicyWatch
+	policyLog *obs.Sampler
+
 	keys     []string // stream, bytes: read-only, shared by every call
 	qkeys    []string // stream, bytes, quarantine
 	probeKey string   // <stream>:probe, never created (RefreshStats)
@@ -312,6 +318,14 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 		return nil, bootErr("connect", err)
 	}
 
+	// Who answered, for the log (SPEC §10.3.1): never used to decide.
+	{
+		ictx, cancel := context.WithTimeout(ctx, cfg.OpTimeout)
+		id := rediscli.Identify(ictx, client)
+		cancel()
+		log.Info("ring redis: server", "server", id.Server, "server_version", id.Version)
+	}
+
 	if client.Mode() == rueidis.ClientModeCluster && hashTag(cfg.Stream) == "" {
 		// The scripts touch three keys, and in a cluster rueidis refuses a
 		// multi-key command across slots by panicking when it is BUILT --
@@ -329,7 +343,8 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 	// so every entry waiting in it goes at once, the byte counter with it or
 	// apart from it, with the ring reporting itself available. Refused here,
 	// with exit 3, as a misconfiguration waiting cannot fix.
-	if err := checkEviction(ctx, client, cfg.OpTimeout, log); err != nil {
+	policy := new(rediscli.PolicyWatch)
+	if err := checkEviction(ctx, client, policy, cfg.OpTimeout, log); err != nil {
 		client.Close()
 		return nil, bootErr("maxmemory-policy check", err)
 	}
@@ -339,6 +354,8 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 		log:          log,
 		m:            cfg.Metrics,
 		client:       client,
+		policy:       policy,
+		policyLog:    obs.NewSampler(30 * time.Second),
 		keys:         []string{cfg.Stream, cfg.Stream + ":bytes"},
 		qkeys:        []string{cfg.Stream, cfg.Stream + ":bytes", cfg.Stream + ":quarantine"},
 		probeKey:     cfg.Stream + ":probe",
@@ -383,11 +400,13 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 // spelled out, not a refusal: least-privilege ACLs are what a hardened
 // deployment has, and the premise is then the operator's to keep. Any other
 // error goes back to bootErr: fatal for allkeys-*, retried for the rest.
-func checkEviction(ctx context.Context, client rueidis.Client, timeout time.Duration, log *slog.Logger) error {
+func checkEviction(ctx context.Context, client rueidis.Client, w *rediscli.PolicyWatch,
+	timeout time.Duration, log *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	policy, err := rediscli.CheckEviction(ctx, client)
+	policy, err := w.Check(ctx, client)
 	if errors.Is(err, rediscli.ErrPolicyUnknown) {
+		w.FirstUnknown() // the WARN below is the one of the process
 		log.Warn("ring redis: cannot read maxmemory-policy; it must be noeviction (or volatile-*: the "+
 			"ring's keys never have a TTL), or a full Redis evicts the whole stream with the ring UP",
 			"error", err)
@@ -464,6 +483,13 @@ func (r *RedisRing) resetOrphanCounter(ctx context.Context) error {
 	prev, err := luaOrphan.Exec(ctx, r.client, r.keys, nil).ToString()
 	if rueidis.IsRedisNil(err) {
 		return nil
+	}
+	if rediscli.ScriptingMissing(err) {
+		// The first script of the boot: a server without Lua (a build
+		// without it, a managed service that blocks EVAL) is said so here,
+		// and it is fatal (rediscli.ClassifyReply), not a boot retried until
+		// boot_timeout (SPEC §9.5).
+		return fmt.Errorf("the Redis ring needs Lua scripting (EVAL/EVALSHA): %w", err)
 	}
 	if err != nil {
 		return err
@@ -1110,11 +1136,19 @@ func (r *RedisRing) statsLoop() {
 // Available() turns false when any of the three fails, and only a successful
 // probe -- or a successful enqueue -- turns it back.
 func (r *RedisRing) RefreshStats(ctx context.Context) error {
-	resps := r.client.DoMulti(ctx,
+	cmds := rueidis.Commands{
 		r.client.B().Xlen().Key(r.keys[0]).Build(),
 		r.client.B().Get().Key(r.keys[1]).Build(),
 		r.client.B().Xadd().Key(r.probeKey).Nomkstream().Id("*").FieldValue().FieldValue("p", "1").Build(),
-	)
+	}
+	// The eviction policy rides in the same pipeline (SPEC §9.5): CONFIG SET
+	// changes it on a live server, and under allkeys-* the stream is evicted
+	// whole with the ring UP. One round trip still.
+	pcmd, readPolicy := r.policy.Cmd(r.client)
+	if readPolicy {
+		cmds = append(cmds, pcmd)
+	}
+	resps := r.client.DoMulti(ctx, cmds...)
 	n, nerr := resps[0].AsInt64()
 	b, berr := resps[1].AsInt64()
 	if rueidis.IsRedisNil(berr) {
@@ -1134,8 +1168,41 @@ func (r *RedisRing) RefreshStats(ctx context.Context) error {
 		r.down.Store(true)
 		return err
 	}
+	if readPolicy {
+		if err := r.judgePolicy(ctx, resps[3]); err != nil {
+			r.down.Store(true)
+			return err
+		}
+	}
 	r.down.Store(false)
 	return nil
+}
+
+// judgePolicy is the runtime half of the boot's eviction check (SPEC §9.5):
+// allkeys-* makes the ring unavailable -- the UDP drops, the TCP stops
+// reading, /readyz fails -- with an ERROR every 30 s, until the policy is
+// back; an unreadable policy is the WARN of the boot, once per process.
+// Other failures of the reading (the connection, a transient reply) are a
+// failed probe, like the three commands before it.
+func (r *RedisRing) judgePolicy(ctx context.Context, resp rueidis.RedisResult) error {
+	policy, err := r.policy.Judge(ctx, r.client, resp)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, rediscli.ErrPolicyUnknown):
+		if r.policy.FirstUnknown() {
+			r.log.Warn("ring redis: cannot read maxmemory-policy; it must be noeviction (or volatile-*: the "+
+				"ring's keys never have a TTL), or a full Redis evicts the whole stream with the ring UP",
+				"error", err)
+		}
+		return nil
+	case errors.Is(err, rediscli.ErrEvictionPolicy):
+		if ok, _ := r.policyLog.Allow(); ok {
+			r.log.Error("ring redis: maxmemory-policy changed to one that evicts the stream; the ring is "+
+				"unavailable until it is noeviction (or volatile-*) again", "policy", policy, "error", err)
+		}
+	}
+	return runtimeErr("maxmemory-policy", err)
 }
 
 // Stats is the GLOBAL occupancy of the shared stream, from the cache: every

@@ -60,11 +60,14 @@ type Redis struct {
 	// bounded by construction.
 	streams atomic.Pointer[[2]string]
 
-	// validated is set once the eviction policy has been checked
-	// (checkEviction): once per process, at the first check that reaches the
-	// server, which is the boot's.
-	validated atomic.Bool
-	closed    atomic.Bool
+	// policy re-reads the eviction policy at every health check, pipelined
+	// with the probe (rediscli.PolicyWatch, SPEC §10.3): CONFIG SET changes
+	// it on a live server.
+	policy rediscli.PolicyWatch
+	// identified is set once the server's identity has been logged, at the
+	// first check that reached it (SPEC §10.3.1).
+	identified atomic.Bool
+	closed     atomic.Bool
 }
 
 // NewRedis prepares the client without dialling: the connection is opened by
@@ -224,8 +227,15 @@ func (r *Redis) Health(ctx context.Context) error {
 		client.B().Xadd().Key(stream+":healthprobe").Nomkstream().Id("*").
 			FieldValue().FieldValue("p", "1").Build(),
 	}
+	// The policy reading rides in the same pipeline: one round trip, the
+	// one sink.health_timeout bounds.
+	pcmd, readPolicy := r.policy.Cmd(client)
+	if readPolicy {
+		cmds = append(cmds, pcmd)
+	}
 	ops := [2]string{"xlen", "writeprobe"}
-	for i, resp := range client.DoMulti(ctx, cmds...) {
+	resps := client.DoMulti(ctx, cmds...)
+	for i, resp := range resps[:2] {
 		err := resp.Error()
 		// A nil reply is the expected answer from the probe: the key is absent,
 		// so nothing was appended. rueidis reports it as an error value, which
@@ -237,17 +247,20 @@ func (r *Redis) Health(ctx context.Context) error {
 			return classifyRedis(ops[i], err, "")
 		}
 	}
-	if !r.validated.Load() {
-		if err := r.checkEviction(ctx, client); err != nil {
-			return err
-		}
-		r.validated.Store(true)
+	if !r.identified.Swap(true) {
+		id := rediscli.Identify(ctx, client)
+		r.log.Info("sink redis: server", "server", id.Server, "server_version", id.Version)
 	}
-	return nil
+	if !readPolicy {
+		return nil
+	}
+	return r.checkEviction(ctx, client, resps[2])
 }
 
 // checkEviction refuses a server whose maxmemory-policy is allkeys-* (SPEC
-// §10.3), once, at the first check that reaches it. Under such a policy a full
+// §10.3), at every check: the boot's and each one after it, since CONFIG SET
+// changes the policy of a live server (a fatal answer to a probe is FATAL,
+// §13.3, with the emergency dump). Under such a policy a full
 // Redis never answers the OOM that is fatal here: it evicts keys, and each
 // stream is one key, so every event already confirmed to its emitter goes at
 // once while this sink stays UP. The write probe above cannot see it: under
@@ -256,11 +269,14 @@ func (r *Redis) Health(ctx context.Context) error {
 // It runs after the probe, so a Redis that is not up yet stays a network
 // failure retried by WaitReady, and only a server that answers is judged. An
 // unreadable policy (an ACL without INFO and CONFIG) is a WARN with the
-// premise, and the boot goes on.
-func (r *Redis) checkEviction(ctx context.Context, client rueidis.Client) error {
-	policy, err := rediscli.CheckEviction(ctx, client)
+// premise, once per process, and the check passes.
+func (r *Redis) checkEviction(ctx context.Context, client rueidis.Client, resp rueidis.RedisResult) error {
+	policy, err := r.policy.Judge(ctx, client, resp)
 	switch {
 	case errors.Is(err, rediscli.ErrPolicyUnknown):
+		if !r.policy.FirstUnknown() {
+			return nil
+		}
 		r.log.Warn("sink redis: cannot read maxmemory-policy; it must be noeviction (or volatile-*: the "+
 			"streams never have a TTL), or a full Redis evicts whole streams of delivered events",
 			"error", err)

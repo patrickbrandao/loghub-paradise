@@ -10,6 +10,9 @@ import (
 type flagEntry struct {
 	Name string
 	Raw  string
+	// Spelled is the name as typed, which differs from Name for a valkey
+	// alias (--sink.valkey.addrs). Errors name the flag the operator wrote.
+	Spelled string
 }
 
 // Meta holds the command-line switches that are not configuration parameters.
@@ -171,7 +174,7 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			// Bare --sec.key on a bool means true. Anything else must carry a
 			// value: guessing would make "--ring.mode sqlite" ambiguous with a
 			// positional argument.
-			out = append(out, flagEntry{Name: p.Name(), Raw: "true"})
+			out = append(out, flagEntry{Name: p.Name(), Raw: "true", Spelled: name})
 			continue
 		}
 		v, err := takeValue()
@@ -179,7 +182,7 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			return nil, m, err
 		}
 		assigned(v)
-		out = append(out, flagEntry{Name: p.Name(), Raw: v})
+		out = append(out, flagEntry{Name: p.Name(), Raw: v, Spelled: name})
 	}
 	return out, m, nil
 }
