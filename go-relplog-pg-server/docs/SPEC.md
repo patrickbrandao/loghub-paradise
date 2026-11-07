@@ -2634,6 +2634,17 @@ ou `#` sem codificar, que encurta a autoridade (`postgres://app:39182#Zs3@db/x`
 discava `app:39182` sem senha, com o `sslmode` jogado fora no fragmento). Uma
 URL PostgreSQL com fragmento também é recusada.
 
+**Erros de valor não citam o valor** (revisão independente de 2026-11-07,
+portada do pai, go-relplog-server §16.2): o erro de um valor que não parseia ou não passa
+na validação nomeia a chave e o problema (o formato esperado, a classe do
+caractere), **nunca o texto dado**: `invalid integer`, `invalid duration: …`,
+`the value is not one of …`, `admin.bind: not host:port`. Antes vários citavam
+o valor com `%q` (`invalid integer "hunter2"` para uma senha colada na chave
+errada). Os erros de arquivo perdem o caminho do `*os.PathError` (a chave já
+diz qual arquivo), e os construtores dos destinos, que repetem as regras para
+quem contorna a config, seguem a mesma regra. Números já parseados continuam
+citados: não são o texto dado. Teste: `TestConfigErrorsNeverEchoTheValue`.
+
 Durações aceitam a sintaxe do Go (`30s`, `5ms`). O inteiro puro em segundos do
 pai existia só para `loghub.beacon_interval` e saiu com ele.
 Tamanhos aceitam **só** `KiB`, `MiB`, `GiB` (sem diferença de caixa) e inteiros

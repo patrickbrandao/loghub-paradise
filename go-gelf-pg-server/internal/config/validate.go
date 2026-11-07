@@ -129,7 +129,7 @@ func validateListeners(c *Config) error {
 			continue
 		}
 		if _, _, err := net.SplitHostPort(e.addr); err != nil {
-			return fmt.Errorf("%s: %q is not host:port (a bare \":12201\" is fine)", e.name, e.addr)
+			return fmt.Errorf("%s: not host:port (a bare \":12201\" is fine)", e.name)
 		}
 	}
 
@@ -143,9 +143,9 @@ func validateListeners(c *Config) error {
 		for j := i + 1; j < len(stream); j++ {
 			a, b := stream[i], stream[j]
 			if a.addr != "" && b.addr != "" && sameStreamSocket(a.addr, b.addr) {
-				return fmt.Errorf("%s (%q) and %s (%q) are, or may resolve to, the same TCP "+
+				return fmt.Errorf("%s and %s are, or may resolve to, the same TCP "+
 					"address: they are different protocols and cannot share one stream socket (to share a "+
-					"port, use two distinct IP literals)", a.name, a.addr, b.name, b.addr)
+					"port, use two distinct IP literals)", a.name, b.name)
 			}
 		}
 	}
@@ -180,7 +180,7 @@ func validateListeners(c *Config) error {
 				"or admin.enabled=false to turn the admin port off")
 		}
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
-			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
+			return fmt.Errorf("admin.bind: not host:port")
 		}
 		// Refused here, not when the transport opens after the admin port
 		// served the whole boot -- and on macOS/BSD not even there:
@@ -189,9 +189,9 @@ func validateListeners(c *Config) error {
 		// stream listeners: UDP is another protocol.
 		for _, e := range stream {
 			if e.addr != "" && sameStreamSocket(e.addr, c.Admin.Bind) {
-				return fmt.Errorf("admin.bind (%q) and %s (%q) are, or may resolve to, the same "+
+				return fmt.Errorf("admin.bind and %s are, or may resolve to, the same "+
 					"TCP address: the admin port and a GELF listener cannot share one stream "+
-					"socket (to share a port, use two distinct IP literals)", c.Admin.Bind, e.name, e.addr)
+					"socket (to share a port, use two distinct IP literals)", e.name)
 			}
 		}
 	}
@@ -410,23 +410,23 @@ func validatePostgres(c *Config) error {
 		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
 		// which pgx then tries as a list: refused like "h1,h2" below.
 		if strings.ContainsAny(d.Addr, ",\t ") {
-			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
-				"with no comma or blank", d.Addr)
+			return fmt.Errorf("sink.postgres.addr: a socket directory names one server, " +
+				"with no comma or blank")
 		}
 		if err != nil {
 			break // a bare socket directory: port 5432
 		}
 		if !validPort(port) {
-			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
-				"must be 1..65535", d.Addr)
+			return fmt.Errorf("sink.postgres.addr: the port after the socket directory " +
+				"must be 1..65535")
 		}
 	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
-		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
-			"1..65535) nor a unix socket directory starting with /", d.Addr)
+		return fmt.Errorf("sink.postgres.addr: neither host:port (one server, port " +
+			"1..65535) nor a unix socket directory starting with /")
 	}
 	if !pgIdent.MatchString(d.Table) {
-		return fmt.Errorf("sink.postgres.table: %q must be a lowercase identifier, "+
-			"optionally schema-qualified", d.Table)
+		return fmt.Errorf("sink.postgres.table: must be a lowercase identifier, " +
+			"optionally schema-qualified")
 	}
 	if d.PoolSize < 0 || d.PoolSize > maxPoolSize {
 		return fmt.Errorf("sink.postgres.pool_size: %d is outside 0..%d; 0 derives sink.workers + 1",

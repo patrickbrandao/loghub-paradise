@@ -135,7 +135,7 @@ func validateListeners(c *Config) error {
 			continue
 		}
 		if _, _, err := net.SplitHostPort(e.addr); err != nil {
-			return fmt.Errorf("%s: %q is not host:port (a bare \":12201\" is fine)", e.name, e.addr)
+			return fmt.Errorf("%s: not host:port (a bare \":12201\" is fine)", e.name)
 		}
 	}
 	// UDP and TCP may share a port -- they are different protocols on
@@ -145,9 +145,9 @@ func validateListeners(c *Config) error {
 	// other way round. A wildcard host overlaps every concrete host on the
 	// same port.
 	if a, b := stream[0], stream[1]; a.addr != "" && b.addr != "" && sameStreamSocket(a.addr, b.addr) {
-		return fmt.Errorf("%s (%q) and %s (%q) are, or may resolve to, the same TCP "+
+		return fmt.Errorf("%s and %s are, or may resolve to, the same TCP "+
 			"address: they are different protocols and cannot share one stream socket (to share a "+
-			"port, use two distinct IP literals)", a.name, a.addr, b.name, b.addr)
+			"port, use two distinct IP literals)", a.name, b.name)
 	}
 
 	for _, n := range []struct {
@@ -180,7 +180,7 @@ func validateListeners(c *Config) error {
 				"or admin.enabled=false to turn the admin port off")
 		}
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
-			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
+			return fmt.Errorf("admin.bind: not host:port")
 		}
 		// Refused here, not when the transport opens after the admin port
 		// served the whole boot -- and on macOS/BSD not even there:
@@ -189,9 +189,9 @@ func validateListeners(c *Config) error {
 		// the stream listeners: UDP is another protocol.
 		for _, e := range stream {
 			if e.addr != "" && sameStreamSocket(e.addr, c.Admin.Bind) {
-				return fmt.Errorf("admin.bind (%q) and %s (%q) are, or may resolve to, the same "+
+				return fmt.Errorf("admin.bind and %s are, or may resolve to, the same "+
 					"TCP address: the admin port and a GELF listener cannot share one stream "+
-					"socket (to share a port, use two distinct IP literals)", c.Admin.Bind, e.name, e.addr)
+					"socket (to share a port, use two distinct IP literals)", e.name)
 			}
 		}
 	}
@@ -452,8 +452,8 @@ func validateNATS(c *Config) error {
 			"URL's and ignore the key; keep one of them")
 	}
 	if n.Mode == NATSModeJetStream && !natsToken.MatchString(n.Stream) {
-		return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
-			"(no whitespace, dots, wildcards or slashes)", n.Stream)
+		return fmt.Errorf("sink.nats.stream: not a valid stream name " +
+			"(no whitespace, dots, wildcards or slashes)")
 	}
 	// The client library accepts every credential it is given and picks one at
 	// connect time. Two of them in one configuration is a mistake nobody
@@ -483,8 +483,8 @@ func validateNATS(c *Config) error {
 	}
 	for _, tok := range strings.Split(ns, ".") {
 		if !natsToken.MatchString(tok) {
-			return fmt.Errorf("loghub.ctl_namespace: %q is not a publishable subject prefix "+
-				"(dot-separated tokens, no whitespace, no * or >)", ns)
+			return fmt.Errorf("loghub.ctl_namespace: not a publishable subject prefix " +
+				"(dot-separated tokens, no whitespace, no * or >)")
 		}
 	}
 	return nil

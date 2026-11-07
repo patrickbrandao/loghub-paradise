@@ -205,7 +205,7 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 		}
 	case NATSModeCore:
 	default:
-		return nil, fmt.Errorf("sink nats: mode %q is neither jetstream nor core", cfg.Mode)
+		return nil, errors.New("sink nats: mode is neither jetstream nor core")
 	}
 	if cfg.Workspace == "" {
 		return nil, errors.New("sink nats: workspace is required to derive the subject")

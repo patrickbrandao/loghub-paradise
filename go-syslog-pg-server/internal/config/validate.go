@@ -130,7 +130,7 @@ func validateListeners(c *Config) error {
 			continue
 		}
 		if _, _, err := net.SplitHostPort(e.addr); err != nil {
-			return fmt.Errorf("%s: %q is not host:port (a bare \":1514\" is fine)", e.name, e.addr)
+			return fmt.Errorf("%s: not host:port (a bare \":1514\" is fine)", e.name)
 		}
 	}
 
@@ -146,16 +146,15 @@ func validateListeners(c *Config) error {
 		}
 	}
 	if c.Listen.Unix != "" && !filepath.IsAbs(c.Listen.Unix) {
-		return fmt.Errorf("listen.unix: %q must be an absolute path", c.Listen.Unix)
+		return fmt.Errorf("listen.unix: must be an absolute path")
 	}
 	// A unix socket path lives in a fixed-size sun_path field. Past it, the
 	// kernel answers bind with a bare "invalid argument" that names nothing, and
 	// the operator is left guessing at permissions. Checking the length here
 	// turns that into an error that says what is wrong.
 	if max := unixPathMax(); len(c.Listen.Unix) > max {
-		return fmt.Errorf("listen.unix: %q is %d bytes, above the %d this platform allows "+
-			"for a socket path (sun_path); choose a shorter path", c.Listen.Unix,
-			len(c.Listen.Unix), max)
+		return fmt.Errorf("listen.unix: %d bytes, above the %d this platform allows "+
+			"for a socket path (sun_path); choose a shorter path", len(c.Listen.Unix), max)
 	}
 	// An empty admin.bind would make net.Listen bind every interface on a
 	// random port, publishing /metrics wherever the host is reachable: the
@@ -167,7 +166,7 @@ func validateListeners(c *Config) error {
 				"or admin.enabled=false to turn the admin port off")
 		}
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
-			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
+			return fmt.Errorf("admin.bind: not host:port")
 		}
 		// Refused here, not when the transport opens after the admin port
 		// served the whole boot -- and on macOS/BSD not even there:
@@ -175,9 +174,9 @@ func validateListeners(c *Config) error {
 		// silently took localhost's TCP connections (SPEC §13.2, §14). UDP is
 		// another protocol, listen.unix a path.
 		if c.Listen.TCP != "" && sameStreamSocket(c.Listen.TCP, c.Admin.Bind) {
-			return fmt.Errorf("admin.bind (%q) and listen.tcp (%q) are, or may resolve to, the same "+
-				"TCP address: the admin port and the syslog listener cannot share one stream "+
-				"socket (to share a port, use two distinct IP literals)", c.Admin.Bind, c.Listen.TCP)
+			return fmt.Errorf("admin.bind and listen.tcp are, or may resolve to, the same " +
+				"TCP address: the admin port and the syslog listener cannot share one stream " +
+				"socket (to share a port, use two distinct IP literals)")
 		}
 	}
 	if c.Listen.UnixMode == 0 && c.Listen.Unix != "" {
@@ -257,8 +256,8 @@ func validateSyslog(c *Config) error {
 			"the conversion differ between hosts; name the IANA zone (America/Sao_Paulo) or UTC")
 	}
 	if _, err := time.LoadLocation(s.RFC3164Timezone); err != nil {
-		return fmt.Errorf("syslog.rfc3164_timezone: %q is not a known IANA zone: %v",
-			s.RFC3164Timezone, err)
+		return fmt.Errorf("syslog.rfc3164_timezone: not a known IANA zone (a name such as " +
+			"America/Sao_Paulo, or UTC)")
 	}
 	if s.MaxMessageBytes < MinMessageBytes || s.MaxMessageBytes > MaxMessageBytes {
 		return fmt.Errorf("syslog.max_message_bytes: %s is outside 480..16MiB (480 is the "+
@@ -392,23 +391,23 @@ func validatePostgres(c *Config) error {
 		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
 		// which pgx then tries as a list: refused like "h1,h2" below.
 		if strings.ContainsAny(d.Addr, ",\t ") {
-			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
-				"with no comma or blank", d.Addr)
+			return fmt.Errorf("sink.postgres.addr: a socket directory names one server, " +
+				"with no comma or blank")
 		}
 		if err != nil {
 			break // a bare socket directory: port 5432
 		}
 		if !validPort(port) {
-			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
-				"must be 1..65535", d.Addr)
+			return fmt.Errorf("sink.postgres.addr: the port after the socket directory " +
+				"must be 1..65535")
 		}
 	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
-		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
-			"1..65535) nor a unix socket directory starting with /", d.Addr)
+		return fmt.Errorf("sink.postgres.addr: neither host:port (one server, port " +
+			"1..65535) nor a unix socket directory starting with /")
 	}
 	if !pgIdent.MatchString(d.Table) {
-		return fmt.Errorf("sink.postgres.table: %q must be a lowercase identifier, "+
-			"optionally schema-qualified", d.Table)
+		return fmt.Errorf("sink.postgres.table: must be a lowercase identifier, " +
+			"optionally schema-qualified")
 	}
 	if d.PoolSize < 0 || d.PoolSize > maxPoolSize {
 		return fmt.Errorf("sink.postgres.pool_size: %d is outside 0..%d; 0 derives sink.workers + 1",

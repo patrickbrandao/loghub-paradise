@@ -243,7 +243,7 @@ func derive(l *Loaded, opts Options) error {
 		if wd == "" {
 			w, err := os.Getwd()
 			if err != nil {
-				return "", fmt.Errorf("resolving %q: %w", path, err)
+				return "", fmt.Errorf("resolving a relative path: %w", err)
 			}
 			wd = w
 		}
