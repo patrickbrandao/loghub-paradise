@@ -143,8 +143,8 @@ type flowStream struct {
 	end func()
 }
 
-func (f *flowStream) End() {
-	f.Stream.End()
+func (f *flowStream) End(closed bool) {
+	f.Stream.End(closed)
 	f.end()
 }
 
@@ -229,6 +229,7 @@ func (p *Pcap) step() error {
 			p.asm.Flush()
 			p.addAsm(p.asm.Stats)
 			p.asm = nil
+			p.dec.Flush() // fragments still waiting are lost (SPEC §6.3)
 			if len(p.queue) > 0 {
 				return nil
 			}
@@ -242,12 +243,14 @@ func (p *Pcap) step() error {
 	if !ok {
 		return nil
 	}
-	if p.copyOfPacket(pk, seg) {
-		return nil
-	}
 	switch seg.Proto {
 	case pcap.ProtoUDP:
 		if !p.opt.UDP || !p.wantPort(seg.Dst.Port()) {
+			return nil
+		}
+		// After the port filter, so a copy it refuses does not shadow the
+		// one it keeps (NAT may rewrite the port between copies; SPEC §6.9).
+		if p.copyOfPacket(pk, seg) {
 			return nil
 		}
 		if seg.Truncated {
@@ -268,6 +271,9 @@ func (p *Pcap) step() error {
 		}
 	case pcap.ProtoTCP:
 		if p.opt.TCP {
+			if p.wantPort(seg.Dst.Port()) && p.copyOfPacket(pk, seg) {
+				return nil
+			}
 			p.asm.Add(seg)
 		}
 	}
@@ -307,6 +313,7 @@ func (p *Pcap) accumulate() {
 	x.SkippedBytes += e.SkippedBytes
 	x.LostFrames += e.LostFrames
 	x.LongLines += e.LongLines
+	x.ClosedPartial += e.ClosedPartial
 	p.ext = extract.Stats{}
 	if p.asm != nil {
 		p.addAsm(p.asm.Stats)
@@ -359,6 +366,7 @@ func (p *Pcap) Stats() map[string]uint64 {
 		"tcp_skipped_bytes":         e.SkippedBytes + ce.SkippedBytes,
 		"frames_lost":               e.LostFrames + ce.LostFrames,
 		"tcp_long_lines":            e.LongLines + ce.LongLines,
+		"tcp_closed_partial_frames": e.ClosedPartial + ce.ClosedPartial,
 		"messages_replayed":         p.sent,
 	}
 	if p.asm != nil {

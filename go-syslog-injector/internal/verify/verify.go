@@ -31,7 +31,9 @@ type Target struct {
 	Space string
 	Key   string // stream / table override; "" = the default of the kind
 	Run   string
-	// Since bounds the read: the run's start minus ClockSlack.
+	// Since bounds the PostgreSQL and SQLite read: the run's start minus
+	// ClockSlack. NATS and Redis start after the stream's last entry at Open
+	// instead (SPEC §8.5).
 	Since time.Time
 }
 

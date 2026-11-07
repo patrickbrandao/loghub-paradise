@@ -35,6 +35,20 @@ Testes da rodada de 2026-11-07 (SPEC §9), todos com checagem de mutação
 | `app` `TestVerifyUnreachable` | §8.5: destino inalcançável (Redis, Valkey, PostgreSQL, NATS, SQLite inexistente) → 4, nada enviado, senha nunca impressa | seguir sem o destino |
 | `app` `TestPendingUsageErrors` | §3.2: as 12 recusas novas, sem ecoar a URL | — |
 
+Porte entre injetores (2026-11-07; SPEC §9 item 6), também com mutação:
+
+| Teste | Regra | Mutação que ele pega |
+|---|---|---|
+| `pcap` `TestPKTAPInnerLinkType` (do RI) | §6.2: o enlace de dentro do PKTAP é `pth_dlt`; `pth_type_next` ≠ 1 não é pacote; cada `pth_ifname` é um ponto | ler `pth_type_next`; aceitar `next` ≠ 1 |
+| `pcap` `TestFragmentsWaitingAtEndAreLost` (do RI), `source` `TestPcapFragmentsWaitingAtEndAreLost` | §6.3: o fim da passada conta os fragmentos à espera | `flush` sem contar; não chamar `Decoder.Flush` no fim da passada |
+| `pcap` `TestVantage`, `TestDedupRule` | §6.9: ponto de captura (pcapng, SLL2 índice+tipo, SLL); cópia só de outro ponto, uma por ponto, na janela; endereços fora da chave | tirar o tipo do SLL2; ignorar a interface pcapng; aceitar cópia do mesmo ponto; absorver mais de uma por ponto |
+| `app` `TestPcapDedupAnyCopies` (revisto) | §6.9: a repetição do emissor com o **mesmo** IP ID sai duas vezes | a regra antiga (só a chave) |
+| `app` `TestPcapDedupAfterPortFilter` | §6.9: com DNAT e `--pcap-port`, a cópia recusada pelo filtro não esconde a aceita (UDP e TCP) | perguntar a cópia antes do filtro |
+| `pcap` `TestTCPEndClosed` (do GI) | §6.4: FIN = fechada; fim de captura = cortada; RST logo depois do último byte = fechada; RST adiante de um buraco = cortada | trocar cada um dos três `closed` |
+| `extract` `TestTailClosedVersusCut`, `source` `TestPcapClosedTail` | §6.6: LF entrega a cauda nas duas; octet fechada entrega o parcial (`tcp_closed_partial_frames`), cortada perde; RELP sem LF perde nas duas; resto de ressincronização perde; com e sem `--pcap-flows` | entregar o parcial também na cortada; nunca entregar; entregar sem byte de mensagem. Sobrevive (equivalente) tirar o `!resync` da regra octet: no fim, uma ressincronização sem candidato já esvaziou o buffer |
+| `extract` `TestResyncLinearCost`, `TestResyncLargeRELPCandidate`, `TestResyncLargeOctetCandidateHolds` (do RI) | §6.6: sem candidato o buffer fica em 64 bytes e a busca não recomeça; um quadro de 6 MiB em 4300 segmentos pede no máximo 10 buscas | não aparar sem candidato; buscar a cada segmento; esquecer `from`/`need` |
+| `verify` `TestNATSStartsAfterLast`, `TestRedisStartsAfterLast` (opt-in: `SI_TEST_VERIFY_NATS`, `SI_TEST_VERIFY_REDIS` com Redis e Valkey) | §8.5: o que já estava no stream na abertura não é lido; o stream que nasce depois é lido inteiro; 1500 mensagens em mais de um `Fetch` | partir do início (sequência 1, `-`) |
+
 ## 2. Fuzz
 
 Antes de release, 10 min cada; 60 s no dia a dia:

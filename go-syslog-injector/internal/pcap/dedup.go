@@ -2,7 +2,7 @@ package pcap
 
 import (
 	"encoding/binary"
-	"hash/fnv"
+	"slices"
 	"time"
 )
 
@@ -12,6 +12,13 @@ import (
 // (DNAT) or the source address (SNAT) rewritten. Replayed as is, a UDP
 // datagram went out twice and the TCP copy with another 4-tuple became a
 // second whole flow.
+//
+// What stays equal between the copies is the content; what differs is the
+// vantage (Segment.Iface). A packet whose key matches an original seen
+// within DedupWindow on ANOTHER vantage is a copy, and each original absorbs
+// at most one copy per vantage, so a sender that really sent the same bytes
+// twice is replayed twice (the rule of go-relplog-injector, decision 22,
+// and of go-gelf-injector, G15; until 2026-11-07 the key alone decided).
 
 // DedupWindow is how far apart, in capture time, two packets with the same
 // key are taken as copies. The copies of a packet are microseconds apart (one
@@ -19,59 +26,98 @@ import (
 // and waits at least Linux's minimum RTO (200 ms).
 const DedupWindow = 50 * time.Millisecond
 
-// dedupMax bounds the remembered keys: a capture whose clock steps back would
-// otherwise keep them all.
+// dedupMax bounds the remembered originals (the oldest go first): a capture
+// whose clock steps back would otherwise keep them all.
 const dedupMax = 1 << 16
 
 type dedupEntry struct {
-	key uint64
-	ts  time.Time
+	key    uint64
+	ts     time.Time
+	ifaces []uint64 // the original's vantage, then one per absorbed copy
 }
 
-// Dedup drops the -i any copies of a packet.
+// Dedup drops the -i any copies of a packet. The zero value is not usable:
+// use NewDedup.
 type Dedup struct {
-	seen  map[uint64]time.Time
-	order []dedupEntry // FIFO of seen, for expiry in capture order
+	byKey map[uint64][]*dedupEntry
+	fifo  []*dedupEntry // in capture order, for expiry
+	head  int
 	// Dropped counts the copies.
 	Dropped uint64
 }
 
 // NewDedup returns an empty deduplicator.
-func NewDedup() *Dedup { return &Dedup{seen: make(map[uint64]time.Time)} }
+func NewDedup() *Dedup { return &Dedup{byKey: make(map[uint64][]*dedupEntry)} }
 
-// Copy reports whether s is a copy of a packet seen within DedupWindow, and
-// remembers s otherwise. The key leaves out the addresses and the
-// destination port, which NAT rewrites; it keeps what NAT preserves: the IP
-// ID, the source port, the TCP sequence and acknowledgement numbers and
-// flags, the length on the wire and a hash of the captured payload.
+// Copy reports whether s is a copy of an original seen within DedupWindow on
+// another vantage, and makes s an original otherwise.
 func (d *Dedup) Copy(s Segment) bool {
-	h := fnv.New64a()
-	var b [20]byte
-	b[0] = byte(s.Proto)
-	binary.BigEndian.PutUint16(b[1:3], s.IPID)
-	binary.BigEndian.PutUint16(b[3:5], s.Src.Port())
-	binary.BigEndian.PutUint32(b[5:9], s.Seq)
-	binary.BigEndian.PutUint32(b[9:13], s.Ack)
-	b[13] = s.Flags
-	binary.BigEndian.PutUint32(b[14:18], uint32(s.WireLen))
-	_, _ = h.Write(b[:18])
-	_, _ = h.Write(s.Payload)
-	k := h.Sum64()
-
-	for len(d.order) > 0 && (len(d.order) >= dedupMax || s.TS.Sub(d.order[0].ts) > DedupWindow) {
-		e := d.order[0]
-		if t, ok := d.seen[e.key]; ok && t.Equal(e.ts) {
-			delete(d.seen, e.key)
+	key := Key(s)
+	d.expire(s.TS)
+	for _, e := range d.byKey[key] {
+		if dt := s.TS.Sub(e.ts); dt > DedupWindow || dt < -DedupWindow {
+			continue
 		}
-		d.order = d.order[1:]
-	}
-	if t, ok := d.seen[k]; ok {
-		if dt := s.TS.Sub(t); dt <= DedupWindow && dt >= -DedupWindow {
-			d.Dropped++
-			return true
+		if slices.Contains(e.ifaces, s.Iface) {
+			continue // same vantage: not a copy of this one
 		}
+		e.ifaces = append(e.ifaces, s.Iface)
+		d.Dropped++
+		return true
 	}
-	d.seen[k] = s.TS
-	d.order = append(d.order, dedupEntry{key: k, ts: s.TS})
+	e := &dedupEntry{key: key, ts: s.TS, ifaces: []uint64{s.Iface}}
+	d.byKey[key] = append(d.byKey[key], e)
+	d.fifo = append(d.fifo, e)
 	return false
+}
+
+func (d *Dedup) expire(now time.Time) {
+	for d.head < len(d.fifo) {
+		e := d.fifo[d.head]
+		if len(d.fifo)-d.head <= dedupMax && now.Sub(e.ts) <= DedupWindow {
+			break
+		}
+		d.fifo[d.head] = nil
+		d.head++
+		list := d.byKey[e.key]
+		if i := slices.Index(list, e); i >= 0 {
+			list = slices.Delete(list, i, i+1)
+		}
+		if len(list) == 0 {
+			delete(d.byKey, e.key)
+		} else {
+			d.byKey[e.key] = list
+		}
+	}
+	if d.head > 1024 && d.head*2 > len(d.fifo) {
+		d.fifo = append(d.fifo[:0], d.fifo[d.head:]...)
+		d.head = 0
+	}
+}
+
+func fnv64(h uint64, b []byte) uint64 {
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= 1099511628211
+	}
+	return h
+}
+
+const fnvOffset = 14695981039346656037
+
+// Key is the dedup key of a decoded packet (after IP reassembly, before the
+// TCP assembler). It leaves out the addresses and the destination port,
+// which NAT rewrites; it keeps what NAT preserves: the IP ID, the source
+// port, the TCP sequence and acknowledgement numbers and flags, the length on
+// the wire and an FNV-1a 64 of the captured payload.
+func Key(s Segment) uint64 {
+	var n [18]byte
+	n[0] = byte(s.Proto)
+	binary.BigEndian.PutUint16(n[1:], s.IPID)
+	binary.BigEndian.PutUint16(n[3:], s.Src.Port())
+	binary.BigEndian.PutUint32(n[5:], s.Seq)
+	binary.BigEndian.PutUint32(n[9:], s.Ack)
+	n[13] = s.Flags
+	binary.BigEndian.PutUint32(n[14:], uint32(s.WireLen))
+	return fnv64(fnv64(fnvOffset, n[:]), s.Payload)
 }

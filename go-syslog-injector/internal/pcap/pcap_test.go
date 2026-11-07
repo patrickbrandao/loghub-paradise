@@ -201,15 +201,16 @@ func TestFragmentCutBySnaplen(t *testing.T) {
 
 // collector records what the assembler delivers.
 type collector struct {
-	data  bytes.Buffer
-	gaps  []int
-	ended int
-	mid   bool
+	data   bytes.Buffer
+	gaps   []int
+	ended  int
+	closed bool
+	mid    bool
 }
 
 func (c *collector) Data(b []byte, _ time.Time) { c.data.Write(b) }
 func (c *collector) Gap(n int)                  { c.gaps = append(c.gaps, n) }
-func (c *collector) End()                       { c.ended++ }
+func (c *collector) End(closed bool)            { c.ended++; c.closed = closed }
 
 func assemble(t *testing.T, frames []pcaptest.Frame) (map[pcap.FlowKey]*collector, *pcap.Assembler) {
 	t.Helper()
@@ -330,7 +331,7 @@ type funcHandler struct {
 
 func (h *funcHandler) Data(b []byte, _ time.Time) { h.data(b) }
 func (h *funcHandler) Gap(int)                    {}
-func (h *funcHandler) End()                       { h.end() }
+func (h *funcHandler) End(bool)                   { h.end() }
 
 // FuzzReader: no input may panic the reader or the decoder.
 func FuzzReader(f *testing.F) {

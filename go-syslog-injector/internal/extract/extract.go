@@ -48,6 +48,10 @@ type Stats struct {
 	SkippedBytes  uint64 // bytes dropped while resynchronizing
 	LostFrames    uint64 // frames cut by a capture gap or by the end of the stream
 	LongLines     uint64 // non-transparent lines cut at MaxFrame
+	// ClosedPartial counts octet-counting frames cut by a closed end (FIN
+	// or RST) and replayed with what arrived, as the server delivered them
+	// (SPEC §6.6).
+	ClosedPartial uint64
 }
 
 // Datagram reports whether a UDP payload is taken as a message. Strict (no
@@ -72,11 +76,11 @@ type Stream struct {
 	resync bool
 	buf    []byte
 	ts     time.Time
-	// need: while resynchronizing and holding for a waiting candidate, the
-	// buffer length before which searching again gives the same answer. A
-	// candidate may now hold for up to 16 MiB (SPEC §6.6): searching the
-	// whole buffer at every segment would be quadratic.
-	need int
+	// While resynchronizing: positions of buf before from are refused for
+	// good, and searching again before len(buf) reaches need gives the same
+	// answer (SPEC §6.6).
+	from, need int
+	scans      int // findSync calls, for the tests of the linear cost
 }
 
 // NewStream returns the parser of one direction. A midstream direction starts
@@ -109,15 +113,21 @@ func (s *Stream) Gap(int) {
 		s.st.SkippedBytes += uint64(len(s.buf))
 		s.buf = s.buf[:0]
 	}
+	s.from, s.need = 0, 0
 	if !s.resync {
 		s.resync = true
 		s.st.Resyncs++
 	}
-	s.need = 0
 }
 
-// End implements pcap.StreamHandler.
-func (s *Stream) End() {
+// End implements pcap.StreamHandler. What is left is the last frame, without
+// its end; how it is taken depends on how the direction ended (SPEC §6.6,
+// from go-gelf-injector G12, 2026-11-07). closed (a FIN with every byte
+// before it, or a RST with no hole before it) proves the sender stopped
+// there: the frame is read as the server reads it at EOF. Otherwise (the
+// capture stopped, the direction went idle) the cut may have fallen
+// anywhere, and the rule from before applies.
+func (s *Stream) End(closed bool) {
 	if s.mode == ModeIgnore {
 		return
 	}
@@ -126,16 +136,36 @@ func (s *Stream) End() {
 		s.count()
 		return
 	}
-	if s.mode == ModeLF && !s.resync {
+	switch {
+	case s.mode == ModeLF && !s.resync:
 		// The server delivers a last line without terminator whole (its
-		// SPEC §5.3), so the replay does too.
+		// SPEC §5.3), so the replay does too -- closed or not: a line has
+		// no length to prove it whole, and this was always the rule.
 		s.out(s.buf)
-	} else {
+	case s.mode == ModeOctet && !s.resync && closed && s.octetTail():
+		// Closed in the middle of a frame: go-syslog-server delivers what
+		// arrived (marked truncated, its SPEC §5.4), so the replay sends it.
+	default:
+		// A RELP frame without its trailer is never read by a RELP server;
+		// an octet frame of a direction cut by the capture end cannot be
+		// told from one the sender finished; what a resync left is no frame.
 		s.st.LostFrames++
 		s.st.SkippedBytes += uint64(len(s.buf))
 	}
 	s.buf = nil
 	s.count()
+}
+
+// octetTail replays the content of an octet-counting frame cut by a closed
+// end, when its header and at least one byte of message arrived.
+func (s *Stream) octetTail() bool {
+	h, _, st := octetHeader(s.buf)
+	if st != hOK || h >= len(s.buf) {
+		return false
+	}
+	s.st.ClosedPartial++
+	s.out(s.buf[h:])
+	return true
 }
 
 func (s *Stream) count() {
@@ -196,34 +226,38 @@ func (s *Stream) sync(final bool) bool {
 	if !final && len(s.buf) < s.need {
 		return false // the waiting candidate cannot resolve yet
 	}
-	pos, m, wait, need, ok := findSync(s.buf, s.mode, s.strict, final)
-	s.need = need
+	s.scans++
+	pos, m, ok, wait, need := findSync(s.buf, s.from, s.mode, s.strict, final)
 	if !ok {
 		if final {
 			s.st.SkippedBytes += uint64(len(s.buf))
 			s.buf = s.buf[:0]
+			s.from, s.need = 0, 0
 			return false
 		}
-		if len(s.buf) > MaxFrame+resyncWindow {
-			// Keep from the earliest candidate still waiting for bytes (and
-			// the byte before it: an LF or RELP start is recognized by the
-			// terminator that precedes it); with none, a tail long enough for
-			// a header split across segments. What is dropped holds no
-			// candidate that more bytes could verify, so the trim never
-			// changes the decision -- only bounds the buffer.
-			drop := len(s.buf) - resyncWindow
-			if wait >= 0 {
-				drop = max(wait-1, 0)
+		if wait < 0 {
+			// No candidate: every position is refused for good. Keep only
+			// the context a frame start split across segments needs.
+			if drop := len(s.buf) - resyncWindow; drop > 0 {
+				s.st.SkippedBytes += uint64(drop)
+				s.buf = append(s.buf[:0], s.buf[drop:]...)
 			}
+			s.from, s.need = len(s.buf), 0
+			return false
+		}
+		// Hold for the waiting candidate; what is before it is refused.
+		if drop := wait - resyncWindow; drop > 0 {
 			s.st.SkippedBytes += uint64(drop)
 			s.buf = append(s.buf[:0], s.buf[drop:]...)
-			s.need = max(s.need-drop, 0)
+			wait -= drop
+			need -= drop
 		}
+		s.from, s.need = wait, need
 		return false
 	}
-	s.need = 0
 	s.st.SkippedBytes += uint64(pos)
 	s.buf = s.buf[pos:]
+	s.from, s.need = 0, 0
 	if s.mode == ModeDetect {
 		s.mode = m
 	}
@@ -422,16 +456,17 @@ func frame(m Mode, b []byte, final bool) (n int, msg []byte, st fstate) {
 	return 0, nil, fBad
 }
 
-// findSync returns the first position where a frame verifiably starts. For a
-// known mode only that mode is searched; ModeDetect searches all three and
-// returns the mode found. ok is false when no position qualifies yet -- also
-// when a candidate before the best one is still waiting for bytes, so the
-// choice never depends on how the capture split the stream. wait is the
-// earliest such waiting candidate, or -1; need is the buffer length that
-// candidate needs before its state can change (0 without one). Positions
-// before wait are refused for good, so until the buffer reaches need the
-// answer stays "not yet".
-func findSync(b []byte, m Mode, strict, final bool) (pos int, found Mode, wait, need int, ok bool) {
+// findSync returns the first position at or after from where a frame
+// verifiably starts. For a known mode only that mode is searched; ModeDetect
+// searches all three and returns the mode found. ok is false when no position
+// qualifies yet -- also when a candidate before the best one is still waiting
+// for bytes, so the choice never depends on how the capture split the stream.
+//
+// When ok is false, wait is the earliest candidate still waiting (-1: none,
+// every position of b is refused for good) and need is a lower bound of the
+// buffer length at which that candidate can resolve: until then, searching
+// again gives the same answer (SPEC §6.6).
+func findSync(b []byte, from int, m Mode, strict, final bool) (pos int, found Mode, ok bool, wait, need int) {
 	best := -1
 	wait = -1
 	var bestMode Mode
@@ -439,11 +474,11 @@ func findSync(b []byte, m Mode, strict, final bool) (pos int, found Mode, wait, 
 		if m != ModeDetect && m != mode {
 			return
 		}
-		p, w, n := syncMode(b, mode, strict, final)
+		p, w, n := syncMode(b, from, mode, strict, final)
 		if p >= 0 && (best < 0 || p < best) {
 			best, bestMode = p, mode
 		}
-		if w >= 0 && (wait < 0 || w < wait || (w == wait && n < need)) {
+		if w >= 0 && (wait < 0 || w < wait) {
 			wait, need = w, n
 		}
 	}
@@ -451,86 +486,42 @@ func findSync(b []byte, m Mode, strict, final bool) (pos int, found Mode, wait, 
 	try(ModeOctet)
 	try(ModeLF)
 	if best < 0 || (!final && wait >= 0 && wait <= best) {
-		if wait < 0 || (best >= 0 && best < wait) {
-			need = 0
-		}
-		return 0, 0, wait, need, false
+		return 0, 0, false, wait, need
 	}
-	return best, bestMode, wait, 0, true
+	return best, bestMode, true, -1, 0
 }
 
-// A candidate whose frame has not arrived yet holds the search whatever
-// length it declares, up to MaxFrame (SPEC §6.6). Until 2026-11-07 only one
-// of at most 64 KiB did: a larger one lost to a later candidate while its
-// frame was incomplete and won when the frame came in the same segment, so
-// the choice depended on the split. Holding costs memory and delay, never
-// the result.
-
-// syncMode returns the first verified candidate of one mode, or -1; the
-// position of a candidate before it that still waits for bytes, or -1; and
-// the buffer length that waiting candidate needs before it can resolve.
-func syncMode(b []byte, mode Mode, strict, final bool) (pos, wait, need int) {
-	pos, wait = syncModeAt(b, mode, strict, final)
-	if wait < 0 {
-		return pos, wait, 0
-	}
-	need = len(b) + 1 // by default, any new byte may resolve it
-	switch mode {
-	case ModeOctet:
-		if h, l, st := octetHeader(b[wait:]); st == hOK && wait+h < len(b) && wait+h+l > len(b) {
-			need = wait + h + l // its frame must arrive whole
-		}
-	case ModeRELP:
-		if n := relpFrameLen(b[wait:]); n > 0 && wait+n > len(b) {
-			need = wait + n
-		}
-	}
-	return pos, wait, need
-}
-
-// relpFrameLen returns the length of the RELP frame at the start of b once
-// its DATALEN is known, or 0.
-func relpFrameLen(b []byte) int {
-	_, h, st := relpHeader(b)
-	if st != hOK {
-		return 0
-	}
-	i, v := h, 0
-	for i < len(b) && b[i] >= '0' && b[i] <= '9' && i-h < 9 {
-		v = v*10 + int(b[i]-'0')
-		i++
-	}
-	if i == h || i == len(b) || v > MaxFrame {
-		return 0
-	}
-	if v == 0 {
-		return i + 1
-	}
-	return i + 1 + v + 1
-}
-
-func syncModeAt(b []byte, mode Mode, strict, final bool) (pos, wait int) {
+// syncMode returns the first verified candidate of one mode at or after from,
+// or -1; and the position of a candidate before it that still waits for
+// bytes, or -1, with the buffer length it needs. Every valid candidate waits:
+// a frame header is valid up to MaxFrame, and the old 64 KiB cap on waiting
+// made the choice depend on the segmentation (SPEC §6.6, pendência 5).
+func syncMode(b []byte, from int, mode Mode, strict, final bool) (pos, wait, need int) {
+	more := len(b) + 1
 	switch mode {
 	case ModeLF:
 		// The byte after a terminator starts a line. Strict streams also
 		// want the PRI there, so text inside a binary flow does not match.
-		for i := 0; i < len(b); i++ {
+		for i := max(from-1, 0); i < len(b); i++ {
 			if b[i] != '\n' && b[i] != 0 {
+				continue
+			}
+			if i+1 < from {
 				continue
 			}
 			if i+1 >= len(b) {
 				if final {
-					return -1, -1
+					return -1, -1, 0
 				}
-				return -1, i + 1
+				return -1, i + 1, more
 			}
 			if !strict || b[i+1] == '<' {
-				return i + 1, -1
+				return i + 1, -1, 0
 			}
 		}
 	case ModeRELP:
 		// A RELP frame starts after a LF and parses whole up to its own LF.
-		for i := 0; i < len(b); i++ {
+		for i := from; i < len(b); i++ {
 			if i > 0 && b[i-1] != '\n' {
 				continue
 			}
@@ -539,17 +530,17 @@ func syncModeAt(b []byte, mode Mode, strict, final bool) (pos, wait int) {
 			}
 			switch _, _, st := frame(ModeRELP, b[i:], final); st {
 			case fOK, fOther:
-				return i, -1
+				return i, -1, 0
 			case fNeed:
 				if !final && relpPending(b[i:]) {
-					return -1, i
+					return -1, i, max(i+relpNeed(b[i:]), more)
 				}
 			}
 		}
 	case ModeOctet:
 		// A candidate "LEN SP <" is verified by the frame after it: its
 		// header must parse whole (and start with "<" when strict).
-		for i := 0; i < len(b); i++ {
+		for i := from; i < len(b); i++ {
 			if b[i] < '1' || b[i] > '9' || (i > 0 && b[i-1] >= '0' && b[i-1] <= '9') {
 				continue
 			}
@@ -557,7 +548,7 @@ func syncModeAt(b []byte, mode Mode, strict, final bool) (pos, wait int) {
 			if st != hOK || i+h >= len(b) {
 				// The header, or the byte after it, has not arrived.
 				if (st == hNeed || st == hOK) && !final {
-					return -1, i
+					return -1, i, more
 				}
 				continue
 			}
@@ -568,40 +559,61 @@ func syncModeAt(b []byte, mode Mode, strict, final bool) (pos, wait int) {
 			switch {
 			case end > len(b):
 				if !final {
-					return -1, i
+					return -1, i, end
 				}
 				continue
 			case end == len(b):
 				if final {
-					return i, -1
+					return i, -1, 0
 				}
-				return -1, i
+				return -1, i, more
 			}
 			nh, _, nst := octetHeader(b[end:])
 			switch nst {
 			case hOK:
 				if !strict {
-					return i, -1
+					return i, -1, 0
 				}
 				if end+nh < len(b) {
 					if b[end+nh] == '<' {
-						return i, -1
+						return i, -1, 0
 					}
 					continue
 				}
 				if final {
-					return i, -1
+					return i, -1, 0
 				}
-				return -1, i
+				return -1, i, more
 			case hNeed:
 				if final {
-					return i, -1
+					return i, -1, 0
 				}
-				return -1, i
+				return -1, i, more
 			}
 		}
 	}
-	return -1, -1
+	return -1, -1, 0
+}
+
+// relpNeed returns the length of the RELP frame at the start of b when its
+// DATALEN has arrived, else len(b)+1 (one more byte may tell more).
+func relpNeed(b []byte) int {
+	_, h, st := relpHeader(b)
+	if st != hOK {
+		return len(b) + 1
+	}
+	i, v := h, 0
+	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+		v = v*10 + int(b[i]-'0')
+		i++
+	}
+	if i == len(b) || i == h {
+		return len(b) + 1
+	}
+	if v == 0 {
+		return i + 1
+	}
+	return i + 1 + v + 1
 }
 
 // relpKnown reports whether b starts with a header of a RELP command (a
@@ -619,7 +631,7 @@ func relpKnown(b []byte) bool {
 }
 
 // relpPending reports whether b starts with a RELP header that could still
-// become a frame (of at most MaxFrame bytes).
+// become a frame (DATALEN up to MaxFrame).
 func relpPending(b []byte) bool {
 	cmd, h, st := relpHeader(b)
 	if st == hNeed {

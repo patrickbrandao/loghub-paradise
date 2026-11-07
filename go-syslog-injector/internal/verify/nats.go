@@ -33,10 +33,7 @@ func openNATS(ctx context.Context, t *Target) (reader, error) {
 		nc.Close()
 		return nil, fmt.Errorf("nats: jetstream: %w", err)
 	}
-	cfg := jetstream.OrderedConsumerConfig{
-		DeliverPolicy: jetstream.DeliverByStartTimePolicy,
-		OptStartTime:  &t.Since,
-	}
+	cfg := jetstream.OrderedConsumerConfig{DeliverPolicy: jetstream.DeliverByStartSequencePolicy}
 	stream := t.Key
 	if stream == "" {
 		// subjects=exact publishes on loghub.<space>.syslog, and
@@ -57,6 +54,22 @@ func openNATS(ctx context.Context, t *Target) (reader, error) {
 			nc.Close()
 			return nil, fmt.Errorf("nats: no JetStream stream holds loghub.%s.syslog (sink.nats.mode=core has none; or give --verify-key)", t.Space)
 		}
+	}
+	// Open runs before the first send: everything of the run lands after
+	// the stream's last sequence now. Starting there reads nothing of the
+	// past and needs no clock (SPEC §8.5; the start time minus ClockSlack
+	// re-read every message of the last minutes of a busy stream --
+	// go-gelf-injector found ~250 000 of them, past --verify-timeout).
+	st, err := js.Stream(ctx, stream)
+	if err == nil {
+		var info *jetstream.StreamInfo
+		if info, err = st.Info(ctx); err == nil {
+			cfg.OptStartSeq = info.State.LastSeq + 1
+		}
+	}
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("nats: stream %s: %w", stream, err)
 	}
 	cons, err := js.OrderedConsumer(ctx, stream, cfg)
 	if err != nil {

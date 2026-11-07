@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 
 	"github.com/redis/rueidis"
 )
@@ -16,7 +15,7 @@ type redisReader struct {
 	t      *Target
 	c      rueidis.Client
 	stream string
-	start  string // next XRANGE start: "<ms>-0" first, then "(<last id>"
+	start  string // next XRANGE start: after the last entry at Open, then after the last read
 	seen   bool   // the stream existed at some poll
 }
 
@@ -38,10 +37,20 @@ func openRedis(ctx context.Context, t *Target) (reader, error) {
 	if stream == "" {
 		stream = "loghub." + t.Space + ".syslog" // the sink.redis.stream default
 	}
-	r := &redisReader{t: t, c: c, stream: stream, start: strconv.FormatInt(t.Since.UnixMilli(), 10) + "-0"}
+	r := &redisReader{t: t, c: c, stream: stream, start: "-"}
 	if err := c.Do(ctx, c.B().Ping().Build()).Error(); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("redis: ping: %w", err)
+	}
+	// As with NATS: the run's entries come after the stream's last one now,
+	// before the first send (SPEC §8.5); a stream not born yet is read whole.
+	last, err := c.Do(ctx, c.B().Xrevrange().Key(stream).End("+").Start("-").Count(1).Build()).AsXRange()
+	if err != nil && !rueidis.IsRedisNil(err) {
+		c.Close()
+		return nil, fmt.Errorf("redis: XREVRANGE %s: %w", stream, err)
+	}
+	if len(last) == 1 {
+		r.start, r.seen = "("+last[0].ID, true
 	}
 	return r, nil
 }
