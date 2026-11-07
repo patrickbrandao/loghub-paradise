@@ -146,6 +146,7 @@ func (f *Framer) nextOctet() ([]byte, error) {
 	if digits == 0 {
 		return nil, ErrMalformedFrame
 	}
+	f.buf = keepSmall(f.buf)
 	if n == 0 {
 		// A declared length of zero is a legal empty message.
 		return f.buf[:0], nil
@@ -167,42 +168,59 @@ func (f *Framer) nextOctet() ([]byte, error) {
 	return f.buf, nil
 }
 
-// octetChunk is how much a counted read grows the buffer per step. It matches
-// the connection's bufio.Reader, so a step never waits on more than one refill.
-const octetChunk = 64 << 10
+// minFrameCap is the first block of a counted read: a peer that declares a
+// huge length and sends three bytes costs 2 KiB, not 64 (pendência 1 de
+// §21.1, SPEC §5.5).
+const minFrameCap = 2 << 10
 
-// readCounted reads exactly n bytes into *buf, growing it as the bytes arrive
+// frameKeepCap is the largest buffer a reader keeps between frames. After one
+// 1 MiB message an idle connection would otherwise hold 1 MiB for as long as
+// it lives, outside every ceiling (SPEC §5.5).
+const frameKeepCap = 16 << 10
+
+// keepSmall drops a frame buffer that grew past frameKeepCap, so what an idle
+// connection holds is bounded by the small frames, not by its largest one.
+func keepSmall(buf []byte) []byte {
+	if cap(buf) > frameKeepCap {
+		return nil
+	}
+	return buf[:0]
+}
+
+// readCounted reads exactly n bytes into *buf, growing it as the bytes ARRIVE
 // rather than from the declared count (SPEC §5.5). On a short read *buf holds
 // what did arrive and the error is io.ErrUnexpectedEOF.
 //
-// The capacity doubles up to n, so a legitimate large frame pays a logarithmic
-// number of copies, amortised across the connection because the buffer is
-// reused -- while a client that declares n and sends one byte costs one chunk.
+// It takes what the reader has buffered, one refill at a time, and the
+// capacity starts at minFrameCap and doubles (capped at n) as the bytes come
+// in: a legitimate large frame pays a logarithmic number of copies, while a
+// client that declares n and then goes quiet costs one small block for the
+// whole idle timeout (ported from go-syslog-server's Framer.readCounted).
 func readCounted(r *bufio.Reader, buf *[]byte, n int) error {
 	b := (*buf)[:0]
 	for len(b) < n {
-		step := n - len(b)
-		if step > octetChunk {
-			step = octetChunk
+		if r.Buffered() == 0 {
+			if _, err := r.Peek(1); err != nil {
+				*buf = b
+				return io.ErrUnexpectedEOF
+			}
 		}
-		if cap(b)-len(b) < step {
-			want := 2 * cap(b)
-			if want < len(b)+step {
-				want = len(b) + step
+		take := r.Buffered()
+		if want := n - len(b); take > want {
+			take = want
+		}
+		if need := len(b) + take; need > cap(b) {
+			c := max(2*cap(b), minFrameCap, need)
+			if c > n {
+				c = n
 			}
-			if want > n {
-				want = n
-			}
-			grown := make([]byte, len(b), want)
+			grown := make([]byte, len(b), c)
 			copy(grown, b)
 			b = grown
 		}
-		m, err := io.ReadFull(r, b[len(b):len(b)+step])
-		b = b[:len(b)+m]
-		if err != nil {
-			*buf = b
-			return io.ErrUnexpectedEOF
-		}
+		p, _ := r.Peek(take)
+		b = append(b, p...)
+		_, _ = r.Discard(take)
 	}
 	*buf = b
 	return nil
@@ -210,7 +228,7 @@ func readCounted(r *bufio.Reader, buf *[]byte, n int) error {
 
 // nextLF reads up to the next newline.
 func (f *Framer) nextLF() ([]byte, error) {
-	f.buf = f.buf[:0]
+	f.buf = keepSmall(f.buf)
 	for {
 		chunk, err := f.r.ReadSlice('\n')
 		f.buf = append(f.buf, chunk...)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -155,7 +156,7 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			m.SinkNATSReconnectsTotal.Inc()
-			log.Warn("nats reconnected", "url", nc.ConnectedUrl())
+			log.Warn("nats reconnected", "url", connectedURL(nc))
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			// Our own Close arrives here too; only a close the client decided
@@ -224,7 +225,7 @@ func (n *NATS) connect() (*nats.Conn, jetstream.JetStream, error) {
 		return nil, nil, classifyNATS("jetstream", err)
 	}
 	n.nc, n.js = nc, js
-	n.log.Info("nats connected", "url", nc.ConnectedUrl(), "max_payload", nc.MaxPayload())
+	n.log.Info("nats connected", "url", connectedURL(nc), "max_payload", nc.MaxPayload())
 	return nc, js, nil
 }
 
@@ -553,4 +554,18 @@ func classifyNATSError(err error) Class {
 	// Unknown is retried rather than dropped: a filling ring is visible, a
 	// discarded batch is not (invariant §19.17).
 	return ClassNetwork
+}
+
+// connectedURL is the server this connection reached, scheme and host only
+// (pendência 4 de §21.1, SPEC §10.8.9; ported from go-syslog-server).
+// nats.go's ConnectedUrlRedacted hides a password and nothing else: a URL whose
+// user part is a token (nats://<token>@host) came out whole, in the INFO line
+// of every boot and the WARN of every reconnect. A URL that does not parse is
+// never echoed: the bare address stands in for it.
+func connectedURL(nc *nats.Conn) string {
+	u, err := url.Parse(nc.ConnectedUrl())
+	if err != nil || u.Host == "" {
+		return nc.ConnectedAddr()
+	}
+	return u.Scheme + "://" + u.Host
 }

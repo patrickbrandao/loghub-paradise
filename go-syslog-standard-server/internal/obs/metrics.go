@@ -191,10 +191,13 @@ type Metrics struct {
 	// Connection-oriented transports only.
 	ConnsActive             [NumTransports]Gauge
 	ConnsTotal              [NumTransports]Counter
+	ConnsRefusedTotal       [NumTransports]Counter // max_conns_per_ip only: max_conns blocks, it never refuses
 	BackpressureSecondsHund [NumTransports]Counter // hundredths of a second
 	UDPReceiveErrorsTotal   Counter
 	RELPFramesTotal         [numRELPCommands]Counter
 	RELPAcksTotal           Counter
+	RELPInflightBytes       Gauge   // bytes charged to relp.inflight_max_bytes (SPEC §4.5)
+	RELPInflightWaitsTotal  Counter // readers that stopped on the exhausted budget
 
 	// Ring.
 	RingItems         Gauge
@@ -351,6 +354,14 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 		x.counter("syslog_conns_total", "", lbl("transport", transportNames[t]), m.ConnsTotal[t].Load())
 	}
 
+	x.header("syslog_conns_refused_total", "counter",
+		"Connections closed at accept by max_conns_per_ip, by transport. max_conns "+
+			"never refuses: it holds the connection in the kernel backlog.")
+	for _, t := range streamTransports {
+		x.counter("syslog_conns_refused_total", "", lbl("transport", transportNames[t]),
+			m.ConnsRefusedTotal[t].Load())
+	}
+
 	x.header("syslog_backpressure_seconds_total", "counter",
 		"Time spent not reading because the ring was full, by transport. This is "+
 			"backpressure working, not an error: nothing was lost.")
@@ -373,6 +384,13 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 		"RELP transactions answered 200 OK. The only true delivery confirmation "+
 			"this server can give.")
 	x.counter("syslog_relp_acks_total", "", "", m.RELPAcksTotal.Load())
+	x.header("syslog_relp_inflight_bytes", "gauge",
+		"Bytes of in-flight RELP transactions charged to relp.inflight_max_bytes. Not "+
+			"in the ring: these are the copies held until each transaction is decided.")
+	x.gauge("syslog_relp_inflight_bytes", "", m.RELPInflightBytes.Load())
+	x.header("syslog_relp_inflight_waits_total", "counter",
+		"Times a RELP reader stopped reading because relp.inflight_max_bytes was exhausted.")
+	x.counter("syslog_relp_inflight_waits_total", "", "", m.RELPInflightWaitsTotal.Load())
 
 	x.header("syslog_ring_items", "gauge", "Items currently held by the ring.")
 	x.gauge("syslog_ring_items", "", m.RingItems.Load())

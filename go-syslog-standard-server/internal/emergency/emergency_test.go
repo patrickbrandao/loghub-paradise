@@ -127,7 +127,7 @@ func TestTruncatedFileYieldsItsPrefix(t *testing.T) {
 // allocation.
 func TestAbsurdDeclaredLengthDoesNotAllocate(t *testing.T) {
 	dir := t.TempDir()
-	p := filepath.Join(dir, "emg-node-1.bin")
+	p := filepath.Join(dir, "slstd-emg-node-1.bin")
 	if err := os.WriteFile(p, []byte("1073741824 1073741824\nshort"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestUndecodableRecordIsSkipped(t *testing.T) {
 	// and only the HEAD is unusable. A mismatched length would desynchronise
 	// the next header, which is a different failure.
 	bad := []byte("8 4\nnot!jsonabcd")
-	p := filepath.Join(dir, "emg-node-2.bin")
+	p := filepath.Join(dir, "slstd-emg-node-2.bin")
 	if err := os.WriteFile(p, append(bad, goodBytes...), 0o600); err != nil {
 		t.Fatal(err)
 	}

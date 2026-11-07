@@ -30,6 +30,11 @@ type RELPConfig struct {
 	// Version is advertised in the open handshake, so an operator reading an
 	// rsyslog log can tell which build is on the other end.
 	Version string
+
+	// Budget is relp.inflight_max_bytes, ONE value for the whole process
+	// (SPEC §4.5). nil gives the transport its own budget of the default
+	// size, which only tests want.
+	Budget *Budget
 }
 
 // RELP receives librelp streams (SPEC §4.5).
@@ -61,6 +66,9 @@ type RELP struct {
 }
 
 func NewRELP(ctx context.Context, cfg RELPConfig, in *Ingest, m *obs.Metrics, log *obs.Logger) (*RELP, error) {
+	if cfg.Budget == nil {
+		cfg.Budget = NewBudget(0, m)
+	}
 	r := &RELP{cfg: cfg, in: in, m: m, log: log, conns: map[net.Conn]struct{}{}}
 	n := cfg.Listeners
 	if n < 1 {
@@ -69,6 +77,7 @@ func NewRELP(ctx context.Context, cfg RELPConfig, in *Ingest, m *obs.Metrics, lo
 	// One limiter for every listener of this transport: the ceilings are per
 	// transport, not per listener (SPEC §4.4).
 	limiter := newConnLimiter(cfg.MaxConns, cfg.MaxConnsPerIP)
+	limiter.countRefusals(&m.ConnsRefusedTotal[obs.TransportRELP])
 	for i := 0; i < n; i++ {
 		l, err := listenStream(ctx, cfg.Addr, n > 1)
 		if err != nil {
@@ -143,6 +152,11 @@ func (r *RELP) untrack(c net.Conn) {
 	c.Close()
 }
 
+// relpSoftware is the name the open handshake advertises: this server's own,
+// so an rsyslog log never confuses it with go-syslog-server (pendência 20 de
+// §21.1, SPEC §4.5).
+const relpSoftware = "go-syslog-standard-server"
+
 // ack is one decided transaction on its way to the writer goroutine.
 type ack struct {
 	txnr int64
@@ -209,7 +223,7 @@ func (r *RELP) serve(ctx context.Context, c net.Conn, listener string) {
 			r.m.RELPFramesTotal[obs.RELPOpen].Inc()
 			// The offer is answered, not negotiated: this server speaks version
 			// 0 and the syslog command, which is everything librelp needs.
-			send(ctx, acks, ack{f.Txnr, "200 OK\nrelp_version=0\nrelp_software=go-syslog-server," +
+			send(ctx, acks, ack{f.Txnr, "200 OK\nrelp_version=0\nrelp_software=" + relpSoftware + "," +
 				r.cfg.Version + "\ncommands=syslog\n"})
 
 		case "close":
@@ -229,6 +243,25 @@ func (r *RELP) serve(ctx context.Context, c net.Conn, listener string) {
 				continue
 			}
 
+			// A slot in the window first, then the bytes of the copy in the
+			// process-wide budget, and only then the copy: the copy is what
+			// both ceilings bound (SPEC §4.5; pendência 2 de §21.1). Copying
+			// first, as this code once did, held relp.window + 1 copies per
+			// connection outside every ceiling during backpressure. Waiting
+			// on either one stops this reader, and the TCP window holds the
+			// emitter.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			charged, ok := r.cfg.Budget.Acquire(ctx, TxnCharge(len(f.Data)))
+			if !ok || ctx.Err() != nil {
+				r.cfg.Budget.Release(charged)
+				<-sem
+				return
+			}
+
 			// The frame buffer is reused by the next ReadFrame, so a transaction
 			// that outlives this iteration needs its own copy. It is the one
 			// copy RELP pays that the other transports do not, and it buys the
@@ -236,15 +269,11 @@ func (r *RELP) serve(ctx context.Context, c net.Conn, listener string) {
 			raw := make([]byte, len(f.Data))
 			copy(raw, f.Data)
 
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
 			inFlight.Add(1)
 			go func(txnr int64, raw []byte) {
 				defer inFlight.Done()
 				defer func() { <-sem }()
+				defer r.cfg.Budget.Release(charged)
 				body := r.accept(ctx, raw, Wire{
 					Transport: envelope.TransportRELP,
 					Framing:   envelope.FramingRELP,

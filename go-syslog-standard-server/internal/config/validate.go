@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server/internal/syslog"
 )
@@ -118,7 +119,7 @@ func validateEnums(c *Config) error {
 	switch c.Sink.Type {
 	case SinkRedisType, SinkSQLiteType, SinkPostgresType, SinkMySQLType, SinkNATSType, SinkNoneType:
 	default:
-		return fmt.Errorf("sink.type: %q is not one of redis, sqlite, postgres, mysql, nats, none", c.Sink.Type)
+		return fmt.Errorf("sink.type: %q is not one of redis (or valkey), sqlite, postgres, mysql, nats, none", c.Sink.Type)
 	}
 	switch c.TCP.Framing {
 	case FramingAuto, FramingOctet, FramingLF:
@@ -285,6 +286,12 @@ func validateRanges(c *Config) error {
 	if c.RELP.MaxFrameBytes < 1024 {
 		return fmt.Errorf("relp.max_frame_bytes: %s is below 1KiB", FormatBytes(c.RELP.MaxFrameBytes))
 	}
+	// One transaction must always fit in the in-flight budget (SPEC §4.5).
+	if c.Listen.RELP != "" && c.RELP.InflightMaxBytes < c.RELP.MaxFrameBytes {
+		return fmt.Errorf("relp.inflight_max_bytes (%s) is below relp.max_frame_bytes (%s): "+
+			"one transaction must always fit", FormatBytes(c.RELP.InflightMaxBytes),
+			FormatBytes(c.RELP.MaxFrameBytes))
+	}
 	if c.RELP.Window < 1 {
 		return fmt.Errorf("relp.window: %d is below 1", c.RELP.Window)
 	}
@@ -399,6 +406,9 @@ func validateMySQL(c *Config) error {
 	if my.Database == "" {
 		return fmt.Errorf("sink.mysql.database: cannot be empty when sink.type=mysql")
 	}
+	if err := validateDBName("sink.mysql.database", my.Database); err != nil {
+		return err
+	}
 	if !mysqlIdent.MatchString(my.Table) {
 		return fmt.Errorf("sink.mysql.table: %q is not a plain identifier "+
 			"(name or database.name; letters, digits and _; up to 64 characters each)", my.Table)
@@ -409,6 +419,33 @@ func validateMySQL(c *Config) error {
 	if c.Sink.Batch > mysqlMaxBatch {
 		return fmt.Errorf("sink.batch: %d exceeds %d, the most rows one MySQL INSERT can carry "+
 			"(65535 placeholders, 17 per row)", c.Sink.Batch, mysqlMaxBatch)
+	}
+	return nil
+}
+
+// maxDBName is MySQL's limit on a database name, in characters.
+const maxDBName = 64
+
+// validateDBName is the rule of sink.mysql.database, which goes between
+// backticks in every statement and, unlike the table, is not held to
+// mysqlIdent (SPEC §10.7.1; pendência 12 de §21.1, ported from
+// go-syslog-server). A backtick broke the statement (1064, classified as
+// network, so the probe waited sink.boot_timeout), a backslash or a control
+// byte is no name the server would show back, and above 64 characters MySQL
+// refuses it anyway, after the wait. The sink's constructor checks the same
+// rule (checkQuotedName) for a caller that bypasses this.
+func validateDBName(key, v string) error {
+	if n := utf8.RuneCountInString(v); n > maxDBName {
+		return fmt.Errorf("%s: %d characters is above %d", key, n, maxDBName)
+	}
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; {
+		case c == '`' || c == '\\':
+			return fmt.Errorf("%s: %q holds a backtick or a backslash, which would break the "+
+				"quoting of the name in every statement", key, v)
+		case c < 0x20 || c == 0x7f:
+			return fmt.Errorf("%s: %q holds a control byte", key, v)
+		}
 	}
 	return nil
 }
@@ -447,7 +484,7 @@ func validateNATS(c *Config) error {
 	if n.Password != "" && n.Username == "" {
 		return fmt.Errorf("sink.nats.password is set without sink.nats.username")
 	}
-	return nil
+	return validateNATSURLs(n)
 }
 
 func validateStorageWarnings(c *Config, warn func(string, ...any)) {

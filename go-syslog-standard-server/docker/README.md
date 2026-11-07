@@ -1,6 +1,6 @@
 # Deploy em Docker
 
-Build e execução do `go-syslog-server` em contêiner, com um arquivo compose para
+Build e execução do `go-syslog-standard-server` em contêiner, com um arquivo compose para
 cada combinação de **ring** (onde a mensagem espera) e **sink** (para onde ela
 vai).
 
@@ -70,6 +70,39 @@ rodam no mesmo host com frequência.
 | `compose.none-none.yml` | none | none | **descartado** | tudo — benchmark de transporte |
 
 ★ padrão de `docker-compose.yml`.
+
+### Redis e Valkey
+
+Os três compose de Redis têm gêmeos Valkey, com nomes próprios
+(`slstd-<ring>-valkey`, volume `slstd-valkey-data`):
+
+| arquivo | ring | sink | portas padrão (syslog / RELP / admin / Valkey) |
+|---|---|---|---|
+| `compose.memory-valkey.yml` | memory | valkey (= redis) | 5158 / 20618 / 19118 / 16320 |
+| `compose.sqlite-valkey.yml` | sqlite | valkey (= redis) | 5159 / 20619 / 19119 / 16324 |
+| `compose.none-valkey.yml` | none | valkey (= redis) | 5160 / 20620 / 19120 / 16328 |
+
+A imagem vem de `SYSLOG_VALKEY_IMAGE` (padrão `valkey/valkey:8.1-alpine`;
+testados 7.2, 8.1 e 9.0, `docs/TESTING.md` §6.1). O serviço roda
+`valkey-server`, não `redis-server`: o entrypoint da imagem oficial só rebaixa
+o privilégio para o usuário `valkey` (e ajusta o `/data`) quando o primeiro
+argumento é `valkey-server`, e o symlink com o nome antigo rodaria como root. O
+healthcheck é `valkey-cli ping`. Dentro do servidor `sink.type=valkey` e as
+chaves `SYSLOG_SINK_VALKEY_*` são aliases exatos de `redis` e
+`SYSLOG_SINK_REDIS_*` (`docs/SPEC.md` §15.2); logs e métricas dizem `redis`.
+
+```bash
+docker compose -f compose.memory-valkey.yml up -d --build
+docker compose -f compose.memory-valkey.yml exec valkey valkey-cli XRANGE syslog:in - +
+```
+
+A política de despejo do servidor precisa ser `noeviction` (ou `volatile-*`):
+com `allkeys-*` o boot sai com 3, e um `CONFIG SET` com o servidor no ar leva o
+sink a FATAL na sonda seguinte (`docs/SPEC.md` §10.3).
+
+**Nomes.** Imagem `go-syslog-standard-server`, projetos, contêineres, volumes e
+`SYSLOG_NODE_ID` com o prefixo `slstd-`: nada colide com o `go-syslog-server`
+(`sls-*`), que pode subir na mesma máquina.
 
 † Depende de configuração fora deste processo: `synchronous_commit` no
 PostgreSQL, `innodb_flush_log_at_trx_commit` no MySQL (os compose fixam `1`), e
@@ -225,7 +258,7 @@ baixam os frames TCP e RELP para 1 MiB (o maior evento fica em 7 MiB).
 ## Recarregar sem reiniciar
 
 ```bash
-docker kill -s HUP sls-memory-redis
+docker kill -s HUP slstd-memory-redis
 ```
 
 Recarrega filtro, rate limit, nível de log e `keep_files`. Qualquer outra chave

@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server/internal/obs"
@@ -50,7 +50,7 @@ type SQLite struct {
 	log *slog.Logger
 	m   *obs.Metrics
 
-	mu      sync.Mutex
+	mu      ctxMutex
 	db      *sql.DB
 	insert  *sql.Stmt
 	current string // path of the open file
@@ -63,6 +63,10 @@ type SQLite struct {
 	now func() time.Time
 
 	closed bool
+
+	// writing is true while Write holds mu: what lets Health tell a busy
+	// writer from a lock nobody releases (SPEC §10.4).
+	writing atomic.Bool
 }
 
 // Three indexes, not four. (app_name, ts) is the obvious fourth and is left out
@@ -129,7 +133,7 @@ func NewSQLite(cfg SQLiteConfig, log *slog.Logger, m *obs.Metrics) (*SQLite, err
 		cfg.WALAutocheckpoint = 1000
 	}
 
-	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now}
+	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now, mu: newCtxMutex()}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o750); err != nil {
 		return nil, fmt.Errorf("sink sqlite: %w", err)
 	}
@@ -324,6 +328,8 @@ func (s *SQLite) Write(ctx context.Context, batch []Prepared) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.writing.Store(true)
+	defer s.writing.Store(false)
 
 	if s.closed {
 		return ErrClosed
@@ -373,8 +379,24 @@ func (s *SQLite) Write(ctx context.Context, batch []Prepared) error {
 // outlasts sink.health_timeout, the sink is marked DOWN, the fuses escalate to
 // FATAL, and the next boot fails the same way, forever. The integrity scan is
 // still run once, at boot (SPEC §10.4).
+//
+// The lock is taken within the check's context (pendência 16 de §21.1, SPEC
+// §10.4). The writer holds it for a whole batch, and a batch longer than
+// sink.health_timeout -- a large one on a slow disk -- made the probe fail by
+// deadline with the database intact: a DOWN cycle out of slowness. When the
+// deadline passes with the WRITER still holding the lock, the database is
+// being written right now, and that write's own outcome is what the workers
+// classify; the probe reports the busy writer as healthy instead of
+// inventing a failure. A writer cannot hold the lock forever: every write
+// runs under sink.op_timeout, and a broken disk makes each one fail fast,
+// release the lock and leave the next probe to see the error.
 func (s *SQLite) Health(ctx context.Context) error {
-	s.mu.Lock()
+	if !s.mu.LockCtx(ctx) {
+		if s.writing.Load() {
+			return nil
+		}
+		return networkErr("heartbeat", ctx.Err())
+	}
 	defer s.mu.Unlock()
 
 	if s.closed {

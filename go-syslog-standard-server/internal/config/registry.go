@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -30,8 +32,10 @@ func (p *Param) Name() string { return p.Sec + "." + p.Key }
 func (p *Param) Flag() string { return "--" + p.Name() }
 
 // Env is the environment form: "SYSLOG_SINK_REDIS_ADDRS".
-func (p *Param) Env() string {
-	return "SYSLOG_" + strings.ToUpper(strings.NewReplacer(".", "_", "-", "_").Replace(p.Name()))
+func (p *Param) Env() string { return envOf(p.Name()) }
+
+func envOf(name string) string {
+	return "SYSLOG_" + strings.ToUpper(strings.NewReplacer(".", "_", "-", "_").Replace(name))
 }
 
 // Registry returns the parameter table bound to c. Every parameter in SPEC
@@ -97,6 +101,8 @@ func Registry(c *Config) []*Param {
 			Desc: "unacknowledged transactions held before the reader stops pulling"},
 		{Sec: "relp", Key: "backpressure_timeout", Kind: KDuration, Def: "30s", Ptr: &c.RELP.BackpressureTimeout,
 			Desc: "how long to wait on a full ring before answering 500 ring full"},
+		{Sec: "relp", Key: "inflight_max_bytes", Kind: KBytes, Def: "64MiB", Ptr: &c.RELP.InflightMaxBytes,
+			Desc: "ceiling, for the whole process, of the copies held by transactions not yet decided (outside ring.max_bytes); at least relp.max_frame_bytes; exhausted, readers stop reading"},
 
 		// ----------------------------------------------------------------- parse
 		{Sec: "parse", Key: "prefer", Kind: KString, Def: "auto", Ptr: &c.Parse.Prefer,
@@ -164,7 +170,7 @@ func Registry(c *Config) []*Param {
 
 		// ------------------------------------------------------------------ sink
 		{Sec: "sink", Key: "type", Kind: KString, Def: "redis", Ptr: &c.Sink.Type,
-			Desc: "redis | sqlite | postgres | mysql | nats | none -- the final destination"},
+			Desc: "redis | sqlite | postgres | mysql | nats | none -- the final destination; valkey is an alias of redis"},
 		{Sec: "sink", Key: "workers", Kind: KInt, Def: "8", Ptr: &c.Sink.Workers,
 			Desc: "drain goroutines, which also run the full parse; forced to 1 when type=sqlite, lowered to 4 when type=postgres or mysql and not set"},
 		{Sec: "sink", Key: "batch", Kind: KInt, Def: "256", Ptr: &c.Sink.Batch,
@@ -355,11 +361,136 @@ func newIndex(params []*Param) *index {
 }
 
 func (ix *index) lookup(name string) (*Param, error) {
-	p, ok := ix.byName[name]
+	canon, _ := canonicalName(name)
+	p, ok := ix.byName[canon]
 	if !ok {
+		// Named only when it has the shape of a name. What reaches here from
+		// an INI key or a flag is everything before the first '=', and a
+		// ':' typed for the '=' ("password: hunter2 = x",
+		// "--sink.nats.password:hunter2") puts the value inside it; the error
+		// goes to stderr and, on a SIGHUP, to the log (SPEC §15.1; pendência 5
+		// de §21.1, ported from go-syslog-server).
+		if !paramNameRE.MatchString(name) {
+			return nil, fmt.Errorf("unknown parameter (the name holds characters no parameter " +
+				"name has, so it is not shown; a value goes after an '=')")
+		}
+		if ix.extendsAName(canon) {
+			// "--sink.nats.passwordhunter2": the '=' was forgotten and the
+			// value glued to the name. Quoted, the error would print the
+			// secret.
+			return nil, fmt.Errorf("unknown parameter (it starts with the name of a parameter " +
+				"and goes on, so it is not shown: the '=' between the name and the value may be missing)")
+		}
 		return nil, fmt.Errorf("unknown parameter %q", name)
 	}
 	return p, nil
+}
+
+// extendsAName reports whether name is a parameter name of the registry with
+// something glued after it.
+func (ix *index) extendsAName(name string) bool {
+	for n := range ix.byName {
+		if len(name) > len(n) && strings.HasPrefix(name, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownSectionOf reports whether name, read as "<section>.<key>", names a
+// section of the registry (or an alias of one): "sink.nats.subjet" does,
+// "hunter2" does not.
+func (ix *index) knownSectionOf(name string) bool {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 {
+		return false
+	}
+	return ix.knownSection(name[:i])
+}
+
+func (ix *index) knownSection(sec string) bool {
+	if c, ok := aliasSections[sec]; ok {
+		sec = c
+	}
+	for _, p := range ix.all {
+		if p.Sec == sec {
+			return true
+		}
+	}
+	return false
+}
+
+// paramNameRE is what a parameter name, known or not, can look like: the
+// dotted lowercase words of the registry, with room for a typo in case or a
+// dash. Anything else is not printed.
+var paramNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+
+// iniKeyRE is what an INI key of this server looks like. It is narrower than
+// paramNameRE on purpose: an unknown INI key is named only when it has this
+// shape, because the INI is where a secret wraps onto a second line
+// ("token = eyJhbGciOiJI" then "UzI1NiJ9abcDEF==") and the continuation reads
+// as a key.
+var iniKeyRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// lookupINI is lookup for an INI entry. An unknown key is named only when its
+// section is one this server has, its key has the shape of a key, and the
+// line before it was not a secret: a key right after a password or a token is
+// most likely the rest of that value on the next line ("password = abc" then
+// "ffd3a9c1b2=").
+func (ix *index) lookupINI(e iniEntry, afterSecret bool) (*Param, error) {
+	canon, _ := canonicalName(e.Name)
+	if p, ok := ix.byName[canon]; ok {
+		return p, nil
+	}
+	switch {
+	case afterSecret:
+		return nil, errors.New("unknown parameter right after a secret value; it is not shown, " +
+			"in case it is the rest of that value: a value must fit on one line")
+	case !iniKeyRE.MatchString(e.Key) || !ix.knownSection(e.Sec):
+		return nil, errors.New("unknown parameter (not shown: its section or its key is not one " +
+			"a parameter has; a value goes after an '=' on the same line)")
+	}
+	return ix.lookup(e.Name)
+}
+
+// aliasSections maps an alias section onto the canonical one (SPEC §15.2):
+// [sink.valkey] is [sink.redis], key for key, in the INI, as flags
+// (--sink.valkey.<k>) and in the environment (SYSLOG_SINK_VALKEY_<K>). The
+// protocol is the same, and "redis" stays the canonical name everywhere the
+// server prints one: logs, metrics, --dump-config.
+var aliasSections = map[string]string{
+	"sink.valkey": "sink.redis",
+}
+
+// canonicalName maps a dotted name written under an alias section onto its
+// canonical name, and reports whether it was an alias.
+func canonicalName(name string) (string, bool) {
+	for a, c := range aliasSections {
+		if rest, ok := strings.CutPrefix(name, a+"."); ok {
+			return c + "." + rest, true
+		}
+	}
+	return name, false
+}
+
+// AliasName is the name of p under its alias section, or "" when its section
+// has none: sink.valkey.addrs for sink.redis.addrs.
+func (p *Param) AliasName() string {
+	for a, c := range aliasSections {
+		if p.Sec == c {
+			return a + "." + p.Key
+		}
+	}
+	return ""
+}
+
+// AliasEnv is the environment form of AliasName: SYSLOG_SINK_VALKEY_ADDRS.
+func (p *Param) AliasEnv() string {
+	a := p.AliasName()
+	if a == "" {
+		return ""
+	}
+	return envOf(a)
 }
 
 // sections returns section names in registry order, which is the order used by

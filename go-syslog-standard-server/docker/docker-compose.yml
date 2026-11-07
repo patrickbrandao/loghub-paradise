@@ -7,7 +7,7 @@
 #   docker compose up -d --build
 #   docker compose -f compose.memory-redis.yml up -d --build
 
-name: sls-memory-redis
+name: slstd-memory-redis
 
 include:
   - compose.memory-redis.yml

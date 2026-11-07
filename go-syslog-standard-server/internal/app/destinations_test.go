@@ -267,7 +267,7 @@ func emergencyFiles(t *testing.T, dir string) []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "emg-") && strings.HasSuffix(e.Name(), ".bin") {
+		if strings.HasPrefix(e.Name(), "slstd-emg-") && strings.HasSuffix(e.Name(), ".bin") {
 			out = append(out, e.Name())
 		}
 	}

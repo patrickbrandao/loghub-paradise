@@ -45,7 +45,11 @@ import (
 // beside them hiding the loss. Here the head IS the metadata and comes back
 // whole.
 const (
-	filePrefix  = "emg-"
+	// filePrefix is this server's own: go-syslog-server writes emg-*.bin, and
+	// a decoder that read those would quarantine them as .corrupt (their
+	// head is another format) when both share a directory (pendência 20 de
+	// §21.1, SPEC §11.1).
+	filePrefix  = "slstd-emg-"
 	fileSuffix  = ".bin"
 	corruptExt  = ".corrupt"
 	maxLenField = 1 << 31 // sanity ceiling on a declared length

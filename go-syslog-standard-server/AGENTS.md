@@ -10,8 +10,15 @@
 > renomeio; onde ele diz `go-syslog-server`, leia esta pasta.
 >
 > **Antes de portar um trecho, leia `docs/SPEC.md` §21.1.** Ela lista os
-> defeitos conhecidos que esta referência ainda tem, com a direção da correção:
-> o trecho vai para o módulo novo já corrigido.
+> defeitos que esta referência teve e a regra que corrigiu cada um; desde
+> 2026-11-07 nenhum está aberto.
+>
+> **Nomes próprios desde 2026-11-07** (SPEC §21.1, item 20): binário e imagem
+> `go-syslog-standard-server` (`cmd/go-syslog-standard-server/`), prefixo
+> `slstd-` nos projetos, contêineres, volumes e `node.id` dos compose,
+> `relp_software=go-syslog-standard-server`, dumps `slstd-emg-*.bin`. Os nomes
+> `go-syslog-server`, `sls-*` e `emg-*` são do servidor LogHub; não os traga de
+> volta.
 
 Instruções para agentes de IA que trabalham **dentro desta pasta**. Leia antes
 de editar qualquer arquivo.
@@ -28,7 +35,7 @@ loghub-paradise/                  <- monorepo, SEM go.mod, mantido por outro age
   go-webhook-server/              <- serviço IRMÃO, módulo Go independente
   go-syslog-server/               <- VOCÊ ESTÁ AQUI (módulo Go independente)
     go.mod                        module github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server
-    cmd/go-syslog-server/
+    cmd/go-syslog-standard-server/
     internal/
     docs/SPEC.md                  fonte da verdade do comportamento
     docs/TESTING.md               como testar e o que ainda não é provado
@@ -115,7 +122,8 @@ documentação descritiva do código: é o contrato que o código cumpre.
 - **RING** — *onde a mensagem espera* entre ser aceita e ser entregue.
   `memory` | `sqlite` | `none`
 - **SINK** — *para onde ela vai*, o destino final.
-  `redis` | `sqlite` | `postgres` | `mysql` | `nats` | `none`
+  `redis` | `sqlite` | `postgres` | `mysql` | `nats` | `none` (`valkey` é alias
+  de `redis`: mesmo protocolo, nome canônico `redis` em logs, métricas e dump)
 
 As dezoito combinações são válidas e distintas. `ring=sqlite` é uma **fila**
 (linhas apagadas após entrega); `sink=sqlite` é um **destino final**
@@ -163,7 +171,7 @@ datagrama descartado, não.
 ## 6. Mapa do código
 
 ```
-cmd/go-syslog-server/main.go   só injeta versão/commit e chama internal/app
+cmd/go-syslog-standard-server/main.go   só injeta versão/commit e chama internal/app
 internal/
   app/        montagem, ciclo de vida, boot, shutdown, SIGHUP, reingestão
   config/     registry único -> ini + flags + env + --help + dump; validação
@@ -214,26 +222,37 @@ go test ./internal/receiver/  -run=XXX -fuzz=FuzzFrame -fuzztime=60s
 go test ./internal/emergency/ -run=XXX -fuzz=FuzzRead  -fuzztime=60s
 ```
 
-Destino Redis — **é o padrão de produção**. A suíte que lê esta variável **ainda
-não existe** (`docs/TESTING.md` §8, item 1); o comando abaixo é o formato
-combinado com o irmão, para quando ela for escrita:
+Destino Redis/Valkey — **é o padrão de produção**. Suíte opt-in desde
+2026-11-07 com o prefixo `SLSTD_TEST_` (nunca o `SYSLOG_TEST_*` do
+`go-syslog-server`); a matriz é **Redis 7.4 e Valkey 7.2, 8.1 e 9.0**, e uma
+mudança em `internal/sink/redis.go`, `health.go` ou no boot roda nos quatro.
+Receita completa (LRU, Sentinel, cluster) em `docs/TESTING.md` §6.1; `-p 1`
+porque os testes reconfiguram o servidor:
 
 ```bash
-docker run --rm -d -p 16379:6379 --name sls-test-redis redis:7-alpine
-SYSLOG_TEST_REDIS_ADDR=127.0.0.1:16379 go test -race -timeout 600s ./internal/app/
-docker rm -f sls-test-redis
+docker run --rm -d -p 127.0.0.1:38301:6379 --name slstd-test-redis valkey/valkey:8.1-alpine valkey-server --save ""
+docker run --rm -d -p 127.0.0.1:38302:6379 --name slstd-test-redis-lru valkey/valkey:8.1-alpine \
+  valkey-server --save "" --maxmemory 64mb --maxmemory-policy allkeys-lru
+SLSTD_TEST_REDIS_ADDR=127.0.0.1:38301 SLSTD_TEST_REDIS_LRU_ADDR=127.0.0.1:38302 \
+  go test -p 1 -race -timeout 600s -run Redis ./internal/sink/ ./internal/app/
+docker rm -f slstd-test-redis slstd-test-redis-lru
 ```
 
-Destino PostgreSQL — a suíte que lê esta variável **ainda não existe**
-(`docs/TESTING.md` §8, item 2). O servidor não cria a tabela; quando a suíte for
-escrita, ela cria as dela a partir de `docker/postgres/schema.sql`:
+Nunca decida recurso por `redis_version` (o Valkey responde `7.2.4` sempre;
+SPEC §10.3), e em cluster nunca misture um comando sem chave (`INFO`,
+`CONFIG`) com comandos com chave no mesmo `DoMulti`: o rueidis entra em
+`panic`.
+
+Destino PostgreSQL — suíte opt-in desde 2026-11-07 (`docs/TESTING.md` §6.2). O
+servidor não cria a tabela; a suíte cria as dela a partir de
+`docker/postgres/schema.sql`, uma por esquema:
 
 ```bash
-docker run --rm -d -p 15432:5432 -e POSTGRES_USER=sls -e POSTGRES_PASSWORD=sls \
-  -e POSTGRES_DB=sls_test --name sls-test-pg postgres:17-alpine
-SYSLOG_TEST_PG_DSN='postgres://sls:sls@127.0.0.1:15432/sls_test?sslmode=disable' \
-  go test -race -timeout 600s ./internal/sink/ ./internal/app/
-docker rm -f sls-test-pg
+docker run --rm -d -p 127.0.0.1:38360:5432 -e POSTGRES_USER=slstd -e POSTGRES_PASSWORD=slstd \
+  -e POSTGRES_DB=slstd_test --name slstd-test-pg postgres:18-alpine
+SLSTD_TEST_PG_DSN='postgres://slstd:slstd@127.0.0.1:38360/slstd_test?sslmode=disable' \
+  go test -race -timeout 600s -run Postgres ./internal/sink/
+docker rm -f slstd-test-pg
 ```
 
 Destino MySQL — a suíte rodou pela primeira vez contra MySQL 8.4 real em
@@ -243,10 +262,10 @@ foram corrigidos no mesmo dia (`docs/TESTING.md` §8, itens 18, 21 e 22). Cria a
 
 ```bash
 docker run --rm -d -p 13306:3306 -e MYSQL_ROOT_PASSWORD=sls -e MYSQL_DATABASE=sls_test \
-  --name sls-test-mysql mysql:8.4
+  --name slstd-test-mysql mysql:8.4
 SYSLOG_TEST_MYSQL_DSN='root:sls@tcp(127.0.0.1:13306)/sls_test' \
   go test -race -timeout 600s -run MySQL ./internal/sink/ ./internal/app/
-docker rm -f sls-test-mysql
+docker rm -f slstd-test-mysql
 ```
 
 Destino NATS — o `nats-server` é um módulo Go, sem Docker. A suíte cria os
@@ -265,9 +284,9 @@ que a moldura funciona no fio**. Se você mexeu em `receiver/framing.go`,
 Executar e inspecionar:
 
 ```bash
-go run ./cmd/go-syslog-server --help
-go run ./cmd/go-syslog-server --dump-config
-go run ./cmd/go-syslog-server --listen.udp=127.0.0.1:1514 --listen.tcp=127.0.0.1:1514 \
+go run ./cmd/go-syslog-standard-server --help
+go run ./cmd/go-syslog-standard-server --dump-config
+go run ./cmd/go-syslog-standard-server --listen.udp=127.0.0.1:1514 --listen.tcp=127.0.0.1:1514 \
   --sink.type=sqlite --ring.data_dir=./data --admin.bind=127.0.0.1:9102
 logger -n 127.0.0.1 -P 1514 -d "teste"
 ```
@@ -323,7 +342,7 @@ socket de leitura e por definição mora fora (`/dev/log`).
 
 **Caminhos fixos do contêiner.** `/app` guarda o binário (dono `root`), `/data`
 é a única área gravável, `/etc/syslog` é o INI em `:ro`, `/tmp` é tmpfs. O
-`WORKDIR` é `/data` e o binário é invocado por `/app/go-syslog-server`, nunca
+`WORKDIR` é `/data` e o binário é invocado por `/app/go-syslog-standard-server`, nunca
 pelo nome solto.
 
 **As portas padrão não são 514.** São `:1514` (UDP e TCP) e `:20514` (RELP),
@@ -432,10 +451,13 @@ O que já foi verificado fora dos testes unitários, numa máquina real:
 
 O `sink=mysql` rodou a suíte contra MySQL 8.4 real só em 2026-10-14
 (`docs/TESTING.md` §8.1), e os seis compose de MySQL e NATS nunca subiram
-(`docs/TESTING.md` §8, item 19).
+(`docs/TESTING.md` §8, item 19). Desde 2026-11-07 o `sink=redis` tem suíte
+contra Redis 7.4 e Valkey 7.2/8.1/9.0 (Sentinel e cluster incluídos) e o
+`sink=postgres` uma parcial contra PostgreSQL 18 (`docs/TESTING.md` §6.1,
+§6.2, §8.2); os três `compose.*-valkey.yml` não subiram.
 
 Antes de qualquer deploy real faltam, em ordem: versionamento (nível acima),
-integração contínua com Redis, PostgreSQL **e** os emissores vivos, o teste do
+integração contínua com Redis/Valkey, PostgreSQL **e** os emissores vivos, o teste do
 RELP com corte do servidor no meio do fluxo, e a aferição dos critérios de aceite
 de `SPEC.md` §17.7, que **nunca foram medidos**.
 

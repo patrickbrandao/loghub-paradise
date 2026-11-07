@@ -75,9 +75,31 @@ func (a *App) reingest(ctx context.Context) int {
 		}
 	}
 
-	a.metrics.EmergencyFiles.Set(0)
-	a.metrics.EmergencyEventsPending.Set(0)
+	// Recounted from the directory, never zeroed: a dump left behind
+	// (unreadable, or whose removal or quarantine failed) is still a dump, and
+	// an alert on "> 0" must fire for it (pendência 14 de §21.1, SPEC §11.2;
+	// ported from go-syslog-server).
+	a.refreshEmergencyGauges()
 	return ExitOK
+}
+
+// refreshEmergencyGauges sets syslog_emergency_files and
+// syslog_emergency_events_pending from what is on disk, the only honest
+// source (SPEC §11.2). The file count comes from the listing, so a dump that
+// cannot even be read still counts as one; its messages are unknowable and
+// count as none.
+func (a *App) refreshEmergencyGauges() {
+	files, err := a.emg.List()
+	if err == nil {
+		var events int64
+		if _, events, err = a.emg.Count(); err == nil {
+			a.metrics.EmergencyFiles.Set(int64(len(files)))
+			a.metrics.EmergencyEventsPending.Set(events)
+			return
+		}
+	}
+	a.log.Warn("cannot count the emergency dumps; syslog_emergency_* keep their previous values",
+		"dir", a.emg.Dir(), "error", err)
 }
 
 // writeDirect parses and sends items straight to the sink in batches, bypassing
@@ -208,7 +230,8 @@ func (a *App) dumpEmergency(items []*envelope.Item) bool {
 	a.log.Warn("pending messages written to an emergency dump; "+
 		"they will be reingested at the next boot",
 		"count", len(items), "path", path)
-	a.metrics.EmergencyFiles.Set(1)
-	a.metrics.EmergencyEventsPending.Set(int64(len(items)))
+	// The dump adds to whatever an earlier boot left on disk: recounted, not
+	// set to this dump alone.
+	a.refreshEmergencyGauges()
 	return true
 }

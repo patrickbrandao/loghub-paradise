@@ -13,17 +13,17 @@
 # 127.0.0.1:19105. Defaults distintos por combinacao para que varias rodem lado
 # a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
 
-name: sls-sqlite-sqlite
+name: slstd-sqlite-sqlite
 
 services:
   syslog:
     extends:
       file: common.yml
-      service: sls-base
-    container_name: sls-sqlite-sqlite
+      service: slstd-base
+    container_name: slstd-sqlite-sqlite
 
     environment:
-      SYSLOG_NODE_ID: sls-sqlite-sqlite
+      SYSLOG_NODE_ID: slstd-sqlite-sqlite
 
       # --- ring: sqlite ---------------------------------------------------------
       SYSLOG_RING_MODE: sqlite
@@ -53,7 +53,7 @@ services:
       - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19105}:9102"
 
     volumes:
-      - sls-data:/data
+      - slstd-data:/data
 
 volumes:
-  sls-data:
+  slstd-data:

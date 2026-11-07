@@ -123,6 +123,7 @@ func (rd *RELPReader) ReadFrame() (RELPFrame, error) {
 	}
 	// Grown as the bytes arrive, never sized from DATALEN: the same defence
 	// the octet-counting framer has, for the same reason (SPEC §5.5).
+	rd.buf = keepSmall(rd.buf)
 	if err := readCounted(rd.r, &rd.buf, int(n)); err != nil {
 		return f, io.ErrUnexpectedEOF
 	}
