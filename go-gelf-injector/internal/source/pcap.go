@@ -39,6 +39,8 @@ type Pcap struct {
 	dec   *pcap.Decoder
 	asm   *pcap.Assembler
 	dg    *extract.Datagrams
+	tdup  *pcap.Dedup   // TCP copies of -i any (nil with --pcap-dedup off)
+	tdups uint64        // TCP segments dropped as copies, over passes
 	ext   extract.Stats // accumulates over passes
 	queue []Message
 	first time.Time
@@ -87,6 +89,10 @@ func (p *Pcap) open() error {
 	p.f, p.rd = f, rd
 	p.dec = pcap.NewDecoder()
 	p.dg = &extract.Datagrams{St: &p.ext, Strict: p.strict(), R: gelf.NewReassembler(), Dedup: p.opt.Dedup}
+	p.tdup = nil
+	if p.opt.Dedup != extract.DedupOff {
+		p.tdup = pcap.NewDedup()
+	}
 	p.asm = pcap.NewAssembler(func(k pcap.FlowKey, mid bool) pcap.StreamHandler {
 		if !p.wantPort(k.Dst.Port()) {
 			return nil
@@ -209,6 +215,15 @@ func (p *Pcap) step() error {
 		}
 	case pcap.ProtoTCP:
 		if p.opt.TCP {
+			// The per-packet key of go-syslog- and go-relplog-injector,
+			// before the assembler (review of 2026-11-07, item 7): with NAT
+			// between two vantages the copy is another 4-tuple, and became
+			// a second direction replayed whole. After the port filter, so
+			// a copy it refuses does not shadow the one it keeps.
+			if p.tdup != nil && p.wantPort(seg.Dst.Port()) && p.tdup.Copy(pcap.Key(seg), seg.Vantage, seg.TS) {
+				p.tdups++
+				return nil
+			}
 			p.asm.Add(seg)
 		}
 	}
@@ -306,6 +321,7 @@ func (p *Pcap) Stats() map[string]uint64 {
 		"compressed_deflate":      e.Compressed[gelf.Deflate],
 		"decompress_errors":       e.DecompressError,
 		"docs_too_large":          e.TooLarge,
+		"tcp_segments_duplicate":  p.tdups,
 		"tcp_directions":          a.Flows,
 		"tcp_midstream":           a.Midstream,
 		"tcp_directions_filtered": a.Ignored,

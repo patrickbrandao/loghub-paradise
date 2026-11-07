@@ -31,6 +31,7 @@ type Segment struct {
 	Src     netip.AddrPort
 	Dst     netip.AddrPort
 	Seq     uint32 // TCP only
+	Ack     uint32 // TCP only (the per-packet dedup key, Key)
 	Flags   uint8  // TCP only
 	Payload []byte
 	// Truncated: the capture cut the payload short (snaplen). For TCP the
@@ -107,8 +108,11 @@ func (d *Decoder) Decode(p Packet) (Segment, bool) {
 func linkVantage(lt uint16, b []byte) uint64 {
 	switch lt {
 	case LinkSLL:
-		if len(b) >= 2 {
-			return uint64(binary.BigEndian.Uint16(b[0:2])) & 0xff
+		// Cooked v1 does not record the interface: the packet type and the
+		// link-layer address are the closest thing (alignment 8(d) of the
+		// review of 2026-11-07, the rule of go-relplog-injector).
+		if len(b) >= 14 {
+			return 1 | uint64(hash32(b[0:2], b[6:14]))
 		}
 	case LinkSLL2:
 		if len(b) >= 11 {
@@ -383,6 +387,7 @@ func l4(proto uint8, src, dst netip.Addr, b []byte, wire int, trunc bool) (Segme
 			Src:       netip.AddrPortFrom(src.Unmap(), binary.BigEndian.Uint16(b[0:2])),
 			Dst:       netip.AddrPortFrom(dst.Unmap(), binary.BigEndian.Uint16(b[2:4])),
 			Seq:       binary.BigEndian.Uint32(b[4:8]),
+			Ack:       binary.BigEndian.Uint32(b[8:12]),
 			Flags:     b[13],
 			Payload:   b[doff:],
 			Truncated: trunc && w > len(b)-doff,

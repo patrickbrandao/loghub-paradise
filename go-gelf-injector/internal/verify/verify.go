@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"regexp"
 	"sort"
@@ -50,14 +51,14 @@ type Dest interface {
 // Spec is a parsed --verify-url or --verify-sqlite: usage errors come from
 // Parse (exit 2), connection errors from Check (exit 4).
 type Spec struct {
-	Kind     string // nats | postgres | redis | sqlite
-	Display  string // scheme and host only (never user, password, path or query), or the file
-	raw      string // the URL for the driver
-	secret   string // password (or token) to scrub from driver errors
-	space    string // --verify-space
-	stream   string // nats stream / redis key
-	subject  string // nats filter
-	path     string // sqlite file
+	Kind     string   // nats | postgres | redis | sqlite
+	Display  string   // scheme and host only (never user, password, path or query), or the file
+	raw      string   // the URL for the driver (a NATS list: the elements joined by ",")
+	secrets  []string // passwords (or NATS tokens) of every element, scrubbed from driver errors
+	space    string   // --verify-space
+	stream   string   // nats stream / redis key
+	subject  string   // nats filter
+	path     string   // sqlite file
 	TLSRoots *x509.CertPool
 }
 
@@ -66,23 +67,44 @@ var SpaceRE = regexp.MustCompile(`^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$`)
 
 // Parse reads a --verify-url with --verify-space and --verify-key (key may
 // be empty: the default of the destination). Errors never repeat the URL:
-// it may hold a password.
+// it may hold a password. A NATS list (comma-separated, as nats.go takes it)
+// is split and every element parsed here, before any driver sees it: the
+// driver's own parse error quotes the element, password included, and the
+// second element of a list was never parsed before (review of 2026-11-07).
 func Parse(raw, space, key string) (*Spec, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, errors.New("--verify-url: not a URL")
-	}
 	if !SpaceRE.MatchString(space) {
 		return nil, errors.New("--verify-space: want a LogHub space ([A-Za-z0-9_-] words joined by dots)")
 	}
-	s := &Spec{space: space}
-	if p, ok := u.User.Password(); ok {
-		s.secret = p
-	} else if u.User != nil && u.User.Username() != "" && (u.Scheme == "nats" || u.Scheme == "tls") {
-		s.secret = u.User.Username() // a NATS token goes as the user
+	scheme, _, _ := strings.Cut(raw, "://")
+	scheme = strings.ToLower(scheme)
+	elems := []string{raw}
+	if scheme == "nats" || scheme == "tls" {
+		elems = strings.Split(raw, ",")
 	}
+	s := &Spec{space: space}
+	var us []*url.URL
+	for i, e := range elems {
+		u, err := url.Parse(strings.TrimSpace(e))
+		if err != nil {
+			// Never the *url.Error text: it quotes the element.
+			return nil, fmt.Errorf("--verify-url: server %d of the list is not a URL", i+1)
+		}
+		es := strings.ToLower(u.Scheme)
+		if len(elems) > 1 && es != "nats" && es != "tls" {
+			return nil, fmt.Errorf("--verify-url: server %d of the list is not nats:// or tls://", i+1)
+		}
+		if p, ok := u.User.Password(); ok && p != "" {
+			s.secrets = append(s.secrets, p)
+		} else if u.User != nil && u.User.Username() != "" && (es == "nats" || es == "tls") {
+			s.secrets = append(s.secrets, u.User.Username()) // a NATS token goes as the user
+		}
+		if p := u.Query().Get("password"); p != "" {
+			s.secrets = append(s.secrets, p) // libpq's password= parameter
+		}
+		us = append(us, u)
+	}
+	u := us[0]
 	q := u.Query()
-	scheme := strings.ToLower(u.Scheme)
 	switch scheme {
 	case "nats", "tls":
 		s.Kind = "nats"
@@ -92,8 +114,10 @@ func Parse(raw, space, key string) (*Spec, error) {
 		if key != "" {
 			s.stream = key
 		}
-		if len(q) > 0 {
-			return nil, errors.New("--verify-url: a nats:// URL takes no parameters (--verify-key names the stream)")
+		for _, e := range us {
+			if len(e.Query()) > 0 {
+				return nil, errors.New("--verify-url: a nats:// URL takes no parameters (--verify-key names the stream)")
+			}
 		}
 	case "postgres", "postgresql":
 		s.Kind = "postgres"
@@ -117,15 +141,28 @@ func Parse(raw, space, key string) (*Spec, error) {
 	default:
 		return nil, errors.New("--verify-url: want nats://, tls://, postgres://, postgresql://, redis://, rediss://, valkey:// or valkeys://")
 	}
-	if u.Host == "" && !(s.Kind == "postgres" && q.Has("host")) {
-		return nil, errors.New("--verify-url: no host")
+	for i, e := range us {
+		if e.Host == "" && !(s.Kind == "postgres" && q.Has("host")) {
+			return nil, fmt.Errorf("--verify-url: server %d of the list has no host", i+1)
+		}
 	}
-	s.raw = u.String()
+	if s.Kind == "nats" {
+		parts := make([]string, len(us))
+		for i, e := range us {
+			parts[i] = e.String()
+		}
+		s.raw = strings.Join(parts, ",")
+	} else {
+		s.raw = u.String()
+	}
 	host := u.Host
 	if host == "" {
 		host = "(socket)"
 	}
 	s.Display = scheme + "://" + host
+	if len(us) > 1 {
+		s.Display += fmt.Sprintf(" (+%d)", len(us)-1)
+	}
 	switch s.Kind {
 	case "nats":
 		s.Display += " (stream " + s.stream + ", subject " + s.subject + ")"
@@ -145,28 +182,36 @@ func SQLite(path, space string) (*Spec, error) {
 	return &Spec{Kind: "sqlite", path: path, space: space, Display: "sqlite " + path + " (gelf_events, space " + space + ")"}, nil
 }
 
-// scrub replaces the password in a driver's error text.
+// scrub replaces the passwords of every element in a driver's error text.
 func (s *Spec) scrub(t string) string {
-	if s.secret == "" {
-		return t
-	}
-	t = strings.ReplaceAll(t, s.secret, "xxxxx")
-	if e := url.QueryEscape(s.secret); e != s.secret {
-		t = strings.ReplaceAll(t, e, "xxxxx")
-	}
-	if e := url.PathEscape(s.secret); e != s.secret {
-		t = strings.ReplaceAll(t, e, "xxxxx")
+	for _, p := range s.secrets {
+		for _, f := range []string{p, url.QueryEscape(p), url.PathEscape(p), url.UserPassword("", p).String()[1:]} {
+			if f != "" {
+				t = strings.ReplaceAll(t, f, "xxxxx")
+			}
+		}
 	}
 	return t
 }
 
-// Err is a destination error with the password scrubbed.
+// Err is a destination error fit to print: a *url.Error (it quotes a URL)
+// becomes a generic text, and the passwords are scrubbed. ErrRunPresent
+// passes as it is (the app tells it apart).
 func (s *Spec) Err(err error) error {
-	if err == nil {
-		return nil
+	if err == nil || errors.Is(err, ErrRunPresent) {
+		return err
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return errors.New("a server URL does not parse")
 	}
 	return errors.New(s.scrub(err.Error()))
 }
+
+// ErrRunPresent: the destination already holds records of this --run in
+// the window (PostgreSQL, SQLite), found before anything is sent: the count
+// would mix the two runs (exit 2, SPEC §10.3).
+var ErrRunPresent = errors.New("--run already present at the destination; use another --run")
 
 // Open returns the destination of s for the run, reading from since on.
 func (s *Spec) Open(run string, since time.Time) Dest {
@@ -181,14 +226,47 @@ func (s *Spec) Open(run string, since time.Time) Dest {
 	return &sqliteDest{s: s, run: run, since: since}
 }
 
-// Counter is what a destination holds of the run.
+// Counter is what a destination holds of the run: the copies of each seq
+// produced in a vector (review of 2026-11-07, item 10: a map[uint64]uint32
+// rebuilt at every full read cost ~40 bytes a seq; now 1 byte), the extra
+// copies summed as they come, and the seqs of the run that were never
+// produced in a small map.
 type Counter struct {
-	Copies     map[uint64]uint32
+	copies     []uint8 // index seq-1, seq 1..produced; saturating at 255
+	extra      uint64  // copies beyond the first, every seq
+	beyond     map[uint64]uint32
 	Unparsable uint64
 }
 
-// NewCounter returns an empty counter.
-func NewCounter() *Counter { return &Counter{Copies: map[uint64]uint32{}} }
+// NewCounter returns an empty counter for the seqs 1..produced.
+func NewCounter(produced uint64) *Counter {
+	return &Counter{copies: make([]uint8, produced), beyond: map[uint64]uint32{}}
+}
+
+// Count is how many copies of seq were counted (saturating at 255 for a seq
+// produced).
+func (c *Counter) Count(seq uint64) uint32 {
+	if seq >= 1 && seq <= uint64(len(c.copies)) {
+		return uint32(c.copies[seq-1])
+	}
+	return c.beyond[seq]
+}
+
+func (c *Counter) add(n uint64) {
+	if n >= 1 && n <= uint64(len(c.copies)) {
+		if c.copies[n-1] > 0 {
+			c.extra++
+		}
+		if c.copies[n-1] < 255 {
+			c.copies[n-1]++
+		}
+		return
+	}
+	if c.beyond[n] > 0 {
+		c.extra++
+	}
+	c.beyond[n]++
+}
 
 // AddSeq counts one record whose fields.seq is text (a JSON number's text, or
 // a string's value).
@@ -198,7 +276,7 @@ func (c *Counter) AddSeq(text string) {
 		c.Unparsable++
 		return
 	}
-	c.Copies[n]++
+	c.add(n)
 }
 
 // jlh is the part of an envelope the check reads.
@@ -267,9 +345,10 @@ func (t *Tracker) snapshot(produced uint64) []uint8 {
 	return out
 }
 
-// Result is the "verify" object of the report (SPEC §10.4). The names
-// follow go-syslog-injector's (expected, found, lost, duplicated,
-// unexpected, lost_seqs, waited, complete, error).
+// Result is the "verify" object of the report (SPEC §10.4). The names and
+// their meaning follow go-syslog-injector's (expected = successes,
+// duplicated = copies beyond the first, unexpected = seqs of the run found
+// that are no success; aligned in the review of 2026-11-07).
 type Result struct {
 	Destination      string   `json:"destination"`
 	Run              string   `json:"run"`
@@ -280,7 +359,6 @@ type Result struct {
 	Found            uint64   `json:"found"`
 	Lost             uint64   `json:"lost"`
 	Duplicated       uint64   `json:"duplicated"`
-	ExtraCopies      uint64   `json:"extra_copies"`
 	FailedFound      uint64   `json:"failed_found"`
 	FailedMissing    uint64   `json:"failed_missing"`
 	Unexpected       uint64   `json:"unexpected"`
@@ -293,10 +371,11 @@ type Result struct {
 	Failed bool `json:"-"`
 }
 
-// Bad says the destination does not hold exactly the successful messages
-// (exit 1).
+// Bad says the destination lost or doubled a successful message (exit 1).
+// unexpected and unparsable are informative, as in go-syslog-injector: a
+// failure the server processed anyway is already a failure in the report.
 func (r *Result) Bad() bool {
-	return r.Lost > 0 || r.Duplicated > 0 || r.Unexpected > 0 || r.Unparsable > 0
+	return r.Lost > 0 || r.Duplicated > 0
 }
 
 const (
@@ -329,9 +408,10 @@ func Classify(states []uint8, c *Counter) Result {
 	var r Result
 	var rs, rl uint64
 	full := false
+	var dups, unexp []uint64
 	for i, st := range states {
 		seq := uint64(i + 1)
-		n := c.Copies[seq]
+		n := c.Count(seq)
 		switch {
 		case st == 1 && n > 0:
 			r.Expected++
@@ -345,25 +425,30 @@ func Classify(states []uint8, c *Counter) Result {
 			}
 		case n > 0:
 			r.FailedFound++
+			r.Unexpected++
+			if len(unexp) < sampleMax {
+				unexp = append(unexp, seq)
+			}
 		default:
 			r.FailedMissing++
+		}
+		if n > 1 && len(dups) < sampleMax {
+			dups = append(dups, seq)
 		}
 	}
 	if rl != 0 && !full {
 		r.LostSeqs = append(r.LostSeqs, rangeText(rs, rl))
 	}
-	var dups, unexp []uint64
-	for seq, n := range c.Copies {
-		if seq > uint64(len(states)) {
-			r.Unexpected++
-			unexp = append(unexp, seq)
-		}
+	// Seqs of the run that were never produced (0 is unparsable): beyond the
+	// last, or produced by a reused --run (SPEC §10.1).
+	for seq, n := range c.beyond {
+		r.Unexpected++
+		unexp = append(unexp, seq)
 		if n > 1 {
-			r.Duplicated++
-			r.ExtraCopies += uint64(n - 1)
 			dups = append(dups, seq)
 		}
 	}
+	r.Duplicated = c.extra
 	r.DuplicatedSample = sample(dups)
 	r.UnexpectedSample = sample(unexp)
 	r.Unparsable = c.Unparsable
@@ -386,14 +471,14 @@ func Run(ctx context.Context, s *Spec, d Dest, run string, t *Tracker, produced 
 	start := time.Now()
 	deadline := start.Add(timeout)
 	states := t.snapshot(produced)
-	c := NewCounter()
+	c := NewCounter(produced)
 	var r Result
 	var reads uint64
 	var lastErr error
 	good, settled := false, false
 	for {
 		if !d.Incremental() {
-			c = NewCounter()
+			c = NewCounter(produced)
 		}
 		rctx, cancel := context.WithDeadline(ctx, deadline.Add(5*time.Second))
 		err := d.Read(rctx, c)

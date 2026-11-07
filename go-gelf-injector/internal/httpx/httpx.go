@@ -1,11 +1,15 @@
 // Package httpx finds the HTTP/1.x requests inside a reassembled TCP stream
-// (SPEC §6.5; copied from go-webhook-injector, whose SPEC §6.6 it follows):
-// pipelined requests one after the other, bodies by
-// Content-Length or chunked, and resynchronization on the next request line
-// after a capture gap or from a capture that began inside a connection.
+// (SPEC §6.5; copied from go-webhook-injector, whose SPEC §6.6 it follows --
+// ported again on 2026-11-07 with the request-line bound of 1 MiB, the
+// incremental chunked search and the linear resynchronization, alignment
+// 8(f) of the review; WI's h2c replay is left out, GELF has no h2c):
+// pipelined requests one after the other, bodies by Content-Length or
+// chunked, and resynchronization on the next request line after a capture
+// gap or from a capture that began inside a connection.
 //
-// net/http does the parsing (http.ReadRequest), so a request is extracted
-// exactly when the server's own parser would read one.
+// net/http validates an HTTP/1.x head (http.ReadRequest), so a request is
+// extracted exactly when the server's own parser would read one; the fields
+// are then read again by an own parser that keeps their order (WI SPEC §5.5).
 package httpx
 
 import (
@@ -14,6 +18,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httputil"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +29,11 @@ type Request struct {
 	Method string
 	URI    string // the request-target as captured (path and query)
 	Proto  string
+	// Header is the canonical map (Host and Transfer-Encoding put back).
 	Header http.Header
+	// Fields are the header fields in capture order, the names as written
+	// (lowercase for HTTP/2), one entry per field line (WI SPEC §5.5).
+	Fields [][2]string
 	Body   []byte
 }
 
@@ -37,7 +46,7 @@ const resyncWindow = 64
 
 // Stats counts what the extractor did over all streams.
 type Stats struct {
-	Requests     uint64
+	Requests     uint64 // HTTP/1.x requests
 	HTTPStreams  uint64 // client directions that carried HTTP/1.x
 	Responses    uint64 // server directions (HTTP/1.x responses), ignored
 	H2C          uint64 // h2c prior-knowledge directions, not replayed
@@ -56,6 +65,21 @@ const (
 	mIgnore
 )
 
+// partial remembers, for the request at the start of the buffer, how far the
+// search has gone, so the next segment continues from there instead of
+// rescanning the buffer (WI SPEC §6.6: the quadratic cost of a large chunked
+// body arriving slowly). It is reset whenever the start of the buffer moves.
+type partial struct {
+	lineScan int           // the request line has no LF before this offset
+	headScan int           // the head has no blank line before this offset
+	head     int           // > 0: the head ends here and was validated
+	hr       *http.Request // the validated head
+	fields   [][2]string
+	chunked  bool
+	cl       int // Content-Length (not chunked)
+	chunkAt  int // chunked: offset, from head, of the next unproven size line
+}
+
 // Stream implements pcap.StreamHandler for one direction.
 type Stream struct {
 	st     *Stats
@@ -64,6 +88,7 @@ type Stream struct {
 	resync bool
 	buf    []byte
 	need   int // do not reparse before the buffer has this many bytes
+	p      partial
 	ts     time.Time
 	ended  bool
 	// midWord: the buffer was cut inside an uppercase word, so its first
@@ -100,6 +125,7 @@ func (s *Stream) Gap(int) {
 		s.buf = s.buf[:0]
 	}
 	s.need, s.midWord = 0, false
+	s.p = partial{}
 	if !s.resync {
 		s.resync = true
 		s.st.Resyncs++
@@ -129,13 +155,21 @@ func (s *Stream) End() {
 	}
 }
 
+// shift drops n bytes from the start of the buffer and forgets the search
+// state of the request that was there.
+func (s *Stream) shift(n int) {
+	s.buf = s.buf[n:]
+	s.need = 0
+	s.p = partial{}
+}
+
 func (s *Stream) run(final bool) {
 	for len(s.buf) > 0 && s.mode != mIgnore {
 		if s.need > 0 && len(s.buf) < s.need && !final {
 			return
 		}
 		if s.mode == mDetect && !s.resync {
-			switch kind := lineKind(s.buf); kind {
+			switch kind := lineKind(s.buf, &s.p.lineScan); kind {
 			case lkNeed:
 				if !final {
 					return
@@ -165,13 +199,12 @@ func (s *Stream) run(final bool) {
 			}
 			continue
 		}
-		req, n, need, err := parse(s.buf)
+		req, n, need, err := parse(s.buf, &s.p)
 		switch {
 		case err == nil:
 			s.st.Requests++
 			s.emit(req, s.ts)
-			s.buf = s.buf[n:]
-			s.need = 0
+			s.shift(n)
 		case errors.Is(err, errIncomplete):
 			if len(s.buf) > MaxRequest {
 				s.st.TooLarge++
@@ -192,8 +225,7 @@ func (s *Stream) run(final bool) {
 func (s *Stream) dropAndResync() {
 	// Skip one byte so the search does not find the same broken start.
 	s.st.SkippedBytes++
-	s.buf = s.buf[1:]
-	s.need = 0
+	s.shift(1)
 	s.resync = true
 	s.st.Resyncs++
 }
@@ -205,16 +237,60 @@ func (s *Stream) dropAndResync() {
 // pipelined request follows its predecessor's body with no separator, so a
 // capture that began inside that body finds the next request mid-line.
 func (s *Stream) sync(final bool) bool {
+	// lf is the next LF at or after the candidate (len(buf) when there is
+	// none), blank the LF that starts the next blank line (len(buf): none
+	// up to the end). Every candidate between two LFs shares them, so the
+	// search for each is not redone from every candidate: 1 MiB without an
+	// LF, a candidate every few bytes, was quadratic (7.7 s; 3 MiB 34.6 s;
+	// review of 2026-11-07).
+	lf, blank := -1, -1
 	for i := 0; i < len(s.buf); i++ {
 		if !isUpper(s.buf[i]) || i > 0 && isUpper(s.buf[i-1]) || i == 0 && s.midWord {
 			continue
 		}
-		switch lineKind(s.buf[i:]) {
+		// The candidate at the start keeps its search state; any other one
+		// starts fresh, from the shared LF positions.
+		var p partial
+		if i == 0 {
+			p = s.p
+		}
+		if lf < i {
+			// The candidate at the start already searched up to its scan.
+			from := i + min(p.lineScan, len(s.buf)-i)
+			if j := bytes.IndexByte(s.buf[from:], '\n'); j >= 0 {
+				lf = from + j
+				lfScanned += j + 1
+			} else {
+				lf = len(s.buf)
+				lfScanned += len(s.buf) - from
+			}
+		}
+		p.lineScan = max(p.lineScan, lf-i)
+		switch lineKind(s.buf[i:], &p.lineScan) {
 		case lkRequest:
-			_, _, _, err := parse(s.buf[i:])
+			if blank < i {
+				if j := headEnd(s.buf, i); j >= 0 {
+					blank = j - 2 // the LF of "\n\n" or of "\n\r\n"
+					if s.buf[blank] != '\n' {
+						blank--
+					}
+				} else {
+					blank = len(s.buf)
+				}
+			}
+			if p.head == 0 {
+				// headEnd keeps the last three bytes in view, as parse does.
+				p.headScan = max(p.headScan, min(blank, len(s.buf)-3)-i)
+			}
+			_, _, need, err := parse(s.buf[i:], &p)
 			if err == nil || (errors.Is(err, errIncomplete) && !final) {
 				s.st.SkippedBytes += uint64(i)
 				s.buf = s.buf[i:]
+				s.p = p
+				s.need = 0
+				if err != nil {
+					s.need = need
+				}
 				s.resync, s.midWord = false, false
 				if s.mode == mDetect {
 					s.mode = mHTTP
@@ -224,6 +300,7 @@ func (s *Stream) sync(final bool) bool {
 		case lkNeed:
 			if !final {
 				s.keepFrom(i)
+				s.p = p
 				return false
 			}
 		}
@@ -257,6 +334,7 @@ func (s *Stream) keepFrom(i int) {
 	s.midWord = false
 	s.st.SkippedBytes += uint64(i)
 	s.buf = append(s.buf[:0], s.buf[i:]...)
+	s.p = partial{}
 }
 
 type lk uint8
@@ -269,9 +347,28 @@ const (
 	lkOther
 )
 
-// lineKind classifies the first line: "METHOD SP target SP HTTP/1.x".
-func lineKind(b []byte) lk {
-	if bytes.HasPrefix(b, []byte("PRI * HTTP/2.0")) {
+// lfScanned counts the bytes searched for the LF of a request line, for the
+// test that proves the resynchronization is linear (TestResyncLinear). A
+// stream is parsed by one goroutine, the source's.
+var lfScanned int
+
+// headParses counts the heads given to net/http, for the same test: the
+// candidates inside one long line must not each parse it.
+var headParses int
+
+// lineKind classifies the first line: "METHOD SP target SP HTTP/1.x". scan
+// remembers how far the LF was searched for, so a long line arriving in
+// pieces is not rescanned.
+//
+// A line without its LF holds the decision up to maxHead, the same bound the
+// head has in parse: the limit must refuse a candidate the same way whether
+// it arrived whole or in pieces (WI SPEC §6.6; 16 KiB here made a 20 KiB line
+// accepted in one segment and refused in pieces).
+func lineKind(b []byte, scan *int) lk {
+	if bytes.HasPrefix(b, []byte("PRI * HTTP/2.0")) || len(b) < 14 && bytes.HasPrefix([]byte("PRI * HTTP/2.0"), b) {
+		if len(b) < 14 {
+			return lkNeed
+		}
 		return lkH2C
 	}
 	if len(b) >= 5 && string(b[:5]) == "HTTP/" {
@@ -290,20 +387,44 @@ func lineKind(b []byte) lk {
 	if i == 0 || b[i] != ' ' {
 		return lkOther
 	}
-	end := bytes.IndexByte(b, '\n')
+	from := min(*scan, len(b))
+	end := bytes.IndexByte(b[from:], '\n')
 	if end < 0 {
-		if len(b) > 16<<10 {
+		lfScanned += len(b) - from
+		*scan = len(b)
+		if len(b) > maxHead {
 			return lkOther
 		}
 		return lkNeed
 	}
-	line := bytes.TrimSuffix(b[:end], []byte("\r"))
-	sp := bytes.LastIndexByte(line, ' ')
-	if sp <= i {
+	lfScanned += end + 1
+	end += from
+	if end > maxHead {
 		return lkOther
 	}
-	proto := line[sp+1:]
-	if string(proto) != "HTTP/1.1" && string(proto) != "HTTP/1.0" {
+	line := bytes.TrimSuffix(b[:end], []byte("\r"))
+	// The version is the word after the last space: the line ends in
+	// " HTTP/1.x". Looked at from the end only -- a search for the last
+	// space ran over the whole line for each candidate inside it
+	// (quadratic resynchronization, review of 2026-11-07).
+	const v = len(" HTTP/1.1")
+	if len(line) < v || len(line)-v <= i || line[len(line)-v] != ' ' {
+		return lkOther
+	}
+	if proto := string(line[len(line)-v+1:]); proto != "HTTP/1.1" && proto != "HTTP/1.0" {
+		return lkOther
+	}
+	// One target between the method and the version, with no space: net/http
+	// refuses any other line. Searched from the method on, the search stops
+	// at the next word, so the candidates of one long line ("A A A ... /x
+	// HTTP/1.1") cost their own words only, not a parse of the line each.
+	j := bytes.IndexByte(line[i+1:], ' ')
+	if j < 0 {
+		lfScanned += len(line) - i - 1
+		return lkOther
+	}
+	lfScanned += j + 1
+	if i+1+j != len(line)-v || j == 0 {
 		return lkOther
 	}
 	return lkRequest
@@ -320,69 +441,84 @@ var (
 // maxHead bounds a request head (net/http's own default is 1 MiB).
 const maxHead = 1 << 20
 
-// chunkedEnd returns the length of the chunked body at the start of b (the
-// last chunk and the trailer included), errIncomplete when b ends before it
-// does, or an error when it is malformed.
-func chunkedEnd(b []byte) (int, error) {
-	line := func(at int) (string, int, error) {
-		i := bytes.IndexByte(b[at:], '\n')
+// maxChunkLine bounds a chunk size line or a trailer line.
+const maxChunkLine = 4096
+
+// chunkLines counts the size and trailer lines read, for the test that
+// proves the search is incremental (TestChunkedIncremental). A stream is
+// parsed by one goroutine, the source's.
+var chunkLines int
+
+// chunkedEnd finds the end of the chunked body at the start of b (the last
+// chunk and the trailer included), resuming at offset at, the start of a
+// size line already known to begin there. On errIncomplete it returns where
+// to resume (the size line that could not be completed) and need, the length
+// b must reach before a retry can make progress: the data of a chunk is
+// never read, only jumped over.
+func chunkedEnd(b []byte, at int) (end, resume, need int, err error) {
+	line := func(from int) (string, int, error) {
+		chunkLines++
+		i := bytes.IndexByte(b[from:], '\n')
 		if i < 0 {
-			if len(b)-at > 4096 {
+			if len(b)-from > maxChunkLine {
 				return "", 0, errors.New("chunked: line too long")
 			}
 			return "", 0, errIncomplete
 		}
-		return string(bytes.TrimSuffix(b[at:at+i], []byte("\r"))), at + i + 1, nil
+		// The same bound whether the line came whole or in pieces.
+		if i > maxChunkLine {
+			return "", 0, errors.New("chunked: line too long")
+		}
+		return string(bytes.TrimSuffix(b[from:from+i], []byte("\r"))), from + i + 1, nil
 	}
-	at := 0
 	for {
 		l, next, err := line(at)
 		if err != nil {
-			return 0, err
+			return 0, at, len(b) + 1, err
 		}
 		if i := strings.IndexByte(l, ';'); i >= 0 {
 			l = l[:i]
 		}
 		size, err := strconv.ParseUint(strings.TrimSpace(l), 16, 63)
 		if err != nil {
-			return 0, errors.New("chunked: bad size line")
+			return 0, at, 0, errors.New("chunked: bad size line")
 		}
-		at = next
 		if size == 0 {
+			t := next
 			for {
-				l, next, err := line(at)
+				l, n, err := line(t)
 				if err != nil {
-					return 0, err
+					return 0, at, len(b) + 1, err
 				}
-				at = next
+				t = n
 				if l == "" {
-					return at, nil
+					return t, at, 0, nil
 				}
 			}
 		}
 		if size > MaxRequest {
-			return 0, errors.New("chunked: chunk too large")
+			return 0, at, 0, errors.New("chunked: chunk too large")
 		}
-		end := at + int(size)
+		e := next + int(size)
 		switch {
-		case len(b) < end+1:
-			return 0, errIncomplete
-		case b[end] == '\n':
-			at = end + 1
-		case b[end] == '\r' && len(b) < end+2:
-			return 0, errIncomplete
-		case b[end] == '\r' && b[end+1] == '\n':
-			at = end + 2
+		case len(b) < e+1:
+			return 0, at, e + 1, errIncomplete
+		case b[e] == '\n':
+			at = e + 1
+		case b[e] == '\r' && len(b) < e+2:
+			return 0, at, e + 2, errIncomplete
+		case b[e] == '\r' && b[e+1] == '\n':
+			at = e + 2
 		default:
-			return 0, errors.New("chunked: missing CRLF after data")
+			return 0, at, 0, errors.New("chunked: missing CRLF after data")
 		}
 	}
 }
 
 // headEnd returns the offset just past the blank line that ends the head,
-// or -1.
-func headEnd(b []byte) int {
-	for i := 0; i < len(b); i++ {
+// or -1. The search starts at from (no end before it).
+func headEnd(b []byte, from int) int {
+	for i := max(from, 0); i < len(b); i++ {
 		if b[i] != '\n' {
 			continue
 		}
@@ -396,86 +532,109 @@ func headEnd(b []byte) int {
 	return -1
 }
 
-type counter struct {
-	r *bytes.Reader
-	n int
-}
-
-func (c *counter) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += n
-	return n, err
-}
-
-// parse reads one request at the start of b. n is its length; need, on
-// errIncomplete, is a lower bound for the buffer size worth retrying at.
-func parse(b []byte) (req *Request, n, need int, err error) {
-	// The head must be whole before net/http sees it: on a head cut in the
-	// middle of a line its parser reports a malformed header, not "more
-	// data", and the stream would drop a request that was only incomplete.
-	if headEnd(b) < 0 {
-		if len(b) > maxHead {
-			return nil, 0, 0, errors.New("request head too large")
-		}
-		return nil, 0, len(b) + 1, errIncomplete
-	}
-	c := &counter{r: bytes.NewReader(b)}
-	br := bufio.NewReaderSize(c, 4096)
-	hr, err := http.ReadRequest(br)
-	if err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+// parse reads one request at the start of b, resuming the search recorded
+// in p. n is its length; need, on errIncomplete, is a lower bound for the
+// buffer size worth retrying at.
+func parse(b []byte, p *partial) (req *Request, n, need int, err error) {
+	if p.head == 0 {
+		// The head must be whole before net/http sees it: on a head cut in
+		// the middle of a line its parser reports a malformed header, not
+		// "more data", and the stream would drop a request that was only
+		// incomplete.
+		h := headEnd(b, p.headScan)
+		if h < 0 {
+			if len(b) > maxHead {
+				return nil, 0, 0, errors.New("request head too large")
+			}
+			// The last three bytes may start the blank line.
+			p.headScan = max(len(b)-3, 0)
 			return nil, 0, len(b) + 1, errIncomplete
 		}
-		return nil, 0, 0, err
+		if h > maxHead {
+			// Refused whole as it would be in pieces (WI SPEC §6.6).
+			return nil, 0, 0, errors.New("request head too large")
+		}
+		headParses++
+		hr, err := http.ReadRequest(bufio.NewReaderSize(bytes.NewReader(b[:h]), 4096))
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		if hr.ContentLength > MaxRequest {
+			return nil, 0, 0, errTooLarge
+		}
+		p.head, p.hr = h, hr
+		p.fields = headerFields(b[:h])
+		p.chunked = len(hr.TransferEncoding) > 0
+		p.cl = int(max(hr.ContentLength, 0))
+		p.chunkAt = 0
 	}
-	head := c.n - br.Buffered()
-	if hr.ContentLength > MaxRequest {
-		return nil, 0, 0, errTooLarge
-	}
-	// A chunked body cut inside a size line or the trailer reads as
-	// malformed to net/http, so its end is found here first.
-	if len(hr.TransferEncoding) > 0 {
-		if _, err := chunkedEnd(b[head:]); err != nil {
+	h := p.head
+	var body []byte
+	if p.chunked {
+		// A chunked body cut inside a size line or the trailer reads as
+		// malformed to net/http, so its end is found here first.
+		end, at, need, err := chunkedEnd(b[h:], p.chunkAt)
+		if err != nil {
 			if errors.Is(err, errIncomplete) {
-				return nil, 0, len(b) + 1, errIncomplete
+				p.chunkAt = at
+				return nil, 0, min(h+need, MaxRequest+1), errIncomplete
 			}
 			return nil, 0, 0, err
 		}
-	}
-	body, err := io.ReadAll(hr.Body)
-	if err != nil {
-		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-			need = len(b) + 1
-			if hr.ContentLength > 0 {
-				need = max(need, head+int(hr.ContentLength))
-			}
-			need = min(need, MaxRequest+1)
-			return nil, 0, need, errIncomplete
+		body, err = io.ReadAll(httputil.NewChunkedReader(bytes.NewReader(b[h : h+end])))
+		if err != nil {
+			return nil, 0, 0, err
 		}
-		return nil, 0, 0, err
+		n = h + end
+	} else {
+		if len(b) < h+p.cl {
+			return nil, 0, min(h+p.cl, MaxRequest+1), errIncomplete
+		}
+		body = append([]byte(nil), b[h:h+p.cl]...)
+		n = h + p.cl
 	}
-	n = c.n - br.Buffered()
-	h := hr.Header.Clone()
+	hr := p.hr
+	hdr := hr.Header.Clone()
 	if hr.Host != "" {
-		h.Set("Host", hr.Host)
+		hdr.Set("Host", hr.Host)
 	}
 	// What net/http folded into fields is put back as headers, so the replay
 	// can decide about each one.
 	if len(hr.TransferEncoding) > 0 {
-		h.Set("Transfer-Encoding", joinComma(hr.TransferEncoding))
+		hdr.Set("Transfer-Encoding", strings.Join(hr.TransferEncoding, ", "))
 	}
-	return &Request{Method: hr.Method, URI: hr.RequestURI, Proto: hr.Proto, Header: h, Body: body}, n, 0, nil
+	return &Request{Method: hr.Method, URI: hr.RequestURI, Proto: hr.Proto, Header: hdr, Fields: p.fields, Body: body}, n, 0, nil
 }
 
-func joinComma(v []string) string {
-	var b bytes.Buffer
-	for i, s := range v {
-		if i > 0 {
-			b.WriteString(", ")
+// headerFields reads the field lines of a head already validated by
+// net/http, in order and with the names as written. An obs-fold line is
+// joined to the previous value with a space, as net/http does.
+func headerFields(head []byte) [][2]string {
+	var out [][2]string
+	lines := bytes.Split(head, []byte("\n"))
+	for _, l := range lines[1:] {
+		l = bytes.TrimSuffix(l, []byte("\r"))
+		if len(l) == 0 {
+			break
 		}
-		b.WriteString(s)
+		if l[0] == ' ' || l[0] == '\t' {
+			if len(out) > 0 {
+				v := strings.Trim(string(l), " \t")
+				if out[len(out)-1][1] == "" {
+					out[len(out)-1][1] = v
+				} else if v != "" {
+					out[len(out)-1][1] += " " + v
+				}
+			}
+			continue
+		}
+		name, value, ok := bytes.Cut(l, []byte(":"))
+		if !ok {
+			continue
+		}
+		out = append(out, [2]string{string(name), strings.Trim(string(value), " \t")})
 	}
-	return b.String()
+	return out
 }
 
 // Kind is what the first bytes of a direction look like.
@@ -491,4 +650,7 @@ const (
 
 // Classify tells what the first line of b is, with the rule NewStream uses
 // on a direction that starts at its beginning.
-func Classify(b []byte) Kind { return Kind(lineKind(b)) }
+func Classify(b []byte) Kind {
+	var scan int
+	return Kind(lineKind(b, &scan))
+}

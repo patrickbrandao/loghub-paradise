@@ -124,10 +124,11 @@ func (d *natsDest) Close() {
 // ---- PostgreSQL loghub.inbox (go-gelf-server SPEC §3.7.1) ----
 
 type pgDest struct {
-	s     *Spec
-	run   string
-	since time.Time
-	conn  *pgx.Conn
+	s       *Spec
+	run     string
+	since   time.Time
+	conn    *pgx.Conn
+	checked bool // the --run was checked absent (once, before the send)
 }
 
 func (d *pgDest) Incremental() bool { return false }
@@ -144,6 +145,22 @@ func (d *pgDest) Check(ctx context.Context) error {
 	// role has only SELECT (uuid), SPEC §10.2).
 	if _, err := conn.Exec(cctx, `SELECT uuid, type, payload FROM loghub.inbox LIMIT 0`); err != nil {
 		return fmt.Errorf("postgres: loghub.inbox: %w", err)
+	}
+	if !d.checked {
+		// A --run reused within the window would mix two runs in the count
+		// (review of 2026-11-07, decision of the integrator): refused
+		// before anything is sent. Once only: a reconnect during the wait
+		// finds this run's own records.
+		var used bool
+		if err := conn.QueryRow(cctx, `SELECT EXISTS (SELECT 1 FROM loghub.inbox
+			WHERE uuid >= $1::uuid AND type = 'gelf' AND space = $3 AND payload->'fields'->>'run' = $2)`,
+			uuidFloor(d.since), d.run, d.s.space).Scan(&used); err != nil {
+			return fmt.Errorf("postgres: %w", err)
+		}
+		if used {
+			return ErrRunPresent
+		}
+		d.checked = true
 	}
 	return nil
 }
@@ -273,10 +290,11 @@ func (d *redisDest) Close() {
 // ---- SQLite gelf_events (go-gelf-server SPEC §3.7, §10.4) ----
 
 type sqliteDest struct {
-	s     *Spec
-	run   string
-	since time.Time
-	db    *sql.DB
+	s       *Spec
+	run     string
+	since   time.Time
+	db      *sql.DB
+	checked bool // the --run was checked absent (once, before the send)
 }
 
 func (d *sqliteDest) Incremental() bool { return false }
@@ -298,6 +316,19 @@ func (d *sqliteDest) Check(ctx context.Context) error {
 	defer cancel()
 	if _, err := db.ExecContext(cctx, `SELECT uuid, env FROM gelf_events LIMIT 0`); err != nil {
 		return fmt.Errorf("sqlite: gelf_events: %w", err)
+	}
+	if !d.checked {
+		// As in PostgreSQL: a reused --run is refused before the send.
+		var used bool
+		if err := db.QueryRowContext(cctx, `SELECT EXISTS (SELECT 1 FROM gelf_events WHERE uuid >= ? AND space = ?
+			AND CAST(json_extract(CAST(env AS TEXT), '$.payload.fields.run') AS TEXT) = ?)`,
+			uuidFloor(d.since), d.s.space, d.run).Scan(&used); err != nil {
+			return fmt.Errorf("sqlite: %w", err)
+		}
+		if used {
+			return ErrRunPresent
+		}
+		d.checked = true
 	}
 	return nil
 }

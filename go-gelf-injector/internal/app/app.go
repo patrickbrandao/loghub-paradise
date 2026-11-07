@@ -530,6 +530,11 @@ func verifySpec(c *config) (*verify.Spec, error) {
 	} else if s, err = verify.Parse(c.verifyURL, c.verifySpace, c.verifyKey); err != nil {
 		return nil, err
 	}
+	if c.verifyCA != "" && (s.Kind == "postgres" || s.Kind == "sqlite") {
+		// PostgreSQL takes its CA in the URL; a file has no TLS (as in
+		// go-webhook-injector, 2026-11-07).
+		return nil, errors.New("--verify-tls-ca is for NATS and Redis/Valkey; PostgreSQL takes sslrootcert= in the URL")
+	}
 	if c.verifyCA != "" {
 		pem, err := os.ReadFile(c.verifyCA)
 		if err != nil {
@@ -616,6 +621,9 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 		defer dest.Close()
 		if err := dest.Check(ctx); err != nil {
 			fmt.Fprintf(stderr, "%s: --verify: %v\n", Name, r.verify.Err(err))
+			if errors.Is(err, verify.ErrRunPresent) {
+				return ExitUsage // nothing sent: another --run is the fix
+			}
 			return ExitVerifyError
 		}
 		tracker = &verify.Tracker{}
