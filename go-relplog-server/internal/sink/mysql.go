@@ -135,14 +135,14 @@ func checkQuotedName(what, name string) error {
 	// UTF-8 the server itself created (CREATE DATABASE `日本…`, 25 characters
 	// in 75 bytes) was refused here (go-syslog-server review, 2026-10-13).
 	if n := utf8.RuneCountInString(name); n > 64 {
-		return fmt.Errorf("%s %q has %d characters; the limit is 64", what, name, n)
+		return fmt.Errorf("%s has %d characters; the limit is 64", what, n)
 	}
 	for i := 0; i < len(name); i++ {
 		switch c := name[i]; {
 		case c == '`' || c == '\\':
-			return fmt.Errorf("%s %q has %q, which cannot appear between the backticks of the INSERT", what, name, c)
+			return fmt.Errorf("%s has %q, which cannot appear between the backticks of the INSERT", what, c)
 		case c < 0x20 || c == 0x7f:
-			return fmt.Errorf("%s %q has the control byte 0x%02x", what, name, c)
+			return fmt.Errorf("%s has the control byte 0x%02x", what, c)
 		}
 	}
 	return nil
@@ -199,7 +199,7 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 		cfg.Table = "syslog_events"
 	}
 	if !mysqlIdent.MatchString(cfg.Table) {
-		return nil, fmt.Errorf("sink mysql: table %q is not a plain identifier", cfg.Table)
+		return nil, errors.New("sink mysql: the table is not a plain identifier")
 	}
 	if err := checkQuotedName("sink mysql: database", cfg.Database); err != nil {
 		return nil, err
@@ -215,7 +215,7 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	} else {
 		h, _, err := net.SplitHostPort(cfg.Addr)
 		if err != nil {
-			return nil, fmt.Errorf("sink mysql: addr %q: %w", cfg.Addr, err)
+			return nil, errors.New("sink mysql: addr is not host:port")
 		}
 		host = h
 		mc.Net, mc.Addr = "tcp", cfg.Addr

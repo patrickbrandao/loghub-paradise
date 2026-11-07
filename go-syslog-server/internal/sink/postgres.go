@@ -169,7 +169,7 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 		cfg.Table = DefaultPostgresTable
 	}
 	if !pgIdent.MatchString(cfg.Table) {
-		return nil, fmt.Errorf("sink postgres: table %q is not a plain lowercase identifier", cfg.Table)
+		return nil, errors.New("sink postgres: the table is not a plain lowercase identifier")
 	}
 	host, port, err := splitPostgresAddr(cfg.Addr)
 	if err != nil {
@@ -302,11 +302,11 @@ func splitPostgresAddr(addr string) (host string, port uint16, err error) {
 		if strings.HasPrefix(addr, "/") {
 			return addr, 5432, nil
 		}
-		return "", 0, fmt.Errorf("sink postgres: addr %q: %w", addr, serr)
+		return "", 0, errors.New("sink postgres: addr is not host:port")
 	}
 	n, perr := strconv.ParseUint(ps, 10, 16)
 	if perr != nil || n == 0 {
-		return "", 0, fmt.Errorf("sink postgres: addr %q: bad port", addr)
+		return "", 0, errors.New("sink postgres: addr has a bad port")
 	}
 	return h, uint16(n), nil
 }

@@ -10,8 +10,9 @@
 #
 #   docker compose -f compose.none-valkey.yml up -d --build
 #
-# Publicado no host: syslog 5153/udp e 5153/tcp (SYSLOG_PORT), TLS 16513
-# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19113 (SYSLOG_ADMIN_PORT).
+# Publicado no host: syslog 5164/udp e 5164/tcp (SYSLOG_PORT), TLS 16524
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19124 (SYSLOG_ADMIN_PORT).
+# Servicos de apoio no host: Valkey 127.0.0.1:16324 (SYSLOG_VALKEY_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: sls-none-valkey

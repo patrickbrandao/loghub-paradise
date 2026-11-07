@@ -161,12 +161,12 @@ type Filter struct {
 func (f Filter) Resolve() (minSeverity int, facilities []int, err error) {
 	sev, ok := ParseSeverity(f.MinSeverity)
 	if !ok {
-		return 0, nil, fmt.Errorf("filter.min_severity: %q is not a severity name or a number 0..7", f.MinSeverity)
+		return 0, nil, fmt.Errorf("filter.min_severity: not a severity name or a number 0..7")
 	}
 	for _, s := range f.Facilities {
 		fac, ok := ParseFacility(s)
 		if !ok {
-			return 0, nil, fmt.Errorf("filter.facilities: %q is not a facility name or a number 0..23", s)
+			return 0, nil, fmt.Errorf("filter.facilities: an entry is not a facility name or a number 0..23")
 		}
 		facilities = append(facilities, fac)
 	}

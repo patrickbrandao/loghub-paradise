@@ -13,10 +13,11 @@
 #   docker compose -f compose.valkey-nats.yml -f compose.emitter.yml --profile demo up -d --build
 #     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
 #
-# Publicado no host: RELP 20532 (RELPLOG_PORT), RELP/TLS 20632 quando ligado
-# (RELPLOG_TLS_PORT), admin 127.0.0.1:9318 (RELPLOG_ADMIN_PORT). Defaults
+# Publicado no host: RELP 20540 (RELPLOG_PORT), RELP/TLS 20640 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9326 (RELPLOG_ADMIN_PORT). Defaults
 # distintos por combinacao, e disjuntos dos do go-syslog-server, para que
 # varias rodem lado a lado no mesmo host (README, "Portas").
+# Servicos de apoio no host: Valkey do ring 127.0.0.1:26426 (RELPLOG_RING_VALKEY_PORT), NATS 127.0.0.1:24226 (RELPLOG_NATS_PORT).
 
 name: rls-valkey-nats
 

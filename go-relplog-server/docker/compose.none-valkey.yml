@@ -16,10 +16,11 @@
 #   docker compose -f compose.none-valkey.yml -f compose.emitter.yml --profile demo up -d --build
 #     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
 #
-# Publicado no host: RELP 20527 (RELPLOG_PORT), RELP/TLS 20627 quando ligado
-# (RELPLOG_TLS_PORT), admin 127.0.0.1:9313 (RELPLOG_ADMIN_PORT). Defaults
+# Publicado no host: RELP 20538 (RELPLOG_PORT), RELP/TLS 20638 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9324 (RELPLOG_ADMIN_PORT). Defaults
 # distintos por combinacao, e disjuntos dos do go-syslog-server, para que
 # varias rodem lado a lado no mesmo host (README, "Portas").
+# Servicos de apoio no host: Valkey 127.0.0.1:26324 (RELPLOG_VALKEY_PORT).
 
 name: rls-none-valkey
 

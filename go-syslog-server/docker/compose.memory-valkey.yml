@@ -10,8 +10,9 @@
 #
 #   docker compose -f compose.memory-valkey.yml up -d --build
 #
-# Publicado no host: syslog 5141/udp e 5141/tcp (SYSLOG_PORT), TLS 16501
-# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19101 (SYSLOG_ADMIN_PORT).
+# Publicado no host: syslog 5163/udp e 5163/tcp (SYSLOG_PORT), TLS 16523
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19123 (SYSLOG_ADMIN_PORT).
+# Servicos de apoio no host: Valkey 127.0.0.1:16323 (SYSLOG_VALKEY_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: sls-memory-valkey

@@ -141,7 +141,7 @@ func validateListeners(c *Config) error {
 			"transport in this server)")
 	}
 	if _, _, err := net.SplitHostPort(c.Listen.TCP); err != nil {
-		return fmt.Errorf("listen.tcp: %q is not host:port (a bare \":20514\" is fine)", c.Listen.TCP)
+		return fmt.Errorf("listen.tcp: not host:port (a bare \":20514\" is fine)")
 	}
 	if c.Listen.TCPListeners < 1 || c.Listen.TCPListeners > maxTCPListeners {
 		return fmt.Errorf("listen.tcp_listeners: %d is outside 1..%d", c.Listen.TCPListeners, maxTCPListeners)
@@ -156,16 +156,16 @@ func validateListeners(c *Config) error {
 				"or admin.enabled=false to turn the admin port off")
 		}
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
-			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
+			return fmt.Errorf("admin.bind: not host:port")
 		}
 		// Refused here, not at boot step 12 after the admin port served the
 		// whole boot -- and on macOS/BSD not even there: SO_REUSEADDR lets
 		// 127.0.0.1:P and *:P coexist, and the admin port silently took
 		// localhost's RELP connections (SPEC §13.2, §14).
 		if sameStreamSocket(c.Listen.TCP, c.Admin.Bind) {
-			return fmt.Errorf("admin.bind (%q) and listen.tcp (%q) are, or may resolve to, the same "+
-				"TCP address: the admin port and RELP cannot share one stream socket (to share a "+
-				"port, use two distinct IP literals)", c.Admin.Bind, c.Listen.TCP)
+			return fmt.Errorf("admin.bind and listen.tcp are, or may resolve to, the same " +
+				"TCP address: the admin port and RELP cannot share one stream socket (to share a " +
+				"port, use two distinct IP literals)")
 		}
 	}
 	return nil
@@ -267,8 +267,8 @@ func validateSyslog(c *Config) error {
 			"the conversion differ between hosts; name the IANA zone (America/Sao_Paulo) or UTC")
 	}
 	if _, err := time.LoadLocation(s.RFC3164Timezone); err != nil {
-		return fmt.Errorf("syslog.rfc3164_timezone: %q is not a known IANA zone: %v",
-			s.RFC3164Timezone, err)
+		return fmt.Errorf("syslog.rfc3164_timezone: not a known IANA zone (a name such as " +
+			"America/Sao_Paulo, or UTC)")
 	}
 	if s.MaxMessageBytes < MinMessageBytes || s.MaxMessageBytes > MaxMessageBytes {
 		return fmt.Errorf("syslog.max_message_bytes: %s is outside 480..16MiB (480 is the "+
@@ -452,8 +452,8 @@ func validateNATS(c *Config) error {
 			"URL's and ignore the key; keep one of them")
 	}
 	if n.Mode == NATSModeJetStream && !natsToken.MatchString(n.Stream) {
-		return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
-			"(no whitespace, dots, wildcards or slashes)", n.Stream)
+		return fmt.Errorf("sink.nats.stream: not a valid stream name " +
+			"(no whitespace, dots, wildcards or slashes)")
 	}
 	// The client library accepts every credential it is given and picks one at
 	// connect time. Two of them in one configuration is a mistake nobody
@@ -478,8 +478,8 @@ func validateNATS(c *Config) error {
 	}
 	for _, tok := range strings.Split(ns, ".") {
 		if !natsToken.MatchString(tok) {
-			return fmt.Errorf("loghub.ctl_namespace: %q is not a publishable subject prefix "+
-				"(dot-separated tokens, no whitespace, no * or >)", ns)
+			return fmt.Errorf("loghub.ctl_namespace: not a publishable subject prefix " +
+				"(dot-separated tokens, no whitespace, no * or >)")
 		}
 	}
 	return nil

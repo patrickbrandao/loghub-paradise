@@ -285,7 +285,12 @@ contra o quê a rodada correu (`server under test: valkey 8.1.11`); a política 
 relida a cada sonda (`TestRedisPolicyIsReadAtEveryCheck`,
 `TestRedisRingPolicyIsReadAtEveryRefresh`: o cliente trocado para o servidor
 `allkeys-lru` faz o papel do `CONFIG SET`, que quebraria os pacotes em
-paralelo).
+paralelo; depois da virada o `Enqueue` do ring é recusado com `ErrUnavailable`
+e o ring fica indisponível, SPEC §9.5). A mesma virada, sem servidor e nos dois
+sentidos (volta a `noeviction` e o ring reabre), é
+`TestRedisRingPolicyFlipMakesItUnavailable`. `TestIdentifyLive` cria um
+usuário ACL sem `INFO` (com o controle: `PING` passa, `INFO` é negado) e exige
+`server=unknown`.
 
 **Sentinel** (opt-in). Primário, réplica e sentinel num contêiner só (um
 namespace de rede), todos em `127.0.0.1` com as mesmas portas dentro e fora:
@@ -328,9 +333,19 @@ docker rm -f t-cl
 Redis 7.4 e Valkey 7.2/8.1 respondem `SELECT is not allowed in cluster mode`,
 Valkey 9 sem `cluster-databases` responde `DB index is out of range`: FATAL em
 milissegundos, com a dica de `cluster-databases`. Os testes de `sink` e `ring`
-no mesmo cluster usam `db=0` e provam sonda, releitura da política (um `Do` à
-parte num cluster: o rueidis entra em pânico num pipeline que mistura comando
-sem chave com comandos de chave) e escrita.
+no mesmo cluster usam `db=0` e provam sonda, releitura da política e escrita
+contra um servidor real. **Um cluster de um nó não distingue nós:** qualquer
+leitura cai no mesmo processo, então ele não prova que a política e a
+identidade vêm do primário dono do stream (SPEC §10.3.1, "Cluster e
+pipeline"). Isso é travado sem servidor, em toda rodada, por
+`internal/rediscli/clustertest` (um `rueidis.Client` que se diz cluster,
+calcula o slot de cada comando e registra os pipelines) e pelos testes
+`TestKeylessReadingsArePinnedToTheStreamOnACluster` (`rediscli`: `Identify`,
+`Check`, o recuo `CONFIG GET`), `TestRedisHealthClusterReadingsArePinned`
+(`sink`: `INFO` atrás do `XLEN` do stream, sonda `XADD` num `Do` à parte) e
+`TestRedisRingClusterReadingsArePinned` (`ring`: um pipeline só, todas as
+chaves no slot da hash tag), que recusam um comando sem chave sozinho,
+misturado com chaves de dois slots (o pânico do rueidis) ou preso a outro slot.
 
 **Resultado da rodada de 2026-11-07** (macOS, Docker Desktop, `-race`;
 `scripts/test-redis-valkey.sh` para a suíte, as receitas acima para Sentinel e
@@ -604,3 +619,26 @@ Registradas por honestidade, não por esquecimento.
     8 KiB quando ociosa" do buffer de quadro vale só entre quadros; a sonda do
     `sink=sqlite` com o passo do relógio simulado; *pool* NATS só de servidores
     que recusam TLS e URL com vários IPs, sem teste.
+
+### Revisão independente de 2026-11-07 (Valkey em S, R, G)
+
+Entrada: `review-findings.md` da rodada ("Valkey S/R/G + cortes", itens 1 a 6;
+"Valkey W/F/WP/WN" 1 a 3 e "STD" 2 e 5 aplicados aqui). **Ordem:** SPEC, código,
+teste. **Mutação:** cada correção revertida sozinha (`mutate.py` da rodada, o
+arquivo restaurado depois), com o teste da linha falhando.
+
+| Item | Mutante | Teste que o mata |
+|---|---|---|
+| `allkeys-*` em execução deixa o ring indisponível (SPEC §9.5; ALTO) | `Enqueue` sem a guarda `policyBad`; `Available()` sem `policyBad`; uma leitura que falha limpando `policyBad` | `TestRedisRingPolicyFlipMakesItUnavailable` (sem servidor); `TestRedisRingPolicyIsReadAtEveryRefresh` (vivo) estendido com o `Enqueue` depois da virada |
+| Cluster: política e identidade no primário do stream (§10.3, §10.3.1) | `Pinned` sem o `XLEN`; recuo `CONFIG GET` por `Do`; `Identify` por `Do`; sonda do sink no mesmo pipeline num cluster | `TestKeylessReadingsArePinnedToTheStreamOnACluster`, `TestRedisHealthClusterReadingsArePinned`, `TestRedisRingClusterReadingsArePinned` (`internal/rediscli/clustertest`) |
+| `PolicyWatch.Cmd` devolve a leitura e `Judge` a recebe | `Judge` relendo o estado aprendido | `TestJudgeUsesTheReadingOfCmd` |
+| Alias: último valor de cada grafia, uma vez por fonte (§16.2.1) | `note` guardando a primeira ocorrência | `TestValkeyAliasConflictComparesTheLastValues` |
+| `--dump-config`: origem canônica (§16.2.1) | origem da flag e do env com a grafia escrita | `TestDumpOriginsAreCanonical` |
+| Erros de config sem o valor (§16.2) | `invalid integer %q`; enum com `%q`; `validateDBName` com `%q` | `TestConfigErrorsNeverEchoTheValue` |
+| `TestIdentifyLive` prova a ACL sem `INFO` (§10.3.1) | — (o teste é a correção: usuário sem `INFO`, controle `PING`/`INFO`, `server=unknown`) | `TestIdentifyLive` |
+
+Cabeçalhos dos `compose.*valkey*.yml` corrigidos para as portas que cada
+arquivo liga (antes repetiam as do irmão Redis), com uma linha para os
+serviços de apoio. `registry.go`: o índice de env não grava mais a chave `""`.
+
+Rodadas (macOS, Docker Desktop, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem servidores: verdes. `rediscli`, `ring`, `sink` e `app` com `GELF_TEST_REDIS_ADDR`/`GELF_TEST_REDIS_LRU_ADDR` contra Redis 7.4, Valkey 8.1 e Valkey 9.0: verdes. `-run Cluster` contra um cluster de um nó (Valkey 9.0): verde. Os 14 mutantes da tabela: mortos. Valkey 7.2 não rodou nesta rodada (a matriz completa é `scripts/test-redis-valkey.sh`).

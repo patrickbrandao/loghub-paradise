@@ -10,9 +10,10 @@
 #
 #   docker compose -f compose.memory-valkey.yml up -d --build
 #
-# Publicado no host: GELF 22011/udp e 22011/tcp (GELF_PORT), HTTP 22012 (GELF_HTTP_PORT),
-# TCP+TLS 22013 e HTTPS 22014 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
-# admin 127.0.0.1:29101 (GELF_ADMIN_PORT).
+# Publicado no host: GELF 22231/udp e 22231/tcp (GELF_PORT), HTTP 22232 (GELF_HTTP_PORT),
+# TCP+TLS 22233 e HTTPS 22234 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29123 (GELF_ADMIN_PORT).
+# Servicos de apoio no host: Valkey 127.0.0.1:26323 (GELF_VALKEY_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: gls-memory-valkey

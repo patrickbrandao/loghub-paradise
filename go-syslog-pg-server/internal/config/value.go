@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/netip"
@@ -81,6 +82,14 @@ var byteSuffixes = []struct {
 	{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30},
 }
 
+// Parse errors here never quote the value (SPEC §16.2: configuration errors
+// do not echo the input). The caller prefixes the key -- "--sink.workers:",
+// "<PREFIX>_SINK_WORKERS (sink.workers):", "file line N: key:" -- so the message
+// says what is wrong and nothing else: a password pasted under the wrong key,
+// or split by the shell onto the next one, would otherwise land in the
+// stderr of the boot and, on a SIGHUP, in the log (independent review of
+// 2026-11-07).
+
 // parseBytes accepts "8MiB", "512 MiB", "64KiB" and "1000000".
 func parseBytes(s string) (int64, error) {
 	t := strings.TrimSpace(s)
@@ -92,24 +101,24 @@ func parseBytes(s string) (int64, error) {
 			num := strings.TrimSpace(t[:len(t)-len(bs.suffix)])
 			n, err := strconv.ParseInt(num, 10, 64)
 			if err != nil {
-				return 0, fmt.Errorf("invalid byte size %q: %w", s, err)
+				return 0, errors.New("invalid byte size: the number before the unit is not an integer")
 			}
 			if n < 0 {
-				return 0, fmt.Errorf("invalid byte size %q: negative", s)
+				return 0, errors.New("invalid byte size: negative")
 			}
 			// Overflow guard: n*mult must stay in int64.
 			if n > (1<<62)/bs.mult {
-				return 0, fmt.Errorf("invalid byte size %q: overflow", s)
+				return 0, errors.New("invalid byte size: overflow")
 			}
 			return n * bs.mult, nil
 		}
 	}
 	n, err := strconv.ParseInt(t, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid byte size %q: want an integer of bytes or a KiB/MiB/GiB suffix", s)
+		return 0, errors.New("invalid byte size: want an integer of bytes or a KiB/MiB/GiB suffix")
 	}
 	if n < 0 {
-		return 0, fmt.Errorf("invalid byte size %q: negative", s)
+		return 0, errors.New("invalid byte size: negative")
 	}
 	return n, nil
 }
@@ -137,7 +146,7 @@ func parseBool(s string) (bool, error) {
 	case "0", "f", "false", "n", "no", "off":
 		return false, nil
 	}
-	return false, fmt.Errorf("invalid bool %q: want true/false, yes/no, on/off or 1/0", s)
+	return false, errors.New("invalid bool: want true/false, yes/no, on/off or 1/0")
 }
 
 // parseList splits on commas, trims each entry and drops empty ones, so
@@ -158,10 +167,10 @@ func parseList(s string) []string {
 func parseDuration(s string) (time.Duration, error) {
 	v, err := time.ParseDuration(strings.TrimSpace(s))
 	if err != nil {
-		return 0, fmt.Errorf("invalid duration %q: want a unit suffix such as 5s, 100ms or 1h", s)
+		return 0, errors.New("invalid duration: want a unit suffix such as 5s, 100ms or 1h")
 	}
 	if v < 0 {
-		return 0, fmt.Errorf("invalid duration %q: negative", s)
+		return 0, errors.New("invalid duration: negative")
 	}
 	return v, nil
 }
@@ -179,7 +188,7 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		if strings.Contains(s, "/") {
 			p, err := netip.ParsePrefix(s)
 			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR %q: %w", raw, err)
+				return nil, errors.New("an entry is not a valid CIDR")
 			}
 			if p.Addr().Is4In6() && p.Bits() >= 96 {
 				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
@@ -191,7 +200,7 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		}
 		a, err := netip.ParseAddr(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid address %q: %w", raw, err)
+			return nil, errors.New("an entry is neither an IP address nor a CIDR")
 		}
 		a = a.Unmap().WithZone("")
 		out = append(out, netip.PrefixFrom(a, a.BitLen()))
@@ -214,7 +223,7 @@ func matchEnum(allowed []string, raw string) (string, error) {
 		}
 		shown[i] = a
 	}
-	return "", fmt.Errorf("%q is not one of %s", raw, strings.Join(shown, ", "))
+	return "", fmt.Errorf("the value is not one of %s", strings.Join(shown, ", "))
 }
 
 // setValue parses raw according to p.Kind and stores it through p.Ptr. The
@@ -247,7 +256,7 @@ func setValue(p *Param, raw string) error {
 		}
 		v, err := strconv.Atoi(strings.TrimSpace(raw))
 		if err != nil {
-			return fmt.Errorf("invalid integer %q", raw)
+			return errors.New("invalid integer")
 		}
 		*ptr = v
 
@@ -258,7 +267,7 @@ func setValue(p *Param, raw string) error {
 		}
 		v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 		if err != nil {
-			return fmt.Errorf("invalid integer %q", raw)
+			return errors.New("invalid integer")
 		}
 		*ptr = v
 
@@ -269,14 +278,14 @@ func setValue(p *Param, raw string) error {
 		}
 		v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
 		if err != nil {
-			return fmt.Errorf("invalid number %q", raw)
+			return errors.New("invalid number")
 		}
 		// ParseFloat accepts NaN and ±Inf, and NaN passes every range check
 		// (every comparison with it is false): ring.high_water=NaN never
 		// reported saturation, and log.access_sample=NaN would pass the
 		// [0, 1] check.
 		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return fmt.Errorf("invalid number %q: must be finite", raw)
+			return errors.New("invalid number: must be finite")
 		}
 		*ptr = v
 
@@ -316,10 +325,10 @@ func setValue(p *Param, raw string) error {
 		}
 		v, err := strconv.ParseUint(strings.TrimSpace(raw), 8, 32)
 		if err != nil {
-			return fmt.Errorf("invalid file mode %q: want octal digits such as 0666 or 660", raw)
+			return errors.New("invalid file mode: want octal digits such as 0666 or 660")
 		}
 		if v > 0o7777 {
-			return fmt.Errorf("invalid file mode %q: above 7777", raw)
+			return errors.New("invalid file mode: above 7777")
 		}
 		*ptr = int(v)
 

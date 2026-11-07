@@ -12,10 +12,11 @@
 #   docker compose -f compose.sqlite-valkey.yml -f compose.emitter.yml --profile demo up -d --build
 #     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
 #
-# Publicado no host: RELP 20521 (RELPLOG_PORT), RELP/TLS 20621 quando ligado
-# (RELPLOG_TLS_PORT), admin 127.0.0.1:9307 (RELPLOG_ADMIN_PORT). Defaults
+# Publicado no host: RELP 20539 (RELPLOG_PORT), RELP/TLS 20639 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9325 (RELPLOG_ADMIN_PORT). Defaults
 # distintos por combinacao, e disjuntos dos do go-syslog-server, para que
 # varias rodem lado a lado no mesmo host (README, "Portas").
+# Servicos de apoio no host: Valkey 127.0.0.1:26325 (RELPLOG_VALKEY_PORT).
 
 name: rls-sqlite-valkey
 

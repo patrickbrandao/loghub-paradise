@@ -280,6 +280,14 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514   # o logger do ma
   (protocolo); `valkey` é alias exato (`alias.go`, SPEC §16.2.1) e não aparece
   em dump, log nem métrica. O erro de handshake do rueidis chega **sem** o
   `ERR ` da resposta: case o texto com e sem ele.
+- **Num Redis Cluster, comando sem chave sozinho vai a um nó qualquer**
+  (réplica inclusive): `INFO`/`CONFIG GET` sempre por `rediscli.Pinned`
+  (atrás de um `XLEN` do stream, mesmo `DoMulti`), e nunca junto de chaves de
+  outro slot (o rueidis entra em pânico). Só `internal/rediscli/clustertest`
+  reclama; o cluster de um nó dos testes opt-in não distingue nós (SPEC §10.3.1).
+- **`allkeys-*` em execução é estado** (`policyBad` no ring, SPEC §9.5): só
+  uma leitura boa da política o limpa; um `Enqueue` ou uma sonda que passa,
+  não.
 
 ## 10. Estado do projeto
 

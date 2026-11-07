@@ -218,6 +218,11 @@ func TestIngestEnqueueErrorDecidesWhetherTheBufferIsPooled(t *testing.T) {
 		{"ring closed releases", ring.ErrClosed, Shutdown, true},
 		{"ring unavailable discards", ring.ErrUnavailable, RingUnavailable, false},
 		{"wrapped unavailable discards", fmt.Errorf("xadd: %w", ring.ErrUnavailable), RingUnavailable, false},
+		// ring=redis under an allkeys-* policy (SPEC §9.5): unavailable AND
+		// fatal is still unavailability -- the stream transports stop
+		// reading, UDP drops.
+		{"unavailable and fatal discards", fmt.Errorf("maxmemory-policy: %w: %w", ring.ErrUnavailable,
+			ring.ErrFatal), RingUnavailable, false},
 		{"op_timeout discards", context.DeadlineExceeded, RingFull, false},
 		{"cancellation discards", context.Canceled, Shutdown, false},
 		{"destination failure discards", errors.New("xadd: broken pipe"), SinkDown, false},

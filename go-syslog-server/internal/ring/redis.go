@@ -227,6 +227,15 @@ type RedisRing struct {
 	// taught it which command works.
 	policy    *rediscli.PolicyWatch
 	policyLog *obs.Sampler
+	// policyBad holds the refusal of the last policy reading that found an
+	// allkeys-* policy, nil while the policy is good. judgePolicy sets it and
+	// only a good reading clears it: an Enqueue that succeeds, a probe that
+	// passes, an unreadable or failed reading -- none of them says the policy
+	// is back. While it is set Enqueue refuses and Available is false
+	// (SPEC §9.5). Before it, the flip only made /readyz blink: the next
+	// successful enqueue turned the ring available again, and the receivers
+	// kept writing into a stream the server may evict whole.
+	policyBad atomic.Pointer[error]
 
 	keys     []string // stream, bytes: read-only, shared by every call
 	qkeys    []string // stream, bytes, quarantine
@@ -318,10 +327,11 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 		return nil, bootErr("connect", err)
 	}
 
-	// Who answered, for the log (SPEC §10.3.1): never used to decide.
+	// Who answered, for the log (SPEC §10.3.1): never used to decide. On a
+	// cluster, the primary that owns the stream.
 	{
 		ictx, cancel := context.WithTimeout(ctx, cfg.OpTimeout)
-		id := rediscli.Identify(ictx, client)
+		id := rediscli.Identify(ictx, client, cfg.Stream)
 		cancel()
 		log.Info("ring redis: server", "server", id.Server, "server_version", id.Version)
 	}
@@ -344,7 +354,7 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 	// apart from it, with the ring reporting itself available. Refused here,
 	// with exit 3, as a misconfiguration waiting cannot fix.
 	policy := new(rediscli.PolicyWatch)
-	if err := checkEviction(ctx, client, policy, cfg.OpTimeout, log); err != nil {
+	if err := checkEviction(ctx, client, policy, cfg.Stream, cfg.OpTimeout, log); err != nil {
 		client.Close()
 		return nil, bootErr("maxmemory-policy check", err)
 	}
@@ -400,11 +410,11 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger) (*RedisRin
 // spelled out, not a refusal: least-privilege ACLs are what a hardened
 // deployment has, and the premise is then the operator's to keep. Any other
 // error goes back to bootErr: fatal for allkeys-*, retried for the rest.
-func checkEviction(ctx context.Context, client rueidis.Client, w *rediscli.PolicyWatch,
+func checkEviction(ctx context.Context, client rueidis.Client, w *rediscli.PolicyWatch, stream string,
 	timeout time.Duration, log *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	policy, err := w.Check(ctx, client)
+	policy, err := w.Check(ctx, client, stream)
 	if errors.Is(err, rediscli.ErrPolicyUnknown) {
 		w.FirstUnknown() // the WARN below is the one of the process
 		log.Warn("ring redis: cannot read maxmemory-policy; it must be noeviction (or volatile-*: the "+
@@ -522,6 +532,11 @@ func isReply(err error, prefix string) bool {
 func (r *RedisRing) Enqueue(ctx context.Context, it *item.Item) error {
 	if r.closed.Load() {
 		return ErrClosed
+	}
+	if bad := r.policyBad.Load(); bad != nil {
+		// allkeys-* (SPEC §9.5): refused before the script, so a write that
+		// would succeed -- by evicting -- does not mark the ring available.
+		return runtimeErr("maxmemory-policy", *bad)
 	}
 	// A fresh head buffer per call, never a pooled one: it travels as a
 	// BinaryString too, and after a timeout it may still be read by the
@@ -1110,6 +1125,10 @@ func (r *RedisRing) statsLoop() {
 		case <-t.C:
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), min(r.cfg.OpTimeout, time.Second))
+		// The error is not dropped on the floor: what it says lives in the
+		// state it leaves behind -- down, and policyBad for an allkeys-*
+		// policy -- which Enqueue and Available read (SPEC §9.5). Logging
+		// it here would repeat judgePolicy's sampled ERROR every second.
 		_ = r.RefreshStats(ctx)
 		cancel()
 	}
@@ -1134,7 +1153,9 @@ func (r *RedisRing) statsLoop() {
 // reply is success.
 //
 // Available() turns false when any of the three fails, and only a successful
-// probe -- or a successful enqueue -- turns it back.
+// probe -- or a successful enqueue -- turns it back; an allkeys-* reading of
+// the policy keeps it false until a reading finds the policy good again
+// (policyBad, judgePolicy).
 func (r *RedisRing) RefreshStats(ctx context.Context) error {
 	cmds := rueidis.Commands{
 		r.client.B().Xlen().Key(r.keys[0]).Build(),
@@ -1143,10 +1164,13 @@ func (r *RedisRing) RefreshStats(ctx context.Context) error {
 	}
 	// The eviction policy rides in the same pipeline (SPEC §9.5): CONFIG SET
 	// changes it on a live server, and under allkeys-* the stream is evicted
-	// whole with the ring UP. One round trip still.
-	pcmd, readPolicy := r.policy.Cmd(r.client)
-	inline := readPolicy && rediscli.Inline(r.client) // never on a cluster
-	if inline {
+	// whole with the ring UP. One round trip still, on a cluster too: the
+	// three commands above share the stream's hash-tag slot (NewRedis refuses
+	// a stream without one), so the keyless reading goes to the primary that
+	// owns the stream (rediscli.Pinned) and rueidis has no cross-slot mix to
+	// panic on.
+	pcmd, read := r.policy.Cmd(r.client)
+	if read != rediscli.PolicyNone {
 		cmds = append(cmds, pcmd)
 	}
 	resps := r.client.DoMulti(ctx, cmds...)
@@ -1169,32 +1193,37 @@ func (r *RedisRing) RefreshStats(ctx context.Context) error {
 		r.down.Store(true)
 		return err
 	}
-	if readPolicy {
-		presp := rueidis.RedisResult{}
-		if inline {
-			presp = resps[3]
-		} else {
-			presp = r.client.Do(ctx, pcmd)
-		}
-		if err := r.judgePolicy(ctx, presp); err != nil {
+	if read != rediscli.PolicyNone {
+		if err := r.judgePolicy(ctx, read, resps[3]); err != nil {
 			r.down.Store(true)
 			return err
 		}
 	}
 	r.down.Store(false)
+	if bad := r.policyBad.Load(); bad != nil {
+		// The policy has become unreadable since it was allkeys-*: the last
+		// thing known about it is that it evicts (SPEC §9.5).
+		return runtimeErr("maxmemory-policy", *bad)
+	}
 	return nil
 }
 
 // judgePolicy is the runtime half of the boot's eviction check (SPEC §9.5):
-// allkeys-* makes the ring unavailable -- the UDP drops, the TCP stops
-// reading, /readyz fails -- with an ERROR every 30 s, until the policy is
-// back; an unreadable policy is the WARN of the boot, once per process.
+// allkeys-* sets policyBad, which makes the ring unavailable -- Enqueue
+// refuses, so the UDP drops, the TCP stops reading, RELP holds its window,
+// /readyz fails -- with an ERROR every 30 s, until a reading finds the policy
+// good again. An unreadable policy is the WARN of the boot, once per process.
 // Other failures of the reading (the connection, a transient reply) are a
-// failed probe, like the three commands before it.
-func (r *RedisRing) judgePolicy(ctx context.Context, resp rueidis.RedisResult) error {
-	policy, err := r.policy.Judge(ctx, r.client, resp)
+// failed probe, like the three commands before it. Neither of these two
+// clears policyBad: only a good reading does.
+//
+// The drain is left alone: Dequeue, Commit and Touch keep working, because
+// every entry delivered and deleted is one less that an eviction could take.
+func (r *RedisRing) judgePolicy(ctx context.Context, read rediscli.PolicyRead, resp rueidis.RedisResult) error {
+	policy, err := r.policy.Judge(ctx, r.client, r.keys[0], read, resp)
 	switch {
 	case err == nil:
+		r.policyBad.Store(nil)
 		return nil
 	case errors.Is(err, rediscli.ErrPolicyUnknown):
 		if r.policy.FirstUnknown() {
@@ -1204,6 +1233,7 @@ func (r *RedisRing) judgePolicy(ctx context.Context, resp rueidis.RedisResult) e
 		}
 		return nil
 	case errors.Is(err, rediscli.ErrEvictionPolicy):
+		r.policyBad.Store(&err)
 		if ok, _ := r.policyLog.Allow(); ok {
 			r.log.Error("ring redis: maxmemory-policy changed to one that evicts the stream; the ring is "+
 				"unavailable until it is noeviction (or volatile-*) again", "policy", policy, "error", err)
@@ -1232,10 +1262,11 @@ func (r *RedisRing) Stats() Stats {
 
 // Available reports whether the ring's Redis accepts writes: false as soon as
 // the write probe of RefreshStats or an Enqueue fails, true again only after a
-// probe or an enqueue succeeds. Read failures of the drain do not move it --
+// probe or an enqueue succeeds -- and false, whatever the probe says, while
+// the last policy reading found allkeys-* (policyBad). Read failures of the drain do not move it --
 // the probe, at most a second later, does. /readyz fails while it is false
 // (SPEC §9.5: Redis of the ring unavailable).
-func (r *RedisRing) Available() bool { return !r.down.Load() }
+func (r *RedisRing) Available() bool { return !r.down.Load() && r.policyBad.Load() == nil }
 
 // Quiesce prepares a graceful shutdown with ring=redis (SPEC §13.4 phase 4).
 //

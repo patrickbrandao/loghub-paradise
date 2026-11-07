@@ -165,8 +165,8 @@ type Filter struct {
 func (f Filter) Resolve() (minLevel int, levels []int, err error) {
 	minLevel, ok := filter.ParseLevel(f.MinLevel)
 	if !ok {
-		return 0, nil, fmt.Errorf("filter.min_level: %q is not a level name (%s) or a number 0..7",
-			f.MinLevel, strings.Join(convert.LevelNames[:], ", "))
+		return 0, nil, fmt.Errorf("filter.min_level: not a level name (%s) or a number 0..7",
+			strings.Join(convert.LevelNames[:], ", "))
 	}
 	for _, s := range f.Levels {
 		if strings.TrimSpace(s) == "" {
@@ -174,8 +174,8 @@ func (f Filter) Resolve() (minLevel int, levels []int, err error) {
 		}
 		l, ok := filter.ParseLevel(s)
 		if !ok {
-			return 0, nil, fmt.Errorf("filter.levels: %q is not a level name (%s) or a number 0..7",
-				s, strings.Join(convert.LevelNames[:], ", "))
+			return 0, nil, fmt.Errorf("filter.levels: an entry is not a level name (%s) or a number 0..7",
+				strings.Join(convert.LevelNames[:], ", "))
 		}
 		levels = append(levels, l)
 	}

@@ -87,7 +87,7 @@ func TestCheckEvictionLive(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer c.Close()
-		policy, err := CheckEviction(ctx, c)
+		policy, err := CheckEviction(ctx, c, "sls:eviction-check")
 		if err != nil || policy != "noeviction" {
 			t.Fatalf("policy %q, err %v; the test server must run with the default noeviction", policy, err)
 		}
@@ -99,7 +99,7 @@ func TestCheckEvictionLive(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer c.Close()
-		policy, err := CheckEviction(ctx, c)
+		policy, err := CheckEviction(ctx, c, "sls:eviction-check")
 		if policy != "allkeys-lru" || !errors.Is(err, ErrEvictionPolicy) || Classify(err) != Fatal {
 			t.Fatalf("policy %q, err %v: want a fatal ErrEvictionPolicy", policy, err)
 		}
@@ -125,7 +125,7 @@ func TestCheckEvictionLive(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer c.Close()
-		_, err = CheckEviction(ctx, c)
+		_, err = CheckEviction(ctx, c, "sls:eviction-check")
 		if !errors.Is(err, ErrPolicyUnknown) || Classify(err) == Fatal {
 			t.Fatalf("err %v: want ErrPolicyUnknown, not fatal", err)
 		}

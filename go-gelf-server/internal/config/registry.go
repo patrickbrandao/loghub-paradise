@@ -522,7 +522,11 @@ func newIndex(params []*Param) *index {
 		// parameter under a second name (alias.go, SPEC §16.2.1).
 		if a := aliasName(p); a != "" {
 			ix.byName[a] = p
-			ix.byEnv[aliasEnv(p)] = p
+			// aliasEnv is "" for a parameter whose env name is fixed
+			// (EnvName): it has no alias in the environment.
+			if e := aliasEnv(p); e != "" {
+				ix.byEnv[e] = p
+			}
 		}
 	}
 	return ix

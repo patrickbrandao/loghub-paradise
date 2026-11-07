@@ -222,21 +222,35 @@ func (r *Redis) Health(ctx context.Context) error {
 		return err
 	}
 	stream := r.streamFor(r.cfg.Workspace)
-	cmds := rueidis.Commands{
-		client.B().Xlen().Key(stream).Build(),
-		client.B().Xadd().Key(stream+":healthprobe").Nomkstream().Id("*").
-			FieldValue().FieldValue("p", "1").Build(),
-	}
+	probe := client.B().Xadd().Key(stream+":healthprobe").Nomkstream().Id("*").
+		FieldValue().FieldValue("p", "1").Build()
+	cmds := rueidis.Commands{client.B().Xlen().Key(stream).Build()}
 	// The policy reading rides in the same pipeline: one round trip, the
-	// one sink.health_timeout bounds.
-	pcmd, readPolicy := r.policy.Cmd(client)
-	inline := readPolicy && rediscli.Inline(client) // never on a cluster
-	if inline {
+	// one sink.health_timeout bounds. On a Redis Cluster it rides with the
+	// XLEN, whose slot sends it to the primary that owns the stream
+	// (rediscli.Pinned); the probe's key is in another slot, and a pipeline
+	// mixing a keyless command with keyed ones of two slots panics in
+	// rueidis, so there the probe is a Do of its own, one round trip more.
+	pcmd, read := r.policy.Cmd(client)
+	if read != rediscli.PolicyNone {
 		cmds = append(cmds, pcmd)
 	}
-	ops := [2]string{"xlen", "writeprobe"}
+	split := rediscli.Cluster(client)
+	if !split {
+		cmds = append(cmds, probe)
+	}
 	resps := client.DoMulti(ctx, cmds...)
-	for i, resp := range resps[:2] {
+	presp := rueidis.RedisResult{}
+	if read != rediscli.PolicyNone {
+		presp = resps[1]
+	}
+	probeResp := rueidis.RedisResult{}
+	if split {
+		probeResp = client.Do(ctx, probe)
+	} else {
+		probeResp = resps[len(resps)-1]
+	}
+	for i, resp := range [2]rueidis.RedisResult{resps[0], probeResp} {
 		err := resp.Error()
 		// A nil reply is the expected answer from the probe: the key is absent,
 		// so nothing was appended. rueidis reports it as an error value, which
@@ -245,23 +259,17 @@ func (r *Redis) Health(ctx context.Context) error {
 			continue
 		}
 		if err != nil {
-			return classifyRedis(ops[i], err, "")
+			return classifyRedis([2]string{"xlen", "writeprobe"}[i], err, "")
 		}
 	}
 	if !r.identified.Swap(true) {
-		id := rediscli.Identify(ctx, client)
+		id := rediscli.Identify(ctx, client, stream)
 		r.log.Info("sink redis: server", "server", id.Server, "server_version", id.Version)
 	}
-	if !readPolicy {
+	if read == rediscli.PolicyNone {
 		return nil
 	}
-	presp := rueidis.RedisResult{}
-	if inline {
-		presp = resps[2]
-	} else {
-		presp = client.Do(ctx, pcmd)
-	}
-	return r.checkEviction(ctx, client, presp)
+	return r.checkEviction(ctx, client, stream, read, presp)
 }
 
 // checkEviction refuses a server whose maxmemory-policy is allkeys-* (SPEC
@@ -277,8 +285,9 @@ func (r *Redis) Health(ctx context.Context) error {
 // failure retried by WaitReady, and only a server that answers is judged. An
 // unreadable policy (an ACL without INFO and CONFIG) is a WARN with the
 // premise, once per process, and the check passes.
-func (r *Redis) checkEviction(ctx context.Context, client rueidis.Client, resp rueidis.RedisResult) error {
-	policy, err := r.policy.Judge(ctx, client, resp)
+func (r *Redis) checkEviction(ctx context.Context, client rueidis.Client, stream string,
+	read rediscli.PolicyRead, resp rueidis.RedisResult) error {
+	policy, err := r.policy.Judge(ctx, client, stream, read, resp)
 	switch {
 	case errors.Is(err, rediscli.ErrPolicyUnknown):
 		if !r.policy.FirstUnknown() {

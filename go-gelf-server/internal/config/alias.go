@@ -81,31 +81,59 @@ func aliasEnv(p *Param) string {
 // spellings and where each came from, never the values: either may be a
 // password. Between sources the precedence of SPEC §16.1 is unchanged; the
 // alias counts as the same key in its source.
+//
+// What is compared is the LAST value of each spelling in the source, once,
+// when the source is done (check): inside a source the last occurrence of a
+// spelling wins, as it does for any key, so `--sink.valkey.db=1
+// --sink.redis.db=2 --sink.valkey.db=2` agrees on 2 and passes. Comparing at
+// every occurrence refused it, over a value the source itself had already
+// replaced (independent review of 2026-11-07). The same holds for repeated
+// INI sections; in the environment each name appears once.
 type aliasGuard struct {
-	// seen: canonical name -> spelling -> {formatted value, origin}.
-	seen map[string]map[string][2]string
+	// last: canonical name -> spelling -> {formatted value, origin} of the
+	// last occurrence of that spelling.
+	last map[string]map[string][2]string
+	// order keeps the error deterministic: the canonical names in the order
+	// they were first seen, and per name the spellings likewise.
+	order    []string
+	spelling map[string][]string
 }
 
-func newAliasGuard() *aliasGuard { return &aliasGuard{seen: map[string]map[string][2]string{}} }
+func newAliasGuard() *aliasGuard {
+	return &aliasGuard{last: map[string]map[string][2]string{}, spelling: map[string][]string{}}
+}
 
 // note records that spelling set p (already parsed into p.Ptr) from origin.
-func (g *aliasGuard) note(p *Param, spelling, origin string) error {
+func (g *aliasGuard) note(p *Param, spelling, origin string) {
 	if aliasName(p) == "" {
-		return nil
+		return
 	}
-	v := formatValue(p)
-	m := g.seen[p.Name()]
+	name := p.Name()
+	m := g.last[name]
 	if m == nil {
 		m = map[string][2]string{}
-		g.seen[p.Name()] = m
+		g.last[name] = m
+		g.order = append(g.order, name)
 	}
-	for other, prev := range m {
-		if other != spelling && prev[0] != v {
-			return fmt.Errorf("%s (%s) and %s (%s) are the same parameter under its redis and valkey "+
-				"names, set to different values; give it once (SPEC §16.2.1)",
-				other, prev[1], spelling, origin)
+	if _, ok := m[spelling]; !ok {
+		g.spelling[name] = append(g.spelling[name], spelling)
+	}
+	m[spelling] = [2]string{formatValue(p), origin}
+}
+
+// check compares, per parameter, the last value of each of its spellings.
+func (g *aliasGuard) check() error {
+	for _, name := range g.order {
+		sp := g.spelling[name]
+		m := g.last[name]
+		for _, other := range sp[1:] {
+			first, prev := sp[0], m[sp[0]]
+			if cur := m[other]; cur[0] != prev[0] {
+				return fmt.Errorf("%s (%s) and %s (%s) are the same parameter under its redis and valkey "+
+					"names, set to different values; give it once (SPEC §16.2.1)",
+					first, prev[1], other, cur[1])
+			}
 		}
 	}
-	m[spelling] = [2]string{v, origin}
 	return nil
 }

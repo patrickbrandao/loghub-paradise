@@ -10,9 +10,10 @@
 #
 #   docker compose -f compose.sqlite-valkey.yml up -d --build
 #
-# Publicado no host: GELF 22071/udp e 22071/tcp (GELF_PORT), HTTP 22072 (GELF_HTTP_PORT),
-# TCP+TLS 22073 e HTTPS 22074 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
-# admin 127.0.0.1:29107 (GELF_ADMIN_PORT).
+# Publicado no host: GELF 22251/udp e 22251/tcp (GELF_PORT), HTTP 22252 (GELF_HTTP_PORT),
+# TCP+TLS 22253 e HTTPS 22254 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29125 (GELF_ADMIN_PORT).
+# Servicos de apoio no host: Valkey 127.0.0.1:26325 (GELF_VALKEY_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: gls-sqlite-valkey
