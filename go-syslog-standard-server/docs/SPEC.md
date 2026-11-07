@@ -114,7 +114,7 @@ As dezoito combinações são válidas e têm significado distinto (§18).
                  final)       partilhado)    partilhado)   "SYSLOG"      puro)
 
  emergência: ring=memory não-vazio + sink FATAL
-             => dump em <emergency.dir>/emg-<node>-<unixnano>.bin  (§11)
+             => dump em <emergency.dir>/slstd-emg-<node>-<unixnano>.bin  (§11)
 
  +------------------------------------------------------------------+
  | porta admin (admin.bind, padrão 127.0.0.1:9102)                   |
@@ -3453,6 +3453,22 @@ do servidor LogHub, e subir os compose daqui retagueava a imagem dele e
 assumia as pilhas e os volumes dele. `TestComposeValkeyFiles` e
 `TestComposeNamesAreThisServers` conferem.
 
+**E as variáveis e as portas também** (corrigido em 2026-11-07, revisão
+independente). A imagem vem de `SLSTD_IMAGE`/`SLSTD_IMAGE_TAG` (`common.yml`,
+`.env.example`), não do `SYSLOG_IMAGE`/`SYSLOG_IMAGE_TAG` do servidor LogHub:
+um `.env` comum às duas pilhas construía uma imagem com o nome da outra. Os
+contêineres da suíte de emissores são `slstd-emit-*`. As portas padrão dos três
+`compose.*-valkey.yml` (que eram 5158–5160, 20618–20620, 19118–19120 e
+16320/16324/16328; o syslog, o admin e o 16324 dentro das faixas do
+`go-syslog-server`) passaram a 5191–5193 (syslog), 20691–20693 (RELP),
+19191–19193 (admin) e 16391–16393 (Valkey), fora das faixas publicadas por ele
+(syslog 5141–5167, admin 19101–19127, Redis/Valkey 16301–16329 e 16418–16427);
+`TestComposeImageVariablesAreThisServers` e `TestComposeValkeyPortsAreFree`
+conferem. Os compose de Redis, SQLite, PostgreSQL, MySQL, NATS e `none`
+continuam nas portas de antes, que coincidem com as do `go-syslog-server`
+(5141–5157, 19101–19117): subir os dois ao mesmo tempo exige fixar as portas
+pelo `.env`.
+
 A de MySQL e a de NATS existem desde a entrada dos dois destinos, pulam sem a
 variável e criam a própria tabela ou o próprio stream **a partir do arquivo que o
 operador aplica** (`docker/mysql/schema.sql`, `docker/nats/stream.json`), para
@@ -3689,3 +3705,4 @@ correção, e um trecho portado leva a correção junto, não o defeito.
 25. *Corrigido em 2026-11-07 (revisão independente):* uma tentativa (discagem do Redis, checagem do `WaitReady`, validação do PostgreSQL/MySQL) passava do prazo único de boot; agora cada uma recebe o mínimo entre o próprio prazo e o que falta; regra em §12.1.
 26. *Corrigido em 2026-11-07 (revisão independente):* erros de parse de valor e de validação (`invalid integer %q`, `sink.type: %q`, `validateDBName`, `checkQuotedName` e os demais) ecoavam o valor; agora nomeiam chave e problema; regra em §15.1.
 27. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a sonda do `sink=sqlite` reportava saudável para sempre uma escritora travada; agora o limite é `sink.op_timeout + sink.health_timeout` no relógio monotônico; regra em §10.4.
+28. *Corrigido em 2026-11-07 (revisão independente):* colisões residuais com o go-syslog-server — `SYSLOG_IMAGE`/`SYSLOG_IMAGE_TAG` viraram `SLSTD_IMAGE`/`SLSTD_IMAGE_TAG`, contêineres `slstd-emit-*`, diagrama com `slstd-emg-`, comentário do `main.go`, portas padrão dos compose Valkey fora das faixas dele; regra em §17.5.

@@ -173,7 +173,7 @@ sleep 8
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	runContainer(t, ctx, "sls-emit-rsyslog-"+strconv.Itoa(os.Getpid()), script)
+	runContainer(t, ctx, "slstd-emit-rsyslog-"+strconv.Itoa(os.Getpid()), script)
 
 	want := map[string]int{
 		"udp/datagram": n,
@@ -243,7 +243,7 @@ cat /tmp/syslog-ng.log
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	out := runContainer(t, ctx, "sls-emit-syslogng-"+strconv.Itoa(os.Getpid()), script)
+	out := runContainer(t, ctx, "slstd-emit-syslogng-"+strconv.Itoa(os.Getpid()), script)
 
 	want := map[string]int{"tcp/lf": n, "tcp/octet": n, "udp/datagram": n}
 	got := s.waitFor(marker, want)

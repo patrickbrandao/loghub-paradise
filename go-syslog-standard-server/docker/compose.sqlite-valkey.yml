@@ -5,8 +5,8 @@
 #
 #   docker compose -f compose.sqlite-valkey.yml up -d --build
 #
-# Publicado no host: syslog 5159/udp e 5159/tcp, RELP 20619/tcp, admin
-# 127.0.0.1:19119. Defaults distintos por combinacao para que varias rodem lado
+# Publicado no host: syslog 5192/udp e 5192/tcp, RELP 20692/tcp, admin
+# 127.0.0.1:19192. Defaults distintos por combinacao para que varias rodem lado
 # a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
 
 name: slstd-sqlite-valkey
@@ -50,11 +50,11 @@ services:
 
     ports:
       # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
-      - "${SYSLOG_PORT:-5159}:1514/udp"
-      - "${SYSLOG_PORT:-5159}:1514/tcp"
-      - "${SYSLOG_RELP_PORT:-20619}:20514/tcp"
+      - "${SYSLOG_PORT:-5192}:1514/udp"
+      - "${SYSLOG_PORT:-5192}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20692}:20514/tcp"
       # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
-      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19119}:9102"
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19192}:9102"
 
     volumes:
       - slstd-data:/data
@@ -78,7 +78,7 @@ services:
     volumes:
       - slstd-valkey-data:/data
     ports:
-      - "127.0.0.1:${SYSLOG_VALKEY_PORT:-16324}:6379"
+      - "127.0.0.1:${SYSLOG_VALKEY_PORT:-16392}:6379"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
