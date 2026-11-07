@@ -306,6 +306,9 @@ var retiredSections = map[string]bool{
 	"sink.nats":       true,
 	"sink.redis":      true,
 	"sink.sqlite":     true,
+	// [sink.valkey] is go-webhook-fast-server's alias of [sink.redis]
+	// (its SPEC §13.2, the Valkey round of 2026-11-07): retired with it.
+	"sink.valkey": true,
 }
 
 // sections returns section names in registry order, which is the order used by

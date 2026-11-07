@@ -39,7 +39,7 @@ continuam valendo. Três chaves **seletoras** continuam aceitas, cada uma só co
 o valor que este servidor implementa: `ring.mode = memory`,
 `sink.type = postgres` e `ratelimit.enabled = false` (qualquer outro valor é
 `exit 1`, com a mensagem dizendo que o recurso foi retirado). Toda outra chave
-de recurso retirado — `[ring.sqlite]`, `ring.max_inflight`, `[sink.redis]`,
+de recurso retirado — `[ring.sqlite]`, `ring.max_inflight`, `[sink.redis]` (e o alias `[sink.valkey]` do fast),
 `[sink.sqlite]`, `[sink.mysql]`, `[sink.nats]`, `[sink.clickhouse]`, o resto de
 `[ratelimit]` — num INI ou numa flag é **chave desconhecida** (`exit 1`), o
 mesmo tratamento que o `server.node_id` recebeu na rodada do JLH: uma

@@ -774,6 +774,7 @@ func TestCompatibilitySelectorsRefuseRetiredFeatures(t *testing.T) {
 		{"--ring.mode=sqlite", `ring.mode: "sqlite" is not available`},
 		{"--ring.mode=none", `ring.mode: "none" is not available`},
 		{"--sink.type=redis", `sink.type: "redis" is not available`},
+		{"--sink.type=valkey", `sink.type: "valkey" is not available`},
 		{"--sink.type=sqlite", `sink.type: "sqlite" is not available`},
 		{"--sink.type=mysql", `sink.type: "mysql" is not available`},
 		{"--sink.type=nats", `sink.type: "nats" is not available`},
@@ -797,7 +798,7 @@ func TestRetiredKeysAreUnknown(t *testing.T) {
 		"ring.max_inflight",
 		"ring.sqlite.path", "ring.sqlite.synchronous",
 		"ratelimit.rate", "ratelimit.burst", "ratelimit.exempt", "ratelimit.sweep_interval",
-		"sink.redis.addrs", "sink.redis.stream",
+		"sink.redis.addrs", "sink.redis.stream", "sink.valkey.addrs", "sink.valkey.password",
 		"sink.sqlite.path", "sink.sqlite.keep_files",
 		"sink.mysql.addr", "sink.nats.urls", "sink.nats.subject", "sink.clickhouse.addrs",
 	}
@@ -836,6 +837,7 @@ func TestRetiredKnobsInTheEnvironmentAreInert(t *testing.T) {
 		"WHS_RATELIMIT_BURST":   "200",
 		"WHS_RING_MAX_INFLIGHT": "3",
 		"WHS_SINK_REDIS_ADDRS":  "redis:6379",
+		"WHS_SINK_VALKEY_ADDRS": "valkey:6379",
 	})})
 	if l.Config.RateLimit.Enabled {
 		t.Error("ratelimit.enabled came out true")
@@ -843,6 +845,7 @@ func TestRetiredKnobsInTheEnvironmentAreInert(t *testing.T) {
 	for _, env := range []map[string]string{
 		{"WHS_RING_MODE": "sqlite"},
 		{"WHS_SINK_TYPE": "redis"},
+		{"WHS_SINK_TYPE": "valkey"},
 		{"WHS_RATELIMIT_ENABLED": "true"},
 	} {
 		if _, err := Load(Options{LookupEnv: envMap(env)}); err == nil {

@@ -290,7 +290,7 @@ func TestFamilyPortPostgresAddrNamesOneServer(t *testing.T) {
 // rule would read it as the split tail of the value before it and blame that
 // flag; it is named, as when it stands alone (retiredSections).
 func TestFamilyPortRetiredKeyAfterAValueIsNamed(t *testing.T) {
-	for _, name := range []string{"sink.redis.addrs", "ring.sqlite.path", "sink.mysql.addr", "sink.clickhouse.addrs",
+	for _, name := range []string{"sink.redis.addrs", "sink.valkey.addrs", "ring.sqlite.path", "sink.mysql.addr", "sink.clickhouse.addrs",
 		"sink.sqlite.path", "sink.nats.urls"} {
 		famFail(t, []string{"--sink.workers=4", "--" + name + "=x"}, nil, `"`+name+`"`)
 		sec, key := name[:strings.LastIndexByte(name, '.')], name[strings.LastIndexByte(name, '.')+1:]

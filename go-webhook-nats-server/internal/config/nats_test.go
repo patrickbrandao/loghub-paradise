@@ -330,6 +330,8 @@ func TestEBURLUnsupportedOrMalformed(t *testing.T) {
 		{"postgres://u:p@pg/db", `"postgres://" is not supported`},
 		{"postgresql://u:p@pg/db", `"postgresql://" is not supported`},
 		{"redis://redis-1:6379/0", `"redis://" is not supported`},
+		{"valkey://valkey-1:6379/0", `"valkey://" is not supported`},
+		{"valkeys://valkey-1:6380/0", `"valkeys://" is not supported`},
 		{"amqp://guest:guest@rabbit:5672/", `"amqp://" is not supported`},
 		{"https://bus.example", `"https://" is not supported`},
 		{"ws://n:8080", `"ws://" is not supported`},
