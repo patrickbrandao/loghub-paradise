@@ -29,7 +29,7 @@ type natsReader struct {
 	cons   jetstream.Consumer
 }
 
-func openNATS(ctx context.Context, rawURL, stream string, since time.Time, timeout time.Duration) (*natsReader, error) {
+func openNATS(ctx context.Context, rawURL, stream string, timeout time.Duration) (*natsReader, error) {
 	nc, err := nats.Connect(rawURL, nats.Name("go-webhook-injector verify"), nats.Timeout(timeout),
 		nats.MaxReconnects(-1))
 	if err != nil {
@@ -40,11 +40,12 @@ func openNATS(ctx context.Context, rawURL, stream string, since time.Time, timeo
 		nc.Close()
 		return nil, fmt.Errorf("--verify-url nats: %v", err)
 	}
+	var st jetstream.Stream
 	if stream == "" {
 		var found []string
 		for _, s := range natsStreams {
-			if _, err := js.Stream(ctx, s); err == nil {
-				found = append(found, s)
+			if x, err := js.Stream(ctx, s); err == nil {
+				found, st = append(found, s), x
 			} else if !errors.Is(err, jetstream.ErrStreamNotFound) {
 				nc.Close()
 				return nil, fmt.Errorf("--verify-url nats: stream %s: %v", s, err)
@@ -56,14 +57,24 @@ func openNATS(ctx context.Context, rawURL, stream string, since time.Time, timeo
 				len(found), strings.Join(natsStreams, ", "))
 		}
 		stream = found[0]
-	} else if _, err := js.Stream(ctx, stream); err != nil {
+	} else if st, err = js.Stream(ctx, stream); err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("--verify-url nats: stream %s: %v", stream, err)
+	}
+	// This runs before the first request: everything of the run lands
+	// after the stream's last sequence now. Starting there reads nothing
+	// of the past and needs no clock (SPEC §8.6.3; a start time a minute
+	// back re-read every message of a busy stream: go-gelf-injector found
+	// ~250 000 of them, past --verify-timeout).
+	info, err := st.Info(ctx)
+	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("--verify-url nats: stream %s: %v", stream, err)
 	}
 	// An ordered consumer is ephemeral, unacknowledged, and resumes where
 	// it stopped: each read continues the last one.
 	cons, err := js.OrderedConsumer(ctx, stream, jetstream.OrderedConsumerConfig{
-		DeliverPolicy: jetstream.DeliverByStartTimePolicy, OptStartTime: &since})
+		DeliverPolicy: jetstream.DeliverByStartSequencePolicy, OptStartSeq: info.State.LastSeq + 1})
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("--verify-url nats: consumer on %s: %v", stream, err)
@@ -161,13 +172,12 @@ const redisPattern = "loghub.*.webhook*"
 const xrangeBatch = 5000
 
 type redisReader struct {
-	c     rueidis.Client
-	key   string            // "" = every key of redisPattern
-	last  map[string]string // stream key -> last ID read
-	floor string
+	c    rueidis.Client
+	key  string            // "" = every key of redisPattern
+	last map[string]string // stream key -> last ID read (or there at open)
 }
 
-func openRedis(ctx context.Context, rawURL, key string, since time.Time) (*redisReader, error) {
+func openRedis(ctx context.Context, rawURL, key string) (*redisReader, error) {
 	// valkey:// is redis:// (the protocol is the same, SPEC §8.6.1).
 	switch {
 	case strings.HasPrefix(rawURL, "valkey://"):
@@ -200,8 +210,25 @@ func openRedis(ctx context.Context, rawURL, key string, since time.Time) (*redis
 		c.Close()
 		return nil, fmt.Errorf("--verify-url redis: %v", err)
 	}
-	return &redisReader{c: c, key: key, last: map[string]string{},
-		floor: strconv.FormatInt(max(since.UnixMilli(), 0), 10) + "-0"}, nil
+	r := &redisReader{c: c, key: key, last: map[string]string{}}
+	// As with NATS: every stream is read after its last entry now, before
+	// the first request (SPEC §8.6.3); a stream born later is read whole.
+	keys, err := r.keys(ctx)
+	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("--verify-url redis: scan: %v", err)
+	}
+	for _, k := range keys {
+		es, err := c.Do(ctx, c.B().Xrevrange().Key(k).End("+").Start("-").Count(1).Build()).AsXRange()
+		if err != nil && !rueidis.IsRedisNil(err) {
+			c.Close()
+			return nil, fmt.Errorf("--verify-url redis: %s: %v", k, err)
+		}
+		if len(es) == 1 {
+			r.last[k] = es[0].ID
+		}
+	}
+	return r, nil
 }
 
 func (r *redisReader) keys(ctx context.Context) ([]string, error) {
@@ -233,7 +260,7 @@ func (r *redisReader) read(ctx context.Context, fn func(record)) error {
 	}
 	for _, k := range keys {
 		for {
-			start := r.floor
+			start := "-"
 			if id, ok := r.last[k]; ok {
 				start = "(" + id
 			}

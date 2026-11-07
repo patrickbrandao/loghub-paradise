@@ -85,7 +85,7 @@ não produz.
 | `app.TestVerifyUsageErrors` | 10 combinações recusadas com 2, sem ecoar a URL |
 | `verify.TestAccounting`, `TestWaitsForTheSink`, `TestNoUUID`, `TestFinalReadCatchesLateDuplicate`, `TestRanges`, `TestMarker`, `TestUUIDFloor`, `TestNoSecretsEchoed` | a contagem de SPEC §8.6.4 com tudo errado de uma vez; a espera; a leitura extra depois da completa; o marcador (`"seq":"12"` entre aspas não conta); a janela por UUIDv7; nenhuma credencial no texto |
 | `verify.TestSQLiteReader` | sempre roda: janela pelo `uuid`, leitura seguinte só depois do último `rowid`, tabela ausente recusada |
-| `verify.TestPGReader`, `TestRedisReader`, `TestValkeyReader`, `TestNATSReader` | opt-in, contra os servidores reais (abaixo): janela, cursor, o mesmo envelope adicionado duas vezes (Redis, NATS), chave que não é stream, stream ausente |
+| `verify.TestPGReader`, `TestRedisReader`, `TestValkeyReader`, `TestNATSReader` | opt-in, contra os servidores reais (abaixo): janela (PostgreSQL); nos streams, o que já estava lá na checagem não é lido e o stream que nasce depois é lido inteiro (SPEC §8.6.3, mutação: partir do início faz `TestNATSReader` ler 2503 e `TestRedisReader` achar a entrada velha); cursor, o mesmo envelope adicionado duas vezes (Redis, NATS), chave que não é stream, stream ausente |
 
 Integração opt-in (2026-11-07: PostgreSQL 18, Redis 7.4, Valkey 8.1, NATS
 2.12, em contêineres `vkg-*`):

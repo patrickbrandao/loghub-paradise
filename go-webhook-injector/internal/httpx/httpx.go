@@ -95,6 +95,12 @@ type Stream struct {
 	ts     time.Time
 	ended  bool
 	h2     *h2conn
+	// midWord: the buffer was cut inside an uppercase word, so its first
+	// byte continues that word and is no candidate (found by the fuzz of
+	// go-gelf-injector, 2026-11-07: a method longer than resyncWindow split
+	// in 1-byte segments was cut to its tail, which then parsed as a
+	// request the whole stream never had; SPEC §6.6).
+	midWord bool
 }
 
 // NewStream returns the parser of one direction. A midstream direction starts
@@ -131,7 +137,7 @@ func (s *Stream) Gap(int) {
 		s.st.SkippedBytes += uint64(len(s.buf))
 		s.buf = s.buf[:0]
 	}
-	s.need = 0
+	s.need, s.midWord = 0, false
 	s.p = partial{}
 	if !s.resync {
 		s.resync = true
@@ -300,7 +306,7 @@ func (s *Stream) dropAndResync() {
 // capture that began inside that body finds the next request mid-line.
 func (s *Stream) sync(final bool) bool {
 	for i := 0; i < len(s.buf); i++ {
-		if !isUpper(s.buf[i]) || i > 0 && isUpper(s.buf[i-1]) {
+		if !isUpper(s.buf[i]) || i > 0 && isUpper(s.buf[i-1]) || i == 0 && s.midWord {
 			continue
 		}
 		// The candidate at the start keeps its search state; any other one
@@ -320,7 +326,7 @@ func (s *Stream) sync(final bool) bool {
 				if err != nil {
 					s.need = need
 				}
-				s.resync = false
+				s.resync, s.midWord = false, false
 				if s.mode == mDetect {
 					s.mode = mHTTP
 				}
@@ -347,7 +353,9 @@ func (s *Stream) sync(final bool) bool {
 		for cut < len(s.buf) && isUpper(s.buf[cut-1]) && isUpper(s.buf[cut]) {
 			cut++
 		}
+		mid := cut == len(s.buf) && isUpper(s.buf[cut-1])
 		s.keepFrom(cut)
+		s.midWord = mid
 	}
 	return false
 }
@@ -358,6 +366,7 @@ func (s *Stream) keepFrom(i int) {
 	if i == 0 {
 		return
 	}
+	s.midWord = false
 	s.st.SkippedBytes += uint64(i)
 	s.buf = append(s.buf[:0], s.buf[i:]...)
 	s.p = partial{}
