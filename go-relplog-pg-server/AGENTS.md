@@ -234,6 +234,10 @@ DATADIR=/tmp/rlpg-data AGENT_NAME=go-relplog-pg-server HOSTNAME=dev-mac \
   escrita.
 - **A cópia da transação vem depois da vaga na janela e no teto em voo**, e a
   conta é `2 × classe + 8 KiB` (RP-7: a do R, de propósito).
+  A vaga e a conta saem do `DATALEN` declarado, **antes** do payload
+  (`ReadHead`/`reserve`/`ReadBody`), e o teto atende em ordem de chegada (SPEC
+  §5.6): adquirir depois do frame inteiro deixava um payload por conexão em
+  espera fora do teto.
 - **A pré-checagem do ring cheio vê os dois tetos** (`ring.FullFor(n)`, com o
   `n` truncado), e a transação confere o fim da sessão de novo logo antes do
   `Enqueue`: só o ring diz "decidida".
