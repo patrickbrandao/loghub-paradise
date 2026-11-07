@@ -52,7 +52,8 @@ func TestRedisRingPolicyIsReadAtEveryRefresh(t *testing.T) {
 	}
 	defer lru.Close()
 	moved := &RedisRing{cfg: r.cfg, log: discard(), client: lru, policy: r.policy,
-		policyLog: obs.NewSampler(30 * time.Second), keys: r.keys, probeKey: r.probeKey}
+		policyLog: obs.NewSampler(30 * time.Second), keys: r.keys, probeKey: r.probeKey,
+		capItems: r.capItems, capBytes: r.capBytes, idleMS: r.idleMS}
 	for i := 0; i < 2; i++ {
 		err := moved.RefreshStats(ctx)
 		if !errors.Is(err, ErrFatal) || !errors.Is(err, ErrUnavailable) ||
@@ -60,6 +61,21 @@ func TestRedisRingPolicyIsReadAtEveryRefresh(t *testing.T) {
 			t.Fatalf("refresh %d after the policy changed: %v (available=%v); want unavailable, "+
 				"ErrFatal wrapping ErrEvictionPolicy", i+1, err, moved.Available())
 		}
+	}
+	// The flip is not a /readyz blink (independent review of 2026-11-07):
+	// the enqueue is refused -- the server would accept it, by evicting --
+	// and the ring stays unavailable after it.
+	for i := 0; i < 2; i++ {
+		err := moved.Enqueue(ctx, mkItem(i, 16))
+		if !errors.Is(err, ErrUnavailable) || !errors.Is(err, rediscli.ErrEvictionPolicy) || moved.Available() {
+			t.Fatalf("enqueue %d after the policy changed: %v (available=%v); want ErrUnavailable and "+
+				"the ring unavailable", i+1, err, moved.Available())
+		}
+	}
+	lruStream := moved.keys[0]
+	defer lru.Do(context.Background(), lru.B().Del().Key(lruStream, lruStream+":bytes").Build())
+	if n, err := lru.Do(ctx, lru.B().Xlen().Key(lruStream).Build()).AsInt64(); err != nil || n != 0 {
+		t.Fatalf("the refused enqueues reached the evicting server: XLEN %d, %v", n, err)
 	}
 }
 

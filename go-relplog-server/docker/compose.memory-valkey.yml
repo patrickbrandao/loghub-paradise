@@ -14,10 +14,11 @@
 #   docker compose -f compose.memory-valkey.yml -f compose.emitter.yml --profile demo up -d --build
 #     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
 #
-# Publicado no host: RELP 20515 (RELPLOG_PORT), RELP/TLS 20615 quando ligado
-# (RELPLOG_TLS_PORT), admin 127.0.0.1:9301 (RELPLOG_ADMIN_PORT). Defaults
+# Publicado no host: RELP 20537 (RELPLOG_PORT), RELP/TLS 20637 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9323 (RELPLOG_ADMIN_PORT). Defaults
 # distintos por combinacao, e disjuntos dos do go-syslog-server, para que
 # varias rodem lado a lado no mesmo host (README, "Portas").
+# Servicos de apoio no host: Valkey 127.0.0.1:26323 (RELPLOG_VALKEY_PORT).
 
 name: rls-memory-valkey
 

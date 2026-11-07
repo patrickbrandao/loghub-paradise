@@ -1463,7 +1463,35 @@ ida e volta, como W/F fazem; `allkeys-*` com o serviço no ar (um `CONFIG SET`,
 o painel de um Redis/Valkey gerenciado) deixa o ring **indisponível**
 (`ErrUnavailable` + `ErrFatal`: UDP descarta, TCP para de ler, HTTP responde `503`, `/readyz` falha)
 com `ERROR` a cada 30 s, até a política voltar; ilegível, o `WARN` é um por
-processo. Um Redis Cluster é lido em um nó.
+processo.
+
+**A indisponibilidade por política é um estado, não uma sonda que falhou**
+(revisão independente de 2026-11-07, achado ALTO: antes a virada só fazia o
+`/readyz` piscar, porque o `Enqueue` seguinte dava certo — o servidor aceita,
+despejando — e devolvia o ring a disponível). A leitura que acha `allkeys-*`
+grava a recusa no ring (`policyBad`); enquanto ela existir, o `Enqueue` recusa
+**antes** do script, com a mesma recusa (`ErrUnavailable` + `ErrFatal`
+envolvendo `ErrEvictionPolicy`: UDP descarta, TCP para de ler, HTTP responde `503`), e `Available()` é
+`!down && !policyBad`. Só uma **leitura boa** da política a limpa: nem um
+`Enqueue`, nem uma sonda que passa, nem uma leitura que falha (rede) ou que fica
+ilegível — depois de um `allkeys-*`, o último fato conhecido é que a política
+despeja, e um ACL que perdeu `INFO` e `CONFIG` nesse meio deixa o ring
+indisponível até o restart. O laço de estatísticas descarta o erro de
+`RefreshStats` sem perdê-lo: o que ele diz fica no estado (`down`, `policyBad`)
+que `Enqueue` e `Available` leem. **O dreno continua** (`Dequeue`, `Commit`,
+`Touch`): cada entrada entregue e apagada é uma a menos que um despejo levaria;
+recusar o `Commit` só faria as entradas já entregues voltarem depois de
+`claim_idle`, em duplicata.
+
+**Num Redis Cluster** a política e a identidade são lidas no **primário dono
+do slot do stream** (revisão independente de 2026-11-07; antes, num nó
+qualquer: o `_pick` do rueidis para um comando sem chave escolhe a primeira
+conexão do mapa, réplica inclusive, e muda entre sondas, de modo que um shard
+em `noeviction` podia responder pelo shard do stream em `allkeys-lru`). As
+chaves do ring dividem o slot pela hash tag, então o `INFO memory`/`CONFIG GET`
+vai no mesmo `DoMulti` da sonda (`XLEN`, `GET`, `XADD`), e o rueidis o manda ao
+primário desse slot (§10.3.1, "Cluster e pipeline"); o recuo para `CONFIG GET`
+e o `INFO server` do boot vão atrás de um `XLEN <stream>` pelo mesmo motivo.
 
 **Scripting Lua** é exigência do ring (o `Enqueue` e o `Commit` são scripts):
 `ERR unknown command 'evalsha'`/`'eval'` (servidor sem Lua, serviço gerenciado
@@ -1666,7 +1694,13 @@ um operador", e um `CONFIG SET` ou o painel de um Redis/Valkey gerenciado muda
 sem restart): a leitura que funcionou (`INFO memory` ou `CONFIG GET`, lembrada)
 vai no pipeline da sonda, uma ida e volta; `allkeys-*` depois do boot é uma
 resposta fatal à sonda, FATAL com o dump de emergência (§13.3). O `WARN` de
-ilegível é um por processo. Um Redis Cluster é checado em um nó.
+ilegível é um por processo. Num Redis Cluster a política (e a identidade,
+§10.3.1) é lida no **primário dono do slot do stream desta instância** (o
+`{space}` expandido com o próprio `Workspace`): `DoMulti(XLEN <stream>, INFO
+memory)` — o recuo `CONFIG GET` do mesmo jeito — e a sonda `XADD
+<stream>:healthprobe`, de outro slot, num `Do` à parte, uma ida e volta a mais
+só no cluster; standalone e Sentinel mantêm um pipeline só. Os outros shards não
+são lidos: a política deles não toca este stream.
 
 #### 10.3.1 Redis e Valkey
 
@@ -1694,6 +1728,7 @@ logs, métricas, `--dump-config`). Vale para o sink e para o ring Redis (§9.5).
   `server` (`redis` | `valkey` | `unknown`) e `server_version`
   (`valkey_version` quando `server_name=valkey`, senão `redis_version`). ACL sem
   `INFO` ou proxy que filtra: `unknown`, sem erro e sem mudar nada. Sem métrica.
+  Num cluster, a identidade do primário dono do stream (abaixo).
 - **Cluster com `db != 0`:** o rueidis manda `SELECT <db>` no handshake de toda
   conexão. Redis Cluster e Valkey < 9 respondem `ERR SELECT is not allowed in
   cluster mode`; Valkey 9 tem vários bancos em cluster (`cluster-databases`,
@@ -1714,12 +1749,24 @@ logs, métricas, `--dump-config`). Vale para o sink e para o ring Redis (§9.5).
   no Redis/Valkey `min-replicas-to-write 1` (com `min-replicas-max-lag`), que
   faz o primário isolado recusar escrita (`NOREPLICAS`, retentado como
   `network`) em vez de aceitá-la para perder.
-- **Cluster e pipeline:** o cliente de cluster do rueidis entra em pânico
-  ("Mixing no-slot and cross slot commands") num `DoMulti` que mistura comando
-  sem chave (`INFO`, `CONFIG GET`) com comandos de chave em slots diferentes.
-  Num cluster a releitura da política é um `Do` à parte (uma ida e volta a
-  mais); standalone e Sentinel mantêm um pipeline só. Achado da rodada de W/F
-  de 2026-11-07, provado aqui por um teste opt-in de cluster com `db=0`.
+- **Cluster e pipeline:** a regra do `_pickMulti` do rueidis (v1.0.77,
+  `cluster.go`): um `DoMulti` com comando sem chave (`INFO`, `CONFIG GET`) e
+  comandos de chave **de um slot só** vai inteiro ao **primário desse slot**; o
+  pânico ("Mixing no-slot and cross slot commands") só acontece quando os
+  comandos de chave estão em slots **diferentes**. Sozinho (`Do`, ou um
+  `DoMulti` só de comandos sem chave), o comando sem chave vai a um nó
+  arbitrário. Por isso, num cluster, toda leitura sem chave vai num `DoMulti`
+  atrás de um `XLEN` do stream (`rediscli.Pinned`): a política e a identidade
+  são as do primário que guarda o stream. O sink manda a sonda `XADD` (outro
+  slot) num `Do` à parte; o ring, cujas chaves dividem a hash tag, mantém um
+  pipeline só. A versão anterior desta seção dizia que a mistura em si era o
+  pânico e mandava a política num `Do` à parte — a um nó qualquer (revisão
+  independente de 2026-11-07). Travado sem servidor
+  (`internal/rediscli/clustertest`: um cliente que se diz cluster e registra os
+  comandos; os testes `…ClusterReadingsArePinned` do sink, do ring e do
+  `rediscli` recusam um sem-chave sozinho, misturado com dois slots ou preso a
+  outro slot); o teste opt-in de cluster de um nó prova o resto contra um
+  servidor real, mas um nó só não distingue nós.
 - **Compose:** cada `compose.*redis*.yml` tem um irmão Valkey
   (`compose.<ring>-valkey.yml`, `compose.valkey-nats.yml`,
   `compose.valkey-postgres.yml`) com `GELF_VALKEY_IMAGE` (padrão
@@ -3357,6 +3404,17 @@ segredo:
   um erro de digitação: o `knownSectionOf` do R); fora disso o erro cita só a
   flag anterior e pede aspas. Depois de um valor **vazio**, nem isso: o
   argumento seguinte é o valor.
+- **Valores** (revisão independente de 2026-11-07, achado do STD que valia
+  aqui): o erro de um valor que não parseia ou não passa na validação nomeia a
+  chave e o problema (a classe do caractere, o formato esperado), **nunca o texto
+  dado**: `invalid integer`, `invalid duration: …`, `the value is not one of …`,
+  `sink.mysql.database: holds a backtick or a backslash`, `admin.bind: not
+  host:port`. Antes vários citavam o valor com `%q` (`invalid integer "hunter2"`
+  para uma senha colada na chave errada). Os erros de arquivo (`tls.*`) perdem o
+  caminho do `*os.PathError`: a chave já diz qual arquivo. Os construtores dos
+  destinos, que repetem as regras para quem contorna a config, seguem a mesma
+  regra. Números já parseados (`sink.pool_size=3 is below sink.workers=4`)
+  continuam citados: não são o texto dado.
 - **Switches** (`--help`, `-h`, `--version`, `-v`, `--dump-config`) não levam
   valor: `--dump-config=false` despejava e saía com 0; agora é exit 1, sem
   citar o valor. Um `--config=` vazio é exit 1 em vez de cair no
@@ -3391,13 +3449,21 @@ parâmetro** sob um segundo nome:
 
 - O valor alias é normalizado para o canônico ao carregar: o que fica guardado,
   e o que logs, métricas e `--dump-config` mostram, é `redis`. O dump mostra só
-  os nomes canônicos; o `--help` diz numa linha que o alias existe, sem
-  duplicar a tabela.
+  os nomes canônicos, **inclusive nos comentários de origem** (`# from flag
+  --sink.redis.addrs`, `# from env GELF_SINK_REDIS_DB`, qualquer que tenha
+  sido a grafia; decisão de 2026-11-07, revisão independente: antes o
+  comentário repetia a grafia alias); o `--help` diz numa linha que o alias
+  existe, sem duplicar a tabela.
 - **Conflito:** a mesma chave pelos dois nomes **na mesma fonte** (duas linhas
   do INI, duas variáveis de ambiente, duas flags) passa se os valores forem
   iguais (comparados depois do parse: `02` e `2` são iguais) e é **exit 1** se
   diferirem; a mensagem nomeia as duas chaves e de onde vieram, **nunca os
-  valores** (podem ser senha). Entre fontes diferentes a precedência de §16.1
+  valores** (podem ser senha). O que se compara é o **último valor de cada
+  grafia** na fonte, uma vez, ao fim dela: dentro de uma fonte a última
+  ocorrência vence, então `--sink.valkey.db=1 --sink.redis.db=2
+  --sink.valkey.db=2` concorda em 2 e passa, e o mesmo vale para seções
+  repetidas do INI (revisão independente de 2026-11-07: a comparação a cada
+  ocorrência recusava esse caso). Entre fontes diferentes a precedência de §16.1
   não muda: o alias conta como a mesma chave na sua fonte (flag alias vence env
   canônico).
 - **`LOGHUB_EB_URL`:** as chaves alias contam como as mesmas chaves donas

@@ -160,11 +160,12 @@ func Load(opts Options) (*Loaded, error) {
 				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, e.Name, err)
 			}
 			origin := "file " + file + " line " + strconv.Itoa(e.Line)
-			if err := guard.note(p, e.Name, origin); err != nil {
-				return nil, err
-			}
+			guard.note(p, e.Name, origin)
 			l.mark(p, FromFile, origin)
 			l.InFile[p.Name()] = true
+		}
+		if err := guard.check(); err != nil {
+			return nil, err
 		}
 		l.File = file
 	}
@@ -186,13 +187,16 @@ func Load(opts Options) (*Loaded, error) {
 			if err := setValue(p, v); err != nil {
 				return nil, fmt.Errorf("%s (%s): %w", name, p.Name(), err)
 			}
-			if err := envGuard.note(p, name, "env"); err != nil {
-				return nil, err
-			}
+			envGuard.note(p, name, "env")
 			if !l.SetIn[p.Name()] || l.Source[p.Name()] != FromEnv {
-				l.mark(p, FromEnv, "env "+name)
+				// The canonical name, whichever spelling set it: the
+				// origin is what --dump-config prints (SPEC §16.2.1).
+				l.mark(p, FromEnv, "env "+p.Env())
 			}
 		}
+	}
+	if err := envGuard.check(); err != nil {
+		return nil, err
 	}
 
 	// --- command line -------------------------------------------------------
@@ -202,10 +206,13 @@ func Load(opts Options) (*Loaded, error) {
 		if err := setValue(p, e.Raw); err != nil {
 			return nil, fmt.Errorf("--%s: %w", e.Spelled, err)
 		}
-		if err := flagGuard.note(p, "--"+e.Spelled, "flag"); err != nil {
-			return nil, err
-		}
-		l.mark(p, FromFlag, "flag --"+e.Spelled)
+		flagGuard.note(p, "--"+e.Spelled, "flag")
+		// Canonical, like the env origin above: the dump shows only
+		// canonical names (SPEC §16.2.1).
+		l.mark(p, FromFlag, "flag --"+p.Name())
+	}
+	if err := flagGuard.check(); err != nil {
+		return nil, err
 	}
 
 	// --- LOGHUB_EB_URL --------------------------------------------------------
@@ -268,7 +275,7 @@ func derive(l *Loaded, opts Options) error {
 		if wd == "" {
 			w, err := os.Getwd()
 			if err != nil {
-				return "", fmt.Errorf("resolving %q: %w", path, err)
+				return "", fmt.Errorf("resolving a relative path: %w", err)
 			}
 			wd = w
 		}

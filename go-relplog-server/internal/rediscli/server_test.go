@@ -2,6 +2,7 @@ package rediscli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -63,11 +64,34 @@ func TestIdentifyLive(t *testing.T) {
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	id := Identify(ctx, c)
+	id := Identify(ctx, c, "rls:identify")
 	if id.Server != "redis" && id.Server != "valkey" || id.Version == "" {
 		t.Fatalf("identity %+v", id)
 	}
 	t.Logf("server under test: %s %s", id.Server, id.Version)
+
+	user := fmt.Sprintf("rls-noinfo-id-%d", time.Now().UnixNano())
+	if err := c.Do(ctx, c.B().Arbitrary("ACL", "SETUSER", user, "on", ">pw", "~*", "&*",
+		"+@all", "-info").Build()).Error(); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Do(context.Background(), c.B().Arbitrary("ACL", "DELUSER", user).Build())
+	cfg.Username, cfg.Password = user, "pw"
+	limited, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer limited.Close()
+	// Control: the user works, only INFO is denied.
+	if err := limited.Do(ctx, limited.B().Ping().Build()).Error(); err != nil {
+		t.Fatalf("the limited user cannot even PING: %v", err)
+	}
+	if err := limited.Do(ctx, limited.B().Info().Section("server").Build()).Error(); err == nil {
+		t.Fatal("the ACL did not deny INFO; the case below would prove nothing")
+	}
+	if got := Identify(ctx, limited, "rls:identify"); got != (Identity{Server: "unknown"}) {
+		t.Fatalf("an ACL without INFO: identity %+v, want server=unknown and no version", got)
+	}
 }
 
 // SPEC §10.3.1 (redis-valkey-04): a cluster with db != 0. Opt-in, a

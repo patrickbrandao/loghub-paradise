@@ -10,9 +10,10 @@
 #
 #   docker compose -f compose.valkey-nats.yml up -d --build
 #
-# Publicado no host: GELF 22181/udp e 22181/tcp (GELF_PORT), HTTP 22182 (GELF_HTTP_PORT),
-# TCP+TLS 22183 e HTTPS 22184 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
-# admin 127.0.0.1:29118 (GELF_ADMIN_PORT).
+# Publicado no host: GELF 22261/udp e 22261/tcp (GELF_PORT), HTTP 22262 (GELF_HTTP_PORT),
+# TCP+TLS 22263 e HTTPS 22264 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29126 (GELF_ADMIN_PORT).
+# Servicos de apoio no host: Valkey do ring 127.0.0.1:26426 (GELF_RING_VALKEY_PORT), NATS 127.0.0.1:24226 (GELF_NATS_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: gls-valkey-nats

@@ -133,7 +133,7 @@ func NewClickHouse(cfg ClickHouseConfig, log *slog.Logger, m *obs.Metrics) (*Cli
 		return nil, errors.New("sink clickhouse: no address")
 	}
 	if !chIdent.MatchString(cfg.Table) {
-		return nil, fmt.Errorf("sink clickhouse: table %q is not a plain identifier", cfg.Table)
+		return nil, errors.New("sink clickhouse: the table is not a plain identifier")
 	}
 	// The database goes between backticks in the INSERT; the rule and the
 	// reason are checkQuotedName's (SPEC §10.10.5). Inside backticks

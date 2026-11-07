@@ -271,14 +271,15 @@ func policyFromInfo(info string) (string, bool) {
 // waiting, and retrying it would hold the boot until sink.boot_timeout over a
 // check that is a precaution.
 //
-// The check reads one node. A Redis Cluster whose nodes disagree on the policy
-// is a configuration nobody runs on purpose, and checking every node would put
-// a fan-out in the boot of both users for it.
+// On a Redis Cluster the check reads the primary that owns key (Pinned): the
+// shard whose policy decides the fate of the stream, not whichever node the
+// client picks for a keyless command. The other shards are not read: their
+// policy does not touch this stream.
 //
 // It is one standalone reading; a user that probes periodically keeps a
 // PolicyWatch instead, which re-reads the policy at every probe.
-func CheckEviction(ctx context.Context, c rueidis.Client) (string, error) {
-	return new(PolicyWatch).Check(ctx, c)
+func CheckEviction(ctx context.Context, c rueidis.Client, key string) (string, error) {
+	return new(PolicyWatch).Check(ctx, c, key)
 }
 
 // verdict is the policy rule of CheckEviction.

@@ -13,8 +13,11 @@ import (
 // Redis Cluster, db 0 (SPEC §10.3.1; opt-in, a one-node cluster announcing
 // 127.0.0.1, docs/TESTING.md §6.1a): the probe and the policy re-read work.
 // rueidis's cluster client panics on a pipeline that mixes keyless commands
-// (INFO, CONFIG GET) with keyed ones, so on a cluster the policy is a Do of
-// its own (rediscli.Inline); before that, every Health here panicked.
+// (INFO, CONFIG GET) with keyed ones of different slots, so on a cluster the
+// policy rides with the XLEN of the stream (rediscli.Pinned, the stream's
+// primary) and the write probe is a Do of its own; before the split, every
+// Health here panicked. One node cannot show WHICH node answered: that is
+// TestRedisHealthClusterReadingsArePinned, server-free.
 func TestRedisClusterHealthAndWrite(t *testing.T) {
 	addr := os.Getenv("GELF_TEST_REDIS_CLUSTER_ADDR")
 	if addr == "" {

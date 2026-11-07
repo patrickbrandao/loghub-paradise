@@ -13,10 +13,11 @@
 #   docker compose -f compose.valkey-postgres.yml -f compose.emitter.yml --profile demo up -d --build
 #     (o mesmo, com o rsyslog de demonstracao mandando por omrelp)
 #
-# Publicado no host: RELP 20533 (RELPLOG_PORT), RELP/TLS 20633 quando ligado
-# (RELPLOG_TLS_PORT), admin 127.0.0.1:9319 (RELPLOG_ADMIN_PORT). Defaults
+# Publicado no host: RELP 20541 (RELPLOG_PORT), RELP/TLS 20641 quando ligado
+# (RELPLOG_TLS_PORT), admin 127.0.0.1:9327 (RELPLOG_ADMIN_PORT). Defaults
 # distintos por combinacao, e disjuntos dos do go-syslog-server, para que
 # varias rodem lado a lado no mesmo host (README, "Portas").
+# Servicos de apoio no host: Valkey do ring 127.0.0.1:26427 (RELPLOG_RING_VALKEY_PORT), PostgreSQL 127.0.0.1:25427 (RELPLOG_POSTGRES_PORT).
 
 name: rls-valkey-postgres
 

@@ -10,9 +10,10 @@
 #
 #   docker compose -f compose.none-valkey.yml up -d --build
 #
-# Publicado no host: GELF 22131/udp e 22131/tcp (GELF_PORT), HTTP 22132 (GELF_HTTP_PORT),
-# TCP+TLS 22133 e HTTPS 22134 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
-# admin 127.0.0.1:29113 (GELF_ADMIN_PORT).
+# Publicado no host: GELF 22241/udp e 22241/tcp (GELF_PORT), HTTP 22242 (GELF_HTTP_PORT),
+# TCP+TLS 22243 e HTTPS 22244 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29124 (GELF_ADMIN_PORT).
+# Servicos de apoio no host: Valkey 127.0.0.1:26324 (GELF_VALKEY_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: gls-none-valkey

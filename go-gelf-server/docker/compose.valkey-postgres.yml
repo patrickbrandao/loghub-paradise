@@ -10,9 +10,10 @@
 #
 #   docker compose -f compose.valkey-postgres.yml up -d --build
 #
-# Publicado no host: GELF 22191/udp e 22191/tcp (GELF_PORT), HTTP 22192 (GELF_HTTP_PORT),
-# TCP+TLS 22193 e HTTPS 22194 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
-# admin 127.0.0.1:29119 (GELF_ADMIN_PORT).
+# Publicado no host: GELF 22271/udp e 22271/tcp (GELF_PORT), HTTP 22272 (GELF_HTTP_PORT),
+# TCP+TLS 22273 e HTTPS 22274 quando ligados (GELF_TLS_PORT, GELF_HTTPS_PORT),
+# admin 127.0.0.1:29127 (GELF_ADMIN_PORT).
+# Servicos de apoio no host: Valkey do ring 127.0.0.1:26427 (GELF_RING_VALKEY_PORT), PostgreSQL 127.0.0.1:25427 (GELF_POSTGRES_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: gls-valkey-postgres

@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -213,7 +214,7 @@ func validateListeners(c *Config) error {
 			continue
 		}
 		if _, _, err := net.SplitHostPort(e.addr); err != nil {
-			return fmt.Errorf("%s: %q is not host:port (a bare \":12201\" is fine)", e.name, e.addr)
+			return fmt.Errorf("%s: not host:port (a bare \":12201\" is fine)", e.name)
 		}
 	}
 
@@ -228,9 +229,9 @@ func validateListeners(c *Config) error {
 		for j := i + 1; j < len(stream); j++ {
 			a, b := stream[i], stream[j]
 			if a.addr != "" && b.addr != "" && sameStreamSocket(a.addr, b.addr) {
-				return fmt.Errorf("%s (%q) and %s (%q) are, or may resolve to, the same TCP "+
+				return fmt.Errorf("%s and %s are, or may resolve to, the same TCP "+
 					"address: they are different protocols and cannot share one stream socket (to share a "+
-					"port, use two distinct IP literals)", a.name, a.addr, b.name, b.addr)
+					"port, use two distinct IP literals)", a.name, b.name)
 			}
 		}
 	}
@@ -266,7 +267,7 @@ func validateListeners(c *Config) error {
 				"or admin.enabled=false to turn the admin port off")
 		}
 		if _, _, err := net.SplitHostPort(c.Admin.Bind); err != nil {
-			return fmt.Errorf("admin.bind: %q is not host:port", c.Admin.Bind)
+			return fmt.Errorf("admin.bind: not host:port")
 		}
 		// Refused here, not at boot step 12 after the admin port served the
 		// whole boot -- and on macOS/BSD not even there: SO_REUSEADDR lets
@@ -275,9 +276,9 @@ func validateListeners(c *Config) error {
 		// listeners: UDP is another protocol.
 		for _, e := range stream {
 			if e.addr != "" && sameStreamSocket(e.addr, c.Admin.Bind) {
-				return fmt.Errorf("admin.bind (%q) and %s (%q) are, or may resolve to, the same "+
+				return fmt.Errorf("admin.bind and %s are, or may resolve to, the same "+
 					"TCP address: the admin port and a GELF listener cannot share one stream "+
-					"socket (to share a port, use two distinct IP literals)", c.Admin.Bind, e.name, e.addr)
+					"socket (to share a port, use two distinct IP literals)", e.name)
 			}
 		}
 	}
@@ -533,9 +534,9 @@ func validatePaths(c *Config) error {
 	}
 	ring, sink := filepath.Clean(c.RingSQL.Path), filepath.Clean(c.SinkSQL.Path)
 	if ring == sink {
-		return fmt.Errorf("ring.sqlite.path and sink.sqlite.path are both %q: the ring is a "+
-			"QUEUE whose rows are deleted after delivery, the sink is an append-only "+
-			"DESTINATION. One file cannot be both", ring)
+		return fmt.Errorf("ring.sqlite.path and sink.sqlite.path name the same file: the ring is a " +
+			"QUEUE whose rows are deleted after delivery, the sink is an append-only " +
+			"DESTINATION. One file cannot be both")
 	}
 	return nil
 }
@@ -633,8 +634,8 @@ func validateSQL(c *Config) error {
 				"next to host=)")
 		}
 		if !pgIdent.MatchString(d.Table) {
-			return fmt.Errorf("sink.postgres.table: %q must be a lowercase identifier, "+
-				"optionally schema-qualified", d.Table)
+			return fmt.Errorf("sink.postgres.table: must be a lowercase identifier, " +
+				"optionally schema-qualified")
 		}
 		return nil
 	}
@@ -642,11 +643,11 @@ func validateSQL(c *Config) error {
 		return err
 	}
 	if !mysqlIdent.MatchString(d.Table) {
-		return fmt.Errorf("sink.mysql.table: %q is not a plain identifier "+
-			"(name or database.name; letters, digits and _; up to 64 characters each)", d.Table)
+		return fmt.Errorf("sink.mysql.table: not a plain identifier " +
+			"(name or database.name; letters, digits and _; up to 64 characters each)")
 	}
 	if d.TLS && strings.HasPrefix(d.Addr, "/") {
-		return fmt.Errorf("sink.mysql.tls=true with a unix socket address (%s): TLS is a TCP feature", d.Addr)
+		return fmt.Errorf("sink.mysql.tls=true with a unix socket address in sink.mysql.addr: TLS is a TCP feature")
 	}
 	if c.Sink.Batch > mysqlMaxBatch {
 		return fmt.Errorf("sink.batch: %d exceeds %d, the most rows one MySQL INSERT can carry "+
@@ -680,10 +681,10 @@ func validateDBName(key, v string) error {
 	for i := 0; i < len(v); i++ {
 		switch c := v[i]; {
 		case c == '`' || c == '\\':
-			return fmt.Errorf("%s: %q holds a backtick or a backslash, which would break the "+
-				"quoting of the name in every statement", key, v)
+			return fmt.Errorf("%s: holds a backtick or a backslash, which would break the "+
+				"quoting of the name in every statement", key)
 		case c < 0x20 || c == 0x7f:
-			return fmt.Errorf("%s: %q holds a control byte", key, v)
+			return fmt.Errorf("%s: holds a control byte", key)
 		}
 	}
 	return nil
@@ -704,19 +705,19 @@ func validatePostgresAddr(addr string) error {
 		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
 		// which pgx then tries as a list: refused like "h1,h2" below.
 		if strings.ContainsAny(addr, ",\t ") {
-			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
-				"with no comma or blank", addr)
+			return fmt.Errorf("sink.postgres.addr: a socket directory names one server, " +
+				"with no comma or blank")
 		}
 		if err != nil {
 			return nil // a bare socket directory: port 5432
 		}
 		if !validPort(port) {
-			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
-				"must be 1..65535", addr)
+			return fmt.Errorf("sink.postgres.addr: the port after the socket directory " +
+				"must be 1..65535")
 		}
 	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
-		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
-			"1..65535) nor a unix socket directory starting with /", addr)
+		return fmt.Errorf("sink.postgres.addr: neither host:port (one server, port " +
+			"1..65535) nor a unix socket directory starting with /")
 	}
 	return nil
 }
@@ -759,7 +760,7 @@ func validateClickHouse(c *Config) error {
 	}
 	for _, a := range ch.Addrs {
 		if _, _, err := net.SplitHostPort(a); err != nil {
-			return fmt.Errorf("sink.clickhouse.addrs: %q is not host:port: %w", a, err)
+			return fmt.Errorf("sink.clickhouse.addrs: an entry is not host:port")
 		}
 	}
 	for _, f := range []struct{ key, v string }{{"username", ch.Username}, {"database", ch.Database}} {
@@ -771,8 +772,8 @@ func validateClickHouse(c *Config) error {
 		return err
 	}
 	if !chIdent.MatchString(ch.Table) {
-		return fmt.Errorf("sink.clickhouse.table: %q is not a plain identifier "+
-			"(name or database.name; letters, digits and _, not starting with a digit; up to 64 characters each)", ch.Table)
+		return fmt.Errorf("sink.clickhouse.table: not a plain identifier " +
+			"(name or database.name; letters, digits and _, not starting with a digit; up to 64 characters each)")
 	}
 	if ch.PoolSize < 0 {
 		return fmt.Errorf("sink.clickhouse.pool_size: %d is negative; 0 derives sink.workers", ch.PoolSize)
@@ -794,8 +795,8 @@ func validateNATS(c *Config) error {
 		return err
 	}
 	if n.Mode == NATSModeJetStream && !natsToken.MatchString(n.Stream) {
-		return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
-			"(no whitespace, dots, wildcards or slashes)", n.Stream)
+		return fmt.Errorf("sink.nats.stream: not a valid stream name " +
+			"(no whitespace, dots, wildcards or slashes)")
 	}
 	// The client library accepts every credential it is given and picks one at
 	// connect time. Two of them in one configuration is a mistake nobody
@@ -820,8 +821,8 @@ func validateNATS(c *Config) error {
 	}
 	for _, tok := range strings.Split(ns, ".") {
 		if !natsToken.MatchString(tok) {
-			return fmt.Errorf("loghub.ctl_namespace: %q is not a publishable subject prefix "+
-				"(dot-separated tokens, no whitespace, no * or >)", ns)
+			return fmt.Errorf("loghub.ctl_namespace: not a publishable subject prefix " +
+				"(dot-separated tokens, no whitespace, no * or >)")
 		}
 	}
 	return nil
@@ -1050,20 +1051,20 @@ func CheckFiles(c *Config) error {
 		}
 		fh, err := os.Open(f.path)
 		if err != nil {
-			return fmt.Errorf("%s: %w", f.name, err)
+			return fmt.Errorf("%s: %w", f.name, pathless(err))
 		}
 		fh.Close()
 	}
 	if _, err := tls.LoadX509KeyPair(c.TLS.CertFile, c.TLS.KeyFile); err != nil {
-		return fmt.Errorf("tls.cert_file/tls.key_file: %w", err)
+		return fmt.Errorf("tls.cert_file/tls.key_file: %w", pathless(err))
 	}
 	if c.TLS.ClientCA != "" {
 		pem, err := os.ReadFile(c.TLS.ClientCA)
 		if err != nil {
-			return fmt.Errorf("tls.client_ca: %w", err)
+			return fmt.Errorf("tls.client_ca: %w", pathless(err))
 		}
 		if !x509.NewCertPool().AppendCertsFromPEM(pem) {
-			return fmt.Errorf("tls.client_ca: %q holds no PEM certificate", c.TLS.ClientCA)
+			return fmt.Errorf("tls.client_ca: the file holds no PEM certificate")
 		}
 	}
 	return nil
@@ -1096,4 +1097,16 @@ func isLoopbackBind(bind string) bool {
 // exists.
 func ringMinBytes(n int64) int64 {
 	return int64(item.PooledCap(int(n))) + ring.ItemOverhead
+}
+
+// pathless drops the path an *os.PathError carries ("open /etc/x.pem: no
+// such file or directory" becomes "open: no such file or directory"): the
+// key in front of the error already says which file, and configuration
+// errors never quote what was configured (SPEC §16.2).
+func pathless(err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("%s: %w", pe.Op, pe.Err)
+	}
+	return err
 }

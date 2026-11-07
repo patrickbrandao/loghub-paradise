@@ -11,9 +11,11 @@ import (
 )
 
 // Redis Cluster, db 0 (SPEC §9.5, §10.3.1; opt-in, docs/TESTING.md §6.1a):
-// boot with a hash-tagged stream, the refresh with the policy re-read (a Do
-// of its own on a cluster: rueidis panics on a pipeline mixing keyless and
-// keyed commands), enqueue and drain.
+// boot with a hash-tagged stream, the refresh with the policy re-read (in
+// the same pipeline: every key of the ring shares the hash-tag slot, so the
+// keyless reading goes to the stream's primary and rueidis, which panics only
+// on keyed commands of different slots, accepts it), enqueue and drain. Which
+// node answered is TestRedisRingClusterReadingsArePinned, server-free.
 func TestRedisRingCluster(t *testing.T) {
 	addr := os.Getenv("RELPLOG_TEST_REDIS_CLUSTER_ADDR")
 	if addr == "" {
