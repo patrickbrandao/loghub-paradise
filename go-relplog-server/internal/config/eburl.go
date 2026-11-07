@@ -102,12 +102,12 @@ func parseEBURL(raw string) (ebTarget, error) {
 	scheme, _, ok := strings.Cut(s, "://")
 	if !ok {
 		return ebTarget{}, errors.New("not a URL: want nats://, tls://, redis://, rediss://, " +
-			"postgres:// or postgresql://")
+			"valkey://, valkeys://, postgres:// or postgresql://")
 	}
 	switch strings.ToLower(scheme) {
 	case "nats", "tls":
 		return parseNATSURL(s)
-	case "redis", "rediss", "postgres", "postgresql":
+	case "redis", "rediss", "valkey", "valkeys", "postgres", "postgresql":
 		// One server only. Splitting on commas is not an option here: a
 		// password may legally contain one.
 		if strings.Count(s, "://") > 1 {
@@ -118,7 +118,9 @@ func parseEBURL(raw string) (ebTarget, error) {
 				"and holds \"://\" only once: a \"://\" in the password must be percent-encoded (%%3A%%2F%%2F)",
 				strings.ToLower(scheme))
 		}
-		if strings.HasPrefix(strings.ToLower(scheme), "redis") {
+		if !strings.HasPrefix(strings.ToLower(scheme), "postgres") {
+			// redis, rediss and their Valkey spellings valkey, valkeys
+			// (SPEC §10.9, §16.2.1): the same protocol, the same sink.
 			return parseRedisURL(s)
 		}
 		return parsePostgresURL(s)
@@ -128,7 +130,8 @@ func parseEBURL(raw string) (ebTarget, error) {
 		shown = strconv.Quote(strings.ToLower(scheme) + "://")
 	}
 	return ebTarget{}, fmt.Errorf("%s is not supported: the eventbus must be nats://, tls://, "+
-		"redis://, rediss://, postgres:// or postgresql:// (amqp:// included, it is refused)", shown)
+		"redis://, rediss://, valkey://, valkeys://, postgres:// or postgresql:// (amqp:// included, "+
+		"it is refused)", shown)
 }
 
 // percentEncodeHint is how a URL that does not parse is explained without
@@ -249,7 +252,9 @@ func parseNATSURL(s string) (ebTarget, error) {
 
 // parseRedisURL follows the redis:// URI convention (the one go-redis and
 // redis-py read): userinfo is username:password, the path is the database
-// number, rediss:// is TLS.
+// number, rediss:// is TLS. valkey:// and valkeys:// are the same URL under
+// the names the Valkey tools use (valkey-cli -u, rueidis's own url.go):
+// valkey = redis, valkeys = rediss (SPEC §10.9).
 func parseRedisURL(s string) (ebTarget, error) {
 	u, err := parseURL(s)
 	if err != nil {
@@ -257,14 +262,14 @@ func parseRedisURL(s string) (ebTarget, error) {
 	}
 	host := u.Hostname()
 	if host == "" {
-		return ebTarget{}, errors.New("a Redis URL needs a host")
+		return ebTarget{}, errors.New("a Redis/Valkey URL needs a host")
 	}
 	if strings.Contains(host, ",") {
 		// sink.redis.addrs is a comma-separated list: "r1,r2" here became
 		// two addresses -- a cluster nobody configured -- out of a URL that
 		// names one server (go-syslog-server review, 2026-10-13). The host is
 		// not shown: it is what a mangled password lands in.
-		return ebTarget{}, errors.New("a Redis URL names one server: its host holds a ',' " +
+		return ebTarget{}, errors.New("a Redis/Valkey URL names one server: its host holds a ',' " +
 			"(several servers go in sink.redis.addrs)")
 	}
 	port := u.Port()
@@ -280,12 +285,12 @@ func parseRedisURL(s string) (ebTarget, error) {
 	if path := strings.TrimPrefix(u.Path, "/"); path != "" {
 		n, err := strconv.Atoi(path)
 		if err != nil || n < 0 {
-			return ebTarget{}, errors.New("the path of a Redis URL is the database number (redis://host:6379/0)")
+			return ebTarget{}, errors.New("the path of a Redis/Valkey URL is the database number (redis://host:6379/0)")
 		}
 		db = n
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
-		return ebTarget{}, errors.New("query parameters of a Redis URL are not supported; use the [sink.redis] keys")
+		return ebTarget{}, errors.New("query parameters of a Redis/Valkey URL are not supported; use the [sink.redis] keys")
 	}
 	return ebTarget{
 		sinkType: SinkTypeRedis,
@@ -294,7 +299,8 @@ func parseRedisURL(s string) (ebTarget, error) {
 			{"sink.redis.username", user},
 			{"sink.redis.password", pass},
 			{"sink.redis.db", strconv.Itoa(db)},
-			{"sink.redis.tls", strconv.FormatBool(strings.EqualFold(u.Scheme, "rediss"))},
+			{"sink.redis.tls", strconv.FormatBool(strings.EqualFold(u.Scheme, "rediss") ||
+				strings.EqualFold(u.Scheme, "valkeys"))},
 		},
 		owned: []string{"sink.redis.addrs", "sink.redis.username", "sink.redis.password",
 			"sink.redis.db", "sink.redis.tls"},

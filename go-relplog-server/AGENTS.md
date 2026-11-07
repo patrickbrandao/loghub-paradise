@@ -289,6 +289,14 @@ e, num rsyslog: `action(type="omrelp" target="127.0.0.1" port="20514")`.
 - **Valores aceitos pela config precisam significar algo para quem os usa.** Um
   enum aceito pelo registry e desconhecido no pacote consumidor desliga o recurso
   em silêncio (aliases de facility; `windows-1252`).
+- **Redis e Valkey ficam na matriz de teste** (SPEC §10.3.1): toda mudança no
+  `rediscli`, no `ring/redis.go` ou no `sink/redis.go` roda contra Redis 7.4 e
+  Valkey 7.2, 8.1 e 9.0 (`../scripts/test-redis-valkey.sh`, `docs/TESTING.md`
+  §7.1a). **Nunca decida recurso por `redis_version`**: o Valkey reporta
+  `7.2.4` fixo; a versão real é `valkey_version`. O nome canônico é `redis`
+  (protocolo); `valkey` é alias exato (`alias.go`, SPEC §16.2.1) e não aparece
+  em dump, log nem métrica. O erro de handshake do rueidis chega **sem** o
+  `ERR ` da resposta: case o texto com e sem ele.
 
 ## 10. Estado do projeto
 

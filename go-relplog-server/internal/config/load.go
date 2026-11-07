@@ -149,6 +149,7 @@ func Load(opts Options) (*Loaded, error) {
 		// afterSecret: the line before was a secret, so an unknown key here
 		// may be the rest of it wrapped onto this line (lookupINI).
 		afterSecret := false
+		guard := newAliasGuard()
 		for _, e := range entries {
 			p, err := ix.lookupINI(e, afterSecret)
 			if err != nil {
@@ -156,33 +157,55 @@ func Load(opts Options) (*Loaded, error) {
 			}
 			afterSecret = p.Redact != RedactNone
 			if err := setValue(p, e.Raw); err != nil {
-				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, p.Name(), err)
+				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, e.Name, err)
 			}
-			l.mark(p, FromFile, "file "+file+" line "+strconv.Itoa(e.Line))
+			origin := "file " + file + " line " + strconv.Itoa(e.Line)
+			if err := guard.note(p, e.Name, origin); err != nil {
+				return nil, err
+			}
+			l.mark(p, FromFile, origin)
 			l.InFile[p.Name()] = true
 		}
 		l.File = file
 	}
 
 	// --- environment --------------------------------------------------------
+	// A key of [sink.redis]/[ring.redis] is also read under its valkey name
+	// (<PREFIX>_SINK_VALKEY_<KEY>); both set with different values is exit 1
+	// (alias.go, SPEC §16.2.1).
+	envGuard := newAliasGuard()
 	for _, p := range params {
-		v, ok := opts.LookupEnv(p.Env())
-		if !ok {
-			continue
+		for _, name := range []string{p.Env(), aliasEnv(p)} {
+			if name == "" {
+				continue
+			}
+			v, ok := opts.LookupEnv(name)
+			if !ok {
+				continue
+			}
+			if err := setValue(p, v); err != nil {
+				return nil, fmt.Errorf("%s (%s): %w", name, p.Name(), err)
+			}
+			if err := envGuard.note(p, name, "env"); err != nil {
+				return nil, err
+			}
+			if !l.SetIn[p.Name()] || l.Source[p.Name()] != FromEnv {
+				l.mark(p, FromEnv, "env "+name)
+			}
 		}
-		if err := setValue(p, v); err != nil {
-			return nil, fmt.Errorf("%s (%s): %w", p.Env(), p.Name(), err)
-		}
-		l.mark(p, FromEnv, "env "+p.Env())
 	}
 
 	// --- command line -------------------------------------------------------
+	flagGuard := newAliasGuard()
 	for _, e := range flagEntries {
 		p := ix.byName[e.Name]
 		if err := setValue(p, e.Raw); err != nil {
-			return nil, fmt.Errorf("%s: %w", p.Flag(), err)
+			return nil, fmt.Errorf("--%s: %w", e.Spelled, err)
 		}
-		l.mark(p, FromFlag, "flag "+p.Flag())
+		if err := flagGuard.note(p, "--"+e.Spelled, "flag"); err != nil {
+			return nil, err
+		}
+		l.mark(p, FromFlag, "flag --"+e.Spelled)
 	}
 
 	// --- LOGHUB_EB_URL --------------------------------------------------------
