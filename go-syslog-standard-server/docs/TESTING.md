@@ -485,6 +485,31 @@ Registradas por honestidade, não por esquecimento.
     abandona o dump nesse caso (`emergency.Store.SetAbandon`), esta referência
     não.
 
+### 8.3 Revisão independente de 2026-11-07 (SPEC §21.1, itens 21–29)
+
+Cada teste novo trava a regra: a coluna da direita é a mutação que o derruba
+(conferida removendo ou revertendo a correção).
+
+| Item | Teste | Mutação que derruba |
+|---|---|---|
+| 21 recontagem | `TestCountDoesNotAllocateTheRawLines`, `FuzzRead` (contagem = leitura), `TestCollectedIsClearedBeforeTheRecount` | `countFile` com `Read` inteiro; zerar `collected` só depois da recontagem |
+| 22 cluster | `TestRedisClusterPolicyIsReadOnTheStreamPrimary` (cluster falso de dois primários, 12 boots × 5 sondas, `INFO memory` e `CONFIG GET`) | política num `Do` solto; `onStreamPrimary` com `Do` |
+| 23 RELP | `TestRELPTakesTheBudgetBeforeThePayload`, `TestBudgetIsFIFO` | aquisição depois do payload; `Acquire` sem a fila; cancelamento sem conceder ao próximo |
+| 24 buffer | `TestFramerKeepsTheBufferWhileFramesReuseIt` (octet, LF, RELP), `TestFramerDropsALargeBufferBetweenFrames` | soltar sem conferir `Buffered() == 0` |
+| 25 prazo | `TestWaitReadyNoAttemptCrossesTheDeadline`, `TestValidationContextStopsAtTheBootDeadline`, `TestRedisBootAttemptStopsAtTheBootDeadline` | sem o `min` em cada um dos três |
+| 26 eco | `TestConfigErrorsNeverEchoTheValue` (33 recusas), `TestCheckQuotedNameDoesNotEchoTheName` | `invalid integer %q`; `%q` no `validateDBName` |
+| 27 sqlite | `TestSQLiteHealthReportsAStuckWriter` | sonda sem o limite `StuckAfter` |
+| 28 nomes | `TestComposeImageVariablesAreThisServers`, `TestComposeValkeyPortsAreFree` | — (conferem os arquivos) |
+| 29 alias | `TestValkeyAliasComparesTheLastValueOfEachSpelling` | o `load.go` anterior (compara a cada ocorrência) |
+
+**O cluster de um nó não distingue** o nó certo de um arbitrário (§6.1): o
+roteamento da política e da identidade só é provado pelo cluster falso, sem
+servidor. Rodado também contra Valkey 8.1 real (`noeviction`, `allkeys-lru` e
+cluster de um nó), `-p 1 -race`: verde; Sentinel não rodou nesta revisão (o
+caminho fora do cluster não mudou: um `Do`). `gofmt -l`, `go vet ./...` e
+`go test -race -count=1 ./...` limpos; `FuzzFrame` e `FuzzRead` 20 s cada,
+limpos.
+
 ### 8.2 Rodada de 2026-11-07: todas as pendências abertas de §21.1 e Valkey
 
 Itens 1, 2, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 e 20, mais a paridade
