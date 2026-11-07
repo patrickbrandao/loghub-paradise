@@ -2,10 +2,12 @@ package sink
 
 // Tests of the independent review of 2026-11-07 (SPEC §21.1, items 21-29)
 // in this package: no boot attempt crosses the one sink.boot_timeout (item
-// 25, SPEC §12.1).
+// 25, SPEC §12.1); the constructor's name check without echo (item 26,
+// SPEC §15.1).
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,5 +57,20 @@ func TestValidationContextStopsAtTheBootDeadline(t *testing.T) {
 	defer fcancel()
 	if d, _ := free.Deadline(); time.Until(d) < 4*time.Second {
 		t.Fatalf("outside the boot the validation got %v, want its own 5s", time.Until(d))
+	}
+}
+
+// The constructor's check of the database name (for a caller that bypasses
+// config) names what is wrong, never the name (SPEC §15.1).
+func TestCheckQuotedNameDoesNotEchoTheName(t *testing.T) {
+	const secret = "hunter2-S3CRET"
+	for _, bad := range []string{secret + "`", secret + `\`, secret + "\x01", strings.Repeat(secret, 5)} {
+		err := checkQuotedName("sink mysql: database", bad)
+		if err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("the error echoes the name: %v", err)
+		}
 	}
 }

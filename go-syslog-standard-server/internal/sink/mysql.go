@@ -162,14 +162,14 @@ func checkQuotedName(what, name string) error {
 		return fmt.Errorf("%s is empty", what)
 	}
 	if n := utf8.RuneCountInString(name); n > 64 {
-		return fmt.Errorf("%s %q has %d characters; the limit is 64", what, name, n)
+		return fmt.Errorf("%s has %d characters; the limit is 64", what, n)
 	}
 	for i := 0; i < len(name); i++ {
 		switch c := name[i]; {
 		case c == '`' || c == '\\':
-			return fmt.Errorf("%s %q has %q, which cannot appear between the backticks of the INSERT", what, name, c)
+			return fmt.Errorf("%s has a backtick or a backslash, which cannot appear between the backticks of the INSERT", what)
 		case c < 0x20 || c == 0x7f:
-			return fmt.Errorf("%s %q has the control byte 0x%02x", what, name, c)
+			return fmt.Errorf("%s has a control byte", what)
 		}
 	}
 	return nil

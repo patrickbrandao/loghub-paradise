@@ -2848,6 +2848,22 @@ valor de outra flag (`--sink.workers --sink.nats.password=x`); e um nome que
 começa com o nome de um parâmetro e continua (`--sink.nats.passwordx`) não é
 citado.
 
+**E a validação também não ecoa** (corrigido em 2026-11-07, revisão
+independente). Os erros do parse de valor (`invalid integer`, `invalid byte
+size`, `invalid duration`, `invalid bool`, `invalid file mode`) e os das regras
+de validação (enumerações como `sink.type`, `listen.*` que não é `host:port`,
+`listen.unix`, `filter.*`, `ratelimit.exempt`, os caminhos SQLite iguais,
+`sink.postgres.table`, `sink.mysql.table`/`database`/`addr`, `sink.nats.stream`/
+`subject`) e o `checkQuotedName` do construtor do `sink=mysql` nomeiam a
+**chave e o problema** (a classe do caractere, o tamanho, a entrada da lista
+pela posição), nunca o texto do valor: um segredo digitado na chave errada, ou
+um valor que é ele mesmo um segredo, chegava ao stderr e, num `SIGHUP`, ao log
+(o `validateDBName` e o `checkQuotedName` vieram do `go-syslog-server` com o
+mesmo defeito). Números **já parseados** (uma contagem abaixo de 1, um tamanho
+abaixo do mínimo) continuam na mensagem: depois do parse são só um número.
+`TestConfigErrorsNeverEchoTheValue` passa um segredo por cada uma dessas
+recusas.
+
 ### 15.2 Registry único
 
 Uma **única tabela** declara, para cada parâmetro: seção, chave, tipo, valor
@@ -3665,3 +3681,4 @@ correção, e um trecho portado leva a correção junto, não o defeito.
 23. *Corrigido em 2026-11-07 (revisão independente):* o RELP pegava a vaga e os bytes de `relp.inflight_max_bytes` depois de ler o frame inteiro, e a espera não era justa; agora depois do `DATALEN` e antes do payload, com fila FIFO; regra em §4.5 e §14.4.
 24. *Corrigido em 2026-11-07 (revisão independente; regra do go-syslog-server):* o buffer de frame acima de 16 KiB era largado a cada frame; agora só entre frames com o leitor vazio; regra em §5.5.
 25. *Corrigido em 2026-11-07 (revisão independente):* uma tentativa (discagem do Redis, checagem do `WaitReady`, validação do PostgreSQL/MySQL) passava do prazo único de boot; agora cada uma recebe o mínimo entre o próprio prazo e o que falta; regra em §12.1.
+26. *Corrigido em 2026-11-07 (revisão independente):* erros de parse de valor e de validação (`invalid integer %q`, `sink.type: %q`, `validateDBName`, `checkQuotedName` e os demais) ecoavam o valor; agora nomeiam chave e problema; regra em §15.1.

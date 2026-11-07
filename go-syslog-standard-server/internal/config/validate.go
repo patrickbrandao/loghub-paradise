@@ -114,22 +114,22 @@ func validateEnums(c *Config) error {
 	switch c.Ring.Mode {
 	case RingMemory, RingSQLiteMode, RingNone:
 	default:
-		return fmt.Errorf("ring.mode: %q is not one of memory, sqlite, none", c.Ring.Mode)
+		return fmt.Errorf("ring.mode: not one of memory, sqlite, none")
 	}
 	switch c.Sink.Type {
 	case SinkRedisType, SinkSQLiteType, SinkPostgresType, SinkMySQLType, SinkNATSType, SinkNoneType:
 	default:
-		return fmt.Errorf("sink.type: %q is not one of redis (or valkey), sqlite, postgres, mysql, nats, none", c.Sink.Type)
+		return fmt.Errorf("sink.type: not one of redis (or valkey), sqlite, postgres, mysql, nats, none")
 	}
 	switch c.TCP.Framing {
 	case FramingAuto, FramingOctet, FramingLF:
 	default:
-		return fmt.Errorf("tcp.framing: %q is not one of auto, octet, lf", c.TCP.Framing)
+		return fmt.Errorf("tcp.framing: not one of auto, octet, lf")
 	}
 	switch c.Parse.Prefer {
 	case PreferAuto, Prefer5424, Prefer3164:
 	default:
-		return fmt.Errorf("parse.prefer: %q is not one of auto, 5424, 3164", c.Parse.Prefer)
+		return fmt.Errorf("parse.prefer: not one of auto, 5424, 3164")
 	}
 	if err := checkSynchronous("ring.sqlite.synchronous", c.RingSQL.Synchronous); err != nil {
 		return err
@@ -140,17 +140,17 @@ func validateEnums(c *Config) error {
 	switch c.SinkSQL.Rotate {
 	case "none", "hourly", "daily":
 	default:
-		return fmt.Errorf("sink.sqlite.rotate: %q is not one of none, hourly, daily", c.SinkSQL.Rotate)
+		return fmt.Errorf("sink.sqlite.rotate: not one of none, hourly, daily")
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
-		return fmt.Errorf("log.level: %q is not one of debug, info, warn, error", c.Log.Level)
+		return fmt.Errorf("log.level: not one of debug, info, warn, error")
 	}
 	switch c.Log.Format {
 	case "json", "text":
 	default:
-		return fmt.Errorf("log.format: %q is not one of json, text", c.Log.Format)
+		return fmt.Errorf("log.format: not one of json, text")
 	}
 	return nil
 }
@@ -175,7 +175,7 @@ func validateListeners(c *Config) error {
 			continue
 		}
 		if _, _, err := net.SplitHostPort(e.addr); err != nil {
-			return fmt.Errorf("%s: %q is not host:port (a bare \":1514\" is fine)", e.name, e.addr)
+			return fmt.Errorf("%s: not host:port (a bare \":1514\" is fine)", e.name)
 		}
 	}
 
@@ -184,8 +184,8 @@ func validateListeners(c *Config) error {
 	// RELP may not: RELP speaks its own framing, and two readers on one
 	// stream socket cannot both be right.
 	if c.Listen.TCP != "" && c.Listen.TCP == c.Listen.RELP {
-		return fmt.Errorf("listen.tcp and listen.relp are both %q: they are different "+
-			"protocols and cannot share one stream socket", c.Listen.TCP)
+		return fmt.Errorf("listen.tcp and listen.relp are the same address: they are different " +
+			"protocols and cannot share one stream socket")
 	}
 
 	for _, n := range []struct {
@@ -201,16 +201,15 @@ func validateListeners(c *Config) error {
 		}
 	}
 	if c.Listen.Unix != "" && !filepath.IsAbs(c.Listen.Unix) {
-		return fmt.Errorf("listen.unix: %q must be an absolute path", c.Listen.Unix)
+		return fmt.Errorf("listen.unix: must be an absolute path")
 	}
 	// A unix socket path lives in a fixed-size sun_path field. Past it, the
 	// kernel answers bind with a bare "invalid argument" that names nothing, and
 	// the operator is left guessing at permissions. Checking the length here
 	// turns that into an error that says what is wrong.
 	if max := unixPathMax(); len(c.Listen.Unix) > max {
-		return fmt.Errorf("listen.unix: %q is %d bytes, above the %d this platform allows "+
-			"for a socket path (sun_path); choose a shorter path", c.Listen.Unix,
-			len(c.Listen.Unix), max)
+		return fmt.Errorf("listen.unix: the path is %d bytes, above the %d this platform allows "+
+			"for a socket path (sun_path); choose a shorter path", len(c.Listen.Unix), max)
 	}
 	if c.Listen.UnixMode == 0 && c.Listen.Unix != "" {
 		return fmt.Errorf("listen.unix_mode: 0 makes the socket unwritable by anyone, " +
@@ -335,12 +334,11 @@ func validateParseAndFilter(c *Config) error {
 		return fmt.Errorf("parse.sd_max_params: %d is below 1", c.Parse.SDMaxParams)
 	}
 	if _, ok := syslog.ParseSeverity(c.Filter.MinSeverity); !ok {
-		return fmt.Errorf("filter.min_severity: %q is not a severity name or a number 0..7",
-			c.Filter.MinSeverity)
+		return fmt.Errorf("filter.min_severity: not a severity name or a number 0..7")
 	}
 	for _, f := range c.Filter.Facilities {
 		if _, ok := syslog.ParseFacility(strings.ToLower(strings.TrimSpace(f))); !ok {
-			return fmt.Errorf("filter.facilities: %q is not a facility name or a number 0..23", f)
+			return fmt.Errorf("filter.facilities: an entry is not a facility name or a number 0..23")
 		}
 	}
 	return nil
@@ -361,9 +359,9 @@ func validatePaths(c *Config) error {
 		return fmt.Errorf("sink.sqlite.path: %w", err)
 	}
 	if ring == sink {
-		return fmt.Errorf("ring.sqlite.path and sink.sqlite.path are both %q: the ring is a "+
-			"QUEUE whose rows are deleted after delivery, the sink is an append-only "+
-			"DESTINATION. One file cannot be both", ring)
+		return fmt.Errorf("ring.sqlite.path and sink.sqlite.path are the same file: the ring is a " +
+			"QUEUE whose rows are deleted after delivery, the sink is an append-only " +
+			"DESTINATION. One file cannot be both")
 	}
 	return nil
 }
@@ -386,8 +384,8 @@ func validateSinkTLS(c *Config) error {
 		return fmt.Errorf("sink.nats.tls_ca is set but sink.nats.tls is false")
 	}
 	if c.Sink.Type == SinkPostgresType && !pgIdent.MatchString(c.SinkPG.Table) {
-		return fmt.Errorf("sink.postgres.table: %q must be a lowercase identifier, "+
-			"optionally schema-qualified", c.SinkPG.Table)
+		return fmt.Errorf("sink.postgres.table: must be a lowercase identifier, " +
+			"optionally schema-qualified")
 	}
 	return nil
 }
@@ -410,11 +408,11 @@ func validateMySQL(c *Config) error {
 		return err
 	}
 	if !mysqlIdent.MatchString(my.Table) {
-		return fmt.Errorf("sink.mysql.table: %q is not a plain identifier "+
-			"(name or database.name; letters, digits and _; up to 64 characters each)", my.Table)
+		return fmt.Errorf("sink.mysql.table: not a plain identifier " +
+			"(name or database.name; letters, digits and _; up to 64 characters each)")
 	}
 	if my.TLS && strings.HasPrefix(my.Addr, "/") {
-		return fmt.Errorf("sink.mysql.tls=true with a unix socket address (%s): TLS is a TCP feature", my.Addr)
+		return fmt.Errorf("sink.mysql.tls=true with a unix socket in sink.mysql.addr: TLS is a TCP feature")
 	}
 	if c.Sink.Batch > mysqlMaxBatch {
 		return fmt.Errorf("sink.batch: %d exceeds %d, the most rows one MySQL INSERT can carry "+
@@ -441,10 +439,10 @@ func validateDBName(key, v string) error {
 	for i := 0; i < len(v); i++ {
 		switch c := v[i]; {
 		case c == '`' || c == '\\':
-			return fmt.Errorf("%s: %q holds a backtick or a backslash, which would break the "+
-				"quoting of the name in every statement", key, v)
+			return fmt.Errorf("%s: holds a backtick or a backslash, which would break the "+
+				"quoting of the name in every statement", key)
 		case c < 0x20 || c == 0x7f:
-			return fmt.Errorf("%s: %q holds a control byte", key, v)
+			return fmt.Errorf("%s: holds a control byte", key)
 		}
 	}
 	return nil
@@ -457,16 +455,16 @@ func validateNATS(c *Config) error {
 		return fmt.Errorf("sink.nats.urls: at least one URL is required when sink.type=nats")
 	}
 	if !natsToken.MatchString(n.Stream) {
-		return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
-			"(no whitespace, dots, wildcards or slashes)", n.Stream)
+		return fmt.Errorf("sink.nats.stream: not a valid stream name " +
+			"(no whitespace, dots, wildcards or slashes)")
 	}
 	if n.Subject == "" {
 		return fmt.Errorf("sink.nats.subject: cannot be empty when sink.type=nats")
 	}
 	for _, tok := range strings.Split(n.Subject, ".") {
 		if !natsToken.MatchString(tok) {
-			return fmt.Errorf("sink.nats.subject: %q is not a publishable subject "+
-				"(dot-separated tokens, no whitespace, no * or >)", n.Subject)
+			return fmt.Errorf("sink.nats.subject: not a publishable subject " +
+				"(dot-separated tokens, no whitespace, no * or >)")
 		}
 	}
 	// The client library accepts every credential it is given and picks one at
@@ -615,7 +613,7 @@ func checkSynchronous(name, v string) error {
 	case "FULL", "NORMAL", "OFF":
 		return nil
 	}
-	return fmt.Errorf("%s: %q is not one of FULL, NORMAL, OFF", name, v)
+	return fmt.Errorf("%s: not one of FULL, NORMAL, OFF", name)
 }
 
 // ParsePrefixes parses a list of CIDRs, accepting a bare address as a
@@ -623,7 +621,7 @@ func checkSynchronous(name, v string) error {
 // Addresses are unmapped first, so "::ffff:10.0.0.5" and "10.0.0.5" agree.
 func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(list))
-	for _, raw := range list {
+	for i, raw := range list {
 		s := strings.TrimSpace(raw)
 		if s == "" {
 			continue
@@ -631,7 +629,7 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		if strings.Contains(s, "/") {
 			p, err := netip.ParsePrefix(s)
 			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR %q: %w", raw, err)
+				return nil, fmt.Errorf("entry %d is not a CIDR", i+1)
 			}
 			// Masked() drops host bits so "10.0.0.5/24" behaves as
 			// "10.0.0.0/24" instead of never matching.
@@ -640,7 +638,7 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		}
 		a, err := netip.ParseAddr(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid address %q: %w", raw, err)
+			return nil, fmt.Errorf("entry %d is not an address or a CIDR", i+1)
 		}
 		a = a.Unmap()
 		out = append(out, netip.PrefixFrom(a, a.BitLen()))
