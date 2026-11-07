@@ -8,8 +8,9 @@ import (
 
 // flagEntry is one assignment found on the command line.
 type flagEntry struct {
-	Name string
-	Raw  string
+	Name    string // canonical name
+	Spelled string // the name as typed: an alias (sink.valkey.*) differs from Name
+	Raw     string
 }
 
 // Meta holds the command-line switches that are not configuration parameters.
@@ -172,7 +173,7 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			// Bare --sec.key on a bool means true. Anything else must carry a
 			// value: guessing would make "--ring.mode sqlite" ambiguous with a
 			// positional argument.
-			out = append(out, flagEntry{Name: p.Name(), Raw: "true"})
+			out = append(out, flagEntry{Name: p.Name(), Spelled: name, Raw: "true"})
 			continue
 		}
 		v, err := takeValue()
@@ -180,7 +181,7 @@ func parseFlags(ix *index, args []string) ([]flagEntry, Meta, error) {
 			return nil, m, err
 		}
 		assigned(v)
-		out = append(out, flagEntry{Name: p.Name(), Raw: v})
+		out = append(out, flagEntry{Name: p.Name(), Spelled: name, Raw: v})
 	}
 	return out, m, nil
 }

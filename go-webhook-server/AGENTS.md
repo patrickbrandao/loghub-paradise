@@ -208,13 +208,23 @@ go test ./internal/sink/      -run=XXX -fuzz=^FuzzJSONBSafe$ -fuzztime=60s
 Destino Redis — **é o padrão de produção e os testes pulam sem um servidor**:
 
 ```bash
-docker run --rm -d -p 16379:6379 --name whs-test-redis redis:7-alpine
+docker run --rm -d -p 16379:6379 --name whs-test-redis redis:7.4-alpine
 WHS_TEST_REDIS_ADDR=127.0.0.1:16379 go test -race -timeout 600s ./internal/app/
 docker rm -f whs-test-redis
 ```
 
 Se você mexeu em `internal/sink/redis.go`, `workers.go`, `health.go` ou no boot,
 **rode esta suíte**. Sem ela, o caminho padrão fica sem prova.
+
+**Redis e Valkey ficam os dois na matriz** (`SPEC.md` §8.2.6): Redis 7.4 e
+Valkey 7.2, 8.1 e 9.0, a mesma suíte contra cada um (`TESTING.md` §5.1, com o
+gêmeo `allkeys-lru` em `WHS_TEST_REDIS_LRU_ADDR`, e o Sentinel e o cluster
+opt-in). O nome `redis` designa o protocolo; `valkey` é alias em
+`sink.type`, `[sink.valkey]`, `--sink.valkey.*` e `WHS_SINK_VALKEY_*`
+(§13.2), sempre normalizado para `redis`. Nunca decida um recurso por
+`redis_version`: o Valkey responde `7.2.4` fixo. E nada de `DoMulti` que
+misture comando com chave e comando sem chave: o cliente de cluster do
+rueidis entra em *panic* (§8.2.5).
 
 Destino PostgreSQL — **os testes pulam sem um servidor**, e o servidor não cria a
 fila (a suíte cria as dela, cada uma num esquema próprio, a partir de
