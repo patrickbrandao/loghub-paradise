@@ -1836,10 +1836,16 @@ Destino final append-only no esquema de §3.5.
   por lentidão. Agora, se o prazo passa com a **escritora** segurando a trava,
   o banco está sendo escrito naquele instante e o resultado daquela escrita é o
   que os workers classificam: a sonda reporta saudável em vez de inventar uma
-  falha. Uma trava presa por qualquer outra coisa ainda é falha. A escritora
-  não segura para sempre: toda escrita roda sob `sink.op_timeout`, e um disco
-  quebrado faz cada uma falhar rápido, soltar a trava e deixar a próxima sonda
-  ver o erro.
+  falha. Uma trava presa por qualquer outra coisa ainda é falha.
+- **"Ocupada" tem limite** (corrigido em 2026-11-07, revisão independente; a
+  regra do `go-syslog-server` e do `go-webhook-server`, item 36 lá). Uma
+  escrita que segura a trava há mais de `sink.op_timeout +
+  sink.health_timeout`, medido no **relógio monotônico** desde que ela pegou a
+  trava, está **presa**, e a sonda falha (`network`, os fusíveis seguem). O
+  `COMMIT` não recebe contexto, e um `fsync` travado num disco que parou
+  deixava a sonda reportar a escritora como saudável para sempre. O relógio é
+  o monotônico porque um passo do relógio de parede (NTP) para trás daria uma
+  idade negativa e manteria o sink UP.
 
 ### 10.5 `sink.type = postgres`
 
@@ -3682,3 +3688,4 @@ correção, e um trecho portado leva a correção junto, não o defeito.
 24. *Corrigido em 2026-11-07 (revisão independente; regra do go-syslog-server):* o buffer de frame acima de 16 KiB era largado a cada frame; agora só entre frames com o leitor vazio; regra em §5.5.
 25. *Corrigido em 2026-11-07 (revisão independente):* uma tentativa (discagem do Redis, checagem do `WaitReady`, validação do PostgreSQL/MySQL) passava do prazo único de boot; agora cada uma recebe o mínimo entre o próprio prazo e o que falta; regra em §12.1.
 26. *Corrigido em 2026-11-07 (revisão independente):* erros de parse de valor e de validação (`invalid integer %q`, `sink.type: %q`, `validateDBName`, `checkQuotedName` e os demais) ecoavam o valor; agora nomeiam chave e problema; regra em §15.1.
+27. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a sonda do `sink=sqlite` reportava saudável para sempre uma escritora travada; agora o limite é `sink.op_timeout + sink.health_timeout` no relógio monotônico; regra em §10.4.

@@ -27,6 +27,11 @@ type SQLiteConfig struct {
 	Synchronous       string // FULL | NORMAL | OFF
 	BusyTimeout       time.Duration
 	WALAutocheckpoint int
+	// StuckAfter is how long a Write may hold the lock and still count as
+	// busy to a probe that cannot get it: sink.op_timeout +
+	// sink.health_timeout (SPEC §10.4). 0 selects 6s, the sum of the
+	// defaults.
+	StuckAfter time.Duration
 }
 
 // SQLite is the standalone final destination (SPEC §10.4). It needs no Redis.
@@ -67,6 +72,29 @@ type SQLite struct {
 	// writing is true while Write holds mu: what lets Health tell a busy
 	// writer from a lock nobody releases (SPEC §10.4).
 	writing atomic.Bool
+
+	// base is NewSQLite's instant, with its monotonic reading: writeStart is
+	// an offset from it, so a step of the wall clock (NTP, a manual change)
+	// does not move the age the probe reads (SPEC §10.4; ported from
+	// go-syslog-server, review A3 there).
+	base time.Time
+	// writeStart is when the Write in progress took the lock, as
+	// time.Since(base). The probe counts the writer as busy only while it has
+	// held the lock for at most cfg.StuckAfter: COMMIT takes no context, and
+	// a stuck fsync kept the sink UP forever (independent review of
+	// 2026-11-07; go-syslog-server review A1, go-webhook-server item 36).
+	writeStart atomic.Int64
+}
+
+// stampWriteStart records that the Write in progress took the lock now, on the
+// monotonic clock. time.Now().UnixNano() carries no monotonic reading: an NTP
+// step backwards during a stuck write would give a negative age and keep the
+// sink UP.
+func (s *SQLite) stampWriteStart() { s.writeStart.Store(int64(time.Since(s.base))) }
+
+// heldFor is how long the Write in progress has held the lock.
+func (s *SQLite) heldFor() time.Duration {
+	return time.Since(s.base) - time.Duration(s.writeStart.Load())
 }
 
 // Three indexes, not four. (app_name, ts) is the obvious fourth and is left out
@@ -133,7 +161,10 @@ func NewSQLite(cfg SQLiteConfig, log *slog.Logger, m *obs.Metrics) (*SQLite, err
 		cfg.WALAutocheckpoint = 1000
 	}
 
-	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now, mu: newCtxMutex()}
+	if cfg.StuckAfter <= 0 {
+		cfg.StuckAfter = 6 * time.Second
+	}
+	s := &SQLite{cfg: cfg, log: log, m: m, now: time.Now, mu: newCtxMutex(), base: time.Now()}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o750); err != nil {
 		return nil, fmt.Errorf("sink sqlite: %w", err)
 	}
@@ -328,6 +359,7 @@ func (s *SQLite) Write(ctx context.Context, batch []Prepared) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stampWriteStart()
 	s.writing.Store(true)
 	defer s.writing.Store(false)
 
@@ -387,13 +419,20 @@ func (s *SQLite) Write(ctx context.Context, batch []Prepared) error {
 // deadline passes with the WRITER still holding the lock, the database is
 // being written right now, and that write's own outcome is what the workers
 // classify; the probe reports the busy writer as healthy instead of
-// inventing a failure. A writer cannot hold the lock forever: every write
-// runs under sink.op_timeout, and a broken disk makes each one fail fast,
-// release the lock and leave the next probe to see the error.
+// inventing a failure. "Busy" has a limit: a write holding the lock for
+// longer than sink.op_timeout + sink.health_timeout (cfg.StuckAfter, on the
+// monotonic clock) is stuck -- COMMIT takes no context, and a hung fsync
+// otherwise kept the sink UP forever -- and the probe fails (independent
+// review of 2026-11-07, the rule of go-syslog-server and go-webhook-server).
 func (s *SQLite) Health(ctx context.Context) error {
 	if !s.mu.LockCtx(ctx) {
 		if s.writing.Load() {
-			return nil
+			held := s.heldFor()
+			if held <= s.cfg.StuckAfter {
+				return nil
+			}
+			return networkErr("heartbeat", fmt.Errorf("the writer has held the database for %s, past "+
+				"sink.op_timeout + sink.health_timeout: %w", held.Round(time.Millisecond), ctx.Err()))
 		}
 		return networkErr("heartbeat", ctx.Err())
 	}

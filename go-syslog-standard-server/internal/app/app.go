@@ -397,6 +397,7 @@ func (a *App) buildSink(ctx context.Context) int {
 			Synchronous:       a.cfg.SinkSQL.Synchronous,
 			BusyTimeout:       a.cfg.SinkSQL.BusyTimeout,
 			WALAutocheckpoint: a.cfg.SinkSQL.WALAutocheckpoint,
+			StuckAfter:        a.cfg.Sink.OpTimeout + a.cfg.Sink.HealthTimeout,
 		}, a.log.Logger, a.metrics)
 		if err != nil {
 			a.log.Error("cannot open the events database", "error", err)

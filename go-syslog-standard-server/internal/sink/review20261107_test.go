@@ -7,6 +7,7 @@ package sink
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,43 @@ func TestValidationContextStopsAtTheBootDeadline(t *testing.T) {
 	defer fcancel()
 	if d, _ := free.Deadline(); time.Until(d) < 4*time.Second {
 		t.Fatalf("outside the boot the validation got %v, want its own 5s", time.Until(d))
+	}
+}
+
+// A writer that has held the lock past sink.op_timeout + sink.health_timeout
+// is stuck, not busy: the probe fails instead of reporting it healthy forever
+// (item 27, SPEC §10.4). The age is on the monotonic clock.
+func TestSQLiteHealthReportsAStuckWriter(t *testing.T) {
+	s, err := NewSQLite(SQLiteConfig{Path: filepath.Join(t.TempDir(), "events.db"), Synchronous: "OFF",
+		StuckAfter: 150 * time.Millisecond}, discard(), metrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	s.mu.Lock() // a Write in progress, from now
+	s.stampWriteStart()
+	s.writing.Store(true)
+	probe := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		return s.Health(ctx)
+	}
+	if err := probe(); err != nil {
+		t.Fatalf("Health = %v behind a writer busy for a moment", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	err = probe()
+	s.writing.Store(false)
+	s.mu.Unlock() // before any Fatal: Close takes the lock
+	if err == nil {
+		t.Fatal("Health passed behind a writer stuck past StuckAfter")
+	}
+	if IsFatal(err) {
+		t.Fatalf("a stuck writer is a network failure for the fuses, not fatal: %v", err)
+	}
+	if err := s.Health(context.Background()); err != nil {
+		t.Fatalf("Health after the writer let go: %v", err)
 	}
 }
 
