@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -57,6 +58,14 @@ func TestRedisBootHasOneDeadline(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `msg="sink ready" type=redis`) {
 		t.Fatalf("control: the Redis client was never built, so the wait for the check never ran:\n%s", buf.String())
+	}
+	// SPEC §8.2.6: the boot log says which server answered, from INFO
+	// server -- valkey with its valkey_version, never Valkey's fixed 7.2.4.
+	if m := regexp.MustCompile(`msg="sink ready" type=redis .* server=(\w+) server_version=(\S+)`).
+		FindStringSubmatch(buf.String()); m == nil || m[1] == "unknown" || m[2] == "" {
+		t.Fatalf("the sink ready line does not identify the server:\n%s", buf.String())
+	} else {
+		t.Logf("server=%s server_version=%s", m[1], m[2])
 	}
 	if took > 3*time.Second {
 		t.Fatalf("the boot took %s with sink.boot_timeout=2s: the wait for the first check started a "+

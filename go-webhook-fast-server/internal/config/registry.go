@@ -32,8 +32,60 @@ func (p *Param) Name() string { return p.Sec + "." + p.Key }
 func (p *Param) Flag() string { return "--" + p.Name() }
 
 // Env is the environment form: "WHS_SINK_REDIS_ADDRS".
-func (p *Param) Env() string {
-	return "WHS_" + strings.ToUpper(strings.NewReplacer(".", "_", "-", "_").Replace(p.Name()))
+func (p *Param) Env() string { return envName(p.Name()) }
+
+func envName(name string) string {
+	return "WHS_" + strings.ToUpper(strings.NewReplacer(".", "_", "-", "_").Replace(name))
+}
+
+// aliasSections maps an alias section to the canonical one it stands for
+// (SPEC §13.2, §8.2.6). Valkey speaks the Redis protocol, so [sink.valkey],
+// --sink.valkey.<key> and WHS_SINK_VALKEY_<KEY> are exactly the keys of
+// [sink.redis]: the registry keeps ONE parameter and only the spelling of its
+// name differs. A second parameter per key would have doubled the dump, the
+// validation and the removed-key lists of the cuts, and let the two drift.
+// The canonical name is the one --dump-config, the logs and the metrics show.
+var aliasSections = map[string]string{"sink.valkey": "sink.redis"}
+
+// canonicalName returns the registry name of a name written with an alias
+// section ("sink.valkey.addrs" -> "sink.redis.addrs"); any other name comes
+// back unchanged.
+func canonicalName(name string) string {
+	for alias, canon := range aliasSections {
+		if strings.HasPrefix(name, alias+".") {
+			return canon + name[len(alias):]
+		}
+	}
+	return name
+}
+
+// aliasOf returns the alias section of a canonical section, "" when it has
+// none.
+func aliasOf(sec string) string {
+	for alias, canon := range aliasSections {
+		if canon == sec {
+			return alias
+		}
+	}
+	return ""
+}
+
+// AliasName is p's dotted name under its alias section ("sink.valkey.addrs"),
+// "" when p's section has no alias.
+func (p *Param) AliasName() string {
+	if alias := aliasOf(p.Sec); alias != "" {
+		return alias + "." + p.Key
+	}
+	return ""
+}
+
+// AliasEnv is the environment form of AliasName ("WHS_SINK_VALKEY_ADDRS"), ""
+// when p's section has no alias.
+func (p *Param) AliasEnv() string {
+	if n := p.AliasName(); n != "" {
+		return envName(n)
+	}
+	return ""
 }
 
 // Registry returns the parameter table bound to c. Every parameter in SPEC
@@ -130,7 +182,7 @@ func Registry(c *Config) []*Param {
 
 		// ------------------------------------------------------------------ sink
 		{Sec: "sink", Key: "type", Kind: KString, Def: "redis", Ptr: &c.Sink.Type,
-			Desc: "redis | sqlite | postgres | mysql | nats | clickhouse | none -- the final destination"},
+			Desc: "redis | sqlite | postgres | mysql | nats | clickhouse | none -- the final destination; valkey = redis"},
 		{Sec: "sink", Key: "workers", Kind: KInt, Def: "8", Ptr: &c.Sink.Workers,
 			Desc: "drain goroutines; forced to 1 when type=sqlite; lowered to 4 when type=postgres, mysql or clickhouse and not set"},
 		{Sec: "sink", Key: "batch", Kind: KInt, Def: "256", Ptr: &c.Sink.Batch,
@@ -341,7 +393,7 @@ func newIndex(params []*Param) *index {
 }
 
 func (ix *index) lookup(name string) (*Param, error) {
-	p, ok := ix.byName[name]
+	p, ok := ix.byName[canonicalName(name)]
 	if !ok {
 		// Named only when it has the shape of a name. What reaches here from
 		// an INI key or a flag is everything before the first '=', and a
@@ -353,7 +405,7 @@ func (ix *index) lookup(name string) (*Param, error) {
 			return nil, fmt.Errorf("unknown parameter (the name holds characters no parameter " +
 				"name has, so it is not shown; a value goes after an '=')")
 		}
-		if ix.extendsAName(name) {
+		if ix.extendsAName(canonicalName(name)) {
 			// "--sink.x.passwordhunter2": the '=' was forgotten and the value
 			// glued to the name, with or without a separator ("-hunter2",
 			// "_hunter2", ".hunter2"). Quoted, the error would print the
@@ -389,6 +441,9 @@ func (ix *index) knownSectionOf(name string) bool {
 }
 
 func (ix *index) knownSection(sec string) bool {
+	if canon, ok := aliasSections[sec]; ok {
+		sec = canon
+	}
 	for _, p := range ix.byName {
 		if p.Sec == sec {
 			return true
@@ -412,7 +467,7 @@ var iniKeyRE = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 // the server log (SPEC §13.2; go-relplog-nats-server's review, ported
 // 2026-10-13).
 func (ix *index) lookupINI(e iniEntry, afterSecret bool) (*Param, error) {
-	if p, ok := ix.byName[e.Name]; ok {
+	if p, ok := ix.byName[canonicalName(e.Name)]; ok {
 		return p, nil
 	}
 	switch {

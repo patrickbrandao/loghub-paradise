@@ -1,0 +1,126 @@
+# ring na RAM  ->  descarga no Valkey (Streams)
+#
+# Variante Valkey de compose.memory-redis.yml (docs/SPEC.md 8.2.6 e 13.6): o
+# mesmo servidor, o mesmo protocolo e as mesmas WHS_SINK_REDIS_* do .env, com
+# o destino num Valkey. WHS_SINK_TYPE=valkey e' alias de redis. O comando e'
+# valkey-server de proposito: so' com ele o entrypoint da imagem rebaixa o
+# privilegio para o usuario valkey e ajusta o dono de /data (com redis-server,
+# um symlink na imagem, o servidor rodaria como root). Projeto, conteineres,
+# volume e portas sao proprios, para subir ao lado da variante Redis.
+#
+# Combinacao de referencia e a mais rapida: aceitar o evento custa uma copia em
+# memoria, e o dreno vai para o Redis em lotes com varios workers em paralelo.
+#
+# Durabilidade: o evento so' existe na RAM ate' o XADD confirmar. Uma queda
+# abrupta do processo (SIGKILL, OOM, falta de energia) perde o backlog. O que
+# cobre o caso previsivel -- sink permanentemente inutilizavel -- e' o dump de
+# emergencia: em FATAL o ring inteiro vai para disco e e' reingerido no proximo
+# boot. Por isso emergency.enabled fica ligado e o volume e' obrigatorio, mesmo
+# num deploy que "nao usa disco".
+#
+#   docker compose -f compose.memory-valkey.yml up -d --build
+
+name: whs-memory-valkey
+
+services:
+  webhook:
+    extends:
+      file: common.yml
+      service: whs-base
+    container_name: whs-memory-valkey
+    # O HOSTNAME do go-loghub-ident (SPEC §3.5): sem ele seria o id do
+    # container, que muda a cada recriacao.
+    hostname: whs-memory-valkey
+
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+    environment:
+
+      # --- ring: memoria ----------------------------------------------------
+      WHS_RING_MODE: memory
+      # Tetos do ring. Estourar qualquer um dos dois responde 429 ao cliente --
+      # que e' o comportamento desejado: backpressure explicita, nunca descarte
+      # silencioso.
+      WHS_RING_CAPACITY_ITEMS: ${WHS_RING_CAPACITY_ITEMS:-65536}
+      # Metade do GOMEMLIMIT de common.yml (512MiB): com ring=memory o teto de
+      # bytes do ring fica todo na RAM e o boot avisa se GOMEMLIMIT for menor que
+      # o dobro dele. Quem subir um, suba o outro junto (WHS_GOMEMLIMIT e
+      # WHS_MEMORY_LIMIT).
+      WHS_RING_MAX_BYTES: ${WHS_RING_MAX_BYTES:-256MiB}
+      # Acima desta fracao de ocupacao o /readyz falha e o balanceador tira
+      # esta instancia da rotacao antes de ela comecar a devolver 429.
+      WHS_RING_HIGH_WATER: ${WHS_RING_HIGH_WATER:-0.80}
+
+      # Rede de seguranca do ring em RAM: em FATAL, despeja o backlog em
+      # /data/emergency e reingere no boot seguinte. E' a unica escrita em disco
+      # desta combinacao -- e por isso que ela tambem monta o volume.
+      WHS_EMERGENCY_ENABLED: "true"
+
+      # --- sink: redis ------------------------------------------------------
+      # alias de redis: o dump e os logs mostram redis
+      WHS_SINK_TYPE: valkey
+      WHS_SINK_REDIS_ADDRS: valkey:6379
+      WHS_SINK_REDIS_STREAM: ${WHS_SINK_REDIS_STREAM:-loghub.{space}.{type}}
+      WHS_SINK_REDIS_DB: ${WHS_SINK_REDIS_DB:-0}
+      WHS_SINK_REDIS_USERNAME: ${WHS_SINK_REDIS_USERNAME:-}
+      WHS_SINK_REDIS_PASSWORD: ${WHS_SINK_REDIS_PASSWORD:-}
+      # maxlen=0 desliga o trim. Ligar MAXLEN faria o Redis descartar eventos
+      # antigos em silencio, que e' exatamente o oposto da backpressure que
+      # este servidor implementa.
+      WHS_SINK_REDIS_MAXLEN: ${WHS_SINK_REDIS_MAXLEN:-0}
+
+      # Redis aguenta escrita concorrente: varios workers valem a pena aqui.
+      WHS_SINK_WORKERS: ${WHS_SINK_WORKERS:-8}
+      WHS_SINK_BATCH: ${WHS_SINK_BATCH:-256}
+      WHS_SINK_BATCH_MAX_BYTES: ${WHS_SINK_BATCH_MAX_BYTES:-16MiB}
+      WHS_SINK_BATCH_MAX_DELAY: ${WHS_SINK_BATCH_MAX_DELAY:-5ms}
+      WHS_SINK_OP_TIMEOUT: ${WHS_SINK_OP_TIMEOUT:-5s}
+
+    ports:
+      - "${WHS_HTTP_PORT:-8101}:8080"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${WHS_ADMIN_PORT:-9131}:9101"
+
+    # /data: unico ponto gravavel da imagem, aqui so' para os dumps de
+    # emergencia. Sem o volume, um dump feito durante um incidente iria para a
+    # camada efemera do container e sumiria no restart -- exatamente o que ele
+    # existe para impedir.
+    volumes:
+      - whs-data:/data
+
+  valkey:
+    image: ${WHS_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}
+    container_name: whs-memory-valkey-valkey
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1s de stream num crash.
+      # RDB desligado (--save "") porque o AOF ja' cobre a durabilidade e o
+      # fork do snapshot causa picos de latencia no XADD.
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - valkey-data:/data
+    ports:
+      - "127.0.0.1:${WHS_VALKEY_PORT:-6390}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whs-data:
+  valkey-data:

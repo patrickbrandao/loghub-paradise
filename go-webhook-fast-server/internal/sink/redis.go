@@ -68,6 +68,10 @@ type Redis struct {
 	// WARN given). The probe pipelines that one command only, so it stays
 	// one round trip (SPEC §8.2.5, W §19.1 item 42).
 	policyRead atomic.Int32
+
+	// server and serverVersion are what INFO server said at boot: redis,
+	// valkey or unknown (SPEC §8.2.6). Read once, for the log.
+	server, serverVersion string
 }
 
 const (
@@ -139,6 +143,7 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger, m *obs.Met
 		client.Close()
 		return nil, err
 	}
+	r.identify(ctx)
 	return r, nil
 }
 
@@ -290,7 +295,18 @@ func (r *Redis) Health(ctx context.Context) error {
 		cmds = append(cmds, r.client.B().ConfigGet().Parameter("maxmemory-policy").Build())
 	}
 	ops := [2]string{"xlen", "writeprobe"}
-	resps := r.client.DoMulti(ctx, cmds...)
+	var resps []rueidis.RedisResult
+	if len(cmds) > 2 && r.client.Mode() == rueidis.ClientModeCluster {
+		// The cluster client of rueidis PANICS on a DoMulti that mixes keyed
+		// commands with a keyless one ("Mixing no-slot and cross slot
+		// commands"): against any cluster, db 0 included, the first probe
+		// brought the process down (found by the Valkey round, SPEC
+		// §8.2.5). The policy command goes on its own there, to the node the
+		// client picks -- one round trip more, in cluster mode only.
+		resps = append(r.client.DoMulti(ctx, cmds[:2]...), r.client.Do(ctx, cmds[2]))
+	} else {
+		resps = r.client.DoMulti(ctx, cmds...)
+	}
 	for i, resp := range resps[:2] {
 		err := resp.Error()
 		// A nil reply is the expected answer from the probe: the key is absent,
@@ -490,6 +506,63 @@ func transientRedisReply(upper string) bool {
 	return false
 }
 
+// missingDB reports the two replies to the handshake's SELECT of a db the
+// server does not have (SPEC §8.2.6): Redis Cluster and Valkey < 9 in cluster
+// mode refuse any SELECT; Valkey 9 in cluster mode, and any standalone
+// server, refuse a db index beyond what it has.
+func missingDB(upper string) bool {
+	return strings.Contains(upper, "SELECT IS NOT ALLOWED IN CLUSTER MODE") ||
+		strings.Contains(upper, "DB INDEX IS OUT OF RANGE")
+}
+
+// Server names of serverIdentity.
+const (
+	ServerRedis   = "redis"
+	ServerValkey  = "valkey"
+	ServerUnknown = "unknown"
+)
+
+// identityFromInfo reads the server and its version from INFO server (SPEC
+// §8.2.6). Valkey reports redis_version:7.2.4 in every release, its real
+// version is valkey_version, under server_name:valkey -- so the version is
+// never redis_version on a Valkey, and nothing here may decide a feature by
+// redis_version. The HELLO reply would not do: Valkey 7.2 answers
+// "server redis" to it.
+func identityFromInfo(info string) (server, version string) {
+	fields := map[string]string{}
+	for _, line := range strings.Split(info, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimRight(line, "\r"), ":"); ok {
+			fields[k] = strings.TrimSpace(v)
+		}
+	}
+	if strings.EqualFold(fields["server_name"], ServerValkey) {
+		if v := fields["valkey_version"]; v != "" {
+			return ServerValkey, v
+		}
+		return ServerValkey, ""
+	}
+	if v := fields["redis_version"]; v != "" {
+		return ServerRedis, v
+	}
+	return ServerUnknown, ""
+}
+
+// identify asks INFO server once, for the boot log. Any failure -- an ACL
+// without INFO, a proxy, the deadline -- is "unknown" and never an error: the
+// identity is observability, not a condition to start.
+func (r *Redis) identify(ctx context.Context) {
+	info, err := r.client.Do(ctx, r.client.B().Info().Section("server").Build()).ToString()
+	if err != nil {
+		r.server, r.serverVersion = ServerUnknown, ""
+		return
+	}
+	r.server, r.serverVersion = identityFromInfo(info)
+}
+
+// Identity returns the server name (redis, valkey or unknown) and version read
+// at boot (SPEC §8.2.6).
+func (r *Redis) Identity() (server, version string) { return r.server, r.serverVersion }
+
 func (r *Redis) Close() error {
 	r.client.Close()
 	return nil
@@ -520,6 +593,14 @@ func classifyRedisReply(msg string) Class {
 		// identically -- so this is fatal, with the ring dumped and the process
 		// restarted, rather than a slow drip of batches discarded after their
 		// 200 in a process whose PING says it is healthy (SPEC §8.2.4).
+		return ClassFatal
+
+	case missingDB(upper):
+		// The SELECT of the handshake: the configured db does not exist on
+		// this server (SPEC §8.2.6). Matched by text, because the "ERR"
+		// prefix is shared by every generic error. Unrecognised, it was
+		// retried until sink.boot_timeout over a configuration that waiting
+		// cannot fix.
 		return ClassFatal
 
 	case transientRedisReply(upper):
@@ -555,6 +636,11 @@ func classifyRedis(op string, err error, id string) error {
 	var rerr *rueidis.RedisError
 	if errors.As(err, &rerr) {
 		class := classifyRedisReply(rerr.Error())
+		if missingDB(strings.ToUpper(rerr.Error())) {
+			err = fmt.Errorf("%w (sink.redis.db does not exist on this server: Redis Cluster and Valkey < 9 "+
+				"have only db 0; on Valkey 9 the db must exist (cluster-databases); standalone, it must be "+
+				"below databases)", err)
+		}
 		if class != ClassNetwork && id != "" {
 			return &Error{Class: class, Op: op + " id=" + id, Err: err}
 		}

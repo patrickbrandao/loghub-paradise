@@ -175,7 +175,7 @@ pulam quando `WHS_TEST_REDIS_ADDR` não está definido, para que `go test ./...`
 continue rodando num checkout limpo.
 
 ```bash
-docker run --rm -d -p 16379:6379 --name whs-test-redis redis:7-alpine
+docker run --rm -d -p 16379:6379 --name whs-test-redis redis:7.4-alpine
 WHS_TEST_REDIS_ADDR=127.0.0.1:16379 go test -race -timeout 600s ./internal/app/
 docker rm -f whs-test-redis
 ```
@@ -227,7 +227,7 @@ A política de despejo (SPEC §8.2.5) pede um **segundo** Redis, com
 usam pulam sem ele; o Redis normal precisa ser `noeviction` ou `volatile-*`):
 
 ```bash
-docker run --rm -d -p 16380:6379 --name whs-test-redis-lru redis:7-alpine \
+docker run --rm -d -p 16380:6379 --name whs-test-redis-lru redis:7.4-alpine \
   redis-server --maxmemory-policy allkeys-lru
 WHS_TEST_REDIS_ADDR=127.0.0.1:16379 WHS_TEST_REDIS_LRU_ADDR=127.0.0.1:16380 \
   go test -race -timeout 600s ./internal/sink/ ./internal/app/
@@ -250,7 +250,92 @@ dentro do teste**, não por parar o Redis. Isso mantém a falha sob controle do
 teste e deixa um Redis compartilhado utilizável por tudo que estiver rodando
 contra ele.
 
-### 5.1 Verificação manual
+### 5.1 Redis e Valkey: a matriz, Sentinel e cluster
+
+A mesma suíte roda, sem mudança, contra Redis e Valkey (SPEC §8.2.6): as
+versões declaradas são **Redis 7.4** e **Valkey 7.2, 8.1 e 9.0**. Um servidor
+por imagem, e o gêmeo `allkeys-lru` de cada um; as rodadas em série (as suítes
+de `app` usam portas livres, mas outros módulos na mesma máquina podem não
+usar). Para Valkey, o comando é `valkey-server`:
+
+```bash
+docker run --rm -d -p 16379:6379 --name whs-test-valkey valkey/valkey:8.1-alpine
+docker run --rm -d -p 16380:6379 --name whs-test-valkey-lru valkey/valkey:8.1-alpine \
+  valkey-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+WHS_TEST_REDIS_ADDR=127.0.0.1:16379 WHS_TEST_REDIS_LRU_ADDR=127.0.0.1:16380 \
+  go test -race -count=1 -timeout 900s ./internal/sink/ ./internal/app/
+docker rm -f whs-test-valkey whs-test-valkey-lru
+```
+
+`TestRedisIdentity` e `TestRedisBootHasOneDeadline` registram no `-v` contra
+qual servidor rodaram (`server=valkey server_version=8.1.11`, lido do `INFO
+server`, nunca do `redis_version` fixo do Valkey), e o
+`TestIdentityFromInfo` confere o leitor com as quatro respostas, sem servidor.
+`TestRedisMissingDBIsFatalAtBoot` (o standalone com `db` acima de `databases`
+responde o mesmo `ERR DB index is out of range` do Valkey 9 em cluster: fatal
+em menos de 2 s, com a explicação) e `TestClassifyMissingDB` (sem servidor).
+
+**Resultado da rodada Valkey (2026-11-07)**, `-race -count=1`, `internal/sink`
+e `internal/app`, com o servidor e o gêmeo `allkeys-lru`:
+
+| Servidor | `internal/sink` | `internal/app` | Sentinel |
+|---|---|---|---|
+| `redis:7.4-alpine` (7.4.12) | ok | ok | ok |
+| `valkey/valkey:7.2-alpine` (7.2.15) | ok | ok | ok |
+| `valkey/valkey:8.1-alpine` (8.1.11) | ok | ok | ok |
+| `valkey/valkey:9.0-alpine` (9.0.7) | ok | ok | ok |
+
+**Sentinel** (opt-in, `TestRedisSentinelFailover`): `WHS_TEST_REDIS_SENTINEL_ADDR`
+e `WHS_TEST_REDIS_SENTINEL_MASTER`. O Sentinel anuncia os endereços que
+conhece, e o `go test` do host (macOS) precisa alcançá-los: os três processos
+dividem o *namespace* de rede de um contêiner (`--network container:`), todos
+anunciam `127.0.0.1`, e as três portas são publicadas iguais no host. Para
+Valkey, troque a imagem e os binários (`valkey-server`, `valkey-sentinel`):
+
+```bash
+img=redis:7.4-alpine srv=redis-server snt=redis-sentinel
+docker run -d --name whs-sn-primary -p 127.0.0.1:26390:26390 -p 127.0.0.1:26391:26391 \
+  -p 127.0.0.1:26392:26392 $img $srv --port 26390 --replica-announce-ip 127.0.0.1
+docker run -d --name whs-sn-replica --network container:whs-sn-primary $img $srv --port 26391 \
+  --replicaof 127.0.0.1 26390 --replica-announce-ip 127.0.0.1
+docker run -d --name whs-sn-sentinel --network container:whs-sn-primary --entrypoint sh $img -c \
+  "printf 'port 26392\nsentinel announce-ip 127.0.0.1\nsentinel monitor mymaster 127.0.0.1 26390 1\nsentinel down-after-milliseconds mymaster 2000\nsentinel failover-timeout mymaster 5000\n' > /tmp/s.conf && exec $snt /tmp/s.conf"
+WHS_TEST_REDIS_SENTINEL_ADDR=127.0.0.1:26392 WHS_TEST_REDIS_SENTINEL_MASTER=mymaster \
+  go test -race -count=1 -run TestRedisSentinelFailover -v ./internal/sink/
+docker rm -f whs-sn-primary whs-sn-replica whs-sn-sentinel
+```
+
+O teste sobe pelo Sentinel, escreve cinco eventos, espera a réplica (`WAIT 1`),
+pede `SENTINEL FAILOVER`, espera o primário antigo virar réplica, escreve mais
+cinco (retentando `READONLY` como o worker) e confere no **primário novo** que
+os dez estão lá; a sonda de saúde, com a política, passa no novo primário.
+Cada rodada recria a topologia (depois do teste o primário é a réplica antiga).
+A janela de replicação assíncrona do Sentinel (SPEC §8.2.6) apareceu na
+primeira versão do teste: cinco eventos escritos logo depois do
+`SENTINEL FAILOVER`, confirmados pelo primário antigo antes de ele ser
+rebaixado, sumiram.
+
+**Cluster** (opt-in, `TestRedisClusterSelectDB`): `WHS_TEST_REDIS_CLUSTER_ADDR`
+num nó de cluster que anuncia `127.0.0.1` e a mesma porta do host:
+
+```bash
+docker run -d --name whs-cl -p 127.0.0.1:26400:26400 valkey/valkey:9.0-alpine \
+  valkey-server --port 26400 --cluster-enabled yes --cluster-announce-ip 127.0.0.1
+docker exec whs-cl valkey-cli -p 26400 CLUSTER ADDSLOTSRANGE 0 16383
+# esperar cluster_state:ok em CLUSTER INFO
+WHS_TEST_REDIS_CLUSTER_ADDR=127.0.0.1:26400 go test -count=1 -run TestRedisClusterSelectDB -v ./internal/sink/
+docker rm -f whs-cl
+```
+
+`db=0` escreve; `db=1` é FATAL em menos de 2 s com a explicação, salvo num
+Valkey 9 com `--cluster-databases 16`, onde escreve. Resultado (2026-11-07):
+Redis 7.4 e Valkey 8.1 `SELECT is not allowed in cluster mode` (~2 ms);
+Valkey 9.0 `DB index is out of range` (~1 ms); Valkey 9.0 com
+`--cluster-databases 16` grava em `db=1`. A primeira execução achou o *panic*
+do rueidis na sonda em cluster (SPEC §8.2.5): o processo caía contra qualquer
+cluster.
+
+### 5.1.1 Verificação manual
 
 Ainda útil para inspecionar os bytes com o olho:
 
@@ -822,6 +907,14 @@ Registradas por honestidade, não por esquecimento:
     do pgx, e o ambiente `PG*` some do processo durante o parse (SPEC
     §8.5.2): documentados, sem teste próprio além do `libpq_env_test`.
 
+56. **Os `compose.*-valkey.yml` não subiram de ponta a ponta** na rodada Valkey
+    (2026-11-07): o `TestComposeValkeyFiles` confere imagem, comando,
+    healthcheck, nomes e portas sem Docker, o `docker compose config` valida os
+    três, e um `valkey-server` com o mesmo `command` foi conferido rodando como
+    usuário `valkey`; falta o `up --build` com uma requisição e o `XLEN`. O
+    Sentinel e o cluster ficam fora do `go test ./...` (opt-in, §5.1), e
+    cluster com mais de um nó não foi exercitado (SPEC §8.2.2: fora de escopo).
+
 ## 9. Histórico: bugs que os testes encontraram
 
 Registro do que cada tipo de teste pagou, para calibrar onde investir:
@@ -1311,3 +1404,17 @@ uma vez; aqui não chegou a falhar. O `serve` registra o cliente sob a mesma
 trava da checagem de pausa, e o `pipe`, depois de discar, só segue se o cliente
 ainda está no mapa: um `Pause` (mesmo seguido de `Resume`) durante a discagem
 corta o par.
+
+### Rodada Valkey (2026-11-07)
+
+O teste opt-in de cluster (`TestRedisClusterSelectDB`, §5.1) achou, na
+primeira execução, um *panic* do rueidis: a sonda de saúde pedia `XLEN` e
+`XADD` (com chave) e o `INFO memory` (sem chave) num `DoMulti` só, e o cliente
+de cluster recusa misturar os dois com `panic`. Contra qualquer cluster, `db 0`
+inclusive, o processo caía na primeira sonda. Em cluster o comando da política
+sai num `Do` à parte (SPEC §8.2.5); a mutação (voltar ao `DoMulti` único)
+derruba o teste com o mesmo *panic*. O teste de Sentinel mostrou a janela de
+replicação assíncrona (SPEC §8.2.6): escritas confirmadas pelo primário antigo
+entre a promoção e o rebaixamento somem. Os testes novos que travam regra
+(alias, conflito, identidade, `db` ausente, compose Valkey) passaram por
+mutação, uma por regra, todas derrubando o teste.

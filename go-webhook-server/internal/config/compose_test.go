@@ -46,6 +46,15 @@ func TestComposeForwardsEverySinkVariable(t *testing.T) {
 		if len(files) == 0 {
 			t.Errorf("no compose.*-%s.yml for the %s variables of .env.example", sink, sink)
 		}
+		if sink == "redis" {
+			// The Valkey compose files take the same canonical WHS_SINK_REDIS_*
+			// (SPEC §13.6): one .env serves both.
+			valkey, _ := filepath.Glob(filepath.Join(dockerDir, "compose.*-valkey.yml"))
+			if len(valkey) == 0 {
+				t.Errorf("no compose.*-valkey.yml")
+			}
+			files = append(files, valkey...)
+		}
 		sort.Strings(files)
 		for _, f := range files {
 			body, err := os.ReadFile(f)

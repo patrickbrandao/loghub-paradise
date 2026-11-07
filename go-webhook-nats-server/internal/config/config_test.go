@@ -667,6 +667,7 @@ func TestCompatibilitySelectorsRefuseRetiredFeatures(t *testing.T) {
 		{"--ring.mode=sqlite", `ring.mode: "sqlite" is not available`},
 		{"--ring.mode=none", `ring.mode: "none" is not available`},
 		{"--sink.type=redis", `sink.type: "redis" is not available`},
+		{"--sink.type=valkey", `sink.type: "valkey" is not available`},
 		{"--sink.type=sqlite", `sink.type: "sqlite" is not available`},
 		{"--sink.type=mysql", `sink.type: "mysql" is not available`},
 		{"--sink.type=postgres", `sink.type: "postgres" is not available`},
@@ -693,7 +694,7 @@ func TestRetiredKeysAreUnknown(t *testing.T) {
 		"ring.max_inflight",
 		"ring.sqlite.path", "ring.sqlite.synchronous",
 		"ratelimit.rate", "ratelimit.burst", "ratelimit.exempt", "ratelimit.sweep_interval",
-		"sink.redis.addrs", "sink.redis.stream",
+		"sink.redis.addrs", "sink.redis.stream", "sink.valkey.addrs", "sink.valkey.password",
 		"sink.sqlite.path", "sink.sqlite.keep_files",
 		"sink.mysql.addr", "sink.clickhouse.addrs",
 		"sink.postgres.addr", "sink.postgres.table", "sink.postgres.pool_size",
@@ -734,6 +735,7 @@ func TestRetiredKnobsInTheEnvironmentAreInert(t *testing.T) {
 		"WHS_RATELIMIT_BURST":   "200",
 		"WHS_RING_MAX_INFLIGHT": "3",
 		"WHS_SINK_REDIS_ADDRS":  "redis:6379",
+		"WHS_SINK_VALKEY_ADDRS": "valkey:6379",
 		// The PostgreSQL keys of go-webhook-pg-server's environment.
 		"WHS_SINK_POSTGRES_ADDR":     "postgres:5432",
 		"WHS_SINK_POSTGRES_PASSWORD": "webhook",
@@ -745,6 +747,7 @@ func TestRetiredKnobsInTheEnvironmentAreInert(t *testing.T) {
 	for _, env := range []map[string]string{
 		{"WHS_RING_MODE": "sqlite"},
 		{"WHS_SINK_TYPE": "redis"},
+		{"WHS_SINK_TYPE": "valkey"},
 		{"WHS_SINK_TYPE": "postgres"},
 		{"WHS_RATELIMIT_ENABLED": "true"},
 		{"WHS_SINK_NATS_TLS": "true"},

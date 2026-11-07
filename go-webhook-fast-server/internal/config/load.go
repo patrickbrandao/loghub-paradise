@@ -113,6 +113,7 @@ func Load(opts Options) (*Loaded, error) {
 		// afterSecret: the line before was a secret, so an unknown key here
 		// may be the rest of it wrapped onto this line (lookupINI).
 		afterSecret := false
+		guard := aliasGuard{}
 		for _, e := range entries {
 			p, err := ix.lookupINI(e, afterSecret)
 			if err != nil {
@@ -122,6 +123,9 @@ func Load(opts Options) (*Loaded, error) {
 			if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
 				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, p.Name(), err)
 			}
+			if err := guard.check(p, "["+e.Sec+"] "+e.Key); err != nil {
+				return nil, fmt.Errorf("%s line %d: %w", file, e.Line, err)
+			}
 			l.Source[p.Name()] = FromFile
 			l.SetIn[p.Name()] = true
 		}
@@ -129,23 +133,39 @@ func Load(opts Options) (*Loaded, error) {
 	}
 
 	// --- environment --------------------------------------------------------
+	envGuard := aliasGuard{}
 	for _, p := range params {
-		v, ok := opts.LookupEnv(p.Env())
-		if !ok {
-			continue
+		// The canonical name first, then the alias (SPEC §13.2): both are
+		// this parameter in the same source, and the guard refuses them only
+		// when they disagree.
+		for _, name := range []string{p.Env(), p.AliasEnv()} {
+			if name == "" {
+				continue
+			}
+			v, ok := opts.LookupEnv(name)
+			if !ok {
+				continue
+			}
+			if err := setValue(p.Kind, p.Ptr, v); err != nil {
+				return nil, fmt.Errorf("%s: %w", name, err)
+			}
+			if err := envGuard.check(p, name); err != nil {
+				return nil, err
+			}
+			l.Source[p.Name()] = FromEnv
+			l.SetIn[p.Name()] = true
 		}
-		if err := setValue(p.Kind, p.Ptr, v); err != nil {
-			return nil, fmt.Errorf("%s: %w", p.Env(), err)
-		}
-		l.Source[p.Name()] = FromEnv
-		l.SetIn[p.Name()] = true
 	}
 
 	// --- command line -------------------------------------------------------
+	flagGuard := aliasGuard{}
 	for _, e := range flagEntries {
 		p := ix.byName[e.Name]
 		if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
-			return nil, fmt.Errorf("%s: %w", p.Flag(), err)
+			return nil, fmt.Errorf("--%s: %w", e.Spelled, err)
+		}
+		if err := flagGuard.check(p, "--"+e.Spelled); err != nil {
+			return nil, err
 		}
 		l.Source[p.Name()] = FromFlag
 		l.SetIn[p.Name()] = true
@@ -209,10 +229,48 @@ func derive(c *Config, opts Options) error {
 	// Normalise enums so comparisons elsewhere never need folding.
 	c.Ring.Mode = strings.ToLower(strings.TrimSpace(c.Ring.Mode))
 	c.Sink.Type = strings.ToLower(strings.TrimSpace(c.Sink.Type))
+	if c.Sink.Type == SinkValkeyAlias {
+		// Valkey speaks the Redis protocol: one sink, and the canonical name
+		// in the dump, the logs and the metrics (SPEC §13.2, §8.2.6).
+		c.Sink.Type = SinkRedisType
+	}
 	c.SinkSQL.Rotate = strings.ToLower(strings.TrimSpace(c.SinkSQL.Rotate))
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
 	c.Log.Format = strings.ToLower(strings.TrimSpace(c.Log.Format))
 	c.RingSQL.Synchronous = strings.ToUpper(strings.TrimSpace(c.RingSQL.Synchronous))
 	c.SinkSQL.Synchronous = strings.ToUpper(strings.TrimSpace(c.SinkSQL.Synchronous))
+	return nil
+}
+
+// aliasGuard refuses, within ONE source, a parameter set through its
+// canonical name and through its alias to different values (SPEC §13.2):
+// "[sink.redis] db = 1" and "[sink.valkey] db = 2" in the same file, or
+// WHS_SINK_REDIS_DB and WHS_SINK_VALKEY_DB in the same environment, have no
+// winner the operator could predict -- the INI's later line, or the order the
+// loader reads the environment in, would decide it in silence. Equal values
+// pass: the two names are one parameter. Values are compared as parsed
+// ("1MiB" and "1048576" agree) and never printed: one may be the password.
+// Across sources nothing changes: the precedence decides, and the alias is
+// the same key in its source.
+type aliasGuard map[string]map[string]string // canonical name -> spelling -> value
+
+// check runs right after p was set from the name spelled.
+func (g aliasGuard) check(p *Param, spelled string) error {
+	if aliasOf(p.Sec) == "" {
+		return nil
+	}
+	v := formatValue(p.Kind, p.Ptr)
+	seen := g[p.Name()]
+	if seen == nil {
+		seen = map[string]string{}
+		g[p.Name()] = seen
+	}
+	for other, ov := range seen {
+		if other != spelled && ov != v {
+			return fmt.Errorf("%s and %s are set to different values; they are the same parameter "+
+				"(valkey is an alias of redis): set only one, or both to the same value", other, spelled)
+		}
+	}
+	seen[spelled] = v
 	return nil
 }

@@ -1384,7 +1384,10 @@ Knobs de memória do rueidis expostos: `sink.redis.ring_scale_each_conn`,
   claro, com a senha (pendência 13, 2026-10-14).
 
 **Cluster fora de escopo na v1**: um stream vive num único slot, então cluster
-não traz vazão nenhuma — só complexidade de teste e documentação.
+não traz vazão nenhuma — só complexidade de teste e documentação. O rueidis o
+detecta sozinho, e o caso `db ≠ 0` em cluster tem regra própria (§8.2.6).
+
+Redis e Valkey (incluindo `valkey-sentinel`) servem as duas topologias: §8.2.6.
 
 #### 8.2.3 Escrita
 
@@ -1419,6 +1422,7 @@ Um JLH que o leitor do cabeçalho recusa não vira comando: o lote falha como
 | `WRONGTYPE` | `ErrFatal` | FATAL imediato — a chave da stream é outro tipo. Não muda sozinho, e **todo** lote falharia igual |
 | `NOPERM`, `NOAUTH`, `WRONGPASS` | `ErrFatal` | FATAL imediato — credencial ou ACL. Idem: não muda sozinho |
 | `maxmemory-policy` `allkeys-*`, lido pela sonda (§8.2.5) | `ErrFatal` | FATAL imediato — um Redis cheio apagaria o stream inteiro em vez de responder `OOM` |
+| `ERR SELECT is not allowed in cluster mode`, `ERR DB index is out of range` (o `SELECT` do *handshake*, §8.2.6) | `ErrFatal` | FATAL imediato — o db configurado não existe nesse servidor; a mensagem diz que Redis Cluster e Valkey < 9 só têm o db 0 e que em Valkey 9 ele precisa existir (`cluster-databases`) |
 | `LOADING`, `BUSY`, `MASTERDOWN`, `READONLY`, `CLUSTERDOWN`, `TRYAGAIN` | `ErrNetwork` | Vivo mas temporariamente incapaz; retentar é o certo, e se persistir os fusíveis de §10.2 escalam |
 | qualquer outra resposta de erro | `ErrNetwork` | Descartar por palpite é pior que retentar um lote sem esperança: o ring enche, o `429` aparece e o operador vê |
 
@@ -1505,7 +1509,15 @@ rueidis manda o `INFO memory` sem chave a um nó qualquer, então cada checagem
 confere a política de um nó só, e um nó isolado com `allkeys-*` só é pego
 quando é o sorteado. É uma limitação aceita: a conferência é uma precaução, e
 iterar sobre os primários a cada checagem multiplicaria o custo da sonda pelo
-número de nós (revisão independente de 2026-10-14, documentado). **Um proxy
+número de nós (revisão independente de 2026-10-14, documentado). **Em cluster
+o comando da política sai fora do *pipeline*** (achado da rodada Valkey,
+2026-11-07): o cliente de cluster do rueidis entra em *panic* num `DoMulti`
+que mistura comandos com chave e um sem chave ("Mixing no-slot and cross slot
+commands"), então a primeira sonda derrubava o processo contra qualquer
+cluster, `db 0` inclusive. Em cluster a sonda é o `XLEN` + `XADD` num
+`DoMulti` e o `INFO memory` (ou o `CONFIG GET`) num `Do` à parte: uma ida e
+volta a mais, só nesse modo; standalone e Sentinel continuam com uma. O
+`TestRedisClusterSelectDB` (opt-in, §15.3) a cobre. **Um proxy
 que responde o `INFO` com um tipo inesperado** (array ou mapa no lugar de
 texto) dá um erro de leitura que não é resposta de erro do Redis: é tratado
 como transporte, retentado até `sink.boot_timeout`, e o boot sai com 3 e "not
@@ -1518,6 +1530,70 @@ qual todo o resto do desenho (429, dreno, shutdown gracioso) foi construído.
 
 Quando configurado (`> 0`), usa a forma aproximada `MAXLEN ~ N`, muito mais
 barata que a exata.
+
+#### 8.2.6 Redis e Valkey
+
+Rodada Valkey de 2026-11-07 (decisão do usuário). O destino fala o
+**protocolo** Redis, e o nome `redis` (em `sink.type`, `[sink.redis]`,
+`WHS_SINK_REDIS_*`, métricas e logs) designa o protocolo, não o produto:
+**Redis e Valkey são suportados no mesmo nível**.
+
+- **Versões declaradas e testadas**: Redis **7.4**; Valkey **7.2**, **8.1** e
+  **9.0** (a suíte inteira de `internal/sink` e `internal/app` contra cada
+  um, `docs/TESTING.md` §5.1). O que o destino usa: Streams (`XADD`, `XLEN`,
+  `XADD NOMKSTREAM`), `INFO`, `CONFIG GET`, `CLIENT SETINFO`, `HELLO 3` com
+  recuo para RESP2 — Redis ≥ 7.0 ou Valkey ≥ 7.2.
+- **Alias `valkey`** (§13.2): `sink.type = valkey` é `sink.type = redis`;
+  `[sink.valkey]`, `--sink.valkey.<chave>` e `WHS_SINK_VALKEY_<CHAVE>` são as
+  chaves de `[sink.redis]`. O valor é normalizado para `redis` ao carregar:
+  `--dump-config`, logs e métricas mostram só o canônico.
+- **Nunca decidir recurso por `redis_version`.** Valkey responde
+  `redis_version:7.2.4` fixo em todas as versões (7.2, 8.1, 9.0); a versão
+  real está em `valkey_version`, com `server_name:valkey` (que existe desde a
+  7.2; o `HELLO` de um Valkey 7.2 responde `server redis`, então não serve).
+  Uma porta do tipo "precisa de Redis ≥ X" lida de `redis_version` recusaria
+  um Valkey 9. Se um dia um recurso depender de versão, a decisão é por
+  presença do comando (`COMMAND INFO`) ou por `valkey_version` quando
+  `server_name=valkey`.
+- **Identidade no boot.** Depois da primeira sonda boa, o boot roda `INFO
+  server` **uma vez** e o log `sink ready` traz `server` (`redis` \| `valkey`
+  \| `unknown`) e `server_version` (`valkey_version` quando
+  `server_name=valkey`, senão `redis_version`). Uma ACL sem `INFO`, um proxy
+  ou qualquer falha dessa leitura dá `unknown` e versão vazia, **sem erro**:
+  a leitura é observabilidade, não uma condição de boot. Sem métrica nova.
+- **Cluster com `db ≠ 0`.** O rueidis manda `SELECT <db>` no *handshake* de
+  toda conexão quando `sink.redis.db ≠ 0`, inclusive em cluster. Redis
+  Cluster e Valkey < 9 em cluster respondem `ERR SELECT is not allowed in
+  cluster mode`; Valkey 9 em cluster tem bancos (`cluster-databases`, padrão
+  1) e responde `ERR DB index is out of range` a um db que não existe — a
+  mesma resposta de um standalone com `db` acima de `databases`. As duas são
+  **`ErrFatal`** (§8.2.4, casando o texto): esperar não as muda, e como
+  "outra resposta" (`ErrNetwork`) o boot retentava até `sink.boot_timeout`.
+  A mensagem explica: Redis Cluster e Valkey < 9 só têm o db 0; em Valkey 9 o
+  db precisa existir (`cluster-databases`). **Não há recusa estática** de
+  `db ≠ 0` com vários endereços: Valkey 9 com `--cluster-databases 16` e
+  `db = 1` funciona.
+- **Sentinel** (§8.2.2): `redis-sentinel` e `valkey-sentinel` servem igual. O
+  teste de integração opt-in `TestRedisSentinelFailover`
+  (`WHS_TEST_REDIS_SENTINEL_ADDR` + `WHS_TEST_REDIS_SENTINEL_MASTER`,
+  `docs/TESTING.md` §5.1) prova boot, escrita, a conferência da política no
+  primário, `SENTINEL FAILOVER` e escrita depois dele sem perda (`READONLY`
+  e `MASTERDOWN` são transitórios, §8.2.4). **Janela que o cliente não
+  fecha** (medida na rodada): entre a promoção da réplica e o Sentinel
+  rebaixar o primário antigo, este ainda aceita `XADD`, e o que ele confirma
+  nesse intervalo some na ressincronização — a replicação é assíncrona em
+  todo Sentinel, Redis ou Valkey. No teste, cinco eventos confirmados nessa
+  janela sumiram; o teste escreve depois do rebaixamento, que é onde começa a
+  parte do sink. Quem precisa estreitar a janela configura
+  `min-replicas-to-write`/`min-replicas-max-lag` no servidor (o primário
+  isolado passa a recusar com `NOREPLICAS`, que aqui é retentado).
+- **Compose** (§13.6): cada `compose.<ring>-redis.yml` tem um
+  `compose.<ring>-valkey.yml` ao lado, com `${WHS_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}`,
+  `command: valkey-server …` e healthcheck `valkey-cli ping`. O comando
+  importa: o *entrypoint* da imagem Valkey só rebaixa o privilégio
+  (`setpriv` para o usuário `valkey`) e ajusta o dono de `/data` quando o
+  primeiro argumento é `valkey-server`; com `redis-server` (um *symlink* na
+  imagem) o servidor rodava como `root`.
 
 ### 8.3 `sink.type = sqlite`
 
@@ -3926,6 +4002,38 @@ value'" ou, com o resto na forma `k = v`, injetava uma chave ou uma seção; na
 linha comentada de um valor derivado, a segunda linha deixava de ser
 comentário. O tab fica, porque o INI o aceita e o dump o relê (entre aspas).
 
+**Alias `valkey`** (rodada Valkey de 2026-11-07, decisão do usuário; §8.2.6).
+A seção `[sink.valkey]`, as flags `--sink.valkey.<chave>` e as variáveis
+`WHS_SINK_VALKEY_<CHAVE>` são aliases exatos de cada chave de `[sink.redis]`:
+o registry continua com **um** parâmetro, e só a grafia do nome muda. O valor
+`sink.type = valkey` é `redis`, normalizado ao carregar (como a caixa de todo
+enum). Regras:
+
+- **Precedência não muda.** O alias conta como a mesma chave na sua fonte
+  (flag > env > INI > padrão): `--sink.valkey.db=2` vence
+  `WHS_SINK_REDIS_DB=1`.
+- **Conflito.** A mesma chave pelos dois nomes **na mesma fonte** — as duas
+  seções no INI, as duas variáveis no ambiente, as duas flags — é `exit 1`
+  **só se os valores diferem** (comparados já interpretados: `1MiB` e
+  `1048576` são iguais); iguais passam. A mensagem nomeia as duas chaves
+  (`[sink.redis] db` e `[sink.valkey] db`, `WHS_SINK_REDIS_DB` e
+  `WHS_SINK_VALKEY_DB`, `--sink.redis.db` e `--sink.valkey.db`), **nunca os
+  valores**: um deles pode ser a senha. Repetir a mesma grafia continua como
+  sempre (a última vence).
+- **`--help`** diz numa linha que o alias existe, sem duplicar a tabela;
+  **`--dump-config`** mostra só os nomes canônicos (`[sink.redis]`,
+  `sink.type = redis`), e o dump relido é igual. A recarga por `SIGHUP`
+  (§13.3) relê pelo mesmo carregador, com as mesmas regras.
+- As regras de erro sem eco valem para o alias como para o nome canônico: um
+  nome que começa com `sink.valkey.<chave>` e continua não é citado, e
+  `[sink.valkey]` é uma seção conhecida para nomear um erro de digitação.
+
+Não há `LOGHUB_EB_URL` neste servidor (ver abaixo), então a regra de "URL dona
+das chaves" dos irmãos syslog/RELP/GELF não se aplica. O `go-webhook-fast-server`
+tem o mesmo alias (registry de mesma origem), e os cortes
+`go-webhook-pg-server` e `go-webhook-nats-server` recusam `[sink.valkey]` e
+`--sink.valkey.*` como recusam `[sink.redis]`.
+
 **Padrões assumidos nesse porte** (este módulo não tem `DECISOES.md`; os mesmos
 do `go-webhook-fast-server`, `DECISOES.md` 4b de lá; contestáveis): os tetos da
 tabela de §10.1 são os do `go-syslog-server`, que tem os mesmos rings e sinks
@@ -4137,7 +4245,7 @@ de conexão, que o emissor vê como falha de entrega. Teste de trava:
 
 | Chave | Padrão | Descrição |
 |---|---|---|
-| `type` | `redis` | `redis` \| `sqlite` \| `postgres` \| `mysql` \| `nats` \| `clickhouse` \| `none` |
+| `type` | `redis` | `redis` \| `sqlite` \| `postgres` \| `mysql` \| `nats` \| `clickhouse` \| `none`; `valkey` é alias de `redis` (§13.2) |
 | `workers` | `8` | Forçado a `1` quando `type=sqlite`; `4` quando `type=postgres`, `type=mysql` ou `type=clickhouse` e não configurado (§8.5.3, §8.6.2, §8.8.2) |
 | `batch` | `256` | |
 | `batch_max_delay` | `5ms` | |
@@ -4152,6 +4260,9 @@ de conexão, que o emissor vê como falha de entrega. Teste de trava:
 | `retry_backoff_max` | `2s` | |
 
 #### `[sink.redis]`
+
+Também `[sink.valkey]`, `--sink.valkey.*`, `WHS_SINK_VALKEY_*`: aliases exatos
+(§13.2, §8.2.6).
 
 | Chave | Padrão | Descrição |
 |---|---|---|
@@ -4350,6 +4461,21 @@ por versão, nunca `latest` (`natsio/nats-box:0.20.0`, a dos irmãos): o `stream
 add` do `nats-init` podia mudar sem mudança neste projeto. O
 `TestComposeForwardsEverySinkVariable` e o `TestComposeImagesArePinned`
 (`internal/config/compose_test.go`) conferem os dois, sem Docker.
+
+**Valkey tem compose próprio** (rodada Valkey de 2026-11-07, decisão do
+usuário; §8.2.6). Ao lado de cada `compose.<ring>-redis.yml` há um
+`compose.<ring>-valkey.yml` (`memory`, `sqlite`, `none`): serviço `valkey`
+com `${WHS_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}` (a variável está no
+`.env.example`), `command: valkey-server …` — só com esse primeiro argumento o
+*entrypoint* rebaixa o privilégio para o usuário `valkey` —, healthcheck
+`valkey-cli ping`, projeto, contêineres e volumes próprios
+(`whs-<ring>-valkey`, `whs-<ring>-valkey-valkey`, `valkey-data`) e portas
+padrão próprias, para subir ao lado do compose Redis. O servidor recebe
+`WHS_SINK_TYPE: valkey` e as mesmas `WHS_SINK_REDIS_*` do `.env.example`
+(nomes canônicos: um `.env` serve aos dois). O
+`TestComposeForwardsEverySinkVariable` confere as variáveis `redis` também
+nos compose `valkey`, e o `TestComposeValkeyFiles` confere a imagem, o
+comando, o healthcheck e o par de cada `compose.*-redis.yml`.
 
 ---
 
@@ -4620,6 +4746,12 @@ Cenários adicionais obrigatórios:
 - `sink=sqlite` com disco cheio simulado → `SQLITE_FULL` → FATAL imediato.
 - Retry de lote no `sink=redis`: `DoMulti` falha e o lote é **reconstruído**
   (regressão da armadilha de reciclagem do rueidis, §8.2.3).
+- `sink=redis` contra Redis 7.4 e Valkey 7.2, 8.1 e 9.0 (§8.2.6): a mesma
+  suíte, um servidor por imagem; com Sentinel (opt-in,
+  `WHS_TEST_REDIS_SENTINEL_ADDR` + `WHS_TEST_REDIS_SENTINEL_MASTER`): boot,
+  escrita, `SENTINEL FAILOVER` e escrita depois sem perda; com cluster
+  (opt-in, `WHS_TEST_REDIS_CLUSTER_ADDR`) e `db = 1`: FATAL em menos de 2 s,
+  ou a escrita, num Valkey 9 com o banco.
 - Validação: `ring=sqlite` + `sink=sqlite` no mesmo arquivo → `exit 1`.
 - `-race` em todos os caminhos de erro do pool de buffers (§12.3).
 - `sink=postgres`: os três rings entregam todo id aceito à tabela; corpo com

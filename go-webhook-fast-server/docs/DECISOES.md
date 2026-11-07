@@ -602,6 +602,30 @@ contestáveis). A linha de cada item está na §19.1 do `go-webhook-server`.
   5), o *keep-alive* do `dialPostgres` e o ambiente `PG*` escondido do processo
   no parse (§8.5.2).
 
+## 4f. Rodada Valkey (2026-11-07)
+
+Decisões do usuário (finais), com a regra na SPEC; o mesmo no
+`go-webhook-server`:
+
+- **Redis e Valkey no mesmo nível**: Redis 7.4 e Valkey 7.2, 8.1 e 9.0
+  testados (SPEC §8.2.6, `TESTING.md` §5.1). O nome `redis` designa o
+  protocolo.
+- **Alias completo**: `sink.type = valkey`, `[sink.valkey]`,
+  `--sink.valkey.*`, `WHS_SINK_VALKEY_*`; normalizado para `redis`; conflito na
+  mesma fonte é `exit 1` só com valores diferentes, nomeando as duas chaves e
+  nunca os valores (SPEC §13.2).
+- **Cluster com `db ≠ 0`**: as duas respostas do `SELECT` são fatais, sem
+  recusa estática (Valkey 9 com `cluster-databases` aceita) (SPEC §8.2.4,
+  §8.2.6).
+- **Identidade no boot** pelo `INFO server`, só no log (SPEC §8.2.6).
+- **Compose Valkey próprios** ao lado dos Redis (SPEC §13.6).
+
+Decidido aqui (contestável): o conflito do alias compara os valores **já
+interpretados** (`1MiB` = `1048576`), e só dentro de uma fonte; o compose
+Valkey passa `WHS_SINK_TYPE: valkey` com as `WHS_SINK_REDIS_*` canônicas, para
+um `.env` servir aos dois; em cluster a leitura da política sai num `Do` à
+parte (achado: o *panic* do rueidis num `DoMulti` misto, SPEC §8.2.5).
+
 ## 5. Ordem de entrega
 
 1. `docs/SPEC.md` reescrita, mais `AGENTS.md`, `CLAUDE.md` e `TESTING.md` novos.

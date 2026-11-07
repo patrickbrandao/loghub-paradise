@@ -51,7 +51,7 @@ o valor que este servidor implementa: `ring.mode = memory`, `sink.type = nats`,
 `ratelimit.enabled = false`, `sink.nats.tls = false` e
 `sink.nats.subject = loghub.{space}.{type}` (qualquer outro valor é `exit 1`,
 com a mensagem dizendo que o recurso não existe aqui). Toda outra chave de
-recurso retirado — `[ring.sqlite]`, `ring.max_inflight`, `[sink.redis]`,
+recurso retirado — `[ring.sqlite]`, `ring.max_inflight`, `[sink.redis]` (e o alias `[sink.valkey]` do fast),
 `[sink.sqlite]`, `[sink.postgres]`, `[sink.mysql]`, `[sink.clickhouse]`,
 `sink.nats.tls_ca`, `sink.nats.tls_insecure`, o resto de `[ratelimit]` — num INI
 ou numa flag é **chave desconhecida** (`exit 1`): uma configuração que pede um

@@ -226,4 +226,8 @@ const (
 	SinkNATSType       = "nats"
 	SinkClickHouseType = "clickhouse"
 	SinkNoneType       = "none"
+
+	// SinkValkeyAlias is accepted for sink.type and normalised to
+	// SinkRedisType when the configuration loads (SPEC §13.2, §8.2.6).
+	SinkValkeyAlias = "valkey"
 )
