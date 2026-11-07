@@ -28,6 +28,13 @@ type relpServer struct {
 	sessions atomic.Int32
 	offers   []string // the open offers received
 	heads    []string
+	// onAck, when set, is called (outside mu) for every message answered 200.
+	onAck func(msg string)
+	// rejectText is the text of the 500 answers (default "500 refused by the server").
+	rejectText string
+	// per session (by its number): the PROXY header and the messages
+	sessHead map[int]string
+	sessMsgs map[int][]string
 }
 
 func newRELPServer(t *testing.T, tlsConf *tls.Config, proxy bool) *relpServer {
@@ -59,6 +66,10 @@ func (s *relpServer) serve(raw net.Conn, tlsConf *tls.Config, proxy bool) {
 		h := readProxy(r)
 		s.mu.Lock()
 		s.heads = append(s.heads, h)
+		if s.sessHead == nil {
+			s.sessHead = map[int]string{}
+		}
+		s.sessHead[n] = h
 		s.mu.Unlock()
 	}
 	if tlsConf != nil {
@@ -94,7 +105,18 @@ func (s *relpServer) serve(raw net.Conn, tlsConf *tls.Config, proxy bool) {
 			if !drop && !closeNow && !hold && !rej {
 				s.acks = append(s.acks, msg)
 			}
+			if s.sessMsgs == nil {
+				s.sessMsgs = map[int][]string{}
+			}
+			s.sessMsgs[n] = append(s.sessMsgs[n], msg)
+			onAck, rtext := s.onAck, s.rejectText
 			s.mu.Unlock()
+			if onAck != nil && !drop && !closeNow && !hold && !rej {
+				onAck(msg)
+			}
+			if rtext == "" {
+				rtext = "500 refused by the server"
+			}
 			switch {
 			case drop:
 				w.Flush()
@@ -105,7 +127,7 @@ func (s *relpServer) serve(raw net.Conn, tlsConf *tls.Config, proxy bool) {
 				return
 			case hold:
 			case rej:
-				fmt.Fprintf(w, "%d rsp 25 500 refused by the server\n", f.Txnr)
+				fmt.Fprintf(w, "%d rsp %d %s\n", f.Txnr, len(rtext), rtext)
 			default:
 				fmt.Fprintf(w, "%d rsp 6 200 OK\n", f.Txnr)
 			}

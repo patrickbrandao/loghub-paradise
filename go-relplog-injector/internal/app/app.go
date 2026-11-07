@@ -25,6 +25,7 @@ import (
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-injector/internal/source"
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-injector/internal/tmpl"
 	"github.com/patrickbrandao/loghub-paradise/go-relplog-injector/internal/transport"
+	"github.com/patrickbrandao/loghub-paradise/go-relplog-injector/internal/verify"
 )
 
 // Exit codes (SPEC §3.3).
@@ -33,6 +34,7 @@ const (
 	ExitFailures    = 1
 	ExitUsage       = 2
 	ExitUnreachable = 3
+	ExitVerify      = 4 // destination check impossible: unreachable or unreadable (SPEC §8.5)
 	ExitInterrupted = 130
 )
 
@@ -73,10 +75,19 @@ type config struct {
 	pcapPorts, pcapProto     string
 	pcapTiming               string
 	pcapSpeed                float64
+	pcapDedup                string
+	pcapFlows                bool
+
+	verifyURL, verifySQLite string
+	verifySpace, verifyKey  string
+	verifyTimeout           time.Duration
+	verifyAllowDup          bool
 
 	reportFmt string
 	progress  string
 	showVer   bool
+
+	set map[string]bool // flags given explicitly
 }
 
 func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
@@ -121,6 +132,14 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.pcapProto, "pcap-proto", "udp,tcp", "protocols to replay from the capture: `udp,tcp`, udp or tcp")
 	fs.StringVar(&c.pcapTiming, "pcap-timing", "asap", "`asap` (paced by --rate) or original (the capture's own intervals)")
 	fs.Float64Var(&c.pcapSpeed, "pcap-speed", 1, "speed `factor` of --pcap-timing original (2 = twice as fast)")
+	fs.StringVar(&c.pcapDedup, "pcap-dedup", "auto", "drop the copies tcpdump -i any writes (same packet on another interface within 50ms): `auto`, on or off")
+	fs.BoolVar(&c.pcapFlows, "pcap-flows", false, "one RELP session per captured flow, with the captured addresses in the PROXY header; --concurrency caps the open sessions (default 1024)")
+	fs.StringVar(&c.verifySpace, "verify-space", "", "LogHub `space` of the destination (default: default)")
+	fs.StringVar(&c.verifyKey, "verify-key", "", "NATS stream, Redis stream key or PostgreSQL table to read (default: the server's)")
+	fs.StringVar(&c.verifyURL, "verify-url", "", "after sending, count lost/duplicated messages at the destination: nats://, tls://, postgres://, postgresql://, redis://, rediss://, valkey://, valkeys:// `url`")
+	fs.StringVar(&c.verifySQLite, "verify-sqlite", "", "after sending, count lost/duplicated messages in the sink=sqlite events `file`")
+	fs.DurationVar(&c.verifyTimeout, "verify-timeout", 30*time.Second, "how long to wait for the destination to hold every acknowledged message")
+	fs.BoolVar(&c.verifyAllowDup, "verify-allow-duplicates", false, "duplicates at the destination do not change the exit code (still counted)")
 
 	fs.StringVar(&c.reportFmt, "report", "text", "final report on stdout: `text` or json")
 	fs.StringVar(&c.progress, "progress", "auto", "progress line on stderr every `interval`; 0 = off; auto = 1s on a terminal")
@@ -128,7 +147,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: %s [flags]\n\nSends syslog messages to a RELP server, to test it or load it (docs/SPEC.md).\n\nFlags:\n", Name)
 		fs.PrintDefaults()
-		fmt.Fprintf(stderr, "\nExit: 0 all acknowledged, 1 some failed, 2 usage, 3 target unreachable, 130 interrupted.\n")
+		fmt.Fprintf(stderr, "\nExit: 0 all acknowledged (and found at the destination), 1 some failed, lost or duplicated,\n2 usage, 3 target unreachable, 4 destination check impossible, 130 interrupted.\n")
 	}
 	return fs
 }
@@ -147,6 +166,8 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%s: unexpected argument %q\n", Name, fs.Arg(0))
 		return ExitUsage
 	}
+	c.set = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { c.set[f.Name] = true })
 	if c.showVer {
 		fmt.Fprintf(stdout, "%s %s (%s)\n", Name, version, commit)
 		return ExitOK
@@ -167,6 +188,10 @@ type runner struct {
 	plan   sched.Plan
 	info   map[string]string
 	report string
+	rep    *report.Report
+
+	verify  *verify.Target // nil without --verify-*
+	matcher *verify.Matcher
 }
 
 func build(c *config) (*runner, error) {
@@ -231,10 +256,23 @@ func build(c *config) (*runner, error) {
 	if c.loop && !finite {
 		return nil, errors.New("--loop applies to --file and --pcap")
 	}
-	r := &runner{c: c, report: c.reportFmt, info: map[string]string{}}
+	r := &runner{c: c, report: c.reportFmt, info: map[string]string{}, rep: report.New()}
+	if err := r.buildVerify(c, finite); err != nil {
+		return nil, err
+	}
+	if c.pcapFlows && c.pcapFile == "" {
+		return nil, errors.New("--pcap-flows needs --pcap")
+	}
+	switch c.pcapDedup {
+	case "auto", "on", "off":
+	default:
+		return nil, fmt.Errorf("--pcap-dedup: want auto, on or off, got %q", c.pcapDedup)
+	}
 	switch {
 	case c.pcapFile != "":
-		opt := source.PcapOptions{Loop: c.loop, Header: h}
+		// auto is on: the rule only drops a packet seen on another
+		// interface, so a single-interface capture is never touched (SPEC §6.8).
+		opt := source.PcapOptions{Loop: c.loop, Header: h, Dedup: c.pcapDedup != "off"}
 		if opt.Ports, err = ports(c.pcapPorts); err != nil {
 			return nil, err
 		}
@@ -263,6 +301,15 @@ func build(c *config) (*runner, error) {
 		var t *tmpl.Template
 		if t, err = tmpl.Compile(body); err == nil {
 			r.src = &source.Template{T: t, H: h, Run: c.run, Size: c.size}
+			if r.verify != nil {
+				pat, ok := t.Pattern(c.run, c.hostname)
+				if !ok {
+					return nil, errors.New("--verify-* needs the run marker: a --template with {seq} and {run} (or the generator)")
+				}
+				if r.matcher, err = verify.NewMatcher(pat); err != nil {
+					return nil, fmt.Errorf("--verify-*: template marker: %w", err)
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -295,6 +342,12 @@ func build(c *config) (*runner, error) {
 	}
 	r.plan.Count = uint64(count)
 	r.plan.Duration, r.plan.Rate, r.plan.Workers, r.plan.Drain = c.duration, c.rate, c.concurrency, c.drain
+	if c.pcapFlows {
+		r.plan.PerFlow = true
+		if !c.set["concurrency"] {
+			r.plan.Workers = DefaultFlowSessions
+		}
+	}
 
 	if c.window < 1 || c.window > transport.MaxWindow {
 		return nil, fmt.Errorf("--window must be 1..%d", transport.MaxWindow)
@@ -317,6 +370,7 @@ func build(c *config) (*runner, error) {
 	default:
 		return nil, fmt.Errorf("--on-reject: want break or continue, got %q", c.onReject)
 	}
+	o.OnReject = r.rep.Rejected
 	r.plan.Retries = c.retries
 	if c.network == "tls" {
 		if o.TLS, err = tlsConfig(c); err != nil {
@@ -349,6 +403,15 @@ func build(c *config) (*runner, error) {
 	if r.dial, err = transport.Dialer(o); err != nil {
 		return nil, err
 	}
+	if r.plan.PerFlow {
+		if r.plan.FlowDial, err = transport.FlowDialer(o); err != nil {
+			return nil, err
+		}
+		r.info["sessions"] = "one per original flow, at most " + strconv.Itoa(r.plan.Workers) + " open"
+	}
+	if r.verify != nil {
+		r.info["verify"] = r.verify.Display
+	}
 	r.info["injector"] = Name + " " + version
 	r.info["run"] = c.run
 	r.info["target"] = "relp+" + c.network + "://" + c.target
@@ -356,6 +419,45 @@ func build(c *config) (*runner, error) {
 	r.info["format"] = fmtName
 	r.info["plan"] = planText(r.plan)
 	return r, nil
+}
+
+// DefaultFlowSessions caps the open sessions of --pcap-flows without
+// --concurrency (SPEC §6.9).
+const DefaultFlowSessions = 1024
+
+// buildVerify validates the --verify-* flags (SPEC §3.2, §8.5).
+func (r *runner) buildVerify(c *config, finite bool) error {
+	switch {
+	case c.verifyURL != "" && c.verifySQLite != "":
+		return errors.New("--verify-url and --verify-sqlite are exclusive")
+	case c.verifyURL == "" && c.verifySQLite == "":
+		if c.set["verify-timeout"] || c.set["verify-allow-duplicates"] || c.set["verify-space"] || c.set["verify-key"] {
+			return errors.New("--verify-timeout, --verify-allow-duplicates, --verify-space and --verify-key need --verify-url or --verify-sqlite")
+		}
+		return nil
+	}
+	if c.verifySQLite != "" && (c.verifySpace != "" || c.verifyKey != "") {
+		return errors.New("--verify-space and --verify-key do not apply to --verify-sqlite")
+	}
+	if finite {
+		return errors.New("--verify-* needs the run marker: --file and --pcap have none (SPEC §8.5)")
+	}
+	if c.verifyTimeout <= 0 {
+		return errors.New("--verify-timeout must be > 0")
+	}
+	if c.verifySQLite != "" {
+		r.verify = verify.SQLite(c.verifySQLite)
+		return nil
+	}
+	t, err := verify.ParseURL(c.verifyURL)
+	if err != nil {
+		return err
+	}
+	if err := t.Override(c.verifySpace, c.verifyKey); err != nil {
+		return err
+	}
+	r.verify = t
+	return nil
 }
 
 func planText(p sched.Plan) string {
@@ -379,9 +481,12 @@ func planText(p sched.Plan) string {
 }
 
 func (r *runner) run(stdout, stderr io.Writer) int {
-	rep := report.New()
+	rep := r.rep
 	rep.Info = r.info
 	rep.OKOutcomes = []string{transport.Acked}
+	if r.verify != nil {
+		rep.TrackAcked()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sig := make(chan os.Signal, 2)
@@ -401,6 +506,21 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 			os.Exit(ExitInterrupted)
 		}
 	}()
+	if r.verify != nil {
+		// The destination is reached before anything is sent: a check that
+		// cannot run is not a run (SPEC §8.5).
+		pctx, pcancel := context.WithTimeout(ctx, r.c.timeout)
+		err := verify.Probe(pctx, r.verify, r.c.run)
+		pcancel()
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: destination check impossible: %s: %v\n", Name, r.verify.Display, err)
+			rep.Start = time.Now()
+			rep.End = rep.Start
+			rep.Verify = &report.Verify{Destination: r.verify.Display, Unreadable: true, Error: err.Error()}
+			r.write(rep, stdout)
+			return ExitVerify
+		}
+	}
 	rep.Start = time.Now()
 	stopProg := make(chan struct{})
 	if every := r.progressEvery(stderr); every > 0 {
@@ -416,13 +536,29 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 	if st.SourceErr != nil {
 		rep.Event("source_error: " + st.SourceErr.Error())
 	}
-	r.write(rep, stdout)
+	if r.plan.PerFlow {
+		r.info["flows"] = strconv.FormatUint(st.Flows, 10)
+	}
 	ok, failed := rep.Totals()
+	unreachable := ok+failed > 0 && rep.Dials() == 0
+	if r.verify != nil && !interrupted.Load() && !unreachable {
+		fmt.Fprintf(stderr, "%s: checking %s (up to %v)\n", Name, r.verify.Display, r.c.verifyTimeout)
+		rep.Verify = verify.Check(ctx, r.verify, r.matcher, st.Produced, rep.Acked(), verify.Options{
+			Run: r.c.run, Since: rep.Start, Timeout: r.c.verifyTimeout, AllowDup: r.c.verifyAllowDup,
+		})
+		// elapsed and the rates stay those of the sending; the wait is
+		// verify.waited_sec.
+	}
+	r.write(rep, stdout)
 	switch {
 	case interrupted.Load():
 		return ExitInterrupted
-	case ok+failed > 0 && rep.Dials() == 0:
+	case unreachable:
 		return ExitUnreachable
+	case rep.Verify != nil && rep.Verify.Unreadable:
+		return ExitVerify
+	case rep.Verify != nil && !rep.Verify.OK:
+		return ExitFailures
 	case failed > 0 || st.SourceErr != nil:
 		return ExitFailures
 	}

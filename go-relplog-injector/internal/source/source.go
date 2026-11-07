@@ -27,6 +27,14 @@ type Message struct {
 	At time.Duration
 	// Src and Dst are the addresses in the capture (pcap only).
 	Src, Dst netip.AddrPort
+	// Flow identifies the original flow of a captured message (a TCP
+	// direction, or a UDP source/destination pair), from 1; 0 without one.
+	// EndFlows lists flows that ended in the capture before this message
+	// (SPEC §6.9).
+	Flow     uint64
+	EndFlows []uint64
+
+	endOf uint64 // queue marker: flow endOf ended here (no message)
 }
 
 // Source yields messages. Next returns io.EOF when a finite source ends.

@@ -21,6 +21,21 @@ type PcapOptions struct {
 	UDP, TCP bool
 	Loop     bool
 	Header   Header // FormatRaw by default: the captured message as is
+	// Dedup drops the copies of tcpdump -i any (SPEC §6.8).
+	Dedup bool
+}
+
+// endHandler is the extractor of one TCP direction that also marks, in the
+// queue, where its flow ended (SPEC §6.9).
+type endHandler struct {
+	*extract.Stream
+	p  *Pcap
+	id uint64
+}
+
+func (h *endHandler) End() {
+	h.Stream.End()
+	h.p.queue = append(h.p.queue, Message{endOf: h.id})
 }
 
 // Pcap replays the syslog messages of a capture, in capture order.
@@ -43,6 +58,12 @@ type Pcap struct {
 	// --loop (a capture rewritten empty between passes would spin forever).
 	passSent uint64
 	cut      uint64 // passes that ended at a truncated record
+
+	dedup   *pcap.Dedup
+	dups    uint64                       // packets dropped as -i any copies
+	flowIDs uint64                       // last flow id given
+	udpFlow map[[2]netip.AddrPort]uint64 // UDP flows of the pass
+	ends    []uint64                     // flows ended before the next message
 
 	// totals of the previous passes, so the report covers the whole run
 	decTotal pcap.Stats
@@ -78,10 +99,19 @@ func (p *Pcap) open() error {
 			return nil
 		}
 		src, dst := k.Src, k.Dst
-		return extract.NewStream(strict, mid, &p.ext, func(b []byte, ts time.Time) {
-			p.push(b, ts, src, dst)
+		p.flowIDs++
+		id := p.flowIDs
+		h := &endHandler{p: p, id: id}
+		h.Stream = extract.NewStream(strict, mid, &p.ext, func(b []byte, ts time.Time) {
+			p.push(b, ts, src, dst, id)
 		})
+		return h
 	})
+	p.dedup = nil
+	if p.opt.Dedup {
+		p.dedup = pcap.NewDedup()
+	}
+	p.udpFlow = map[[2]netip.AddrPort]uint64{}
 	p.first = time.Time{}
 	p.pass++
 	p.passSent = 0
@@ -92,7 +122,7 @@ func (p *Pcap) wantPort(port uint16) bool {
 	return len(p.opt.Ports) == 0 || p.opt.Ports[port]
 }
 
-func (p *Pcap) push(b []byte, ts time.Time, src, dst netip.AddrPort) {
+func (p *Pcap) push(b []byte, ts time.Time, src, dst netip.AddrPort, flow uint64) {
 	at := time.Duration(-1)
 	if !ts.IsZero() {
 		if p.first.IsZero() {
@@ -106,27 +136,49 @@ func (p *Pcap) push(b []byte, ts time.Time, src, dst netip.AddrPort) {
 			p.last = at
 		}
 	}
-	p.queue = append(p.queue, Message{Data: append([]byte(nil), b...), At: at, Src: src, Dst: dst})
+	p.queue = append(p.queue, Message{Data: append([]byte(nil), b...), At: at, Src: src, Dst: dst, Flow: flow})
+}
+
+// udpFlowID returns the flow of a UDP source/destination pair in this pass.
+func (p *Pcap) udpFlowID(src, dst netip.AddrPort) uint64 {
+	k := [2]netip.AddrPort{src, dst}
+	id := p.udpFlow[k]
+	if id == 0 {
+		p.flowIDs++
+		id = p.flowIDs
+		p.udpFlow[k] = id
+	}
+	return id
 }
 
 // Next implements Source.
 func (p *Pcap) Next(_ uint64, now time.Time) (Message, error) {
-	for len(p.queue) == 0 {
-		if err := p.step(); err != nil {
-			if !errors.Is(err, io.EOF) {
-				return Message{}, err
-			}
-			if !p.opt.Loop || p.passSent == 0 {
-				return Message{}, io.EOF
-			}
-			if err := p.reopen(); err != nil {
-				return Message{}, err
+	var m Message
+	for {
+		for len(p.queue) == 0 {
+			if err := p.step(); err != nil {
+				if !errors.Is(err, io.EOF) {
+					return Message{}, err
+				}
+				if !p.opt.Loop || p.passSent == 0 {
+					return Message{}, io.EOF
+				}
+				if err := p.reopen(); err != nil {
+					return Message{}, err
+				}
 			}
 		}
+		m = p.queue[0]
+		p.queue[0] = Message{}
+		p.queue = p.queue[1:]
+		if m.endOf == 0 {
+			break
+		}
+		p.ends = append(p.ends, m.endOf)
 	}
-	m := p.queue[0]
-	p.queue[0] = Message{}
-	p.queue = p.queue[1:]
+	if len(p.ends) > 0 {
+		m.EndFlows, p.ends = p.ends, nil
+	}
 	if p.opt.Header.Format != FormatRaw {
 		m.Data = p.opt.Header.Wrap(make([]byte, 0, len(m.Data)+96), m.Data, now)
 	}
@@ -149,6 +201,12 @@ func (p *Pcap) step() error {
 			p.asm.Flush()
 			p.addAsm(p.asm.Stats)
 			p.asm = nil
+			p.dec.Flush() // fragments still waiting are lost
+			// The UDP flows of the pass end with it.
+			for _, id := range p.udpFlow {
+				p.queue = append(p.queue, Message{endOf: id})
+			}
+			p.udpFlow = map[[2]netip.AddrPort]uint64{}
 			if len(p.queue) > 0 {
 				return nil
 			}
@@ -167,19 +225,39 @@ func (p *Pcap) step() error {
 		if !p.opt.UDP || !p.wantPort(seg.Dst.Port()) {
 			return nil
 		}
+		// After the port filter, so a copy it refuses does not shadow the
+		// one it keeps (NAT may rewrite the port between copies).
+		if p.isCopy(seg) {
+			return nil
+		}
 		if seg.Truncated {
 			p.ext.LostFrames++ // a datagram cut by the snaplen is not replayed
 			return nil
 		}
 		if extract.Datagram(seg.Payload, len(p.opt.Ports) == 0, &p.ext) {
-			p.push(seg.Payload, seg.TS, seg.Src, seg.Dst)
+			p.push(seg.Payload, seg.TS, seg.Src, seg.Dst, p.udpFlowID(seg.Src, seg.Dst))
 		}
 	case pcap.ProtoTCP:
 		if p.opt.TCP {
+			if p.wantPort(seg.Dst.Port()) && p.isCopy(seg) {
+				return nil
+			}
 			p.asm.Add(seg)
 		}
 	}
 	return nil
+}
+
+// isCopy reports (and counts) a packet that copies one seen on another
+// interface within the window: tcpdump -i any (SPEC §6.8). Asked after the
+// port filter, so a copy it refuses does not shadow the one it keeps (NAT
+// may rewrite the port between copies).
+func (p *Pcap) isCopy(seg pcap.Segment) bool {
+	if p.dedup == nil || !p.dedup.Copy(pcap.Key(seg), seg.Iface, seg.TS) {
+		return false
+	}
+	p.dups++
+	return true
 }
 
 func (p *Pcap) reopen() error {
@@ -202,6 +280,8 @@ func (p *Pcap) accumulate() {
 	t.Reassembled += d.Reassembled
 	t.FragmentsLost += d.FragmentsLost
 	t.Truncated += d.Truncated
+	t.SnaplenDatagrams += d.SnaplenDatagrams
+	t.SnaplenUDP += d.SnaplenUDP
 	x := &p.extTotal
 	x.Datagrams += e.Datagrams
 	x.DatagramsSkip += e.DatagramsSkip
@@ -231,6 +311,7 @@ func (p *Pcap) addAsm(a pcap.AsmStats) {
 	t.Gaps += a.Gaps
 	t.GapBytes += a.GapBytes
 	t.Unterminated += a.Unterminated
+
 }
 
 // Stats implements Source.
@@ -241,29 +322,31 @@ func (p *Pcap) Stats() map[string]uint64 {
 	ce := p.ext
 	a := p.asmTotal
 	m := map[string]uint64{
-		"pcap_passes":             p.pass,
-		"pcap_cut_at_end":         p.cut,
-		"pcap_packets":            d.Packets + cur.Packets,
-		"pcap_not_ip":             d.NotIP + cur.NotIP,
-		"pcap_malformed":          d.Malformed + cur.Malformed,
-		"pcap_other_proto":        d.OtherProto + cur.OtherProto,
-		"pcap_snaplen_truncated":  d.Truncated + cur.Truncated,
-		"pcap_ip_fragments":       d.Fragments + cur.Fragments,
-		"pcap_ip_reassembled":     d.Reassembled + cur.Reassembled,
-		"pcap_ip_fragments_lost":  d.FragmentsLost + cur.FragmentsLost,
-		"udp_datagrams":           e.Datagrams + ce.Datagrams,
-		"udp_not_syslog":          e.DatagramsSkip + ce.DatagramsSkip,
-		"tcp_messages":            e.Messages + ce.Messages,
-		"tcp_streams_octet":       e.Streams[extract.ModeOctet] + ce.Streams[extract.ModeOctet],
-		"tcp_streams_lf":          e.Streams[extract.ModeLF] + ce.Streams[extract.ModeLF],
-		"tcp_streams_relp":        e.Streams[extract.ModeRELP] + ce.Streams[extract.ModeRELP],
-		"tcp_streams_not_syslog":  e.Streams[extract.ModeIgnore] + ce.Streams[extract.ModeIgnore] + e.Streams[extract.ModeDetect] + ce.Streams[extract.ModeDetect],
-		"tcp_relp_other_commands": e.RELPOther + ce.RELPOther,
-		"tcp_resyncs":             e.Resyncs + ce.Resyncs,
-		"tcp_skipped_bytes":       e.SkippedBytes + ce.SkippedBytes,
-		"frames_lost":             e.LostFrames + ce.LostFrames,
-		"tcp_long_lines":          e.LongLines + ce.LongLines,
-		"messages_replayed":       p.sent,
+		"pcap_passes":               p.pass,
+		"pcap_cut_at_end":           p.cut,
+		"pcap_packets":              d.Packets + cur.Packets,
+		"pcap_not_ip":               d.NotIP + cur.NotIP,
+		"pcap_malformed":            d.Malformed + cur.Malformed,
+		"pcap_other_proto":          d.OtherProto + cur.OtherProto,
+		"pcap_snaplen_truncated":    d.Truncated + cur.Truncated,
+		"pcap_ip_fragments":         d.Fragments + cur.Fragments,
+		"pcap_ip_reassembled":       d.Reassembled + cur.Reassembled,
+		"pcap_ip_fragments_lost":    d.FragmentsLost + cur.FragmentsLost,
+		"udp_datagrams":             e.Datagrams + ce.Datagrams,
+		"udp_not_syslog":            e.DatagramsSkip + ce.DatagramsSkip,
+		"tcp_messages":              e.Messages + ce.Messages,
+		"tcp_streams_octet":         e.Streams[extract.ModeOctet] + ce.Streams[extract.ModeOctet],
+		"tcp_streams_lf":            e.Streams[extract.ModeLF] + ce.Streams[extract.ModeLF],
+		"tcp_streams_relp":          e.Streams[extract.ModeRELP] + ce.Streams[extract.ModeRELP],
+		"tcp_streams_not_syslog":    e.Streams[extract.ModeIgnore] + ce.Streams[extract.ModeIgnore] + e.Streams[extract.ModeDetect] + ce.Streams[extract.ModeDetect],
+		"tcp_relp_other_commands":   e.RELPOther + ce.RELPOther,
+		"tcp_resyncs":               e.Resyncs + ce.Resyncs,
+		"tcp_skipped_bytes":         e.SkippedBytes + ce.SkippedBytes,
+		"frames_lost":               e.LostFrames + ce.LostFrames + d.SnaplenUDP + cur.SnaplenUDP,
+		"pcap_ip_datagrams_snaplen": d.SnaplenDatagrams + cur.SnaplenDatagrams,
+		"pcap_duplicates":           p.dups,
+		"tcp_long_lines":            e.LongLines + ce.LongLines,
+		"messages_replayed":         p.sent,
 	}
 	if p.asm != nil {
 		c := p.asm.Stats
@@ -276,7 +359,9 @@ func (p *Pcap) Stats() map[string]uint64 {
 		a.Gaps += c.Gaps
 		a.GapBytes += c.GapBytes
 		a.Unterminated += c.Unterminated
+
 	}
+
 	m["tcp_directions"] = a.Flows
 	m["tcp_midstream"] = a.Midstream
 	m["tcp_directions_filtered"] = a.Ignored

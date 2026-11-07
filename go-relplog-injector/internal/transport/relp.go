@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"sync"
@@ -41,6 +42,9 @@ type Options struct {
 	// BreakOnReject ends the session after a non-200 answer, as librelp does
 	// (its scrsp.c returns an error that suspends the action).
 	BreakOnReject bool
+	// OnReject, when set, receives the text of every non-200 answer (its
+	// first line, code included) for the report (SPEC §8.2).
+	OnReject func(text string)
 }
 
 // MaxTxnr is where librelp wraps the transaction number back to 1.
@@ -59,14 +63,39 @@ var (
 
 // Dialer returns the dialer of o.
 func Dialer(o Options) (sched.Dialer, error) {
+	fd, err := FlowDialer(o)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context) (sched.Conn, error) {
+		return fd(ctx, netip.AddrPort{}, netip.AddrPort{})
+	}, nil
+}
+
+// FlowDialer returns the dialer of o for --pcap-per-flow (SPEC §6.9): with a
+// PROXY header, src and dst (the flow's captured addresses) are announced
+// where --proxy-src/--proxy-dst did not fix them; zero values announce the
+// real ones.
+func FlowDialer(o Options) (sched.FlowDialer, error) {
 	if o.Network != "tcp" && o.Network != "tls" {
 		return nil, fmt.Errorf("unknown transport %q", o.Network)
 	}
 	if o.Window < 1 || o.Window > MaxWindow {
 		return nil, fmt.Errorf("window must be 1..%d", MaxWindow)
 	}
-	return func(ctx context.Context) (sched.Conn, error) {
-		c, err := dialStream(ctx, o)
+	return func(ctx context.Context, src, dst netip.AddrPort) (sched.Conn, error) {
+		oo := o
+		if o.Proxy != nil && (src.IsValid() || dst.IsValid()) {
+			ph := *o.Proxy
+			if !ph.Src.IsValid() {
+				ph.Src = src
+			}
+			if !ph.Dst.IsValid() {
+				ph.Dst = dst
+			}
+			oo.Proxy = &ph
+		}
+		c, err := dialStream(ctx, oo)
 		if err != nil {
 			return nil, err
 		}
@@ -324,10 +353,13 @@ func (r *relpConn) read() {
 			return
 		}
 		<-r.window
-		code, _ := RspCode(f.Data)
+		code, text := RspCode(f.Data)
 		if code == 200 {
 			p.m.Done(Acked, true)
 			continue
+		}
+		if r.o.OnReject != nil {
+			r.o.OnReject(text)
 		}
 		p.m.Done(Rejected, false)
 		if r.o.BreakOnReject {

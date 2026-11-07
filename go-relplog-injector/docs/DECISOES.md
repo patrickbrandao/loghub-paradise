@@ -76,3 +76,23 @@ extremo."
 Defeito achado nos três: `--duration` sem `--count` enviava **uma** mensagem (o
 padrão de 1 valia também ali), e os exemplos de carga do README publicado não
 faziam o que diziam. Corrigido nos três, com teste que falha sem a correção.
+
+## 5. Terceira rodada (2026-11-07): as pendências conhecidas
+
+Pedido do usuário (entrevista de 2026-11-07): fechar todas as "Pendências
+conhecidas" dos quatro injetores. Esta seção foi escrita no RI; o SI, o WI e o
+GI registram a sua parte nos próprios módulos, e o integrador reconcilia o
+texto comum.
+
+| # | Tema | Decisão | Por quê |
+|---|---|---|---|
+| 20 | Conferência no destino (revê a decisão 4) | **Passa a ser objetivo.** `--verify-url` (`nats://`, `tls://`, `postgres://`, `postgresql://`, `redis://`, `rediss://`, `valkey://`, `valkeys://`) ou `--verify-sqlite <arquivo>`, mais `--verify-timeout`; depois do envio, espera e conta perdidas e duplicadas pelo marcador da execução, no relatório e no código de saída (SPEC §8.5). Usa `nats.go`, `pgx`, `rueidis` e `modernc.org/sqlite` nas versões do `go-relplog-server/go.mod` — exceção à decisão 6, só no pacote `verify` | Decisão do usuário. Um `200` do RELP prova o ring do servidor, não o destino; só lendo o destino a perda depois da confirmação aparece. As mesmas versões dos servidores evitam que o injetor discorde do servidor sobre o protocolo |
+| 21 | Códigos de saída da conferência | Os do SI (alinhados pelo integrador em 2026-11-07): `4` = conferência **impossível** (o destino é aberto **antes** do envio; inalcançável, nada sai); perdida ou duplicada (sem `--verify-allow-duplicates`, só do RI) = `1`. Precedência `130`, `3`, `4`, `1` | Os injetores são usados em scripts: o mesmo código tem de dizer a mesma coisa nos quatro. Abrir o destino antes evita uma carga inteira cuja conferência já não podia rodar |
+| 22 | Duplicatas do `-i any` | `--pcap-dedup auto|on|off` (auto = on); por pacote, a chave do SI (protocolo, IP ID, porta de origem, sequência/confirmação/flags TCP, tamanho, FNV-1a do conteúdo), 50 ms de captura, só em **outra** interface; um original absorve uma cópia por interface | A chave é a do SI, para que os dois descartem os mesmos pacotes; a exigência de outra interface (do RI) faz a regra nunca descartar nada numa captura de interface única e deixa passar duas mensagens legítimas iguais |
+| 23 | Uma sessão por fluxo | Opt-in (`--pcap-flows`, o nome do SI); PROXY com a origem e o destino capturados; `--concurrency` vira teto de sessões (padrão 1024), e a sessão ociosa cede a vaga a quem espera | Opt-in porque muda o que o teste de carga mede. O RI tem sessões RELP com janela e retransmissão por fluxo, então o teto é global com cessão da vaga ociosa, e não o LRU de 256 conexões por worker do SI: fechar uma sessão RELP espera as respostas, e fechá-la por idade, com mensagens na fila, as reenviaria |
+| 24 | Snaplen nos fragmentos | Condenar o datagrama no primeiro fragmento cortado e contá-lo (`pcap_ip_datagrams_snaplen`) | Os bytes cortados não estão no arquivo: reconstruir é impossível, contar é o que resta |
+| 25 | Ressincronização acima de 64 KiB | Segurar todo candidato válido (até 16 MiB), descartando o que já foi recusado e retomando a busca de onde parou | O teto de 64 KiB fazia a escolha depender da divisão em segmentos; tirar o teto sem os dois cuidados trocaria o defeito por memória e custo quadrático |
+| 26 | Texto das recusas | `rejected: <texto>` nos eventos, 120 bytes, no máximo 32 textos distintos | O operador precisa do motivo; o texto vem do servidor e não pode inflar o relatório sem limite |
+
+A decisão 4 da tabela da seção 1 fica como registro do que foi decidido em
+2026-10-30; a 20 a substitui.
