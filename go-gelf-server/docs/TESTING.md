@@ -283,6 +283,20 @@ no mesmo cluster usam `db=0` e provam sonda, releitura da política (um `Do` à
 parte num cluster: o rueidis entra em pânico num pipeline que mistura comando
 sem chave com comandos de chave) e escrita.
 
+**Resultado da rodada de 2026-11-07** (macOS, Docker Desktop, `-race`;
+`scripts/test-redis-valkey.sh` para a suíte, as receitas acima para Sentinel e
+cluster):
+
+| Servidor | `rediscli` `ring` `sink` `app` | Sentinel (sink + ring) | Cluster: db=1 / db=0 |
+|---|---|---|---|
+| Redis 7.4.12 | ok | ok | FATAL na hora / ok |
+| Valkey 7.2.15 | ok | ok | FATAL na hora / ok |
+| Valkey 8.1.11 | ok | ok | FATAL na hora / ok |
+| Valkey 9.0.7 | ok | ok | FATAL na hora (`DB index is out of range`) / ok |
+| Valkey 9.0.7 `--cluster-databases 16` | — | — | db=1 grava |
+
+Os mesmos 20 pares módulo × servidor (S, R, G, W, F) passaram no script.
+
 ### 6.2 O que cada destino prova
 
 - **Redis:** o script de enfileiramento com os dois tetos globais, o `Commit`
