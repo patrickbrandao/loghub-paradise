@@ -15,20 +15,20 @@
 # 127.0.0.1:19114. Defaults distintos por combinacao para que varias rodem lado
 # a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
 
-name: sls-sqlite-mysql
+name: slstd-sqlite-mysql
 
 services:
   syslog:
     extends:
       file: common.yml
-      service: sls-base
-    container_name: sls-sqlite-mysql
+      service: slstd-base
+    container_name: slstd-sqlite-mysql
     depends_on:
       mysql:
         condition: service_healthy
 
     environment:
-      SYSLOG_NODE_ID: sls-sqlite-mysql
+      SYSLOG_NODE_ID: slstd-sqlite-mysql
 
       # --- ring: sqlite ---------------------------------------------------------
       SYSLOG_RING_MODE: sqlite
@@ -61,11 +61,11 @@ services:
       - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19114}:9102"
 
     volumes:
-      - sls-data:/data
+      - slstd-data:/data
 
   mysql:
     image: ${SYSLOG_MYSQL_IMAGE:-mysql:8.4}
-    container_name: sls-sqlite-mysql-mysql
+    container_name: slstd-sqlite-mysql-mysql
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${SYSLOG_MYSQL_ROOT_PASSWORD:-root}
@@ -87,7 +87,7 @@ services:
       # baixar isto junto.
       - --max_allowed_packet=256M
     volumes:
-      - mysql-data:/var/lib/mysql
+      - slstd-mysql-data:/var/lib/mysql
       # Executado UMA vez pela imagem oficial, ao criar o volume, dentro de
       # MYSQL_DATABASE. Depois disso o esquema e' seu.
       - ./mysql/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
@@ -101,5 +101,5 @@ services:
       start_period: 30s
 
 volumes:
-  sls-data:
-  mysql-data:
+  slstd-data:
+  slstd-mysql-data:

@@ -1,0 +1,91 @@
+# ring persistente em SQLite  ->  Valkey Streams
+#
+# Garantia: COMMIT em disco antes da confirmacao. So' faz sentido com TCP e
+#   RELP: no UDP o fsync garante o que a rede talvez ja' tenha descartado.
+#
+#   docker compose -f compose.sqlite-valkey.yml up -d --build
+#
+# Publicado no host: syslog 5159/udp e 5159/tcp, RELP 20619/tcp, admin
+# 127.0.0.1:19119. Defaults distintos por combinacao para que varias rodem lado
+# a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
+
+name: slstd-sqlite-valkey
+
+services:
+  syslog:
+    extends:
+      file: common.yml
+      service: slstd-base
+    container_name: slstd-sqlite-valkey
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+    environment:
+      SYSLOG_NODE_ID: slstd-sqlite-valkey
+
+      # --- ring: sqlite ---------------------------------------------------------
+      SYSLOG_RING_MODE: sqlite
+      # FULL faz fsync a cada group commit: sobrevive a queda de energia, e a
+      # latencia de confirmacao fica presa ao disco.
+      SYSLOG_RING_SQLITE_SYNCHRONOUS: ${SYSLOG_RING_SQLITE_SYNCHRONOUS:-FULL}
+      SYSLOG_RING_CAPACITY_ITEMS: ${SYSLOG_RING_CAPACITY_ITEMS:-65536}
+      SYSLOG_RING_MAX_BYTES: ${SYSLOG_RING_MAX_BYTES:-512MiB}
+      # Sem efeito com ring=sqlite: os itens ja' estao em disco.
+      SYSLOG_EMERGENCY_ENABLED: "false"
+
+      # --- sink: valkey (= redis, SPEC 10.3) ------------------------------------------------
+      SYSLOG_SINK_TYPE: valkey
+      SYSLOG_SINK_VALKEY_ADDRS: valkey:6379
+      # Stream proprio, separado do webhooks:in: volume, retencao e consumidores
+      # diferentes (docs/SPEC.md 3.3).
+      SYSLOG_SINK_VALKEY_STREAM: ${SYSLOG_SINK_VALKEY_STREAM:-syslog:in}
+      SYSLOG_SINK_VALKEY_DB: ${SYSLOG_SINK_VALKEY_DB:-0}
+      SYSLOG_SINK_VALKEY_USERNAME: ${SYSLOG_SINK_VALKEY_USERNAME:-}
+      SYSLOG_SINK_VALKEY_PASSWORD: ${SYSLOG_SINK_VALKEY_PASSWORD:-}
+      # 0 desliga o trim. MAXLEN descartaria mensagens antigas em silencio.
+      SYSLOG_SINK_VALKEY_MAXLEN: ${SYSLOG_SINK_VALKEY_MAXLEN:-0}
+      SYSLOG_SINK_WORKERS: ${SYSLOG_SINK_WORKERS:-8}
+      SYSLOG_SINK_BATCH: ${SYSLOG_SINK_BATCH:-256}
+
+    ports:
+      # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
+      - "${SYSLOG_PORT:-5159}:1514/udp"
+      - "${SYSLOG_PORT:-5159}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20619}:20514/tcp"
+      # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19119}:9102"
+
+    volumes:
+      - slstd-data:/data
+
+  valkey:
+    # valkey-server como primeiro argumento: e' o que faz o entrypoint da
+    # imagem oficial rebaixar o privilegio para o usuario valkey e ajustar o
+    # /data. Pelo symlink com o nome antigo o processo rodaria como root.
+    image: ${SYSLOG_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}
+    container_name: slstd-sqlite-valkey-valkey
+    restart: unless-stopped
+    command:
+      # AOF com fsync a cada segundo: perde no maximo 1s de stream num crash.
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+    volumes:
+      - slstd-valkey-data:/data
+    ports:
+      - "127.0.0.1:${SYSLOG_VALKEY_PORT:-16324}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  slstd-data:
+  slstd-valkey-data:

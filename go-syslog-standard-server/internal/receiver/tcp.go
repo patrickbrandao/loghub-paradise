@@ -37,10 +37,17 @@ type TCPConfig struct {
 }
 
 // tcpReadBuffer is the bufio.Reader size of one TCP or RELP connection. It is
-// not a configuration key: a frame is read through it in chunks of the same
-// size (octetChunk), so a bigger buffer buys nothing and a smaller one only
-// costs syscalls.
-const tcpReadBuffer = 64 << 10
+// not a configuration key: a frame is read through it one refill at a time, so
+// a bigger buffer buys little and a smaller one only costs syscalls.
+//
+// 4 KiB, not 64 (pendência 1 de §21.1, SPEC §5.5; ported from
+// go-syslog-server): the reader is held for as long as the connection lives,
+// idle or not, outside ring.max_bytes, and with max_conns = 0 (the default) a
+// few thousand silent connections at 64 KiB each took the heap to the OOM
+// killer. The largest Peek of the code is one byte (the framing detection);
+// the rest is ReadByte, ReadSlice and the counted read, which goes one refill
+// at a time.
+const tcpReadBuffer = 4 << 10
 
 // TCP receives RFC 6587 streams (SPEC §4.4).
 //
@@ -78,6 +85,7 @@ func NewTCP(ctx context.Context, cfg TCPConfig, in *Ingest, m *obs.Metrics, log 
 	// One limiter for every listener of this transport: the ceilings are per
 	// transport, not per listener (SPEC §4.4).
 	limiter := newConnLimiter(cfg.MaxConns, cfg.MaxConnsPerIP)
+	limiter.countRefusals(&m.ConnsRefusedTotal[obs.TransportTCP])
 	for i := 0; i < n; i++ {
 		l, err := listenStream(ctx, cfg.Addr, n > 1)
 		if err != nil {

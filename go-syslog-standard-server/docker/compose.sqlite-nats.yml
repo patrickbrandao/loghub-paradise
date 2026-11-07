@@ -14,14 +14,14 @@
 # 127.0.0.1:19115. Defaults distintos por combinacao para que varias rodem lado
 # a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
 
-name: sls-sqlite-nats
+name: slstd-sqlite-nats
 
 services:
   syslog:
     extends:
       file: common.yml
-      service: sls-base
-    container_name: sls-sqlite-nats
+      service: slstd-base
+    container_name: slstd-sqlite-nats
     depends_on:
       nats:
         condition: service_healthy
@@ -29,7 +29,7 @@ services:
         condition: service_completed_successfully
 
     environment:
-      SYSLOG_NODE_ID: sls-sqlite-nats
+      SYSLOG_NODE_ID: slstd-sqlite-nats
 
       # --- ring: sqlite ---------------------------------------------------------
       SYSLOG_RING_MODE: sqlite
@@ -71,17 +71,17 @@ services:
       - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19115}:9102"
 
     volumes:
-      - sls-data:/data
+      - slstd-data:/data
 
   nats:
     image: ${SYSLOG_NATS_IMAGE:-nats:2.11-alpine}
-    container_name: sls-sqlite-nats-nats
+    container_name: slstd-sqlite-nats-nats
     restart: unless-stopped
     # A imagem oficial ja' roda `nats-server --config /etc/nats/nats-server.conf`;
     # o arquivo montado por cima liga o JetStream em /data e sobe max_payload
     # para 8 MB (ver ./nats/nats-server.conf).
     volumes:
-      - nats-data:/data
+      - slstd-nats-data:/data
       - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
     ports:
       - "127.0.0.1:${SYSLOG_NATS_PORT:-14215}:4222"
@@ -98,7 +98,7 @@ services:
   # nem altera um stream (docs/SPEC.md 10.8.5).
   nats-init:
     image: ${SYSLOG_NATS_BOX_IMAGE:-natsio/nats-box:0.20.0}
-    container_name: sls-sqlite-nats-nats-init
+    container_name: slstd-sqlite-nats-nats-init
     depends_on:
       nats:
         condition: service_healthy
@@ -111,5 +111,5 @@ services:
         || nats --server nats://nats:4222 stream add ${SYSLOG_SINK_NATS_STREAM:-SYSLOG} --config /etc/nats/stream.json
 
 volumes:
-  sls-data:
-  nats-data:
+  slstd-data:
+  slstd-nats-data:

@@ -65,6 +65,7 @@ type RELP struct {
 	MaxConnsPerIP       int
 	Window              int
 	BackpressureTimeout time.Duration
+	InflightMaxBytes    int64
 }
 
 type Parse struct {
@@ -237,6 +238,10 @@ const (
 	SinkMySQLType    = "mysql"
 	SinkNATSType     = "nats"
 	SinkNoneType     = "none"
+
+	// SinkValkeyAlias is accepted for sink.type and normalised to
+	// SinkRedisType when the configuration is loaded (SPEC §10.3, §15.2).
+	SinkValkeyAlias = "valkey"
 )
 
 // TCP framing modes (SPEC §5.2).

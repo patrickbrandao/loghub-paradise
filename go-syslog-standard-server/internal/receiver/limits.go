@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server/internal/obs"
 )
 
 // listenStream opens a TCP listener, optionally with SO_REUSEPORT so several
@@ -48,6 +50,19 @@ type connLimiter struct {
 
 	mu   sync.Mutex
 	byIP map[netip.Addr]int
+
+	// refused counts the per-IP refusals into syslog_conns_refused_total
+	// (SPEC §13.1; pendência 18 de §21.1): without it an operator could not
+	// tell "nobody connects" from "one IP is refused all the time". nil
+	// counts nothing.
+	refused *obs.Counter
+}
+
+// countRefusals points the per-IP refusals at c. Safe on a nil limiter.
+func (cl *connLimiter) countRefusals(c *obs.Counter) {
+	if cl != nil {
+		cl.refused = c
+	}
 }
 
 // newConnLimiter builds the limiter for one transport, or returns nil when both
@@ -115,6 +130,9 @@ func (l *limitListener) Accept() (net.Conn, error) {
 				cl.mu.Unlock()
 				c.Close()
 				cl.releaseGlobal()
+				if cl.refused != nil {
+					cl.refused.Inc()
+				}
 				// Not counted as a dropped message: no message existed yet.
 				continue
 			}

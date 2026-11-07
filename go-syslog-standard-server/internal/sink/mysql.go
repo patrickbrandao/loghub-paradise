@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -32,7 +33,11 @@ type MySQLConfig struct {
 	TLSCA          string
 	TLSInsecure    bool
 	ConnectTimeout time.Duration
-	AppName        string // program_name connection attribute, visible in performance_schema
+	// ValidateTimeout bounds the one-time boot validation of SPEC §10.7.4:
+	// sink.op_timeout, not the health check's deadline. Zero takes
+	// ConnectTimeout, which the app sets to sink.op_timeout.
+	ValidateTimeout time.Duration
+	AppName         string // program_name connection attribute, visible in performance_schema
 
 	// MaxRawBytes and MaxEnvelopeBytes are the longest raw line an enabled
 	// transport can accept and the largest envelope that line can produce
@@ -146,6 +151,30 @@ var errMySQLReadOnly = errors.New("server is read-only (@@read_only = 1): a repl
 // never mint, inserted inside a transaction that is rolled back.
 const nilUUID = "00000000-0000-0000-0000-000000000000"
 
+// checkQuotedName is the rule of a name this sink quotes with backticks and
+// does not hold to mysqlIdent (the database): not empty, up to 64 characters,
+// and no backtick, backslash or control byte. A backtick in the name broke the
+// statement (1064, a syntax error classified as network, so the boot waited
+// sink.boot_timeout), and it is the hole in the injection defence the
+// identifier rule promises (ported from go-syslog-server).
+func checkQuotedName(what, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s is empty", what)
+	}
+	if n := utf8.RuneCountInString(name); n > 64 {
+		return fmt.Errorf("%s %q has %d characters; the limit is 64", what, name, n)
+	}
+	for i := 0; i < len(name); i++ {
+		switch c := name[i]; {
+		case c == '`' || c == '\\':
+			return fmt.Errorf("%s %q has %q, which cannot appear between the backticks of the INSERT", what, name, c)
+		case c < 0x20 || c == 0x7f:
+			return fmt.Errorf("%s %q has the control byte 0x%02x", what, name, c)
+		}
+	}
+	return nil
+}
+
 // NewMySQL builds the sink without opening a connection: sql.OpenDB is lazy, and
 // the boot's WaitReady owns the retry loop (SPEC §10.7.1). The errors here are
 // configuration errors and never a network condition.
@@ -156,11 +185,17 @@ func NewMySQL(cfg MySQLConfig, log *slog.Logger, m *obs.Metrics) (*MySQL, error)
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 5 * time.Second
 	}
+	if cfg.ValidateTimeout <= 0 {
+		cfg.ValidateTimeout = cfg.ConnectTimeout
+	}
 	if !mysqlIdent.MatchString(cfg.Table) {
 		return nil, fmt.Errorf("sink mysql: table %q is not a plain identifier", cfg.Table)
 	}
-	if cfg.Database == "" {
-		return nil, errors.New("sink mysql: database is empty")
+	// The database goes between backticks in the INSERT too, so it is held
+	// to the rule the config applies (pendência 12 de §21.1, SPEC §10.7.1),
+	// for a caller that bypasses config.
+	if err := checkQuotedName("sink mysql: database", cfg.Database); err != nil {
+		return nil, err
 	}
 
 	mc := mysql.NewConfig()
@@ -443,7 +478,13 @@ func (p *MySQL) Health(ctx context.Context) error {
 		return networkErr("health", errMySQLReadOnly)
 	}
 	if !p.validated.Load() {
-		if err := p.validate(ctx); err != nil {
+		// sink.op_timeout, not sink.health_timeout: the validation is a dozen
+		// round trips and never finished against a distant server (pendência
+		// 10 de §21.1, SPEC §10.7.4); validationContext in postgres.go.
+		vctx, cancel := validationContext(ctx, p.cfg.ValidateTimeout)
+		err := p.validate(vctx)
+		cancel()
+		if err != nil {
 			return err
 		}
 		p.validated.Store(true)

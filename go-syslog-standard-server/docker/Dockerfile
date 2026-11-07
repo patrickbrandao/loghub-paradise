@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1
 #
-# go-syslog-server -- imagem de deploy.
+# go-syslog-standard-server -- imagem de deploy.
 #
 # Build totalmente CGO-free: o driver SQLite e' modernc.org/sqlite (Go puro), o
 # cliente Redis e' rueidis e o do PostgreSQL e' pgx, ambos Go puro. Isso permite
 # um binario estatico e uma imagem final sem toolchain nenhuma.
 #
-#   docker build -f docker/Dockerfile -t go-syslog-server:local .
+#   docker build -f docker/Dockerfile -t go-syslog-standard-server:local .
 #
-# O contexto de build e' a raiz do modulo (go-syslog-server/), NAO esta pasta.
+# O contexto de build e' a raiz do modulo (go-syslog-standard-server/), NAO esta pasta.
 
 ARG GO_VERSION=1.25
 ARG ALPINE_VERSION=3.22
@@ -41,8 +41,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -trimpath \
       -tags osusergo,netgo \
       -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-      -o /app/go-syslog-server \
-      ./cmd/go-syslog-server
+      -o /app/go-syslog-standard-server \
+      ./cmd/go-syslog-standard-server
 
 # ---------------------------------------------------------------- runtime stage
 FROM alpine:${ALPINE_VERSION}
@@ -62,7 +62,7 @@ RUN apk add --no-cache ca-certificates tzdata \
 # loghub-paradise. O diretorio fica com dono root e modo 0755, herdado do
 # estagio de build: o processo (uid 65532) executa o binario e nao tem como
 # reescreve-lo.
-COPY --from=build /app/go-syslog-server /app/go-syslog-server
+COPY --from=build /app/go-syslog-standard-server /app/go-syslog-standard-server
 
 # /app no PATH so' por ergonomia de `docker exec`. O ENTRYPOINT usa caminho
 # absoluto e nao depende disto.
@@ -105,4 +105,4 @@ EXPOSE 1514/udp 1514/tcp 20514/tcp 9102/tcp
 #
 # O binario trata SIGTERM/SIGINT diretamente, entao roda como PID 1 sem init
 # externo. Nao ha processos filhos para reap.
-ENTRYPOINT ["/app/go-syslog-server"]
+ENTRYPOINT ["/app/go-syslog-standard-server"]

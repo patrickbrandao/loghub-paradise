@@ -113,13 +113,21 @@ func Load(opts Options) (*Loaded, error) {
 		if err != nil {
 			return nil, err
 		}
+		// afterSecret: the line before was a secret, so an unknown key here
+		// may be the rest of it wrapped onto this line (lookupINI).
+		afterSecret := false
+		seen := aliasTracker{}
 		for _, e := range entries {
-			p, err := ix.lookup(e.Name)
+			p, err := ix.lookupINI(e, afterSecret)
 			if err != nil {
 				return nil, fmt.Errorf("%s line %d: %w", file, e.Line, err)
 			}
+			afterSecret = secretKeys[p.Name()]
 			if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
 				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, p.Name(), err)
+			}
+			if err := seen.note(p, "["+e.Sec+"] "+e.Key, e.Name != p.Name(), "the ini file"); err != nil {
+				return nil, fmt.Errorf("%s line %d: %w", file, e.Line, err)
 			}
 			l.Source[p.Name()] = FromFile
 			l.SetIn[p.Name()] = true
@@ -128,23 +136,43 @@ func Load(opts Options) (*Loaded, error) {
 	}
 
 	// --- environment --------------------------------------------------------
+	envSeen := aliasTracker{}
 	for _, p := range params {
-		v, ok := opts.LookupEnv(p.Env())
-		if !ok {
-			continue
+		// The canonical variable, then its alias (SYSLOG_SINK_VALKEY_*): both
+		// are the same parameter in the same source, so they may agree, and
+		// differ only as an error (SPEC §15.2).
+		for i, name := range []string{p.Env(), p.AliasEnv()} {
+			if name == "" {
+				continue
+			}
+			v, ok := opts.LookupEnv(name)
+			if !ok {
+				continue
+			}
+			if err := setValue(p.Kind, p.Ptr, v); err != nil {
+				return nil, fmt.Errorf("%s: %w", name, err)
+			}
+			if err := envSeen.note(p, name, i == 1, "the environment"); err != nil {
+				return nil, err
+			}
+			l.Source[p.Name()] = FromEnv
+			l.SetIn[p.Name()] = true
 		}
-		if err := setValue(p.Kind, p.Ptr, v); err != nil {
-			return nil, fmt.Errorf("%s: %w", p.Env(), err)
-		}
-		l.Source[p.Name()] = FromEnv
-		l.SetIn[p.Name()] = true
 	}
 
 	// --- command line -------------------------------------------------------
+	flagSeen := aliasTracker{}
 	for _, e := range flagEntries {
 		p := ix.byName[e.Name]
+		spelled := "--" + e.Spelled
+		if e.Spelled == "" {
+			spelled = p.Flag()
+		}
 		if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
-			return nil, fmt.Errorf("%s: %w", p.Flag(), err)
+			return nil, fmt.Errorf("%s: %w", spelled, err)
+		}
+		if err := flagSeen.note(p, spelled, e.Spelled != "" && e.Spelled != e.Name, "the command line"); err != nil {
+			return nil, err
 		}
 		l.Source[p.Name()] = FromFlag
 		l.SetIn[p.Name()] = true
@@ -159,6 +187,43 @@ func Load(opts Options) (*Loaded, error) {
 	}
 	l.Warnings = warns
 	return l, nil
+}
+
+// aliasTracker enforces, within ONE source, the conflict rule of the alias
+// sections (SPEC §15.2): sink.redis.addrs and sink.valkey.addrs are the same
+// parameter, so setting both is accepted when they agree and an error (exit 1)
+// when they differ -- whichever came last would otherwise win in silence, and
+// which one that is depends on the order of the file or the shell. The values
+// are compared parsed ("yes" and "true" agree), and the message names the two
+// spellings, never a value: either may be a password. Across sources the
+// precedence of §15.1 stands unchanged; the alias counts as the same key in its
+// source.
+type aliasTracker map[string]map[bool]aliasSet
+
+type aliasSet struct {
+	spelled string
+	value   string
+}
+
+// note records the value p holds now, set under spelled (alias says whether
+// spelled is the alias spelling), and refuses it when the other spelling set
+// a different value earlier in the same source.
+func (t aliasTracker) note(p *Param, spelled string, alias bool, source string) error {
+	if p.AliasName() == "" {
+		return nil
+	}
+	v := formatValue(p.Kind, p.Ptr)
+	byAlias := t[p.Name()]
+	if byAlias == nil {
+		byAlias = map[bool]aliasSet{}
+		t[p.Name()] = byAlias
+	}
+	if other, ok := byAlias[!alias]; ok && other.value != v {
+		return fmt.Errorf("%s and %s are the same parameter (valkey is an alias of redis) and %s "+
+			"sets them to different values; set one of them", other.spelled, spelled, source)
+	}
+	byAlias[alias] = aliasSet{spelled: spelled, value: v}
+	return nil
 }
 
 // derive fills the values whose default depends on another value and therefore
@@ -204,6 +269,11 @@ func derive(c *Config, opts Options) error {
 	// Normalise enums so comparisons elsewhere never need folding.
 	c.Ring.Mode = lower(c.Ring.Mode)
 	c.Sink.Type = lower(c.Sink.Type)
+	// valkey is the same protocol: the canonical name is what logs, metrics
+	// and the dump show (SPEC §10.3, §15.2).
+	if c.Sink.Type == SinkValkeyAlias {
+		c.Sink.Type = SinkRedisType
+	}
 	c.SinkSQL.Rotate = lower(c.SinkSQL.Rotate)
 	c.TCP.Framing = lower(c.TCP.Framing)
 	c.Parse.Prefer = lower(c.Parse.Prefer)

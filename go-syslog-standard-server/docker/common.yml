@@ -1,6 +1,6 @@
 # Fragmento compartilhado por todos os compose deste diretorio.
 #
-# NAO suba este arquivo sozinho: ele define apenas o servico-base `sls-base`,
+# NAO suba este arquivo sozinho: ele define apenas o servico-base `slstd-base`,
 # que os arquivos compose.<ring>-<sink>.yml herdam via `extends`. Tudo que e'
 # identico entre as combinacoes mora aqui; o que distingue uma combinacao da
 # outra (ring.mode, sink.type, portas, volumes, dependencias) fica visivel no
@@ -11,7 +11,7 @@
 # ficam so' no filho); `depends_on` NAO e' herdado por `extends`.
 
 services:
-  sls-base:
+  slstd-base:
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -20,7 +20,7 @@ services:
         COMMIT: ${SYSLOG_COMMIT:-none}
         GO_VERSION: ${SYSLOG_GO_VERSION:-1.25}
         ALPINE_VERSION: ${SYSLOG_ALPINE_VERSION:-3.22}
-    image: ${SYSLOG_IMAGE:-go-syslog-server}:${SYSLOG_IMAGE_TAG:-local}
+    image: ${SYSLOG_IMAGE:-go-syslog-standard-server}:${SYSLOG_IMAGE_TAG:-local}
 
     restart: unless-stopped
 

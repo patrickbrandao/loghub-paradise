@@ -274,6 +274,19 @@ func (w *Workers) unhold(id int) {
 	w.holdMu.Unlock()
 }
 
+// Held counts the items the workers hold right now, without taking them: what
+// a second signal loses on top of the ring (SPEC §12.3). Safe while the
+// workers run.
+func (w *Workers) Held() int {
+	w.holdMu.Lock()
+	defer w.holdMu.Unlock()
+	n := 0
+	for _, items := range w.held {
+		n += len(items)
+	}
+	return n
+}
+
 // Pending returns the batches the workers were still holding when they stopped.
 //
 // Call it only after Wait: a running worker may still deliver its batch, and

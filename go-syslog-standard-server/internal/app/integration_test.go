@@ -650,7 +650,7 @@ func TestEmergencyDumpAndReingestionAreExact(t *testing.T) {
 	if code != ExitSink {
 		t.Fatalf("a shutdown that had to dump exited %d, want %d", code, ExitSink)
 	}
-	dumps, _ := filepath.Glob(filepath.Join(dir, "emergency", "emg-*.bin"))
+	dumps, _ := filepath.Glob(filepath.Join(dir, "emergency", "slstd-emg-*.bin"))
 	if len(dumps) != 1 {
 		t.Fatalf("dump files = %d, want 1", len(dumps))
 	}
@@ -698,7 +698,7 @@ func TestEmergencyDumpAndReingestionAreExact(t *testing.T) {
 	if int64(e["ts"].(float64)) != ts {
 		t.Fatal("the envelope and the column disagree about ts")
 	}
-	if left, _ := filepath.Glob(filepath.Join(dir, "emergency", "emg-*.bin")); len(left) != 0 {
+	if left, _ := filepath.Glob(filepath.Join(dir, "emergency", "slstd-emg-*.bin")); len(left) != 0 {
 		t.Fatalf("the dump was not removed after reingestion: %v", left)
 	}
 }

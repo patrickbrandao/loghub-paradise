@@ -191,7 +191,7 @@ func TestFramerOctetGrowsWithTheBytesNotTheCount(t *testing.T) {
 	if _, err := f.Next(); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("err = %v, want ErrUnexpectedEOF", err)
 	}
-	if cap(f.buf) > 2*octetChunk {
+	if cap(f.buf) > 4<<10 {
 		t.Fatalf("buffer capacity = %d after three bytes; it was sized from the declared count", cap(f.buf))
 	}
 }
@@ -335,7 +335,7 @@ func TestRELPFrameGrowsWithTheBytesNotTheCount(t *testing.T) {
 	if _, err := rd.ReadFrame(); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("err = %v, want ErrUnexpectedEOF", err)
 	}
-	if cap(rd.buf) > 2*octetChunk {
+	if cap(rd.buf) > 4<<10 {
 		t.Fatalf("buffer capacity = %d after three bytes; it was sized from DATALEN", cap(rd.buf))
 	}
 }

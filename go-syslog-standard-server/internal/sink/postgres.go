@@ -36,7 +36,11 @@ type PostgresConfig struct {
 	TLSCA          string
 	TLSInsecure    bool
 	ConnectTimeout time.Duration
-	AppName        string // application_name, visible in pg_stat_activity
+	// ValidateTimeout bounds the one-time boot validation of SPEC §10.5.5:
+	// sink.op_timeout, not the health check's deadline. Zero takes
+	// ConnectTimeout, which the app sets to sink.op_timeout.
+	ValidateTimeout time.Duration
+	AppName         string // application_name, visible in pg_stat_activity
 }
 
 // Postgres is the shared final destination (SPEC §10.5). Schema in §3.6.
@@ -134,6 +138,9 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 5 * time.Second
 	}
+	if cfg.ValidateTimeout <= 0 {
+		cfg.ValidateTimeout = cfg.ConnectTimeout
+	}
 	if !pgIdent.MatchString(cfg.Table) {
 		return nil, fmt.Errorf("sink postgres: table %q is not a plain lowercase identifier", cfg.Table)
 	}
@@ -142,12 +149,24 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 		return nil, err
 	}
 
-	// ParseConfig("") yields the libpq defaults, which also means the libpq
-	// ENVIRONMENT (PGHOST, PGSSLMODE, PGPASSFILE...). Every field the registry
-	// owns is overwritten below so the environment cannot shadow it; the
-	// fallbacks are dropped for the same reason -- otherwise a refused
-	// connection to the configured host would be retried against localhost.
-	pc, err := pgxpool.ParseConfig("")
+	// The pool is built with the libpq ENVIRONMENT out of reach (SPEC §10.5.2,
+	// pendência 11 de §21.1, ported from go-syslog-server). ParseConfig reads
+	// PGHOST, PGSSLMODE, PGCHANNELBINDING, PGREQUIREAUTH, PGSERVICE,
+	// PGTARGETSESSIONATTRS, PG{MIN,MAX}PROTOCOLVERSION... and overwriting the
+	// fields afterwards is not enough: a PGSSLMODE=bogus or a PGPORT that is
+	// not a number fails the parse itself (exit 1 over a variable the registry
+	// does not know), and PGCHANNELBINDING=require, PGREQUIREAUTH=md5,
+	// PGSSLNEGOTIATION=direct, PGMINPROTOCOLVERSION=3.2 or PGCONNECT_TIMEOUT
+	// land in fields nobody overwrote and refuse every connection with no
+	// SQLSTATE -- retried as network until sink.boot_timeout, the log blaming
+	// the network. So the parse runs with every PG* variable hidden, on an
+	// explicit sslmode=disable (TLS is set below from [sink.postgres] alone),
+	// and every field the registry owns is then set. The fallbacks are dropped
+	// too -- otherwise a refused connection to the configured host would be
+	// retried against localhost --, the runtime parameters are rebuilt from
+	// nothing (PGOPTIONS would arrive as "options"), and ValidateConnect goes
+	// (PGTARGETSESSIONATTRS=standby would refuse every primary).
+	pc, err := parseWithoutLibpqEnv("sslmode=disable")
 	if err != nil {
 		return nil, fmt.Errorf("sink postgres: %w", err)
 	}
@@ -160,10 +179,11 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	cc.ConnectTimeout = cfg.ConnectTimeout
 	cc.Fallbacks = nil
 	cc.TLSConfig = nil
-	if cc.RuntimeParams == nil {
-		cc.RuntimeParams = map[string]string{}
+	cc.ValidateConnect = nil
+	cc.RuntimeParams = map[string]string{}
+	if cfg.AppName != "" {
+		cc.RuntimeParams["application_name"] = cfg.AppName
 	}
-	cc.RuntimeParams["application_name"] = cfg.AppName
 	if cfg.TLS {
 		tc, err := buildPostgresTLS(cfg, host)
 		if err != nil {
@@ -189,6 +209,35 @@ func NewPostgres(cfg PostgresConfig, log *slog.Logger, m *obs.Metrics) (*Postgre
 	}
 	p.args.New = func() any { return &pgArgs{} }
 	return p, nil
+}
+
+// libpqEnvMu serialises parseWithoutLibpqEnv: the environment is process-wide.
+var libpqEnvMu sync.Mutex
+
+// parseWithoutLibpqEnv is pgxpool.ParseConfig with every PG* environment
+// variable hidden for the duration of the parse and restored after it. The
+// parse is the only place pgx reads them, it runs once, at boot (NewPostgres),
+// and nothing else in this process reads PG* -- so the window is harmless,
+// and it is the only way to keep the ones a conninfo cannot neutralise
+// (PGSERVICE pulls in a whole service file) from reaching the pool. The
+// alternative, a conninfo naming every key with its default, breaks with the
+// first variable a pgx release adds.
+func parseWithoutLibpqEnv(conninfo string) (*pgxpool.Config, error) {
+	libpqEnvMu.Lock()
+	defer libpqEnvMu.Unlock()
+	saved := map[string]string{}
+	for _, kv := range os.Environ() {
+		if k, v, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(k, "PG") {
+			saved[k] = v
+			os.Unsetenv(k)
+		}
+	}
+	defer func() {
+		for k, v := range saved {
+			os.Setenv(k, v)
+		}
+	}()
+	return pgxpool.ParseConfig(conninfo)
 }
 
 // splitPostgresAddr accepts host:port, [v6]:port, or a unix socket directory
@@ -447,7 +496,17 @@ func (p *Postgres) Health(ctx context.Context) error {
 		return networkErr("health", errInRecovery)
 	}
 	if !p.validated.Load() {
-		if err := p.validate(ctx); err != nil {
+		// The validation is a dozen round trips (SPEC §10.5.5), and the
+		// health check's deadline is sink.health_timeout, 1s by default: with
+		// the database some 60 ms away it never finished, the deadline closed
+		// the connection, every attempt started over and the boot exited 3
+		// after sink.boot_timeout blaming the network (pendência 10 de
+		// §21.1). It runs under sink.op_timeout instead, and a cancelled
+		// boot still reaches it (validationContext).
+		vctx, cancel := validationContext(ctx, p.cfg.ValidateTimeout)
+		err := p.validate(vctx)
+		cancel()
+		if err != nil {
 			return err
 		}
 		p.validated.Store(true)
@@ -471,7 +530,8 @@ func (p *Postgres) validate(ctx context.Context) error {
 	}
 
 	rows, err := p.pool.Query(ctx, `
-		SELECT a.attname, format_type(a.atttypid, a.atttypmod)
+		SELECT a.attname, format_type(a.atttypid, a.atttypmod),
+		       a.attnotnull AND NOT a.atthasdef AND a.attidentity = '' AND a.attgenerated = ''
 		FROM pg_catalog.pg_attribute a
 		WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped`,
 		p.regname)
@@ -479,9 +539,13 @@ func (p *Postgres) validate(ctx context.Context) error {
 		return classifyPostgres("validate", err)
 	}
 	have := map[string]string{}
+	// required is a column every INSERT must fill: NOT NULL with no default,
+	// no identity and no generation expression.
+	required := map[string]bool{}
 	for rows.Next() {
 		var name, typ string
-		if err := rows.Scan(&name, &typ); err != nil {
+		var req bool
+		if err := rows.Scan(&name, &typ, &req); err != nil {
 			rows.Close()
 			return classifyPostgres("validate", err)
 		}
@@ -490,6 +554,7 @@ func (p *Postgres) validate(ctx context.Context) error {
 			typ = typ[:i]
 		}
 		have[name] = typ
+		required[name] = req
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -510,6 +575,25 @@ func (p *Postgres) validate(ctx context.Context) error {
 			return fatalErr("validate", fmt.Errorf(
 				"table %s: column %q is %s, want %s", p.regname, c.name, typ,
 				strings.Join(c.types, " or ")))
+		}
+	}
+
+	// The sink fills exactly the seventeen columns of the contract, so an
+	// EXTRA required column refuses every row with 23502 (pendência 9 de
+	// §21.1, ported from go-syslog-server). 23502 is fatal at write time, but
+	// found here it is fatal at boot, with the column named, before a single
+	// confirmed message is dumped. It is read from the catalogue and not by a
+	// probe INSERT rolled back: a probe would fire the operator's triggers and
+	// consume the sequences of identity or serial columns.
+	contract := map[string]bool{}
+	for _, c := range pgColumns {
+		contract[c.name] = true
+	}
+	for name, req := range required {
+		if req && !contract[name] {
+			return fatalErr("validate", fmt.Errorf(
+				"table %s: extra column %q is NOT NULL with no default, identity or generation "+
+					"expression; this server never fills it, so every row would be refused", p.regname, name))
 		}
 	}
 
@@ -543,6 +627,21 @@ func (p *Postgres) validate(ctx context.Context) error {
 			"role %q has no INSERT privilege on %s", p.cfg.Username, p.regname))
 	}
 	return nil
+}
+
+// validationContext is the context of a boot validation: its own timeout,
+// detached from the deadline of the health check that started it, but still
+// cancelled when the parent is CANCELLED -- a shutdown or an aborted boot --
+// rather than merely past its deadline. Shared by the PostgreSQL and MySQL
+// sinks (SPEC §10.5.5, §10.7.4).
+func validationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	stop := context.AfterFunc(parent, func() {
+		if !errors.Is(context.Cause(parent), context.DeadlineExceeded) {
+			cancel()
+		}
+	})
+	return ctx, func() { stop(); cancel() }
 }
 
 func contains(list []string, s string) bool {

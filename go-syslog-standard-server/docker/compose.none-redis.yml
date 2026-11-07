@@ -9,20 +9,20 @@
 # 127.0.0.1:19108. Defaults distintos por combinacao para que varias rodem lado
 # a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
 
-name: sls-none-redis
+name: slstd-none-redis
 
 services:
   syslog:
     extends:
       file: common.yml
-      service: sls-base
-    container_name: sls-none-redis
+      service: slstd-base
+    container_name: slstd-none-redis
     depends_on:
       redis:
         condition: service_healthy
 
     environment:
-      SYSLOG_NODE_ID: sls-none-redis
+      SYSLOG_NODE_ID: slstd-none-redis
 
       # --- ring: none ---------------------------------------------------------
       SYSLOG_RING_MODE: none
@@ -54,11 +54,11 @@ services:
       - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19108}:9102"
 
     volumes:
-      - sls-data:/data
+      - slstd-data:/data
 
   redis:
     image: ${SYSLOG_REDIS_IMAGE:-redis:7.4-alpine}
-    container_name: sls-none-redis-redis
+    container_name: slstd-none-redis-redis
     restart: unless-stopped
     command:
       # AOF com fsync a cada segundo: perde no maximo 1s de stream num crash.
@@ -70,7 +70,7 @@ services:
       - --save
       - ""
     volumes:
-      - redis-data:/data
+      - slstd-redis-data:/data
     ports:
       - "127.0.0.1:${SYSLOG_REDIS_PORT:-16308}:6379"
     healthcheck:
@@ -81,5 +81,5 @@ services:
       start_period: 10s
 
 volumes:
-  sls-data:
-  redis-data:
+  slstd-data:
+  slstd-redis-data:

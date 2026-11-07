@@ -11,7 +11,9 @@ import (
 // iniEntry is one assignment found in an INI file, kept with its line number so
 // errors can point at the offending line.
 type iniEntry struct {
-	Name string // canonical dotted name
+	Name string // dotted name as written: [sink.valkey] stays sink.valkey.*
+	Sec  string // the [section] it was under
+	Key  string // what came before the '=', trimmed
 	Raw  string
 	Line int
 }
@@ -31,6 +33,11 @@ type iniEntry struct {
 // Values may be wrapped in matching single or double quotes, which are stripped;
 // this is the only way to write a value with meaningful leading or trailing
 // whitespace.
+//
+// No error quotes the text of a line (SPEC §15.1; pendência 5 de §21.1, ported
+// from go-syslog-server): "password: hunter2" is exactly the kind of line that
+// fails here, and the error goes to stderr and, on a SIGHUP, to the log. The
+// line number is what names it.
 func parseINI(r io.Reader) ([]iniEntry, error) {
 	var (
 		out     []iniEntry
@@ -42,14 +49,22 @@ func parseINI(r io.Reader) ([]iniEntry, error) {
 
 	for sc.Scan() {
 		lineNo++
-		line := strings.TrimSpace(sc.Text())
+		text := sc.Text()
+		if lineNo == 1 {
+			// A UTF-8 byte-order mark, which some Windows editors write, is
+			// not part of the first line.
+			text = strings.TrimPrefix(text, "\ufeff")
+		}
+		line := strings.TrimSpace(text)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 
 		if strings.HasPrefix(line, "[") {
 			if !strings.HasSuffix(line, "]") {
-				return nil, fmt.Errorf("line %d: malformed section header %q", lineNo, line)
+				// Not quoted: "[sink.nats hunter2" is a header someone typed
+				// a value into.
+				return nil, fmt.Errorf("line %d: malformed section header (no closing ']')", lineNo)
 			}
 			section = strings.TrimSpace(line[1 : len(line)-1])
 			if section == "" {
@@ -60,17 +75,23 @@ func parseINI(r io.Reader) ([]iniEntry, error) {
 
 		eq := strings.Index(line, "=")
 		if eq < 0 {
-			return nil, fmt.Errorf("line %d: expected 'key = value', got %q", lineNo, line)
+			return nil, fmt.Errorf("line %d: expected 'key = value'", lineNo)
 		}
 		key := strings.TrimSpace(line[:eq])
 		if key == "" {
 			return nil, fmt.Errorf("line %d: empty key", lineNo)
 		}
 		if section == "" {
+			// Named only when it looks like a key, for the reason of lookup.
+			if !iniKeyRE.MatchString(key) {
+				return nil, fmt.Errorf("line %d: a key appears before any [section]", lineNo)
+			}
 			return nil, fmt.Errorf("line %d: key %q appears before any [section]", lineNo, key)
 		}
 		out = append(out, iniEntry{
 			Name: section + "." + key,
+			Sec:  section,
+			Key:  key,
 			Raw:  unquote(strings.TrimSpace(line[eq+1:])),
 			Line: lineNo,
 		})

@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,7 +56,7 @@ func Run(args []string) int {
 			if loaded.Meta.Help {
 				_ = config.Usage(os.Stdout)
 			} else {
-				fmt.Printf("go-syslog-server %s (%s, %s)\n", version, commit, runtime.Version())
+				fmt.Printf("go-syslog-standard-server %s (%s, %s)\n", version, commit, runtime.Version())
 			}
 			return ExitOK
 		}
@@ -154,8 +155,26 @@ type App struct {
 	// the signal has already arrived.
 	stopRecv context.CancelFunc
 
+	// sinkBootDeadline is sink.boot_timeout from the start of step 4, the one
+	// budget of the sink's boot (SPEC §12.1).
+	sinkBootDeadline time.Time
+
 	// ready is closed once every transport is open. Tests wait on it.
 	ready chan struct{}
+
+	// lossMu and collected track what the graceful shutdown has taken out of
+	// the ring's accounting (the held batches, Pending, and the queue, Drain)
+	// and not yet dumped or counted: a second signal then counts it as lost.
+	// Without it an abort that landed while the dump was written read the
+	// ring as (nearly) empty -- Drain had committed the queue -- and counted a
+	// fraction of a loss that was in fact the whole dump (pendência 15 de
+	// §21.1, SPEC §12.3).
+	lossMu    sync.Mutex
+	collected int
+
+	// beforeDump, when set, runs right before the shutdown's emergency dump.
+	// It is nil in the binary; a test lands a second signal there.
+	beforeDump func()
 
 	// abort replaces the OS signal channel that shutdown watches for a second
 	// interrupt. It is nil in the binary; the integration tests set it.
@@ -222,6 +241,12 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	}
 
 	// --- step 4: the sink ---------------------------------------------------
+	//
+	// ONE deadline for the whole boot of the sink: the redis dial loop of
+	// buildSink and the WaitReady below share sink.boot_timeout, so a server
+	// that flaps between the two steps cannot double the wait (pendência 17 de
+	// §21.1, SPEC §12.1).
+	a.sinkBootDeadline = time.Now().Add(a.cfg.Sink.BootTimeout)
 	a.admin.SetBootState("connecting to the sink")
 	if code := a.buildSink(ctx); code != ExitOK {
 		return code
@@ -239,7 +264,7 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	}, a.log.Logger, a.metrics)
 
 	a.admin.SetBootState("waiting for the sink")
-	if err := a.health.WaitReady(ctx, a.cfg.Sink.BootTimeout,
+	if err := a.health.WaitReady(ctx, time.Until(a.sinkBootDeadline),
 		100*time.Millisecond, 5*time.Second); err != nil {
 		if ctx.Err() != nil {
 			a.log.Info("interrupted while waiting for the sink")
@@ -392,7 +417,7 @@ func (a *App) buildSink(ctx context.Context) int {
 			TLSCA:          a.cfg.SinkPG.TLSCA,
 			TLSInsecure:    a.cfg.SinkPG.TLSInsecure,
 			ConnectTimeout: a.cfg.Sink.OpTimeout,
-			AppName:        "sls/" + a.cfg.Node.ID,
+			AppName:        "slstd/" + a.cfg.Node.ID,
 		}, a.log.Logger, a.metrics)
 		if err != nil {
 			a.log.Error("cannot configure the PostgreSQL sink", "error", err)
@@ -418,7 +443,7 @@ func (a *App) buildSink(ctx context.Context) int {
 			TLSCA:            a.cfg.SinkMySQL.TLSCA,
 			TLSInsecure:      a.cfg.SinkMySQL.TLSInsecure,
 			ConnectTimeout:   a.cfg.Sink.OpTimeout,
-			AppName:          "sls/" + a.cfg.Node.ID,
+			AppName:          "slstd/" + a.cfg.Node.ID,
 			MaxRawBytes:      maxRawBytes(a.cfg),
 			MaxEnvelopeBytes: maxEnvelopeBytes(a.cfg),
 		}, a.log.Logger, a.metrics)
@@ -446,7 +471,7 @@ func (a *App) buildSink(ctx context.Context) int {
 			TLSInsecure:      a.cfg.SinkNATS.TLSInsecure,
 			Stream:           a.cfg.SinkNATS.Stream,
 			Subject:          a.cfg.SinkNATS.Subject,
-			ClientName:       "sls/" + a.cfg.Node.ID,
+			ClientName:       "slstd/" + a.cfg.Node.ID,
 			ConnectTimeout:   a.cfg.Sink.OpTimeout,
 			OpTimeout:        a.cfg.Sink.OpTimeout,
 			MaxRawBytes:      maxRawBytes(a.cfg),
@@ -461,13 +486,16 @@ func (a *App) buildSink(ctx context.Context) int {
 			return ExitConfig
 		}
 		a.sink = s
-		a.log.Info("sink configured", "type", "nats", "urls", a.cfg.SinkNATS.URLs,
+		a.log.Info("sink configured", "type", "nats", "urls", config.RedactURLs(a.cfg.SinkNATS.URLs),
 			"stream", a.cfg.SinkNATS.Stream, "subject", a.cfg.SinkNATS.Subject,
 			"tls", a.cfg.SinkNATS.TLS)
 		return ExitOK
 
 	case config.SinkRedisType:
-		deadline := time.Now().Add(a.cfg.Sink.BootTimeout)
+		deadline := a.sinkBootDeadline
+		if deadline.IsZero() {
+			deadline = time.Now().Add(a.cfg.Sink.BootTimeout)
+		}
 		backoff := 100 * time.Millisecond
 		for attempt := 1; ; attempt++ {
 			octx, cancel := context.WithTimeout(ctx, a.cfg.Sink.OpTimeout)
@@ -486,13 +514,19 @@ func (a *App) buildSink(ctx context.Context) int {
 				PipelineMultiplex:   a.cfg.SinkRedis.PipelineMultiplex,
 				ReadBufferEachConn:  a.cfg.SinkRedis.ReadBufferEachConn,
 				WriteBufferEachConn: a.cfg.SinkRedis.WriteBufferEachConn,
-				ClientName:          "sls/" + a.cfg.Node.ID,
+				ClientName:          "slstd/" + a.cfg.Node.ID,
+				DialTimeout:         a.cfg.Sink.OpTimeout,
 			}, a.log.Logger, a.metrics)
 			cancel()
 			if err == nil {
 				a.sink = s
+				// The identity of the server, read once (SPEC §10.3): the
+				// first question of an incident is "Redis 7.4 or Valkey 8.1?".
+				// It is logged, never used to decide anything.
+				server, version := s.Server()
 				a.log.Info("sink ready", "type", "redis",
-					"addrs", a.cfg.SinkRedis.Addrs, "stream", a.cfg.SinkRedis.Stream)
+					"addrs", a.cfg.SinkRedis.Addrs, "stream", a.cfg.SinkRedis.Stream,
+					"server", server, "server_version", version)
 				return ExitOK
 			}
 			if sink.IsFatal(err) {
@@ -718,6 +752,7 @@ func (a *App) openTransports(bindCtx, recvCtx context.Context) int {
 			Window:              a.cfg.RELP.Window,
 			BackpressureTimeout: a.cfg.RELP.BackpressureTimeout,
 			Version:             version,
+			Budget:              receiver.NewBudget(a.cfg.RELP.InflightMaxBytes, a.metrics),
 		}, a.ingest, a.metrics, a.log)
 		if err != nil {
 			a.log.Error("cannot open the relp transport", "addr", a.cfg.Listen.RELP, "error", err)
@@ -776,15 +811,23 @@ func (a *App) shutdown(stopWorkers context.CancelFunc, fatal bool) int {
 	case sig := <-abort:
 		a.log.Warn("second signal during shutdown; exiting immediately and accepting the loss",
 			"signal", sig.String())
-		st := a.ring.Stats()
-		if st.Items > 0 {
+		// What is lost: what the ring still counts -- its queue AND the
+		// batches the workers hold, which leave its accounting only at Commit
+		// -- plus what the graceful path already collected but has not dumped.
+		// Under one lock, so an item moving from one to the other is counted
+		// once.
+		a.lossMu.Lock()
+		lost := a.ring.Stats().Items + int64(a.collected)
+		a.collected = 0
+		a.lossMu.Unlock()
+		if lost > 0 {
 			if a.cfg.Ring.Mode == config.RingSQLiteMode {
 				// The rows are on disk and the next boot drains them: cut
-				// short, not lost.
-				a.log.Warn("messages left in ring.db for the next boot", "count", st.Items)
+				// short, not lost. A held batch is still a row of ring.db.
+				a.log.Warn("messages left in ring.db for the next boot", "count", lost)
 			} else {
-				a.metrics.EventsDroppedTotal[obs.EventDropAbort].Add(uint64(st.Items))
-				a.log.Error("events lost to the abort", "count", st.Items)
+				a.metrics.EventsDroppedTotal[obs.EventDropAbort].Add(uint64(lost))
+				a.log.Error("events lost to the abort", "count", lost)
 			}
 		}
 		return ExitAborted
@@ -837,11 +880,23 @@ func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
 	// A worker retrying a failed batch holds items that are no longer in the
 	// ring (SPEC §10.2). Without this collection they would be lost despite
 	// having been confirmed -- on RELP, to an emitter that then forgot them.
+	a.lossMu.Lock()
 	leftover := a.workers.Pending()
-	if len(leftover) > 0 {
-		a.log.Warn("workers surrendered batches they were retrying", "count", len(leftover))
+	surrendered := len(leftover)
+	if a.cfg.Ring.Mode != config.RingSQLiteMode {
+		// The held batches leave the ring's accounting here, as the queue does
+		// in Drain: from now on the collection is what counts them. Never with
+		// ring=sqlite, where Commit deletes the rows the next boot drains.
+		_ = a.ring.Commit(leftover)
 	}
 	leftover = append(leftover, a.ring.Drain()...)
+	if a.cfg.Ring.Mode != config.RingSQLiteMode {
+		a.collected = len(leftover)
+	}
+	a.lossMu.Unlock()
+	if surrendered > 0 {
+		a.log.Warn("workers surrendered batches they were retrying", "count", surrendered)
+	}
 
 	if a.cfg.Ring.Mode == config.RingSQLiteMode {
 		// The rows were never deleted from ring.db: the next boot's backlog
@@ -855,7 +910,14 @@ func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
 		}
 	} else if len(leftover) > 0 {
 		a.log.Error("messages still pending after the drain", "count", len(leftover))
-		if !a.dumpEmergency(leftover) && a.emg == nil {
+		if a.beforeDump != nil {
+			a.beforeDump()
+		}
+		dumped := a.dumpEmergency(leftover)
+		a.lossMu.Lock()
+		a.collected = 0 // dumped, or counted below: no longer the abort's
+		a.lossMu.Unlock()
+		if !dumped && a.emg == nil {
 			// No emergency store (ring=memory with emergency.enabled=false):
 			// the loss is the abort's. A dump that FAILED was already counted
 			// by dumpEmergency as emergency_failed, and the same messages are

@@ -1,6 +1,6 @@
 # Deploy em Docker
 
-Build e execução do `go-syslog-server` em contêiner, com um arquivo compose para
+Build e execução do `go-syslog-standard-server` em contêiner, com um arquivo compose para
 cada combinação de **ring** (onde a mensagem espera) e **sink** (para onde ela
 vai).
 
@@ -225,7 +225,7 @@ baixam os frames TCP e RELP para 1 MiB (o maior evento fica em 7 MiB).
 ## Recarregar sem reiniciar
 
 ```bash
-docker kill -s HUP sls-memory-redis
+docker kill -s HUP slstd-memory-redis
 ```
 
 Recarrega filtro, rate limit, nível de log e `keep_files`. Qualquer outra chave

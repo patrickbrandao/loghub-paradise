@@ -16,11 +16,31 @@ var secretKeys = map[string]bool{
 	"sink.nats.token":        true,
 }
 
+// urlKeys hold URLs that may carry a credential as userinfo
+// (nats://user:password@host, nats://token@host). They stay readable, with
+// only the userinfo replaced (pendência 4 de §21.1, SPEC §10.8.9).
+var urlKeys = map[string]bool{
+	"sink.nats.urls": true,
+}
+
 func redact(name, value string) string {
 	if secretKeys[name] && value != "" {
 		return "***"
 	}
+	if urlKeys[name] {
+		return redactURL(value)
+	}
 	return value
+}
+
+// RedactURLs is redactURL over a list, for the log lines of the app that name
+// sink.nats.urls.
+func RedactURLs(urls []string) []string {
+	out := make([]string, len(urls))
+	for i, u := range urls {
+		out[i] = redactURL(u)
+	}
+	return out
 }
 
 // Usage writes --help. It is generated from the registry, so a parameter cannot
@@ -30,10 +50,10 @@ func Usage(w io.Writer) error {
 	cfg := &Config{}
 	ix := newIndex(Registry(cfg))
 
-	fmt.Fprint(w, `go-syslog-server -- syslog ingestion server (UDP, TCP, unix, RELP)
+	fmt.Fprint(w, `go-syslog-standard-server -- syslog ingestion server (UDP, TCP, unix, RELP)
 
 Usage:
-  go-syslog-server [--config FILE] [--section.key=value ...]
+  go-syslog-standard-server [--config FILE] [--section.key=value ...]
 
 Precedence (later wins):
   defaults  <  ini file  <  environment  <  command line
@@ -43,6 +63,10 @@ Every parameter below has three equivalent spellings:
   environment SYSLOG_SINK_REDIS_ADDRS=10.0.0.5:6379
   ini         [sink.redis]
               addrs = 10.0.0.5:6379
+
+Valkey: sink.type=valkey is sink.type=redis, and [sink.valkey], --sink.valkey.<key>
+and SYSLOG_SINK_VALKEY_<KEY> are aliases of every [sink.redis] key below (the
+same key under both names must agree; the dump shows only the redis names).
 
 Listener defaults are 1514 and 20514, not 514: the container image runs as an
 unprivileged user. Publish them as "514:1514" or grant CAP_NET_BIND_SERVICE.
@@ -86,13 +110,13 @@ Switches:
 func (l *Loaded) DumpINI(w io.Writer) error {
 	ix := newIndex(l.Params)
 
-	fmt.Fprintln(w, "# effective configuration of go-syslog-server")
+	fmt.Fprintln(w, "# effective configuration of go-syslog-standard-server")
 	if l.File != "" {
 		fmt.Fprintf(w, "# base file: %s\n", l.File)
 	}
 	fmt.Fprintln(w, "# values without a source comment are compiled-in defaults")
 	for _, p := range l.Params {
-		if secretKeys[p.Name()] && formatValue(p.Kind, p.Ptr) != "" {
+		if v := formatValue(p.Kind, p.Ptr); (secretKeys[p.Name()] && v != "") || (urlKeys[p.Name()] && redactURL(v) != v) {
 			fmt.Fprintln(w, "# WARNING: secrets are shown as *** -- this dump cannot be used as a config file as-is")
 			break
 		}

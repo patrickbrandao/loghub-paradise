@@ -12,17 +12,17 @@
 # 127.0.0.1:19103. Defaults distintos por combinacao para que varias rodem lado
 # a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
 
-name: sls-memory-none
+name: slstd-memory-none
 
 services:
   syslog:
     extends:
       file: common.yml
-      service: sls-base
-    container_name: sls-memory-none
+      service: slstd-base
+    container_name: slstd-memory-none
 
     environment:
-      SYSLOG_NODE_ID: sls-memory-none
+      SYSLOG_NODE_ID: slstd-memory-none
 
       # --- ring: memory ---------------------------------------------------------
       SYSLOG_RING_MODE: memory
@@ -53,7 +53,7 @@ services:
       - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19103}:9102"
 
     volumes:
-      - sls-data:/data
+      - slstd-data:/data
 
 volumes:
-  sls-data:
+  slstd-data:
