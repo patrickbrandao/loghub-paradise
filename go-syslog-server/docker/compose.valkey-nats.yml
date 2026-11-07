@@ -10,8 +10,9 @@
 #
 #   docker compose -f compose.valkey-nats.yml up -d --build
 #
-# Publicado no host: syslog 5158/udp e 5158/tcp (SYSLOG_PORT), TLS 16518
-# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19118 (SYSLOG_ADMIN_PORT).
+# Publicado no host: syslog 5166/udp e 5166/tcp (SYSLOG_PORT), TLS 16526
+# quando ligado (SYSLOG_TLS_PORT), admin 127.0.0.1:19126 (SYSLOG_ADMIN_PORT).
+# Servicos de apoio no host: Valkey do ring 127.0.0.1:16426 (SYSLOG_RING_VALKEY_PORT), NATS 127.0.0.1:14226 (SYSLOG_NATS_PORT).
 # Defaults distintos por combinacao para que varias rodem lado a lado.
 
 name: sls-valkey-nats
