@@ -24,18 +24,30 @@ type flowKey struct{ src, dst netip.AddrPort }
 const FlowsPerWorker = 256
 
 type flowWorker struct {
+	key  flowKey
 	jobs chan job
-	used uint64 // last use, for the eviction at Plan.Workers
+	used uint64 // last use, for the eviction at the cap
 }
 
+// A slot of the cap is free only when its worker has returned (review of
+// 2026-11-07, item 6): freed when the flow was closed, it let a new worker
+// dial while the old one still sent what it had queued -- more connections
+// than the cap, and a flow closed at the cap had its next documents on a new
+// connection ahead of its old ones (reordered). At the cap, the flow closed
+// is the least recently used among those with nothing queued, and the new
+// flow waits for a worker to return.
 type flowSet struct {
 	p        Plan
 	rep      *report.Report
 	stopDial context.Context
+	ctx      context.Context
 	wg       sync.WaitGroup
 
-	open map[flowKey]*flowWorker
-	tick uint64
+	open     map[flowKey]*flowWorker
+	closing  map[flowKey]*flowWorker // closed, worker not returned yet
+	running  int                     // workers not returned (open + closing)
+	returned chan *flowWorker
+	tick     uint64
 
 	mu     sync.Mutex
 	shards []*report.Shard // free shards: a flow's counters outlive it in the report, the shard is reused
@@ -48,7 +60,9 @@ func runFlows(ctx context.Context, p Plan, src source.Source, rep *report.Report
 		<-ctx.Done()
 		cancelDial()
 	}()
-	fs := &flowSet{p: p, rep: rep, stopDial: stopDial, open: map[flowKey]*flowWorker{}}
+	limit := p.Workers * max(p.FlowsPerWorker, 1)
+	fs := &flowSet{p: p, rep: rep, stopDial: stopDial, ctx: ctx, open: map[flowKey]*flowWorker{},
+		closing: map[flowKey]*flowWorker{}, returned: make(chan *flowWorker, limit)}
 	st := produce(ctx, p, src, fs.route, fs.end)
 	for k := range fs.open {
 		fs.close(k)
@@ -59,9 +73,43 @@ func runFlows(ctx context.Context, p Plan, src source.Source, rep *report.Report
 	return st
 }
 
+func (fs *flowSet) limit() int { return fs.p.Workers * max(fs.p.FlowsPerWorker, 1) }
+
+func (fs *flowSet) reap(w *flowWorker) {
+	fs.running--
+	if fs.closing[w.key] == w {
+		delete(fs.closing, w.key)
+	}
+}
+
+// collect takes the workers that returned, without waiting.
+func (fs *flowSet) collect() {
+	for {
+		select {
+		case w := <-fs.returned:
+			fs.reap(w)
+		default:
+			return
+		}
+	}
+}
+
+// await waits for a worker to return, or for tick; false when ctx ends.
+func (fs *flowSet) await(tick <-chan time.Time) bool {
+	select {
+	case w := <-fs.returned:
+		fs.reap(w)
+	case <-tick:
+	case <-fs.ctx.Done():
+		return false
+	}
+	return true
+}
+
 // route returns the queue of m's flow, opening it (and its worker) on the
-// flow's first message. Past Plan.Workers open flows, the least recently used
-// is closed as if it had ended.
+// flow's first document. At the cap, the least recently used flow with an
+// empty queue is closed as if it had ended, and the new one waits for a
+// slot.
 func (fs *flowSet) route(m source.Message) chan<- job {
 	k := flowKey{m.Src, m.Dst}
 	fs.tick++
@@ -69,19 +117,43 @@ func (fs *flowSet) route(m source.Message) chan<- job {
 		w.used = fs.tick
 		return w.jobs
 	}
-	if len(fs.open) >= fs.p.Workers*max(fs.p.FlowsPerWorker, 1) {
-		var lru flowKey
-		var min uint64
-		for fk, w := range fs.open {
-			if min == 0 || w.used < min {
-				lru, min = fk, w.used
+	// The same pair again while its old worker still sends: after it, or
+	// the flow reorders.
+	for fs.closing[k] != nil {
+		if !fs.await(nil) {
+			return nil // a nil channel: produce sees ctx end
+		}
+	}
+	fs.collect()
+	evicted := false
+	for fs.running >= fs.limit() {
+		// One eviction at a time: a closed flow returning its slot is
+		// enough; one with queued documents would hold it until they drain.
+		if len(fs.closing) == 0 {
+			var lru *flowWorker
+			for _, w := range fs.open {
+				if len(w.jobs) == 0 && (lru == nil || w.used < lru.used) {
+					lru = w
+				}
+			}
+			if lru != nil {
+				fs.close(lru.key)
+				evicted = true
 			}
 		}
-		fs.close(lru)
+		t := time.NewTimer(5 * time.Millisecond)
+		ok := fs.await(t.C)
+		t.Stop()
+		if !ok {
+			return nil
+		}
+	}
+	if evicted {
 		fs.rep.Event("flow closed at --concurrency")
 	}
-	w := &flowWorker{jobs: make(chan job, 4), used: fs.tick}
+	w := &flowWorker{key: k, jobs: make(chan job, 4), used: fs.tick}
 	fs.open[k] = w
+	fs.running++
 	sh := fs.shard()
 	dial := fs.p.FlowDial(m.Src, m.Dst)
 	fs.wg.Add(1)
@@ -91,6 +163,7 @@ func (fs *flowSet) route(m source.Message) chan<- job {
 		fs.mu.Lock()
 		fs.shards = append(fs.shards, sh)
 		fs.mu.Unlock()
+		fs.returned <- w
 	}()
 	return w.jobs
 }
@@ -102,6 +175,7 @@ func (fs *flowSet) close(k flowKey) {
 	if w := fs.open[k]; w != nil {
 		close(w.jobs)
 		delete(fs.open, k)
+		fs.closing[k] = w
 	}
 }
 

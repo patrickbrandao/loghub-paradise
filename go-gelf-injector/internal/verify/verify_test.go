@@ -72,7 +72,7 @@ func TestParse(t *testing.T) {
 }
 
 func TestAddJLH(t *testing.T) {
-	c := NewCounter()
+	c := NewCounter(2)
 	for _, j := range []string{
 		`{"type":"gelf","payload":{"fields":{"seq":1,"run":"r1"}}}`,
 		`{"type":"gelf","payload":{"fields":{"seq":"2","run":"r1"}}}`,
@@ -86,7 +86,7 @@ func TestAddJLH(t *testing.T) {
 	} {
 		c.AddJLH([]byte(j), "r1")
 	}
-	if !reflect.DeepEqual(c.Copies, map[uint64]uint32{1: 1, 2: 2}) || c.Unparsable != 3 {
+	if c.Count(1) != 1 || c.Count(2) != 2 || c.Count(3) != 0 || c.extra != 1 || c.Unparsable != 3 {
 		t.Fatalf("%+v", c)
 	}
 }
@@ -97,22 +97,35 @@ func TestClassify(t *testing.T) {
 	for seq := uint64(1); seq <= 6; seq++ {
 		tr.Done(seq, seq != 5 && seq != 6) // 5 and 6 failed
 	}
-	c := NewCounter()
-	for _, s := range []string{"1", "2", "2", "3", "5", "9"} { // 4 lost, 2 twice, 5 failed but found, 6 failed and missing, 9 unexpected
+	c := NewCounter(6)
+	// 4 lost, 2 three times, 5 failed but found, 6 failed and missing, 9
+	// never produced (twice).
+	for _, s := range []string{"1", "2", "2", "2", "3", "5", "9", "9"} {
 		c.AddSeq(s)
 	}
 	r := Classify(tr.snapshot(6), c)
-	want := Result{Expected: 4, Found: 3, Lost: 1, Duplicated: 1, ExtraCopies: 1, FailedFound: 1, FailedMissing: 1,
-		Unexpected: 1, LostSeqs: []string{"4"}, DuplicatedSample: []uint64{2}, UnexpectedSample: []uint64{9}}
+	// The names and meanings of go-syslog-injector (review of 2026-11-07):
+	// duplicated is the copies beyond the first (2 of seq 2, 1 of seq 9),
+	// unexpected the seqs found that are no success (5 and 9).
+	want := Result{Expected: 4, Found: 3, Lost: 1, Duplicated: 3, FailedFound: 1, FailedMissing: 1,
+		Unexpected: 2, LostSeqs: []string{"4"}, DuplicatedSample: []uint64{2, 9}, UnexpectedSample: []uint64{5, 9}}
 	if !reflect.DeepEqual(r, want) || !r.Bad() {
-		t.Fatalf("%+v", r)
+		t.Fatalf("got  %+v\nwant %+v", r, want)
 	}
-	c = NewCounter()
+	c = NewCounter(6)
 	for _, s := range []string{"1", "2", "3", "4"} {
 		c.AddSeq(s)
 	}
 	if r := Classify(tr.snapshot(6), c); r.Bad() || r.Lost != 0 || r.FailedMissing != 2 {
 		t.Fatalf("clean run is bad: %+v", r)
+	}
+	// unexpected and unparsable are informative: no exit 1 for them alone.
+	c = NewCounter(6)
+	for _, s := range []string{"1", "2", "3", "4", "5", "77", "x"} {
+		c.AddSeq(s)
+	}
+	if r := Classify(tr.snapshot(6), c); r.Bad() || r.Unexpected != 2 || r.Unparsable != 1 {
+		t.Fatalf("informative counters made the run bad: %+v", r)
 	}
 }
 
@@ -216,7 +229,7 @@ func checkDest(t *testing.T, s *Spec, write func(run string, seq int)) {
 		tr.Done(seq, true)
 	}
 	r := Run(context.Background(), s, d, run, &tr, 5, 2*time.Second)
-	if r.Failed || r.Found != 4 || r.Lost != 1 || r.Duplicated != 1 || r.ExtraCopies != 1 || r.Unexpected != 0 ||
+	if r.Failed || r.Found != 4 || r.Lost != 1 || r.Duplicated != 1 || r.Unexpected != 0 ||
 		!reflect.DeepEqual(r.LostSeqs, []string{"4"}) {
 		t.Fatalf("%+v", r)
 	}
@@ -401,7 +414,7 @@ func TestLostSeqs(t *testing.T) {
 	for seq := uint64(1); seq <= 200; seq++ {
 		tr.Done(seq, true)
 	}
-	c := NewCounter()
+	c := NewCounter(12)
 	for _, s := range []string{"1", "5", "6", "9"} {
 		c.AddSeq(s)
 	}
@@ -409,7 +422,7 @@ func TestLostSeqs(t *testing.T) {
 	if strings.Join(r.LostSeqs, ",") != "2-4,7-8,10-12" {
 		t.Fatalf("%v", r.LostSeqs)
 	}
-	c = NewCounter()
+	c = NewCounter(200)
 	for s := 2; s <= 200; s += 2 {
 		c.AddSeq(fmt.Sprint(s))
 	}

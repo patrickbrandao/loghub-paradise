@@ -298,6 +298,12 @@ func TestUsageRound(t *testing.T) {
 		{"--verify-sqlite", db, "--verify-space", "a b"},
 		{"--verify-sqlite", db, "--verify-key", "k"},
 		{"--verify-url", "postgres://h/db", "--verify-key", "k"},
+		// Review of 2026-11-07: a malformed element of a NATS list, and
+		// --verify-tls-ca with PostgreSQL or SQLite.
+		{"--verify-url", "nats://h:1,nats://u:hunter2 @h2:1"},
+		{"--verify-url", "nats://h:1,http://h2"},
+		{"--verify-url", "postgres://h/db", "--verify-tls-ca", "x"},
+		{"--verify-sqlite", db, "--verify-tls-ca", "x"},
 		{"--verify-space", "x"},
 		{"--pcap-dedup", "on"},
 	}
@@ -358,21 +364,31 @@ func TestVerifyExitCodes(t *testing.T) {
 	if code != ExitFailures || s.Verify == nil || s.Verify.Lost != 50 || s.Verify.Complete {
 		t.Fatalf("nothing at the destination: exit %d verify %+v stderr %s", code, s.Verify, se)
 	}
-	// What the receiver got, written the way the server writes it: complete.
-	r.C.Wait(50, 3*time.Second)
-	for i, d := range r.C.Docs() {
-		var g gelftest.Gen
-		json.Unmarshal(d, &g)
-		if g.Run != "vx1" {
-			continue
-		}
+	// A --run already at the destination (PostgreSQL, SQLite) is refused
+	// before anything is sent (review of 2026-11-07): the count would mix
+	// the two runs.
+	insert := func(run string, seq, i int) {
 		u := fmt.Sprintf("ffffffff-ffff-7000-8000-%012x", i) // above the window's floor
-		env := fmt.Sprintf(`{"type":"gelf","payload":{"fields":{"seq":%d,"run":"vx2"}}}`, g.Seq)
+		env := fmt.Sprintf(`{"type":"gelf","payload":{"fields":{"seq":%d,"run":"%s"}}}`, seq, run)
 		if _, err := db.Exec(`INSERT INTO gelf_events VALUES (?,0,'default',6,1,1,0,'gelf','tcp',NULL,NULL,?,1)`, u, []byte(env)); err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
 	}
+	insert("vx2", 1, 1_000_000)
+	before := r.C.N()
 	code, s, se = run(t, "--target", r.Addr, "--count", "50", "--run", "vx2", "--verify-sqlite", path, "--verify-timeout", "3s")
+	if code != ExitUsage || r.C.N() != before || !strings.Contains(se, "--run already present") {
+		t.Fatalf("reused --run: exit %d, %d sent, stderr %s", code, r.C.N()-before, se)
+	}
+	// What the receiver gets, written the way the server writes it, after
+	// the check: complete.
+	go func() {
+		r.C.Wait(before+50, 5*time.Second)
+		for seq := 1; seq <= 50; seq++ {
+			insert("vx3", seq, seq)
+		}
+	}()
+	code, s, se = run(t, "--target", r.Addr, "--count", "50", "--run", "vx3", "--verify-sqlite", path, "--verify-timeout", "3s")
 	if code != ExitOK || s.Verify == nil || !s.Verify.Complete || s.Verify.Found != 50 {
 		t.Fatalf("destination complete: exit %d verify %+v stderr %s", code, s.Verify, se)
 	}

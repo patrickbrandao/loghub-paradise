@@ -168,6 +168,7 @@ go-webhook-injector [flags]
 | `--verify-timeout` | `30s` | depois do envio, quanto esperar até que toda requisição aceita apareça no destino |
 | `--verify-stream` | automático (§8.6.2) | NATS: o stream; Redis/Valkey: a chave do stream |
 | `--verify-table` | `loghub.inbox` (PostgreSQL), `inbox` (SQLite) | a tabela |
+| `--verify-tls-ca` | — | CAs (PEM) que verificam o destino em `tls://` e `rediss://`/`valkeys://` (padrão: as do sistema; portado do `go-gelf-injector` em 2026-11-07) |
 | `--report` | `text` | relatório final: `text` ou `json` |
 | `--progress` | `auto` | linha de progresso no stderr; `0` desliga; `auto` = 1 s num terminal |
 | `--version` | | imprime a versão e sai |
@@ -184,8 +185,11 @@ com nome inválido, com quebra de linha, ou de enquadramento (`Host`,
 `TE`, `Trailer`, `Expect`, `Proxy-Connection`, `HTTP2-Settings`: são do
 transporte, e um valor do usuário desalinharia a conexão); marcador
 desconhecido; captura que não é pcap nem pcapng; `--pcap-flows` sem `--pcap`; `--verify-url` com `--verify-sqlite`;
-`--verify-url` com outro esquema; `--verify-timeout`, `--verify-stream` ou
-`--verify-table` sem destino de conferência; `--verify-stream` com
+`--verify-url` com outro esquema, ou que não analisa (`url.Parse`; numa lista
+NATS, qualquer elemento: §8.6.1); `--verify-timeout`, `--verify-stream`,
+`--verify-table` ou `--verify-tls-ca` sem destino de conferência;
+`--verify-tls-ca` com PostgreSQL ou SQLite (o PostgreSQL leva a CA na URL,
+`sslrootcert=`), ou cujo arquivo não abre ou não tem certificado PEM; `--verify-stream` com
 PostgreSQL/SQLite, `--verify-table` com NATS/Redis; `--verify-table` fora de
 `nome` ou `esquema.nome` (`[a-z_][a-z0-9_]*`); `--verify-timeout` ≤ 0. Tudo
 antes do primeiro envio. (Um destino de conferência que não conecta, ou não tem
@@ -308,7 +312,11 @@ depois de `Retry-After` (segundos ou data HTTP; sem ele, 100 ms), limitado por
 `--retry-max-wait`, até N vezes. No HTTP/1.1 o reenvio sai na mesma conexão
 quando chega a hora (no próximo `Send` ou `Flush`, ou no `Close`); uma conexão
 gasta (`--requests-per-conn`) ou fechada pelo servidor passa os reenvios
-pendentes para a próxima **com o prazo e as tentativas que tinham**
+pendentes para a próxima **com o prazo e as tentativas que tinham** — e
+também uma conexão que o servidor fechou **ociosa** (o *idle timeout* do
+keep-alive chegando durante o `Retry-After`: achado da revisão de 2026-11-07,
+o `Close` só passava adiante os de uma conexão gasta ou com
+`Connection: close`, e o reenvio terminava como `429`)
 (`sched.Pending.Due`/`Tries`/`Last`): a conexão nova os adota na sua lista de
 reenvios (`sched.Adopter`) e os escreve quando o `Retry-After` restante vencer,
 e `--retries` conta as tentativas de todas as conexões. Até 2026-11-07 a
@@ -458,7 +466,14 @@ sobreposição recusada, RFC 5722). Código herdado do SI.
 
 Um fluxo de bytes por **direção**, em ordem de sequência (com a volta de 2³²),
 sem os bytes retransmitidos (contados), fora de ordem segurado até 4 MiB por
-direção. Um buraco que não se fecha é entregue como **lacuna** (`tcp_gaps`,
+direção — cada segmento segurado conta os seus bytes capturados **mais 64**
+(o custo do registro), de modo que segmentos esvaziados pelo *snaplen* (ou uma
+enxurrada de minúsculos) também têm teto; antes de 2026-11-07 contavam 0, sem
+teto nenhum. Os segurados ficam num *heap* mínimo por sequência: o dreno e a
+declaração de lacuna só tiram o menor (antes, a fila era reordenada a cada
+segmento retirado: O(n² log n)). A mesma mudança, nos mesmos trechos, nos
+quatro injetores (item 10 da revisão de 2026-11-07; o `tcp.go` do SI e do RI
+é a referência). Um buraco que não se fecha é entregue como **lacuna** (`tcp_gaps`,
 `tcp_gap_bytes`). FIN/RST encerram a direção; SYN novo na mesma quádrupla é
 conexão nova; ociosa por 10 min de captura é encerrada; no máximo 131 072
 direções abertas. Uma direção cuja captura começou depois do SYN é
@@ -535,6 +550,15 @@ ressincronização).
   e a próxima requisição verdadeira era perdida — o "64 KiB" do SI); um
   cabeçalho cuja linha vazia passa de 1 MiB é recusado mesmo quando chega
   inteiro (antes só aos pedaços); a linha de chunked acima de 4 KiB, idem.
+- **Ressincronização linear** (revisão de 2026-11-07): os candidatos entre
+  dois LFs dividem a busca do LF (e, para os que são linha de requisição, a
+  da linha vazia do cabeçalho), lembrada dentro da ressincronização; a versão
+  é conferida pelo fim da linha (` HTTP/1.x`), e o alvo tem de ser **uma**
+  palavra (sem espaço) entre o método e a versão — a mesma linha que o
+  `net/http` aceita, decidida sem entregá-la a ele. Antes cada candidato
+  procurava o LF até o fim do buffer e cada candidato de uma linha longa
+  (`A A A … /x HTTP/1.1`) era entregue ao `http.ReadRequest`: 1 MiB sem LF
+  com um candidato a cada 2 bytes custava 7,7 s, 3 MiB 34,6 s.
 
 ### 6.7 O que não é reproduzido
 
@@ -571,6 +595,21 @@ Desde 2026-11-07 (pendência 2; decisão do usuário: `golang.org/x/net/http2`,
 - Um *stream* cancelado pelo cliente (`RST_STREAM`) não é reproduzido
   (`http2_streams_reset`). Um corpo acima de 64 MiB é descartado
   (`http_requests_too_large`).
+- **Tetos** (revisão de 2026-11-07): o bloco de cabeçalho (`HEADERS` e as
+  suas `CONTINUATION`, cabeçalhos de quadro incluídos) até **1 MiB**,
+  recusado pelos tamanhos declarados, antes de os bytes chegarem; o bloco
+  decodificado até 1 MiB (`MaxHeaderListSize`: poucos índices numa tabela
+  dinâmica grande expandem muito); **1000** *streams* abertos ao mesmo tempo;
+  e **128 MiB** de corpo segurado somando os *streams* abertos de uma
+  direção. Um bloco acima do teto encerra a direção (`http2_errors`; os
+  abertos em `http2_streams_lost`), como um bloco que não decodifica — o
+  estado do HPACK vai com ele; um *stream* aberto além do teto, ou cujo
+  `DATA` passaria do total, não é reproduzido (`http2_streams_lost`), e os
+  quadros seguintes dele (dados, *trailers*) não viram requisição: os ids de
+  *stream* do cliente só crescem, e um bloco num id já visto que não está
+  aberto é *trailer*. O fim do bloco é procurado **continuando** de onde
+  parou (antes, cada segmento recomeçava do início do bloco: 40 000
+  `CONTINUATION` de 1 byte custavam 29,9 s).
 - Não há ressincronização: uma **lacuna**, um quadro que o `Framer` recusa ou
   um bloco que o HPACK não decodifica encerra a leitura da direção — o estado
   do HPACK se perdeu, e nenhum bloco seguinte pode ser lido com segurança —; os
@@ -592,11 +631,21 @@ clientes como eram:
   da última, quando a captura mostrou o fim dele (FIN, RST, ociosidade de 10
   min de captura ou fim do arquivo). As requisições do fluxo vão nela, em
   ordem (com `--pipeline` ou `--streams`, como numa conexão qualquer).
-- `--concurrency` é o máximo de fluxos com conexão aberta ao mesmo tempo.
-  Quando um fluxo novo chega com todas tomadas, o fluxo que está há mais tempo
-  sem requisição perde a sua (fechada depois do que está em voo); a próxima
-  requisição dele, se houver, abre uma nova (evento `flow split (concurrency
-  cap)`). Um `Connection: close` do servidor também divide o fluxo (§4.4).
+- `--concurrency` é o máximo de fluxos com conexão aberta ao mesmo tempo,
+  **nunca** passado. Quando um fluxo novo chega com todas tomadas, o fluxo que
+  está há mais tempo sem requisição **entre os que não têm nada na fila**
+  perde a sua (fechada depois do que está em voo); o fluxo novo **espera** a
+  vaga, que só fica livre quando o worker antigo **termina** (escreveu o que
+  tinha, esperou as respostas e fechou). A próxima requisição do fluxo
+  dividido, se houver, abre uma conexão nova — depois de a antiga terminar,
+  então nada dele sai fora de ordem (evento `flow split (concurrency cap)`).
+  Até 2026-11-07 a vaga era devolvida no fechamento, e o worker novo discava
+  enquanto o antigo ainda drenava até 64 requisições: mais conexões que
+  `--concurrency`, dois workers num mesmo *shard* do relatório, e as
+  requisições seguintes de um fluxo dividido à frente das anteriores (item 6
+  da revisão). Fluxos com fila não são escolhidos: fechá-los só somaria a
+  espera do dreno. Um `Connection: close` do servidor também divide o fluxo
+  (§4.4).
 - O fim de um fluxo chega ao produtor como um marcador da fonte
   (`source.Message.FlowEnd`), que não consome `seq` nem conta em `--count`.
   Com `--loop`, os fluxos de cada passada são novos.
@@ -693,7 +742,7 @@ servidor gravou, com as bibliotecas e versões dos servidores (§2.1).
 | Destino | Servidores | O que é lido |
 |---|---|---|
 | `nats://`, `tls://` (NATS JetStream; vírgula separa servidores, como no `nats.go`) | W, F, N com `sink=nats` | as mensagens do stream (o `Data` é o JLH, W SPEC §3.8), por um *consumer* ordenado efêmero que começa depois da última sequência do stream na checagem (§8.6.3) |
-| `postgres://`, `postgresql://` (o `pgx`; `PGPASSWORD` e as demais variáveis do libpq valem) | W, F, P com `sink=postgres` | `uuid` e `payload->'content'` da fila `loghub.inbox` (W SPEC §3.6) |
+| `postgres://`, `postgresql://` (o `pgx`; `PGPASSWORD` e as demais variáveis do libpq valem; a CA vai em `sslrootcert=`) | W, F, P com `sink=postgres` | `uuid` e `payload->'content'` da fila `loghub.inbox` (W SPEC §3.6) |
 | `redis://`, `rediss://`, `valkey://`, `valkeys://` (o `rueidis`; `valkey` é alias de `redis`) | W, F com `sink=redis` | o campo `e` (o JLH) das entradas do stream (W SPEC §3.3), por `XRANGE` |
 | `--verify-sqlite <arquivo>` (só leitura) | W, F com `sink=sqlite` | `uuid` e `payload->content` (o `payload` do JLH, em texto) da tabela `inbox` (W SPEC §3.7) |
 
@@ -705,6 +754,19 @@ hora desperdiçaria a carga. No Redis só a conexão (`PING`) e, com
 no primeiro `XADD` do servidor. Nessa checagem o injetor anota também o ponto
 de partida dos streams (§8.6.3). Com `sink=sqlite` e `rotate=daily|hourly`,
 aponte o arquivo do período da execução.
+
+**A URL nunca vaza** (revisão de 2026-11-07, igual nos quatro injetores): a
+URL é separada e analisada **antes** de qualquer driver — no NATS cada
+elemento da lista separada por vírgula (`url.Parse`, esquema `nats`/`tls`,
+host presente), no PostgreSQL e no Redis a URL inteira —, e o erro diz só qual
+elemento e por quê (exit 2), nunca o texto do `*url.Error`, que cita a URL.
+Antes o `nats.go` recebia a lista crua e o seu erro de análise
+(`parse "nats://u:sekret@…"`) saía com a senha, e o 2º elemento de uma lista
+nunca era analisado pelo injetor. Todo erro de driver depois disso (conexão,
+leitura) passa por uma troca das senhas (e tokens NATS) de **todos** os
+elementos por `xxxxx`, e um `*url.Error` vira texto genérico.
+`--verify-tls-ca` dá as CAs de `tls://` (`nats.Secure`) e de
+`rediss://`/`valkeys://`.
 
 #### 8.6.2 Nome do stream, da chave e da tabela
 
@@ -735,9 +797,12 @@ aponte o arquivo do período da execução.
   sequências, e o que foi gravado nele antes da última sequência anotada não é
   lido (conta `lost`).
 - **Janela** (PostgreSQL e SQLite, que não têm ordem de chegada): só registros
-  a partir de **1 min antes** do início da execução (folga para o relógio),
-  pelo tempo do UUIDv7 (`uuid >= <limite>`). Registros mais antigos não são
-  lidos.
+  a partir de **10 min antes** do início da execução (folga para o relógio:
+  o UUIDv7 vem do relógio do servidor, que pode ser outra máquina), pelo
+  tempo do UUIDv7 (`uuid >= <limite>`). Registros mais antigos não são lidos.
+  Até 2026-11-07 a folga era 1 min (o SI tinha 5); 10 min nos quatro injetores
+  desde a revisão. O `--run` reutilizado não importa aqui: as aceitas são
+  achadas pelo `uuid` do `X-LogHub-UUID`, único por registro.
 - **Aceitas**: cada resposta final `2xx` registra o `seq` e o `X-LogHub-UUID`
   (o uuid do envelope gravado). São as **esperadas**.
 - Um registro é **da execução** quando o seu `uuid` é de uma aceita, ou quando
@@ -754,7 +819,13 @@ pararam: *consumer*, ID, `rowid`; o PostgreSQL relê a janela, porque a fila
 não tem ordem de inserção, e o que já foi visto é ignorado pelo `uuid`), com
 intervalos de 250 ms dobrando até 2 s, até `--verify-timeout`. Um sink que
 grava depois do `200` (`ring=memory`, ou `ring=sqlite` com o sink atrasado) tem
-esse prazo para alcançar.
+esse prazo para alcançar. Uma **leitura que falha** é tentada de novo na volta
+seguinte, até o prazo (antes de 2026-11-07 a primeira falha encerrava a
+conferência; igual nos quatro injetores desde a revisão): o `error` do
+relatório fica só quando a **última** leitura falhou, e então a conferência é
+impossível (`4`). Um destino em que nada aparece (o stream Redis que nunca
+nasce, a tabela vazia) não é erro: as aceitas são `lost`, saída `1` (igual nos
+quatro).
 
 | Contador | Significado |
 |---|---|
@@ -777,8 +848,8 @@ stream já contadas (o `FetchNoWait` do *consumer* ordenado recomeça do início
 cada chamada: achado do SI).
 
 `lost` ou `duplicated` maiores que zero são **falha** da execução (saída `1`);
-`unverifiable` maior que zero ou um erro de leitura (`error`) tornam a
-conferência **impossível** (saída `4`, §3.3). No relatório JSON é o objeto
+`unverifiable` maior que zero ou um erro na última leitura (`error`) tornam
+a conferência **impossível** (saída `4`, §3.3). No relatório JSON é o objeto
 `verify` (`destination` só com esquema, host e nome, sem credenciais; os
 contadores; `error`), com os nomes do relatório do SI onde o sentido é o mesmo;
 no texto, um bloco `verify:`. No PostgreSQL e no SQLite o `uuid` é chave primária, então
@@ -789,7 +860,18 @@ Interrompido (SIGINT), o injetor não confere: sai com `130`.
 **Precisa de um destino parado**: um worker que consome a `loghub.inbox`
 (`DELETE … SKIP LOCKED`), o `MAXLEN` do Redis, os limites de um stream NATS ou
 o `keep_files` do SQLite apagam o que a conferência procura, e o que sumiu
-conta como `lost`. A memória é ~100 bytes por requisição aceita.
+conta como `lost`.
+
+**Memória** (revisão de 2026-11-07, item 10: os outros injetores contam por
+`seq` em vetores; o WI casa pelo `uuid` e fica com os mapas, com o custo
+documentado): o conferidor guarda, por requisição aceita, o `uuid` e o `seq`
+(`accepted`, `okSeq`) e, por registro achado, a chave de releitura, o `uuid`
+achado, o grupo do `seq` e o `seq` achado — cerca de **250 bytes por
+requisição aceita e achada** (medido: 200 000 aceitas e lidas de volta, 251
+B cada), ou seja ~250 MB por milhão. Os mapas por `uuid` são o que permite
+achar uma aceita sem marcador no corpo; trocá-los por vetores por `seq`
+exigiria que toda fonte tivesse `seq` contíguo, o que modelos, arquivos e
+capturas não têm.
 
 ---
 
@@ -821,3 +903,13 @@ conta como `lost`. A memória é ~100 bytes por requisição aceita.
     que a janela de ressincronização não vira candidato pela cauda (§6.6, do
     GI); NATS e Redis/Valkey conferidos depois da última entrada na checagem
     (§8.6.3, do GI).
+12. *Corrigido em 2026-11-07 (revisão independente dos injetores):* senha
+    nunca vaza pela URL de conferência (§8.6.1); `--verify-tls-ca` (§3.1);
+    folga de 10 min, leitura repetida até o prazo, destino vazio = `lost`
+    (§8.6.3, §8.6.4); custo de memória documentado (§8.6.4); h2c com teto do
+    bloco de cabeçalho, de *streams* e de corpo, e busca do bloco linear
+    (§6.8); reenvio de `429` passado adiante também na conexão fechada ociosa
+    (§4.5); ressincronização linear (§6.6); `--pcap-flows` sem passar do teto
+    nem reordenar (§6.9); segurados do TCP com teto por segmento e ordenados
+    uma vez (§6.4). `--proxy-src`/`--proxy-dst` com `--pcap-flows` (alinhamento
+    8(a)): não se aplica, o WI não tem PROXY.

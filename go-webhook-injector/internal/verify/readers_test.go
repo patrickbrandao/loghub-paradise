@@ -122,7 +122,7 @@ func TestPGReader(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	r, err := openPG(ctx, url, tbl, now.Add(-Margin))
+	r, err := openPG(ctx, mustTarget(t, url), tbl, now.Add(-Margin))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestPGReader(t *testing.T) {
 	if got := collect(t, r); len(got) != 2 || !strings.HasSuffix(got[0], " 2") {
 		t.Fatalf("%q", got)
 	}
-	if _, err := openPG(ctx, url, "loghub.nope", now); err == nil {
+	if _, err := openPG(ctx, mustTarget(t, url), "loghub.nope", now); err == nil {
 		t.Fatal("missing table accepted")
 	}
 }
@@ -160,7 +160,7 @@ func testRedis(t *testing.T, env string) {
 	// An entry already there at the check is not read, however recent
 	// (SPEC §8.6.3): the read starts after the stream's last entry.
 	add(key, v7(now, 9), 9)
-	r, err := openRedis(ctx, url, "")
+	r, err := openRedis(ctx, mustTarget(t, url), "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func testRedis(t *testing.T, env string) {
 	// A key that is not a stream is refused with --verify-stream.
 	r.c.Do(ctx, r.c.B().Set().Key(key+"str").Value("x").Build())
 	t.Cleanup(func() { r.c.Do(context.Background(), r.c.B().Del().Key(key+"str").Build()) })
-	if _, err := openRedis(ctx, url, key+"str"); err == nil {
+	if _, err := openRedis(ctx, mustTarget(t, url), key+"str", nil); err == nil {
 		t.Fatal("string key accepted")
 	}
 	_ = rueidis.Nil
@@ -223,7 +223,7 @@ func TestNATSReader(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	r, err := openNATS(ctx, url, name, 5*time.Second)
+	r, err := openNATS(ctx, mustTarget(t, url), name, 5*time.Second, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,16 @@ func TestNATSReader(t *testing.T) {
 	if got := collect(t, r); len(got) != 1 || got[0] != v7(now, 1)+" 1" {
 		t.Fatalf("second read: %q", got)
 	}
-	if _, err := openNATS(ctx, url, name+"_NOPE", 2*time.Second); err == nil {
+	if _, err := openNATS(ctx, mustTarget(t, url), name+"_NOPE", 2*time.Second, nil); err == nil {
 		t.Fatal("missing stream accepted")
 	}
+}
+
+func mustTarget(t *testing.T, raw string) *target {
+	t.Helper()
+	tg, err := parseTarget(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tg
 }

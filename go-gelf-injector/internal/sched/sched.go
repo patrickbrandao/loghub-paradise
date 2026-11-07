@@ -55,6 +55,22 @@ type Pending struct {
 	// closing or dead): the report tells it apart from a request the server
 	// received and announced it would not process.
 	Unwritten bool
+	// A retry of a 429/503 handed on by a spent or server-closed connection
+	// keeps its schedule (SPEC §4.3, from go-webhook-injector's §4.5): Due
+	// is when it may go again, Tries the resends already made, Last the
+	// outcome of its last answer.
+	Due   time.Time
+	Tries int
+	Last  string
+}
+
+// Adopter is implemented by a connection that can take over a retry another
+// connection handed back, keeping its Retry-After and its count of tries.
+// Without it the retry went at once on the next connection, and --retries
+// started again on every connection (alignment 8(e) of the review of
+// 2026-11-07).
+type Adopter interface {
+	Adopt(p Pending) error
 }
 
 // Resender is implemented by a connection that can give messages back. After
@@ -359,7 +375,10 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 			continue
 		}
 		var err error
-		if p != nil {
+		if a, ok := c.(Adopter); ok && p != nil && p.Tries > 0 {
+			// A retry handed on keeps its Retry-After and its tries.
+			err = a.Adopt(*p)
+		} else if p != nil {
 			err = c.Send(p.Seq, p.Msg, p.Done)
 		} else {
 			start := time.Now()

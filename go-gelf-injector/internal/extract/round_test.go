@@ -38,7 +38,10 @@ func TestDatagramCopies(t *testing.T) {
 		{"another IP id", DedupAuto, []dg{{out, 7, a1, 0}, {in, 8, a1, 1}}, 2},
 		{"different documents", DedupAuto, []dg{{out, 7, a1, 0}, {in, 7, `{"a":2}`, 1}}, 2},
 		{"past the window", DedupAuto, []dg{{out, 7, a1, 0}, {in, 7, a1, 60_000}}, 2},
-		{"on: any copy within the window", DedupOn, []dg{{0, 7, a1, 0}, {0, 7, a1, 1}, {0, 8, a1, 2}}, 2},
+		// on is the vantage rule since the review of 2026-11-07 (alignment
+		// 8(b)): a repeat at the same vantage is a message, not a copy.
+		{"on: same vantage repeats", DedupOn, []dg{{0, 7, a1, 0}, {0, 7, a1, 1}, {0, 8, a1, 2}}, 3},
+		{"on: loopback out+in", DedupOn, []dg{{out, 7, a1, 0}, {in, 7, a1, 3}}, 1},
 		{"on: past the window", DedupOn, []dg{{0, 7, a1, 0}, {0, 7, a1, 60_000}}, 2},
 		{"off", DedupOff, []dg{{out, 7, a1, 0}, {in, 7, a1, 3}}, 2},
 	}

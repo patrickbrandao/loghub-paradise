@@ -23,10 +23,10 @@ const (
 	// DedupAuto drops a copy only when it was seen at another vantage than
 	// the copies before it (the counting rule of copyOf).
 	DedupAuto DedupMode = iota
-	// DedupOn drops every identical datagram (same key) within DupWindow,
-	// whatever the vantage: for captures that do not record one (merged
-	// Ethernet captures), at the risk of a sender's repeat with the same IP
-	// identification.
+	// DedupOn is DedupAuto (alignment 8(b) of the review of 2026-11-07:
+	// "on" is the vantage rule in the four injectors). It dropped every
+	// identical datagram within DupWindow whatever the vantage, and with it
+	// a sender's real repeat with the same IP identification.
 	DedupOn
 	// DedupOff keeps every datagram.
 	DedupOff
@@ -94,9 +94,6 @@ func (d *dedup) copyOf(srcPort uint16, ipid uint32, vantage uint64, b []byte, ts
 		e.counts = map[uint64]uint32{}
 	}
 	e.last = ts
-	if d.mode == DedupOn {
-		return true
-	}
 	var others uint32
 	for v, c := range e.counts {
 		if v != vantage && c > others {

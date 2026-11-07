@@ -355,7 +355,7 @@ func (r *Report) WriteText(w io.Writer) error {
 				k string
 				n uint64
 			}{{"expected", v.Expected}, {"found", v.Found}, {"lost", v.Lost}, {"duplicated", v.Duplicated},
-				{"extra_copies", v.ExtraCopies}, {"failed_found", v.FailedFound}, {"failed_missing", v.FailedMissing},
+				{"failed_found", v.FailedFound}, {"failed_missing", v.FailedMissing},
 				{"unexpected", v.Unexpected}, {"unparsable", v.Unparsable}} {
 				fmt.Fprintf(&b, "  %-24s %d\n", kv.k, kv.n)
 			}

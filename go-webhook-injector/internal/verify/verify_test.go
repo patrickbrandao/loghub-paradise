@@ -177,7 +177,7 @@ func TestNoSecretsEchoed(t *testing.T) {
 	if _, err := Kind("mysql://u:s3cret@h/db"); err == nil || strings.Contains(err.Error(), "s3cret") {
 		t.Fatalf("%v", err)
 	}
-	if _, err := openRedis(context.Background(), "redis://u:s3cret@[bad", ""); err == nil || strings.Contains(err.Error(), "s3cret") {
+	if _, err := Open(context.Background(), Config{URL: "redis://u:s3cret@[bad", Timeout: time.Second}, "r"); err == nil || strings.Contains(err.Error(), "s3cret") {
 		t.Fatalf("%v", err)
 	}
 	for _, k := range []string{"nats://h", "tls://h", "postgres://h", "postgresql://h", "redis://h", "rediss://h", "valkey://h", "valkeys://h"} {

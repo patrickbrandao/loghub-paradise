@@ -280,7 +280,8 @@ E o que ela acusa:
   JetStream tem 7612 — `lost` 22 388, `lost_seqs` `534,569-570,…`,
   `complete: false`, **saída 1**. É a cegueira do UDP (AGENTS §6) medida;
 - **duplicação**: a mesma `--run` duas vezes contra o `sink=sqlite`:
-  `duplicated` 50, saída 1; 100 HTTP com a `--run` de uma execução TCP de
+  `duplicated` 50, saída 1 (desde a revisão de 2026-11-07 essa segunda
+  execução é recusada com `2` antes do envio, §10.3 da SPEC); 100 HTTP com a `--run` de uma execução TCP de
   5000: `duplicated` 100, `unexpected` 4900;
 - **destino impossível** (saída 4, **nada enviado**): NATS fechado, senha
   errada do PostgreSQL (a mensagem do `pgx` não tem a senha), chave Redis de
@@ -321,6 +322,44 @@ GELF_TEST_PCAP=w/frag.pcap GELF_TEST_PCAP_RUNS=fragc:20 GELF_TEST_PCAP_EXPECT=w/
 Nota: no loopback de um container (Docker Desktop, kernel 6.x) o `-i any`
 gravou **uma** cópia de cada datagrama; a duplicação aparece entre
 interfaces (ponte, `veth`).
+
+### 3.7.1 Revisão independente dos injetores (2026-11-07)
+
+| Pacote | O que prova |
+|---|---|
+| `verify` | URL e lista NATS malformadas (espaço na senha, `[` sem `]`, elemento `http://`, sem host) recusadas sem citar a senha; a senha e o token de **todo** elemento trocados no erro do driver; `*url.Error` genérico; `ErrRunPresent` passa intacto; `destination` com `(+1)` (`TestURLListNeverEchoed`); contadores com o sentido do SI — `duplicated` = cópias além da primeira (3 para um `seq` 3 vezes e outro 2 vezes), `unexpected` = falhou-mas-achado + nunca produzido, e `unexpected`/`unparsable` sozinhos não fazem a execução ruim (`TestClassify`); a contagem em vetor por `seq` (`TestAddJLH`, `TestLostSeqs`) |
+| `app` | `--run` já no `gelf_events`: saída 2, **nada enviado**, mensagem `--run already present`; registros da execução gravados depois da checagem: completa, saída 0 (`TestVerifyExitCodes`); lista NATS com elemento malformado ou não-NATS e `--verify-tls-ca` com PostgreSQL/SQLite recusados (`TestUsageRound`) |
+| `transport` | `429` com `Retry-After: 1` e o servidor fechando a conexão ociosa: passado adiante com `Tries` 1, `Last` 429 e o prazo; a conexão seguinte o adota, escreve depois do `Retry-After` restante (≥ 0,5 s) e, com `--retries 1`, termina em `429` sem recomeçar a contagem (`TestRetryHandedOnAndAdopted`) |
+| `sched` | `--pcap-flows` com 12 fluxos intercalados em 3 vagas: nunca mais de 3 conexões, nada fora de ordem (`TestFlowsCapAndOrder`); no teto, o fluxo mais ocioso **com fila** fica (`TestFlowsEvictOnlyEmptyQueue`); o mesmo par depois do fim espera o worker antigo (`TestFlowsReopenWaitsForTheOld`) |
+| `source` | `-i any` (cooked v2) de uma conexão TCP com NAT entre as interfaces 3 e 7: 2 documentos, uma direção, `tcp_segments_duplicate` > 0 em `auto` e `on`; 4 documentos com `off` (`TestTCPCopiesOfAnyDeduplicated`) |
+| `extract` | `on` = regra do ponto: repetições no mesmo ponto são 3 mensagens, saída+entrada do loopback 1 (`TestDatagramCopies`) |
+| `pcap` | cooked v1: tipo + endereço de enlace (`TestCookedV1Vantage`); fragmento tardio de cópias intercaladas não é perdido, e depois da janela é datagrama novo (`TestFragmentLateCopy`, do SI); 100 000 segmentos esvaziados atrás de um buraco declaram a lacuna e 30 000 em ordem inversa drenam em O(n log n) (`TestTCPPendingBoundCountsEverySegment`, `TestTCPDrainManySegments`, os do SI e do RI) |
+| `httpx` | do WI: candidato de 20 KiB igual inteiro e aos pedaços, cabeçalho acima de 1 MiB recusado inteiro (`TestLargeCandidateSplitInvariant`); chunked de 4000 pedaços lido uma vez (`TestChunkedIncremental`); 1,5 MiB de candidatos linear (`TestResyncLinear`) |
+
+**Contra destino real** (2026-11-07, `fxf-nats`, NATS 2.12 com JetStream e
+usuário/senha, porta 39550): `TestNATSDest` com
+`GELF_TEST_VERIFY_NATS` = lista de dois servidores (o 2º fechado) passa; o
+binário com `--verify-url` de senha errada (saída 4, `Authorization
+Violation`), lista com o 1º servidor fechado e senha errada no 2º (4),
+elemento com espaço na senha (2, `server 2 of the list is not a URL`) e `[`
+sem `]` no 1º (2): a senha não aparece em nenhuma saída. `fxf-pg`
+(PostgreSQL 18 com o `docker/postgres/inbox.sql` do G, porta 39551):
+`TestPostgresDest` passa; com um registro de `fields.run = fxrun1` na
+`loghub.inbox`, `--run fxrun1` sai com **2** (`--run already present`) e nada
+é enviado, `--run fxrun2` segue; senha errada: saída 4 e a mensagem do `pgx`
+sem a senha. Redis e Valkey não rodaram nesta revisão (uma matriz Redis/Valkey
+de outra área ocupava o Docker; os testes opt-in não mudaram de regra).
+
+**Mutação** (cada uma derruba o seu teste): lista sem separar, `*url.Error`
+repassado, só a 1ª senha trocada, `unexpected`/`unparsable` fazendo a
+execução ruim, falhou-mas-achado fora de `unexpected`, `duplicated` contando
+`seq`, checagem do `--run` no SQLite desligada, `ErrRunPresent` como `4`,
+dedup TCP desligada, `on` de volta a "toda cópia", cooked v1 só pelo tipo,
+fragmento tardio aceito como órfão, segmento segurado sem o custo fixo,
+`Close` sem passar adiante na conexão ociosa, `Adopt` sem `Tries`/`Due`,
+`Pending` sem o prazo, vaga devolvida no fechamento, fluxo com fila escolhido
+no teto, par reaberto sem esperar o antigo, e no `httpx` a linha de volta a
+16 KiB, `chunked` sem retomar, LF não dividido, alvo de várias palavras.
 
 ### 3.8 Mutação (2026-11-07)
 

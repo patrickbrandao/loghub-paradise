@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 type got struct {
@@ -117,6 +119,15 @@ func FuzzStream(f *testing.F) {
 	// HTTP/2 (SPEC §6.8): whole frames only, so the split cannot matter.
 	f.Add(h2Sample(), uint8(5), false)
 	f.Add([]byte("GET /u HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\n\r\n"+string(h2Sample())), uint8(9), false)
+	// A CONTINUATION chain, trailers of a stream reset, and a long line of
+	// resynchronization candidates (review of 2026-11-07).
+	c := newH2Client(true)
+	continuations(c, 1, "vvvvvvvv")
+	c.headers(3, false, false, ":method", "POST", ":scheme", "http", ":authority", "h", ":path", "/r")
+	c.fr.WriteRSTStream(3, http2.ErrCodeCancel)
+	c.headers(3, true, false, "x-trailer", "t")
+	f.Add(c.buf.Bytes(), uint8(4), false)
+	f.Add([]byte("A A A A A B / HTTP/1.1\r\nPOST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\n\r\nZ"), uint8(3), true)
 	f.Fuzz(func(t *testing.T, in []byte, chunk uint8, mid bool) {
 		// Whatever the input and the split, the requests are the same and
 		// nothing panics.

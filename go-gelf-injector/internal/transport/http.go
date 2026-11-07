@@ -176,6 +176,29 @@ func newH1(o Options, c net.Conn) *h1Conn {
 	return h
 }
 
+// pending is p as handed back to the worker, with its retry schedule.
+func (h *h1Conn) pending(p *pend, unwritten bool) sched.Pending {
+	return sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: unwritten,
+		Due: p.due, Tries: p.tries, Last: p.last}
+}
+
+// Adopt implements sched.Adopter: a retry another connection handed back
+// joins this one's retries with the Retry-After it still has to wait and
+// the tries it already made (SPEC §4.3).
+func (h *h1Conn) Adopt(pd sched.Pending) error {
+	p := &pend{seq: pd.Seq, msg: pd.Msg, req: h.build(pd.Msg), done: pd.Done,
+		tries: pd.Tries, due: pd.Due, last: pd.Last}
+	h.mu.Lock()
+	if h.spent || h.closing || h.dead != nil {
+		h.unsent = append(h.unsent, h.pending(p, true))
+		h.mu.Unlock()
+		return sched.ErrSpent
+	}
+	h.retries = append(h.retries, p)
+	h.mu.Unlock()
+	return h.resendDue(false)
+}
+
 var (
 	errDead         = errors.New("connection closed")
 	errServerClosed = errors.New("server closed the connection (Connection: close)")
@@ -217,7 +240,7 @@ func (h *h1Conn) write(p *pend) error {
 		// may follow it (a retry may have been that request). A server that
 		// closed an idle keep-alive connection is a planned close too.
 		closing, dead := h.closing || h.spent || h.idle, h.dead
-		h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: true})
+		h.unsent = append(h.unsent, h.pending(p, true))
 		h.mu.Unlock()
 		<-h.slots
 		if closing {
@@ -406,9 +429,9 @@ func (h *h1Conn) Close(ctx context.Context) error {
 	h.retries = nil
 	// A retry stranded by a spent or server-closed connection goes on the
 	// next one; one stranded by the end of the run keeps its last answer.
-	if (h.spent || h.closing) && ctx.Err() == nil {
+	if (h.spent || h.closing || h.idle) && ctx.Err() == nil {
 		for _, p := range rs {
-			h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0})
+			h.unsent = append(h.unsent, h.pending(p, false))
 		}
 		rs = nil
 	}
@@ -422,7 +445,7 @@ func (h *h1Conn) Close(ctx context.Context) error {
 // giveBack hands a request that never reached the wire back to the worker.
 func (h *h1Conn) giveBack(p *pend) {
 	h.mu.Lock()
-	h.unsent = append(h.unsent, sched.Pending{Seq: p.seq, Msg: p.msg, Done: p.done, Stuck: h.answers == 0, Unwritten: true})
+	h.unsent = append(h.unsent, h.pending(p, true))
 	h.mu.Unlock()
 }
 
@@ -517,7 +540,7 @@ func (h *h1Conn) read() {
 			// so what is behind it was not processed and can go again.
 			h.mu.Lock()
 			for _, q := range h.queue {
-				h.unsent = append(h.unsent, sched.Pending{Seq: q.seq, Msg: q.msg, Done: q.done, Stuck: h.answers == 0})
+				h.unsent = append(h.unsent, h.pending(q, false))
 				<-h.slots
 			}
 			h.queue = nil

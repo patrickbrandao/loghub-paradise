@@ -566,7 +566,7 @@ func (h *h1Conn) Close(ctx context.Context) error {
 	h.retries = nil
 	// A retry stranded by a spent or server-closed connection goes on the
 	// next one; one stranded by the end of the run keeps its last answer.
-	if (h.spent || h.closing) && ctx.Err() == nil {
+	if (h.spent || h.closing || h.idle) && ctx.Err() == nil {
 		for _, p := range rs {
 			h.unsent = append(h.unsent, h.pending(p, false))
 		}

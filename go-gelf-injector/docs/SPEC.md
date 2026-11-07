@@ -163,7 +163,7 @@ go-gelf-injector [flags]
 | `--verify-timeout` | `30s` | espera máxima da conferência, contada do fim do envio |
 | `--verify-space` | `default` | espaço LogHub: subject NATS e stream Redis `loghub.<space>.gelf`, coluna `space` do PostgreSQL e do SQLite |
 | `--verify-key` | — | stream Redis/Valkey (padrão `loghub.<space>.gelf`) ou stream NATS (padrão `LOGHUB_GELF`) |
-| `--pcap-dedup` | `auto` | cópias de um datagrama na captura: `auto` (pelo ponto de captura), `on` (toda cópia em 50 ms) ou `off` (§6.3.1) |
+| `--pcap-dedup` | `auto` | cópias do `-i any` na captura, datagramas e segmentos TCP: `auto` ou `on` (a mesma regra, pelo ponto de captura) ou `off` (§6.2, §6.3.1) |
 | `--verify-tls-ca` | — | CAs (PEM) que verificam o destino em `tls://` e `rediss://`/`valkeys://` (padrão: as do sistema) |
 | `--report` | `text` | `text` ou `json` no stdout |
 | `--progress` | `auto` | intervalo da linha de progresso no stderr (duração Go); `0`/`off` desliga; outro valor é erro de uso |
@@ -186,14 +186,19 @@ que não é `auto`, `off` nem duração `>= 0`; marcador desconhecido; captura q
 não é pcap/pcapng; argumento posicional; `--http-chunked` fora de http/https ou
 fora de `0..16777216`; `--pcap-flows` sem `--pcap`, ou com
 `--proxy-src`/`--proxy-dst` (o fluxo anuncia os seus); `--verify-url` e
-`--verify-sqlite` juntos; esquema de `--verify-url` fora da lista, URL sem
-host, `nats://` com parâmetros (§10.2); `--verify-space` fora da gramática de
+`--verify-sqlite` juntos; esquema de `--verify-url` fora da lista, URL (ou
+qualquer elemento de uma lista NATS) que não analisa, sem host, ou elemento
+de lista que não é `nats://`/`tls://`, `nats://` com parâmetros (§10.2);
+`--verify-tls-ca` com PostgreSQL ou SQLite (o PostgreSQL leva a CA na URL,
+`sslrootcert=`; revisão de 2026-11-07); `--verify-space` fora da gramática de
 espaço, `--verify-key` com PostgreSQL ou SQLite; `--verify-timeout <= 0`, ou
 `--verify-tls-ca`/`--verify-space`/`--verify-key`/`--verify-timeout` sem
 conferência; `--pcap-dedup` sem `--pcap` ou fora de `auto|on|off`; conferência com `--file`/`--pcap`, ou com um
 `--template` sem `"_seq"`, `{seq}`, `"_run"` e `{run}` (§10.1). Tudo conferido
 **antes** do primeiro envio. A mensagem de erro de `--verify-url` nunca repete
-a URL (pode ter senha).
+a URL (pode ter senha). Também `2`, mas descoberto ao abrir o destino (antes
+do primeiro envio, nada enviado): `--run` que já tem registros na janela do
+PostgreSQL ou do SQLite (§10.3).
 
 ### 3.3 Códigos de saída
 
@@ -201,14 +206,16 @@ a URL (pode ter senha).
 |---|---|
 | `0` | todo desfecho foi sucesso (`sent` ou HTTP `2xx`) |
 | `1` | alguma falhou, ou a fonte deu erro no meio |
-| `2` | uso |
+| `2` | uso; `--run` já presente no destino PostgreSQL/SQLite (§10.3) |
 | `3` | alvo inalcançável: houve mensagens e nenhuma conexão abriu |
 | `4` | conferência impossível (§10.3): o destino não abriu antes do envio (e **nada foi enviado**), não tem a tabela/stream, ou nenhuma leitura deu certo |
 | `130` | interrompido (SIGINT/SIGTERM) |
 
 Precedência: `130`, `3`, `4`, `1`. Uma mensagem enviada com sucesso que não
-está no destino, um `_seq` repetido ou desconhecido no destino (§10.1) é
-**`1`**, como uma falha de transporte: o relatório separa as duas. Os códigos
+está no destino, ou um `_seq` repetido no destino (§10.1), é **`1`**, como
+uma falha de transporte: o relatório separa as duas. `unexpected` e
+`unparsable` são informativos e **não** mudam o código (desde a revisão de
+2026-11-07, como no `go-syslog-injector`; antes davam `1`). Os códigos
 são os do `go-syslog-injector` (alinhamento da rodada de 2026-11-07; a
 primeira versão deste módulo tinha `4` para perda e `5` para impossível).
 
@@ -327,7 +334,16 @@ O cliente HTTP/1.1 do WI (sua SPEC §4.1, §4.3–§4.5), sobre `net.Conn` próp
   `Connection: close` continua `no_response` (pode ter sido processada).
 - `--retries N`: `429` e `503` voltam depois de `Retry-After` (segundos ou
   data; sem ele 100 ms), limitado por `--retry-max-wait`, até N vezes; o
-  desfecho final é o último status. `413` e os demais `4xx` são finais.
+  desfecho final é o último status. `413` e os demais `4xx` são finais. Uma
+  conexão gasta (`--requests-per-conn`), fechada com `Connection: close` ou
+  fechada **ociosa** pelo servidor passa os reenvios pendentes para a próxima
+  **com o prazo e as tentativas que tinham** (`sched.Pending.Due`/`Tries`/
+  `Last`): a conexão nova os adota (`sched.Adopter`) e os escreve quando o
+  `Retry-After` restante vencer, e `--retries` conta as tentativas de todas
+  as conexões. Portado do WI (sua SPEC §4.5) na revisão de 2026-11-07
+  (alinhamento 8(e)): antes o reenvio saía logo na conexão nova e a contagem
+  recomeçava; e o fechamento ocioso (item 4 da revisão, o mesmo furo do WI)
+  terminava o reenvio como `429`.
 - `--requests-per-conn N`: a N-ésima sai com `Connection: close` e o worker
   reabre a conexão (sem contá-la como quebrada).
 
@@ -425,6 +441,33 @@ remontados com limites; datagrama cortado pelo snaplen não é reproduzido
 (`frames_lost`); TCP por direção em ordem de sequência, retransmissões e fora
 de ordem tratados, buraco = lacuna, `tcp_midstream`, `tcp_unterminated`.
 
+**Revisão de 2026-11-07** (iguais nos quatro injetores):
+
+- **Cópias TCP do `-i any`** (item 7): todo segmento TCP cuja porta de
+  destino passa no `--pcap-port` é conferido, **antes** da remontagem, pela
+  chave por pacote do SI e do RI — protocolo, identificação IP, porta de
+  origem, sequência, confirmação e flags TCP, tamanho no fio e FNV-1a do
+  conteúdo; endereços e porta de destino fora, porque o NAT os troca. Um
+  segmento cuja chave é a de um original visto há até 50 ms num **outro**
+  ponto de captura é cópia e cai (`tcp_segments_duplicate`); cada original
+  absorve no máximo uma cópia por ponto. Antes só os datagramas UDP sem chunk
+  eram deduplicados: com NAT entre os pontos, a cópia de uma conexão era
+  outra quádrupla e virava uma segunda direção reproduzida inteira. Com
+  `--pcap-dedup off`, nada cai.
+- **Fragmento tardio** (item 9): a cópia `-i any` (sem NAT, mesma chave de
+  remontagem) de um fragmento que chega depois de o datagrama ter sido
+  remontado — cópias intercaladas: f1, f1′, f2, [completo], f2′ — abria um
+  órfão que expirava contando em `pcap_ip_fragments_lost`. Os fragmentos
+  (deslocamento, tamanho) de cada datagrama completado ficam lembrados por
+  50 ms de captura; um fragmento sem datagrama aberto que repete um deles é
+  cópia e é ignorado (a regra do SI). Depois da janela, a mesma chave é um
+  datagrama novo (o IP ID deu a volta).
+- **Segmentos segurados** (item 10): cada segmento segurado à frente de um
+  buraco conta os seus bytes capturados **mais 64** no teto de 4 MiB por
+  direção (os esvaziados pelo *snaplen* contavam 0, sem teto), e ficam num
+  *heap* mínimo por sequência (a fila era reordenada a cada segmento
+  retirado, O(n² log n)). Os mesmos trechos do `tcp.go` do SI e do RI.
+
 Portado do `go-relplog-injector` em 2026-11-07: o PKTAP (o `-i any` do
 macOS) lê o tipo de enlace interno de `pth_dlt` — lia de `pth_type_next`,
 sempre 1 (Ethernet), e o loopback (`DLT_NULL`) nunca decodificava —, e um
@@ -444,8 +487,9 @@ e HTTP. Uma captura pequena dessa forma (30 documentos, 240 fragmentos) fica
 em `internal/app/testdata/captures/ip-fragments.pcap` (`TestRealCaptures`).
 Com o `-i any` do host da ponte, cada fragmento aparece duas vezes (em cada
 `veth`): a cópia de mesmo deslocamento e tamanho é ignorada enquanto o
-datagrama está aberto, e o datagrama remontado de novo pelas cópias tardias é
-uma cópia do primeiro (§6.3.1 ou, se for chunk, a regra da remontagem).
+datagrama está aberto, e a que chega até 50 ms depois de ele completar também
+(acima); uma cópia mais tardia que remonta o datagrama inteiro de novo é uma
+cópia do primeiro (§6.3.1 ou, se for chunk, a regra da remontagem).
 IPv6 fragmentado continua provado só com capturas sintéticas.
 
 ### 6.3 UDP
@@ -486,7 +530,7 @@ esses **não** podem sumir. O que separa os dois é o **ponto de captura**
 | Enlace | Ponto de captura |
 |---|---|
 | Linux cooked v2 (`-i any` moderno) | índice da interface + tipo do pacote (de saída, para o host, ...) |
-| Linux cooked v1 | tipo do pacote |
+| Linux cooked v1 | tipo do pacote + endereço de enlace (desde 2026-11-07, alinhamento 8(d), a regra do RI; antes só o tipo, e duas interfaces do mesmo tipo eram um ponto só) |
 | pcapng | a interface do bloco (IDB), mais o acima quando o enlace é cooked |
 | PKTAP (macOS `-i any`) | o nome da interface (`pth_ifname`), como o `go-relplog-injector` |
 | outros (Ethernet de uma interface, loopback BSD, raw) | um só: nunca há cópia |
@@ -509,10 +553,11 @@ buffer do tcpdump. Numa captura de um ponto só, nada é descartado;
   É a regra do `go-relplog-injector` dita de outro jeito: cada original
   absorve no máximo uma cópia por **outro** ponto de captura, então uma
   mensagem enviada de fato duas vezes é reproduzida duas vezes;
-- `on`: toda repetição da chave dentro da janela é cópia, qualquer que seja o
-  ponto — para capturas que não registram o ponto (Ethernet de várias
-  interfaces juntadas com `mergecap`), ao risco de uma repetição do emissor
-  com a mesma identificação IP;
+- `on`: a **mesma** regra de `auto` (alinhamento 8(b) da revisão de
+  2026-11-07: `on` é a regra do ponto de captura nos quatro injetores). Antes
+  toda repetição da chave dentro da janela era cópia, qualquer que fosse o
+  ponto, e um emissor que repetia o documento com a mesma identificação IP
+  perdia a repetição;
 - `off`: nada é descartado.
 
 A chave esquece **50 ms de tempo de captura** depois da sua última cópia (as
@@ -585,7 +630,16 @@ depois de espaços e `\0`:
 
 Decisão G11. O extrator `httpx` do WI (sua SPEC §6.6: pipelining,
 `Content-Length` ou `chunked`, ressincronização na próxima linha de
-requisição) entrega cada requisição; o corpo de um `POST` não vazio, decodificado
+requisição) entrega cada requisição. Portado de novo na revisão de
+2026-11-07 (alinhamento 8(f)), sem o replay h2c do WI: a linha de requisição
+sem LF segura a decisão até 1 MiB, o teto do cabeçalho, igual inteiro ou aos
+pedaços (antes 16 KiB: uma linha de 20 KiB era aceita inteira e recusada aos
+pedaços); a procura do fim do cabeçalho e do `chunked` continua de onde
+parou a cada segmento (antes, cada segmento reanalisava o buffer inteiro:
+quadrático num upload grande); e a ressincronização é linear — os
+candidatos entre dois LFs dividem a busca do LF e da linha vazia, a versão é
+conferida pelo fim da linha e o alvo tem de ser uma palavra só (1 MiB sem LF
+com um candidato a cada 2 bytes custava segundos); o corpo de um `POST` não vazio, decodificado
 por `Content-Encoding` (`gzip`, `x-gzip`, `deflate` = zlib, e deflate cru se
 o zlib falhar) ou pelos primeiros bytes, é o documento (`http_messages`).
 Outro método, corpo vazio, e no modo estrito um caminho que não é `/gelf` nem
@@ -627,10 +681,18 @@ originais. Com `--pcap-flows`:
   conexão nova. O fim é entregue em ordem: só depois do último documento do
   fluxo.
 - **Teto**: `--concurrency` × **256** fluxos abertos ao mesmo tempo (os 256
-  por worker do `go-syslog-injector`; com o padrão 1, 256). No teto, o fluxo
-  usado há mais tempo é fechado como se tivesse terminado (evento `flow
-  closed at --concurrency`), e um documento dele depois disso reabre a
-  conexão.
+  por worker do `go-syslog-injector`; com o padrão 1, 256), **nunca**
+  passado. No teto, o fluxo usado há mais tempo **entre os que não têm nada
+  na fila** é fechado como se tivesse terminado (evento `flow closed at
+  --concurrency`) e o fluxo novo **espera a vaga**, que só fica livre quando
+  o worker antigo **termina** (escreveu o que tinha, esperou as respostas e
+  fechou). Um documento de um par cujo worker antigo ainda não terminou (o
+  fluxo fechado no teto, ou a porta reusada e a passada seguinte do
+  `--loop`) espera por ele antes de abrir a conexão nova: nada do fluxo sai
+  fora de ordem. Até a revisão de 2026-11-07 (item 6) a vaga era devolvida
+  no fechamento: um worker novo discava enquanto o antigo ainda drenava,
+  passando do teto, e os documentos seguintes de um fluxo fechado no teto
+  saíam à frente dos anteriores.
 - **PROXY** (`--proxy-protocol v1|v2`): cada conexão anuncia a origem e o
   destino **capturados** do seu fluxo (inclusive IPv6, ou famílias
   diferentes como IPv6 mapeado, §4.5). `--proxy-src`/`--proxy-dst` são
@@ -703,7 +765,7 @@ Captura: `pcap_*` (do SI), `udp_datagrams` (documentos de um datagrama),
 `udp_chunks_duplicate`, `udp_chunks_overflow`, `udp_chunked_incomplete`,
 `udp_chunks_dropped`, `compressed_gzip`/`_zlib`/`_deflate`,
 `decompress_errors`, `docs_too_large`, `tcp_*` do remontador (do SI),
-`tcp_streams_gelf`/`_http`/`_ignored`, `tcp_messages`, `tcp_frames_not_gelf`,
+`tcp_segments_duplicate` (§6.2), `tcp_streams_gelf`/`_http`/`_ignored`, `tcp_messages`, `tcp_frames_not_gelf`,
 `tcp_resyncs`, `tcp_skipped_bytes`, `frames_lost`, `http_messages`,
 `http_requests`, `http_requests_skipped`, `http_resyncs`,
 `http_skipped_bytes`, `http_requests_lost`, `http_requests_too_large`,
@@ -728,6 +790,17 @@ Captura: `pcap_*` (do SI), `udp_datagrams` (documentos de um datagrama),
    container); regra e prova em §6.2.
 7. *Corrigido em 2026-11-07:* adaptação a servidor que fecha toda conexão
    (pipeline 1 depois de 2 conexões fechadas na 1ª resposta); regra em §4.3.
+8. *Corrigido em 2026-11-07 (revisão independente dos injetores):* senha
+   nunca vaza pela URL de conferência, lista NATS analisada elemento a
+   elemento (§10.2); `--run` já presente no PostgreSQL/SQLite = `2` (§10.3);
+   contadores com o sentido do SI e `unexpected`/`unparsable` informativos
+   (§10.1, §3.3); contagem por `seq` em vetor (§10.3); reenvio de `429`
+   passado adiante também na conexão ociosa, e adotado com o
+   `Retry-After`/tentativas que tinha (§4.3); `--pcap-flows` sem passar do
+   teto nem reordenar (§6.8); cópias TCP do `-i any`, fragmento tardio e
+   segmentos segurados (§6.2); `--pcap-dedup on` = regra do ponto de captura
+   e cooked v1 por tipo + endereço (§6.3.1); extrator HTTP do WI de novo
+   (§6.5).
 
 ---
 
@@ -755,8 +828,10 @@ continua estático, decisão 6 revista).
   não analisa o modelo além disso). `--file` e `--pcap` são recusados (exit 2):
   os documentos não trazem os marcadores desta execução.
 - **Execução**: o `--run` padrão é aleatório, então duas execuções não se
-  misturam; reusar um `--run` dentro da janela de §10.3 mistura as duas, e o
-  relatório acusa duplicatas.
+  misturam. Um `--run` reutilizado que já tem registros na janela do
+  PostgreSQL ou do SQLite é recusado ao abrir o destino, antes do envio
+  (`2`, §10.3); no NATS e no Redis a leitura começa depois da última
+  entrada, e o passado não é lido.
 - **Classificação**, para os `seq` produzidos (de 1 ao último que entrou na
   fila, §7):
 
@@ -765,11 +840,11 @@ continua estático, decisão 6 revista).
 | `expected` | desfecho de sucesso (`sent`, `2xx`) | — |
 | `found` | dos `expected`, os achados no destino (distintos) | — |
 | `lost` | `expected` que não estão no destino | **sim** |
-| `duplicated` | `seq` achados mais de uma vez (`extra_copies`: as cópias além da 1ª) | **sim** |
-| `failed_found` | desfecho de falha, mas o servidor guardou (um `no_response` ou `timeout` que ele processou) | não: a falha já está no relatório |
+| `duplicated` | cópias além da primeira, somadas (um `seq` achado 3 vezes conta 2; o `extra_copies` de antes era isso, e `duplicated` contava os `seq`: alinhado ao SI na revisão de 2026-11-07, `extra_copies` saiu) | **sim** |
+| `failed_found` | desfecho de falha, mas o servidor guardou (um `no_response` ou `timeout` que ele processou); também conta em `unexpected` | não: a falha já está no relatório |
 | `failed_missing` | desfecho de falha e ausente | não |
-| `unexpected` | `seq` desta execução que nunca foi produzido (`0`, ou além do último) | **sim** |
-| `unparsable` | JLH desta execução com `fields.seq` que não é inteiro positivo | **sim** |
+| `unexpected` | `seq` distintos desta execução no destino que não são sucesso: os de `failed_found` e os que nunca foram produzidos (além do último) — o sentido do SI | não (informativo, desde 2026-11-07) |
+| `unparsable` | JLH desta execução com `fields.seq` que não é inteiro positivo | não (informativo, desde 2026-11-07) |
 
   O relatório lista as perdidas em até 20 faixas (`lost_seqs`: `"4"`,
   `"10-19"`) e até 10 `seq` repetidos e desconhecidos (`duplicated_sample`,
@@ -798,6 +873,16 @@ Valkey de 2026-11-07: o protocolo é o mesmo); no `postgres://` todos vão ao
 (`--verify-key` recusado). Usuário e senha (ou token NATS) na URL;
 `--verify-tls-ca` dá as CAs de `tls://` e `rediss://`.
 
+**A URL nunca vaza** (revisão de 2026-11-07, igual nos quatro injetores):
+uma lista NATS é separada pela vírgula e **cada** elemento é analisado
+(`url.Parse`, esquema `nats`/`tls`, host) antes de o `nats.go` vê-la — o erro
+de análise dele (`parse "nats://u:sekret@…"`) citava a URL com a senha, e o
+2º elemento de uma lista nunca era analisado aqui; a mensagem diz só qual
+elemento e por quê, nunca o texto do `*url.Error`. As senhas (e tokens NATS)
+de **todos** os elementos são trocadas por `xxxxx` em todo erro de driver
+(antes só as da 1ª URL), e um `*url.Error` vindo de um driver vira texto
+genérico. O `destination` mostra o 1º host e `(+N)` para os demais.
+
 Limites de cada destino, que a conferência mostra mas não contorna:
 
 - **`loghub.inbox` é uma fila**: um consumidor que já removeu linhas faz a
@@ -815,7 +900,13 @@ Limites de cada destino, que a conferência mostra mas não contorna:
 
 - **Antes do primeiro envio** o destino é aberto e conferido (o stream existe,
   a tabela existe, o arquivo abre): falha é exit 4 sem enviar nada — uma URL
-  errada não gasta uma carga.
+  errada não gasta uma carga. No PostgreSQL e no SQLite conta-se também se
+  já há registro com `fields.run` = `--run` na janela (`EXISTS`): havendo,
+  **exit 2** ("`--run` já presente no destino; use outro") e nada é enviado
+  (decisão do integrador na revisão de 2026-11-07: antes a execução atual
+  podia perder tudo e passar, porque os registros da anterior eram achados).
+  Só nessa primeira checagem: uma reconexão durante a espera acha os da
+  própria execução.
 - **Ponto de partida**: NATS e Redis/Valkey são lidos **depois da última
   entrada do stream no momento da checagem** (a sequência do JetStream, o ID
   do `XREVRANGE … COUNT 1`): tudo da execução vem depois, sem relógio
@@ -835,7 +926,15 @@ Limites de cada destino, que a conferência mostra mas não contorna:
   (padrão 30 s, contado do fim do envio): aí `complete` é `false` e o que
   falta é `lost`.
 - Uma leitura que falha é tentada de novo na próxima volta; sem nenhuma
-  leitura boa até o prazo, exit 4 com o erro.
+  leitura boa até o prazo, exit 4 com o erro (igual nos quatro injetores
+  desde a revisão de 2026-11-07). Um destino em que nada aparece (o stream
+  Redis que nunca nasce, a tabela vazia) não é erro: os `expected` são
+  `lost`, exit 1.
+- **Memória** (item 10 da revisão de 2026-11-07): as cópias de cada `seq`
+  produzido num vetor de 1 byte por `seq` (saturando em 255; as cópias além
+  da primeira somadas à parte), e só os `seq` nunca produzidos num mapa.
+  Antes um `map[uint64]uint32` refeito a cada leitura cheia (~40 bytes por
+  `seq`).
 - Interrompido (SIGINT) durante a espera: o relatório sai com o que foi
   contado, `complete: false`, exit 130.
 
@@ -845,7 +944,10 @@ O objeto `verify` do JSON (e a seção `verify:` do texto), com os nomes do
 `go-syslog-injector` onde existem: `destination` (**só esquema e host** da URL,
 nunca usuário, senha, caminho ou parâmetros, mais o stream ou a tabela; ou o
 arquivo), `run`, `reads`, `waited` (segundos, do fim do envio), `complete`,
-`expected`, `found`, `lost`, `duplicated`, `unexpected`, `lost_seqs`, os
-demais contadores de §10.1, as amostras e `error` (a última falha de leitura).
+`expected`, `found`, `lost`, `duplicated`, `unexpected`, `lost_seqs` — com
+os sentidos do SI —, os próprios deste injetor (`failed_found`,
+`failed_missing`, `unparsable`, `reads`, `run`), as amostras e `error` (a
+última falha de leitura). `extra_copies` saiu na revisão de 2026-11-07: era o
+que `duplicated` passou a ser.
 Nenhuma mensagem ecoa a URL: o texto de erro dos drivers passa por uma troca
 da senha por `xxxxx` antes de sair.

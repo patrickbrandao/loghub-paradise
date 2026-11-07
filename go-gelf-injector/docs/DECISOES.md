@@ -19,13 +19,13 @@ injeção de syslog e relp devem existir em versão semelhante para GELF."
 | 1 | Empacotamento | Um módulo por família: este é o injetor da família GELF (`go-gelf-server`, `go-gelf-pg-server`, `go-gelf-nats-server`). Código copiado de SI e WI, nada importado |
 | 2 | Alcance | Funcional + carga: N mensagens ou por duração, taxa alvo, concorrência; relatório com desfechos, vazão e latência p50/p90/p99 |
 | 3 | Conteúdo | Gerador com `_seq`, modelo com marcadores, arquivo ou stdin, **replay de captura do tcpdump** (pcap/pcapng) |
-| 4 | Conferência no destino | **Revista pelo usuário em 2026-11-07**: é objetivo. `--verify-url` (`nats://`, `tls://`, `postgres://`, `postgresql://`, `redis://`, `rediss://`, `valkey://`, `valkeys://`) ou `--verify-sqlite`, mais `--verify-timeout`: depois do envio, conta perdidos e duplicados pelos `_seq` da execução, no relatório e no código de saída (4 e 5). Com as bibliotecas e versões dos servidores. SPEC §10 (antes: "não na v1, o relatório vem do transporte") |
+| 4 | Conferência no destino | **Revista pelo usuário em 2026-11-07**: é objetivo. `--verify-url` (`nats://`, `tls://`, `postgres://`, `postgresql://`, `redis://`, `rediss://`, `valkey://`, `valkeys://`) ou `--verify-sqlite`, mais `--verify-timeout`: depois do envio, conta perdidos e duplicados pelos `_seq` da execução, no relatório e no código de saída (`1` perda ou duplicata, `4` conferência impossível; o "4 e 5" de antes estava errado: não existe `5`, corrigido na revisão de 2026-11-07; `--run` já presente no destino PostgreSQL/SQLite é `2`). Com as bibliotecas e versões dos servidores. SPEC §10 (antes: "não na v1, o relatório vem do transporte") |
 
 ## 2. Padrões herdados (contestáveis)
 
 | # | Tema | Decisão em GI | Por quê |
 |---|---|---|---|
-| 5 | Interface | Só flags, relatório no stdout, progresso no stderr, saída 0/1/2/3/130 | ferramenta de linha de comando para scripts e CI |
+| 5 | Interface | Só flags, relatório no stdout, progresso no stderr, saída 0/1/2/3/4/130 | ferramenta de linha de comando para scripts e CI |
 | 6 | Dependências | Fora da stdlib, **só** as da conferência no destino (`nats.go`, `pgx/v5`, `rueidis`, `modernc.org/sqlite`, nas versões do `go-gelf-server/go.mod`), só em `internal/verify`; binário estático `CGO_ENABLED=0` (revista em 2026-11-07; antes: nenhuma) | o leitor de pcap, o gzip/zlib e o cliente HTTP da stdlib bastam para enviar; ler o destino exige o cliente de cada um, e o mesmo do servidor lê exatamente o que ele grava |
 | 7 | Alvo padrão | `tcp` em `127.0.0.1:12201`; por transporte: udp `12201`, tls `12203`, http `12202` (`/gelf`), https `12204` | as portas dos servidores GELF (DESIGN decisão 5) |
 | 8 | Transporte padrão | `tcp` | mostra erro de conexão (o UDP falha em silêncio) |

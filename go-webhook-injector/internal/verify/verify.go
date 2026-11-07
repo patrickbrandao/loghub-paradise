@@ -8,9 +8,9 @@ package verify
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -36,6 +36,9 @@ type Config struct {
 	// older are not read. NATS and Redis start after the stream's last
 	// entry at Open instead (SPEC §8.6.3).
 	Since time.Time
+	// TLSRoots, when set, are the CAs that verify a tls:// or
+	// rediss://-valkeys:// destination (--verify-tls-ca, SPEC §8.6.1).
+	TLSRoots *x509.CertPool
 }
 
 // readBound bounds one read of the destination.
@@ -46,25 +49,19 @@ const finalRead = time.Second
 
 // Margin is how far before the start of the run the PostgreSQL and SQLite
 // window opens (clock skew between the injector and the server, SPEC
-// §8.6.3).
-const Margin = time.Minute
+// §8.6.3). 10 min in the four injectors (review of 2026-11-07: WI had 1 min,
+// SI 5 min; the UUIDv7 comes from the server's clock, another machine's).
+const Margin = 10 * time.Minute
 
-// Kind of a destination, from the URL scheme.
+// Kind of a destination, from the URL scheme. The whole URL (every element
+// of a NATS list) is parsed here, so a malformed one is a usage error (exit
+// 2) whose text never quotes it (SPEC §3.2).
 func Kind(rawURL string) (string, error) {
-	scheme, _, ok := strings.Cut(rawURL, "://")
-	if !ok {
-		return "", errors.New("--verify-url: want scheme://...")
+	t, err := parseTarget(rawURL)
+	if err != nil {
+		return "", err
 	}
-	switch scheme {
-	case "nats", "tls":
-		return "nats", nil
-	case "postgres", "postgresql":
-		return "postgres", nil
-	case "redis", "rediss", "valkey", "valkeys":
-		return "redis", nil
-	}
-	// The scheme is not a secret; the rest of the URL may be.
-	return "", fmt.Errorf("--verify-url: scheme %q is none of nats, tls, postgres, postgresql, redis, rediss, valkey, valkeys", scheme)
+	return t.kind, nil
 }
 
 var identRE = regexp.MustCompile(`^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$`)
@@ -97,6 +94,7 @@ type Verifier struct {
 	r    reader
 	dest string
 	run  string
+	t    *target // nil for SQLite
 
 	mu       sync.Mutex
 	accepted map[string]uint64 // uuid -> seq of a 2xx
@@ -131,15 +129,16 @@ func Open(ctx context.Context, cfg Config, run string) (*Verifier, error) {
 		v.r, err = openSQLite(ctx, cfg.SQLite, cfg.Table, since)
 		return v, err
 	}
-	kind, err := Kind(cfg.URL)
+	t, err := parseTarget(cfg.URL)
 	if err != nil {
 		return nil, err
 	}
+	v.t = t
 	v.dest = describe(cfg.URL)
-	switch kind {
+	switch t.kind {
 	case "nats":
 		var r *natsReader
-		r, err = openNATS(ctx, cfg.URL, cfg.Stream, cfg.Timeout)
+		r, err = openNATS(ctx, t, cfg.Stream, cfg.Timeout, cfg.TLSRoots)
 		if err == nil {
 			v.dest += " stream " + r.stream
 			v.r = r
@@ -149,14 +148,14 @@ func Open(ctx context.Context, cfg Config, run string) (*Verifier, error) {
 			cfg.Table = "loghub.inbox"
 		}
 		v.dest += " table " + cfg.Table
-		v.r, err = openPG(ctx, cfg.URL, cfg.Table, since)
+		v.r, err = openPG(ctx, t, cfg.Table, since)
 	case "redis":
 		if cfg.Stream != "" {
 			v.dest += " stream " + cfg.Stream
 		} else {
 			v.dest += " streams " + redisPattern
 		}
-		v.r, err = openRedis(ctx, cfg.URL, cfg.Stream)
+		v.r, err = openRedis(ctx, t, cfg.Stream, cfg.TLSRoots)
 	}
 	if err != nil {
 		return nil, err
@@ -195,13 +194,15 @@ func (v *Verifier) Accept(seq uint64, status int, uuid string) {
 type Result = report.Verify
 
 // Check reads the destination until every accepted request is found or the
-// timeout passes, and counts.
+// timeout passes, and counts. A read that fails is tried again at the next
+// round, up to the timeout (SPEC §8.6.4, the same in the four injectors):
+// the error stays in the result only when the last read failed.
 func (v *Verifier) Check(ctx context.Context, timeout time.Duration) Result {
 	start := time.Now()
 	deadline := start.Add(timeout)
 	wait := 250 * time.Millisecond
 	var rerr error
-	complete := false
+	complete, settled := false, false
 	for {
 		// A read of a large window may take a while: it has its own bound,
 		// not what is left of the wait, so a slow last read still
@@ -209,50 +210,60 @@ func (v *Verifier) Check(ctx context.Context, timeout time.Duration) Result {
 		rctx, cancel := context.WithTimeout(ctx, max(timeout, readBound))
 		rerr = v.r.read(rctx, v.add)
 		cancel()
-		if rerr != nil {
-			break
-		}
-		if res := v.result(); res.Lost == 0 && res.Unverifiable == 0 {
-			complete = true
-			// One more read a moment later: a copy written after the last
-			// accepted one (a duplicate of the run) would be missed by
-			// stopping at the first complete read (found by SI against
-			// PostgreSQL).
-			t := time.NewTimer(finalRead)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				rerr = ctx.Err()
-			case <-t.C:
-				rctx, cancel := context.WithTimeout(ctx, max(timeout, readBound))
-				rerr = v.r.read(rctx, v.add)
-				cancel()
+		pause := min(wait, 2*time.Second)
+		if rerr == nil {
+			if res := v.result(); res.Lost == 0 && res.Unverifiable == 0 {
+				if settled {
+					complete = true
+					break
+				}
+				// One more read a moment later: a copy written after the
+				// last accepted one (a duplicate of the run) would be
+				// missed by stopping at the first complete read (found by
+				// SI against PostgreSQL). It is made even past the
+				// timeout: the count is already whole.
+				settled, pause = true, finalRead
 			}
-			break
 		}
 		left := time.Until(deadline)
-		if left <= 0 {
+		if left <= 0 && !(settled && rerr == nil) {
 			break
 		}
-		t := time.NewTimer(min(wait, left))
+		if !settled || rerr != nil {
+			pause = min(pause, max(left, 0))
+		}
+		if pause <= 0 {
+			break
+		}
+		t := time.NewTimer(pause)
 		select {
 		case <-ctx.Done():
 			t.Stop()
 			rerr = ctx.Err()
 		case <-t.C:
 		}
-		if rerr != nil {
+		if ctx.Err() != nil {
 			break
 		}
-		wait = min(2*wait, 2*time.Second)
+		if !settled {
+			wait = min(2*wait, 2*time.Second)
+		}
 	}
 	res := v.result()
 	res.Waited = time.Since(start).Seconds()
 	res.Complete = complete && rerr == nil
 	if rerr != nil {
-		res.Error = rerr.Error()
+		res.Error = v.scrub(rerr.Error())
 	}
 	return res
+}
+
+// scrub removes the passwords of the URL from an error text.
+func (v *Verifier) scrub(s string) string {
+	if v.t == nil {
+		return s
+	}
+	return v.t.scrub(s)
 }
 
 // Close releases the destination.
