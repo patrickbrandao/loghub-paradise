@@ -3,7 +3,6 @@ package verify
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/redis/rueidis"
 )
@@ -16,7 +15,6 @@ type redisReader struct {
 	c      rueidis.Client
 	stream string
 	start  string // next XRANGE start: after the last entry at Open, then after the last read
-	seen   bool   // the stream existed at some poll
 }
 
 func openRedis(ctx context.Context, t *Target) (reader, error) {
@@ -29,9 +27,12 @@ func openRedis(ctx context.Context, t *Target) (reader, error) {
 	// this does not need, and dropping it drops the RESP3 requirement.
 	opt.DisableCache = true
 	opt.ClientName = "go-syslog-injector-verify"
+	if t.TLSRoots != nil && opt.TLSConfig != nil {
+		opt.TLSConfig.RootCAs = t.TLSRoots // --verify-tls-ca (SPEC §8.5)
+	}
 	c, err := rueidis.NewClient(opt)
 	if err != nil {
-		return nil, fmt.Errorf("redis: connect: %w", err)
+		return nil, t.clean("redis: connect", err)
 	}
 	stream := t.Key
 	if stream == "" {
@@ -40,29 +41,31 @@ func openRedis(ctx context.Context, t *Target) (reader, error) {
 	r := &redisReader{t: t, c: c, stream: stream, start: "-"}
 	if err := c.Do(ctx, c.B().Ping().Build()).Error(); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("redis: ping: %w", err)
+		return nil, t.clean("redis: ping", err)
 	}
 	// As with NATS: the run's entries come after the stream's last one now,
 	// before the first send (SPEC §8.5); a stream not born yet is read whole.
 	last, err := c.Do(ctx, c.B().Xrevrange().Key(stream).End("+").Start("-").Count(1).Build()).AsXRange()
 	if err != nil && !rueidis.IsRedisNil(err) {
 		c.Close()
-		return nil, fmt.Errorf("redis: XREVRANGE %s: %w", stream, err)
+		return nil, t.clean("redis: XREVRANGE "+stream, err)
 	}
 	if len(last) == 1 {
-		r.start, r.seen = "("+last[0].ID, true
+		r.start = "(" + last[0].ID
 	}
 	return r, nil
 }
+
+// A stream that never appears is every message lost (exit 1), as in the four
+// injectors (SPEC §8.5): the server's XADD creates it, so a sink that wrote
+// nothing lost everything. Until 2026-11-07 it was exit 4 here.
+func (r *redisReader) full() bool { return false }
 
 func (r *redisReader) poll(ctx context.Context, cnt *Counter) error {
 	for {
 		entries, err := r.c.Do(ctx, r.c.B().Xrange().Key(r.stream).Start(r.start).End("+").Count(1000).Build()).AsXRange()
 		if err != nil {
-			return fmt.Errorf("redis: XRANGE %s: %w", r.stream, err)
-		}
-		if len(entries) > 0 {
-			r.seen = true
+			return r.t.clean("redis: XRANGE "+r.stream, err)
 		}
 		for _, e := range entries {
 			if v, ok := e.FieldValues["e"]; ok {
@@ -71,24 +74,9 @@ func (r *redisReader) poll(ctx context.Context, cnt *Counter) error {
 			r.start = "(" + e.ID
 		}
 		if len(entries) < 1000 {
-			if !r.seen {
-				n, err := r.c.Do(ctx, r.c.B().Exists().Key(r.stream).Build()).AsInt64()
-				if err == nil && n > 0 {
-					r.seen = true
-				}
-			}
 			return nil
 		}
 	}
-}
-
-// final: a stream that never existed means the sink writes elsewhere -- the
-// check cannot say anything (code 4), rather than "all lost".
-func (r *redisReader) final() error {
-	if !r.seen {
-		return fmt.Errorf("redis: stream %s does not exist (sink.redis.stream elsewhere? give --verify-key)", r.stream)
-	}
-	return nil
 }
 
 func (r *redisReader) close() { r.c.Close() }

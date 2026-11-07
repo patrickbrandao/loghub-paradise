@@ -157,6 +157,7 @@ go-syslog-injector [flags]
 | `--verify-timeout` | `30s` | quanto esperar pelas mensagens no destino |
 | `--verify-space` | `default` | o `space` do servidor (subject, stream e filtro) |
 | `--verify-key` | por destino | stream JetStream, stream Redis, tabela PostgreSQL ou tabela SQLite a ler (§8.5) |
+| `--verify-tls-ca` | — | CAs (PEM) que verificam o destino em `tls://`, `rediss://` e `valkeys://` (padrão: as do sistema; §8.5) |
 | `--report` | `text` | relatório final no stdout: `text` ou `json` |
 | `--progress` | `auto` | linha de progresso no stderr a cada intervalo; `0` desliga; `auto` = 1 s num terminal |
 | `--version` | | imprime a versão e sai |
@@ -171,13 +172,19 @@ não altera o que foi capturado); `--loop` sem `--file`/`--pcap`, ou com stdin;
 `--pcap-timing original` sem `--pcap` ou com `--rate`; `--framing lf` com TLS;
 `--proxy-protocol` fora de TCP/TLS; `--tls-*` sem `--transport tls`;
 `--transport unix` sem caminho; marcador desconhecido; captura que não é pcap
-nem pcapng; `--pcap-flows` ou `--pcap-dedup` sem `--pcap`; `--verify-url` com
+nem pcapng; `--pcap-flows` ou `--pcap-dedup` sem `--pcap`; `--proxy-src`/`--proxy-dst`
+com `--pcap-flows` (§6.8); `--verify-url` com
 `--verify-sqlite`; esquema de `--verify-url` desconhecido (a mensagem não
-repete a URL, que pode ter senha); `--verify-*` com `--file`/`--pcap`, ou com
+repete a URL, que pode ter senha), ou um elemento da lista NATS que não é uma
+URL (a mensagem é genérica, §8.5); `--verify-tls-ca` sem um esquema TLS
+(`tls://`, `rediss://`, `valkeys://`) ou arquivo sem certificado PEM;
+`--verify-*` com `--file`/`--pcap`, ou com
 `--template` sem `seq={seq}` e `run={run}`; `--run` fora de `[A-Za-z0-9._:-]`
 com `--verify-*` (o marcador é procurado como texto, também dentro do JLH
 escapado); `--verify-key` que não é um nome; `--verify-timeout` ≤ 0. Todas são
-conferidas **antes** do primeiro envio.
+conferidas **antes** do primeiro envio. Também é código 2, conferido na
+abertura do destino e ainda antes do envio, um `--run` que **já está** no
+PostgreSQL ou no SQLite (§8.5).
 
 ### 3.3 Códigos de saída
 
@@ -185,9 +192,9 @@ conferidas **antes** do primeiro envio.
 |---|---|
 | `0` | toda mensagem teve desfecho de sucesso (e, com `--verify-*`, chegou ao destino uma vez) |
 | `1` | ao menos uma falhou, a fonte deu erro no meio da execução, ou a conferência achou perdidas ou duplicadas |
-| `2` | uso: flag inválida, combinação recusada, arquivo que não abre |
+| `2` | uso: flag inválida, combinação recusada, arquivo que não abre; `--run` já presente no destino PostgreSQL/SQLite (§8.5) |
 | `3` | alvo inalcançável: houve mensagens e **nenhuma** conexão abriu |
-| `4` | a conferência não pôde ser feita: destino inalcançável, stream/tabela inexistente, erro de leitura (§8.5) |
+| `4` | a conferência não pôde ser feita: destino inalcançável, stream JetStream ou tabela inexistente, a última leitura falhou (§8.5) |
 | `130` | interrompido (SIGINT/SIGTERM); a conferência não roda |
 
 A precedência é a da tabela de baixo para cima: `130`, `3`, `4`, `1`. Um `4`
@@ -363,15 +370,36 @@ fragmentos dele já guardados saem, e os que chegarem depois (dentro de
 cada fragmento conta em `pcap_ip_fragments_lost`, e o datagrama, **uma vez**,
 em `pcap_ip_datagrams_snaplen`. Antes, só o fragmento cortado era contado; os
 outros ficavam abertos até vencer, e o datagrama perdido não aparecia em
-contador nenhum. Não se sabe se ele era syslog (a porta pode estar só no
-primeiro fragmento, o cortado), por isso não entra em `frames_lost`. A saída é
-capturar com `-s 0`.
+contador nenhum. Um datagrama condenado que é **UDP** (o protocolo está em todo
+fragmento) conta também em `frames_lost`, como um datagrama inteiro cortado
+(alinhamento 8(c) de 2026-11-07, a regra do `go-relplog-injector`; até então o
+SI não o contava ali, porque não se sabe se ele era syslog — a porta pode
+estar só no primeiro fragmento, o cortado —, e os quatro injetores contavam
+diferente). A saída é capturar com `-s 0`.
+
+**Cópia tardia de um fragmento** (regra de 2026-11-07, achado 9 da revisão dos
+injetores): no `-i any` sem NAT as cópias de um fragmento têm a mesma chave de
+remontagem, e intercaladas (`f1` na veth, `f1` na eth0, `f2` na veth — que
+completa o datagrama —, `f2` na eth0) a última abria um datagrama órfão que
+vencia em 30 s e contava em `pcap_ip_fragments_lost`, sem nada perdido. O
+datagrama completado é lembrado por **50 ms** de captura (a janela das cópias,
+§6.9), com o deslocamento e o tamanho de cada fragmento: um fragmento dessa
+chave igual a um deles, nesse prazo, é cópia e é ignorado (como o fragmento
+repetido de um datagrama aberto); qualquer outro abre um datagrama novo. Os
+50 ms bastam para as cópias (microssegundos uma da outra) e não confundem a
+reutilização do IP ID, que leva 65 536 datagramas do mesmo par.
 
 ### 6.4 Remontagem TCP
 
 Um fluxo de bytes por **direção** de conexão, em ordem de sequência (com a
 volta de 2³²), sem os bytes retransmitidos (contados), com os segmentos fora de
-ordem segurados até 4 MiB por direção. Um buraco que não se fecha — perda na
+ordem segurados até 4 MiB por direção — contando, desde 2026-11-07, também um
+custo fixo de 64 bytes por segmento segurado, para que os segmentos sem bytes
+capturados (o snaplen cortou o payload inteiro) não se acumulem sem teto; os
+segmentos segurados ficam num heap mínimo por sequência (só o menor importa),
+e a fila não é mais reordenada a cada segmento retirado (era O(n² log n) num
+buraco com muitos segmentos atrás; achado 10 da revisão,
+`internal/pcap/tcp.go`, igual nos quatro injetores). Um buraco que não se fecha — perda na
 captura — é entregue ao extrator como **lacuna** (`tcp_gaps`, `tcp_gap_bytes`),
 que descarta o quadro atingido e ressincroniza. O snaplen que corta um segmento
 vira lacuna do tamanho que falta. FIN/RST encerram a direção; um SYN novo na
@@ -500,9 +528,12 @@ como eram:
   ociosa, fim da captura): as mensagens dele saem na ordem de captura, numa
   conexão só.
 - Com `--proxy-protocol`, o cabeçalho de cada conexão anuncia a **origem e o
-  destino capturados** do fluxo, no lugar do par real; `--proxy-src` e
-  `--proxy-dst`, se dados, ainda valem para todos. É o que faz o servidor gravar
-  `host.src-ip`/`src-port` do emissor original (e o `sid` de cada um).
+  destino capturados** do fluxo, no lugar do par real. É o que faz o servidor
+  gravar `host.src-ip`/`src-port` do emissor original (e o `sid` de cada um).
+  `--proxy-src`/`--proxy-dst` com `--pcap-flows` é **recusado** (exit 2;
+  alinhamento 8(a) de 2026-11-07, a regra do `go-gelf-injector`, igual nos
+  quatro): até então eles valiam para todos os fluxos e desfaziam o que a flag
+  existe para fazer.
 - Os fluxos são repartidos entre os `--concurrency` workers por hash do fluxo,
   então a ordem dentro de um fluxo se mantém e fluxos diferentes andam em
   paralelo. O ritmo (`--rate`, `--pcap-timing`) é o mesmo de sempre: global.
@@ -655,11 +686,22 @@ mesmo texto dentro do JLH escapado, onde os destinos o procuram.
 | `expected` | mensagens com desfecho de sucesso |
 | `found` | esperadas achadas no destino |
 | `lost` | esperadas que não estão lá (`expected − found`) |
-| `duplicated` | cópias além da primeira, somadas sobre todas as `seq` achadas |
-| `unexpected` | `seq` da execução achadas que não eram esperadas: um desfecho de falha que chegou mesmo assim (normal num `write_error` do TCP, cujo buffer pode ter sido entregue) ou uma `seq` nunca produzida |
+| `duplicated` | cópias além da primeira, somadas sobre todas as `seq` achadas (uma `seq` gravada três vezes conta 2) |
+| `unexpected` | **registros** da execução cuja `seq` não é um sucesso: um desfecho de falha que chegou mesmo assim (normal num `write_error` do TCP, cujo buffer pode ter sido entregue) ou uma `seq` nunca produzida. Informativo: **não** muda o código de saída |
 | `lost_seqs` | as primeiras 20 faixas perdidas (`"7-9,15"`) |
 | `waited_sec`, `complete` | quanto esperou; se achou todas as esperadas |
 | `error` | por que a conferência não terminou (código 4) |
+
+Estes nomes e significados são os dos quatro injetores (decisão do integrador
+de 2026-11-07, achado 6 da revisão): o RI, o WI e o GI os seguem, e campos
+próprios de cada um ficam documentados na SPEC dele. Até 2026-11-07 o
+`unexpected` do SI contava `seq` distintas, não registros: uma `seq` de falha
+gravada duas vezes contava 1 (agora 2, e 1 em `duplicated`).
+
+A conta guarda as cópias de cada `seq` num vetor indexado pela `seq` (2 bytes
+cada, saturando em 65 535), do tamanho da maior `seq` de sucesso; uma `seq`
+acima dele conta só em `unexpected`. Até 2026-11-07 era um mapa refeito a
+cada leitura inteira do PostgreSQL ou do SQLite (achado 10).
 
 Todos os destinos deduplicam pelo `uuid` (o Redis stream, não), então uma
 duplicata aqui é o **servidor** recebendo a mensagem duas vezes — uma
@@ -676,8 +718,24 @@ vai poder ser conferida não deveria ter rodado.
 mesma rajada chega logo depois da primeira; na prova contra servidores reais,
 sem essa leitura a segunda execução com o mesmo `--run` completava com as
 linhas da primeira e não via as cópias); uma duplicata que chegue depois disso
-não é vista. `lost > 0` ou `duplicated > 0` → código 1; erro → código 4
-(§3.3). Interrompido (130), ou alvo inalcançável (3), não confere.
+não é vista (`TestWaitExtraRead` falha sem essa leitura). `lost > 0` ou
+`duplicated > 0` → código 1 (`unexpected` não); a última leitura com erro →
+código 4 (§3.3). Interrompido (130), ou alvo inalcançável (3), não confere.
+
+**Erro de leitura** (alinhamento de 2026-11-07, achado 8): é **repetido** até o
+prazo, como no RI e no GI — até então o SI encerrava a espera no primeiro
+erro. Uma leitura inteira (PostgreSQL, SQLite) é contada num contador novo e só
+substitui a conta anterior se terminar: uma leitura cortada no meio não vira
+"perdidas". Se a **última** leitura antes do prazo falhou, a conta não é a do
+destino: `error` sai preenchido e o código é 4, com o que foi contado até ali.
+
+**`--run` já presente** (decisão do integrador de 2026-11-07, achado 4): o
+PostgreSQL e o SQLite são lidos por uma janela de tempo, e uma execução que
+repete um `--run` de outra dos últimos minutos achava as linhas dela e passava
+mesmo perdendo tudo. Na abertura (antes do envio), o injetor faz a leitura da
+conferência uma vez; se já houver qualquer linha da execução, recusa com
+**código 2** ("`--run` já presente no destino; use outro") e nada é enviado.
+NATS e Redis/Valkey não precisam: são lidos depois da última entrada (abaixo).
 
 **Ponto de partida** (regra de 2026-11-07, portada do `go-gelf-injector`):
 NATS e Redis/Valkey são lidos **depois da última entrada que o stream tinha na
@@ -690,30 +748,48 @@ achou ~250 000 mensagens numa janela de 10 min, e a leitura passava do
 `--verify-timeout`). Limite: um stream NATS apagado e recriado no meio do envio
 recomeça as sequências, e o que for gravado nele abaixo da anotada não é lido
 (conta como perdido). PostgreSQL e SQLite não têm essa ordem: lidos a partir
-de **5 min antes do início** da execução, pelo relógio do destino (folga de
+de **10 min antes do início** da execução, pelo relógio do destino (folga de
 relógio entre as máquinas; um destino atrasado mais que isso perde mensagens
-da leitura e as conta como perdidas).
+da leitura e as conta como perdidas). Até 2026-11-07 a folga era de 5 min; os
+quatro injetores usam 10 (achado 8).
 
 **Destinos**:
 
-- **NATS** (`nats://`, `tls://`; a URL inteira vai ao `nats.go`, como o
-  `sink.nats.urls` do servidor, lista com vírgula). JetStream: o stream é
-  `--verify-key` ou o que tem o subject `loghub.<space>.syslog`
-  (`subjects=exact`) ou `loghub.<space>.syslog.>` (`facility-severity`),
-  achado pelo próprio servidor NATS. Um consumidor **ordenado** (efêmero: não
-  deixa nada no servidor) lê desse subject a partir da hora acima, de forma
+- **NATS** (`nats://`, `tls://`; uma lista com vírgula, como o
+  `sink.nats.urls` do servidor). Cada elemento da lista é conferido com
+  `url.Parse` **antes** de chegar ao `nats.go`, e um que não analisa é erro de
+  uso com mensagem genérica: o `nats.go` repetia o elemento no erro (`parse
+  "nats://u:sekret@…"`), com a senha (achado 3; o 2º elemento de uma lista
+  vazava também). Nenhum texto de `*url.Error` é repassado, e o usuário, a
+  senha e o token de cada elemento são apagados de qualquer erro do cliente.
+  JetStream: o stream é `--verify-key` ou o que tem o subject
+  `loghub.<space>.syslog` (`subjects=exact`) ou `loghub.<space>.syslog.>`
+  (`facility-severity`), achado pelo próprio servidor NATS. O filtro do
+  consumidor é **sempre** os dois subjects, `loghub.<space>.syslog` e
+  `loghub.<space>.syslog.>`, como no RI: a busca só acha o stream. Até
+  2026-11-07 o filtro era o subject que achou o stream, e um stream que cobre
+  os dois (o `LOGHUB_SYSLOG` do servidor, `loghub.*.syslog` e
+  `loghub.*.syslog.>`) com `subjects=facility-severity` era achado pelo
+  primeiro e filtrado nele: tudo perdido (achado 1, reproduzido). Um
+  consumidor **ordenado** (efêmero: não deixa nada no servidor) lê desse filtro, de forma
   incremental (com `Fetch`: o `FetchNoWait` do `nats.go` recomeça o consumidor
   ordenado do início a cada chamada, e a primeira prova contou cada mensagem
   dezenas de vezes; a sequência do stream já contada também é pulada) a partir
   do ponto de partida acima; o
-  `Data` de cada mensagem é o JLH. `sink.nats.mode=core` não tem stream:
-  código 4.
+  `Data` de cada mensagem é o JLH. Uma leitura termina quando o lote vem
+  vazio, quando a mensagem lida diz `NumPending = 0` (alcançou o fim do
+  filtro), ou depois de 2 s lendo: num stream com tráfego alheio constante no
+  mesmo subject (outra carga, outro injetor) o lote nunca vinha vazio, a
+  leitura não voltava, e a espera acabava em código 4 (achado 2, reproduzido).
+  `sink.nats.mode=core` não tem stream: código 4.
 - **Redis e Valkey** (`redis://`, `rediss://`; `valkey://` = `redis://`,
   `valkeys://` = `rediss://`; usuário, senha e banco pela URL, como o
   `rueidis.ParseURL` lê). O stream é `--verify-key` ou `loghub.<space>.syslog`
   (o padrão do `sink.redis.stream`); `XRANGE` desde o ponto de partida acima em
   páginas de 1000, incremental pelo último ID; o JLH está no campo `e` (SPEC do servidor
-  §3.6). Stream inexistente é código 4 (o sink grava em outro lugar).
+  §3.6). Um stream que nunca aparece é **tudo perdido**, código 1 (alinhamento
+  de 2026-11-07, achado 8, igual nos quatro: o `XADD` do servidor o cria, e um
+  sink que não gravou nada perdeu tudo; até então era código 4).
 - **PostgreSQL** (`postgres://`, `postgresql://`, pelo `pgx`). A tabela é
   `--verify-key` ou `loghub.inbox`; `SELECT payload->>'message',
   payload->>'raw'` das linhas `type='syslog'` do `space`, com `event_at` desde a
@@ -730,6 +806,12 @@ da leitura e as conta como perdidas).
 `[esquema.]tabela`, citado como identificador). A URL **nunca** aparece no
 relatório nem num erro (pode ter senha): `info.verify` mostra só esquema e
 host. Para outro `space` que não `default`, `--verify-space`.
+
+**CA privada** (`--verify-tls-ca`, portado do GI em 2026-11-07, achado 7): o
+arquivo PEM dá as CAs que verificam o destino em `tls://` (NATS) e `rediss://`
+/`valkeys://`; sem ele, as do sistema. No PostgreSQL, a CA vai na própria URL
+(`sslrootcert=`, lida pelo `pgx`), e a flag é recusada; idem com
+`--verify-sqlite` ou com um esquema sem TLS.
 
 ---
 
@@ -752,3 +834,12 @@ host. Para outro `space` que não `default`, `--verify-space`.
    último quadro de direção fechada lido como no EOF do servidor (§6.4, §6.6,
    do GI); ressincronização sem candidato linear (§6.6, do RI); NATS e
    Redis/Valkey conferidos depois da última entrada na checagem (§8.5, do GI).
+7. *Corrigido em 2026-11-07 (revisão independente dos injetores):* filtro NATS
+   nos dois subjects, leitura NATS que termina sob tráfego alheio, senha fora
+   dos erros de URL e de lista, `--run` já presente recusado, folga de 10 min,
+   erro de leitura repetido até o prazo, stream Redis que nunca aparece = tudo
+   perdido, `unexpected` em registros, contagem por vetor, `--verify-tls-ca`
+   (§3.2, §3.3, §8.5); `--proxy-src`/`--proxy-dst` recusados com
+   `--pcap-flows` (§6.8); UDP condenado pelo snaplen em `frames_lost`, cópia
+   tardia de fragmento ignorada (§6.3); fila de segmentos TCP ordenada na
+   inserção e com teto que conta todo segmento (§6.4).

@@ -220,6 +220,14 @@ func TestPcapFlowsProxy(t *testing.T) {
 		t.Fatalf("without --pcap-flows: exit %d opened %d", code, sum.Conns.Opened)
 	}
 	_ = fs2
+
+	// One override for every flow would undo --pcap-flows (alignment 8(a)
+	// of 2026-11-07): refused.
+	for _, f := range []string{"--proxy-src", "--proxy-dst"} {
+		if code, _, errs := runMain(t, "--target", addr2, "--pcap", file, "--pcap-flows", "--proxy-protocol", "v1", f, "10.9.9.9:1"); code != ExitUsage || !strings.Contains(errs, "--pcap-flows") {
+			t.Fatalf("%s with --pcap-flows: exit %d %s", f, code, errs)
+		}
+	}
 }
 
 // eventsDB creates a syslog_events table as sink=sqlite does (the columns
@@ -252,18 +260,21 @@ func eventsDB(t *testing.T) (string, func(space, run string, seq int)) {
 // duplicated is 1; everything once is 0, without waiting the timeout.
 func TestVerifySQLite(t *testing.T) {
 	path, insert := eventsDB(t)
-	for seq := 1; seq <= 10; seq++ {
-		if seq != 4 {
-			insert("default", "vr1", seq)
+	addr, srv := streamServer(t, false, false, nil)
+	// The rows land once the run is sending: rows of the run already there
+	// at the opening are a reused --run (exit 2, TestVerifyRunPresent).
+	afterOpen(t, srv, func() {
+		for seq := 1; seq <= 10; seq++ {
+			if seq != 4 {
+				insert("default", "vr1", seq)
+			}
 		}
-	}
-	insert("default", "vr1", 7)   // a duplicate: another uuid
-	insert("default", "other", 4) // another run
-	insert("elsewhere", "vr1", 4) // another space
-	insert("default", "vr1", 99)  // a seq that was never sent
-
-	addr, _ := streamServer(t, false, false, nil)
-	code, sum := runJSON(t, "--target", addr, "--count", "10", "--run", "vr1", "--verify-sqlite", path, "--verify-timeout", "600ms")
+		insert("default", "vr1", 7)   // a duplicate: another uuid
+		insert("default", "other", 4) // another run
+		insert("elsewhere", "vr1", 4) // another space
+		insert("default", "vr1", 99)  // a seq that was never sent
+	})
+	code, sum := runJSON(t, "--target", addr, "--count", "10", "--run", "vr1", "--verify-sqlite", path, "--verify-timeout", "1500ms")
 	v := sum.Verify
 	if code != ExitFailures || v == nil {
 		t.Fatalf("exit %d verify %+v", code, v)
@@ -271,14 +282,17 @@ func TestVerifySQLite(t *testing.T) {
 	if v.Expected != 10 || v.Found != 9 || v.Lost != 1 || v.LostSeqs != "4" || v.Duplicated != 1 || v.Unexpected != 1 || v.Complete || v.Error != "" {
 		t.Fatalf("verify %+v", v)
 	}
-	if v.WaitedSec < 0.5 {
+	if v.WaitedSec < 1.2 {
 		t.Fatalf("gave up before --verify-timeout: %v", v.WaitedSec)
 	}
 
 	path2, insert2 := eventsDB(t)
-	for seq := 1; seq <= 10; seq++ {
-		insert2("default", "vr2", seq)
-	}
+	addr, srv = streamServer(t, false, false, nil)
+	afterOpen(t, srv, func() {
+		for seq := 1; seq <= 10; seq++ {
+			insert2("default", "vr2", seq)
+		}
+	})
 	start := time.Now()
 	code, sum = runJSON(t, "--target", addr, "--count", "10", "--run", "vr2", "--verify-sqlite", path2, "--verify-timeout", "20s")
 	if code != ExitOK || sum.Verify == nil || !sum.Verify.Complete || sum.Verify.Found != 10 || time.Since(start) > 10*time.Second {
@@ -289,11 +303,54 @@ func TestVerifySQLite(t *testing.T) {
 	}
 }
 
+// afterOpen runs fn once the injector connected to srv: after the check
+// opened the destination, which happens before the first send.
+func afterOpen(t *testing.T, srv *sink, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	t.Cleanup(func() { <-done })
+	go func() {
+		defer close(done)
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			srv.mu.Lock()
+			n := srv.conns
+			srv.mu.Unlock()
+			if n > 0 {
+				fn()
+				return
+			}
+		}
+	}()
+}
+
+// TestVerifyRunPresent (SPEC §8.5, review finding 4 of 2026-11-07): a
+// destination read by time that already holds rows of --run refuses the run
+// with exit 2 before anything is sent; it passed before, with the earlier
+// run's rows, while the current one lost everything.
+func TestVerifyRunPresent(t *testing.T) {
+	path, insert := eventsDB(t)
+	insert("default", "used", 1)
+	addr, srv := streamServer(t, false, false, nil)
+	code, _, errs := runMain(t, "--target", addr, "--count", "5", "--run", "used", "--verify-sqlite", path)
+	srv.mu.Lock()
+	n := srv.conns
+	srv.mu.Unlock()
+	if code != ExitUsage || n != 0 || !strings.Contains(errs, "already present") {
+		t.Fatalf("exit %d, %d connections, stderr %q", code, n, errs)
+	}
+	// Another run of the same file is fine; so is a run whose marker only
+	// starts like the used one.
+	insert("default", "usedX", 1)
+	if code, _, errs := runMain(t, "--target", addr, "--count", "1", "--run", "use", "--verify-sqlite", path, "--verify-timeout", "300ms"); code != ExitFailures {
+		t.Fatalf("another run: exit %d %s", code, errs)
+	}
+}
+
 // TestVerifyUnreachable: a destination that cannot be read fails at once with
 // code 4, before anything is sent, and the URL (its password) is not printed.
 func TestVerifyUnreachable(t *testing.T) {
 	addr, s := streamServer(t, false, false, nil)
-	for _, u := range []string{"redis://u:sekret@127.0.0.1:1/0", "valkey://u:sekret@127.0.0.1:1", "postgres://u:sekret@127.0.0.1:1/db", "nats://u:sekret@127.0.0.1:1"} {
+	for _, u := range []string{"redis://u:sekret@127.0.0.1:1/0", "valkey://u:sekret@127.0.0.1:1", "postgres://u:sekret@127.0.0.1:1/db", "nats://u:sekret@127.0.0.1:1", "nats://u:sekret@127.0.0.1:1,tls://u:sekret@127.0.0.1:2"} {
 		code, out, errs := runMain(t, "--target", addr, "--count", "5", "--verify-url", u, "--timeout", "1s")
 		if code != ExitVerify || strings.Contains(out+errs, "sekret") {
 			t.Fatalf("%s: exit %d, stdout %q stderr %q", u[:6], code, out, errs)
@@ -328,6 +385,14 @@ func TestPendingUsageErrors(t *testing.T) {
 		{"--verify-url", "redis://h", "--verify-space", "bad space"},
 		{"--pcap-flows"},
 		{"--pcap-dedup", "on"},
+		{"--verify-tls-ca", f},
+		{"--verify-url", "redis://h", "--verify-tls-ca", f},
+		{"--verify-url", "postgres://h/db", "--verify-tls-ca", f},
+		{"--verify-url", "rediss://h", "--verify-tls-ca", f}, // no PEM in it
+		{"--verify-url", "tls://h", "--verify-tls-ca", f + ".missing"},
+		{"--verify-url", "nats://u:sekret@h1:4222,nats://u:sekret@h2:4222/%zz"},
+		{"--verify-url", "nats://u:sekret@h1:4222,redis://u:sekret@h2"},
+		{"--verify-url", "nats://u:sekret@h1:4222,"},
 	} {
 		code, out, errs := runMain(t, args...)
 		if code != ExitUsage || strings.Contains(out+errs, "sekret") {

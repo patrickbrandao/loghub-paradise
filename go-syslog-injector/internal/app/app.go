@@ -79,6 +79,7 @@ type config struct {
 	verifyURL, verifySQLite string
 	verifyTimeout           time.Duration
 	verifySpace, verifyKey  string
+	verifyCA                string
 
 	reportFmt string
 	progress  string
@@ -131,6 +132,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.verifySQLite, "verify-sqlite", "", "after sending, check the events.db (sink=sqlite) at this `path`")
 	fs.DurationVar(&c.verifyTimeout, "verify-timeout", 30*time.Second, "how long to wait for the messages in the destination")
 	fs.StringVar(&c.verifySpace, "verify-space", "default", "LogHub `space` of the server (subject, stream and filter)")
+	fs.StringVar(&c.verifyCA, "verify-tls-ca", "", "PEM `file` of the CAs that verify the destination of tls://, rediss:// and valkeys:// (default: system roots)")
 	fs.StringVar(&c.verifyKey, "verify-key", "", "JetStream stream, Redis stream, PostgreSQL or SQLite table to read (default: per destination)")
 
 	fs.StringVar(&c.reportFmt, "report", "text", "final report on stdout: `text` or json")
@@ -257,9 +259,16 @@ func build(c *config) (*runner, error) {
 		if c.verifyTimeout <= 0 {
 			return nil, errors.New("--verify-timeout must be > 0")
 		}
-		if vt, err = verify.Parse(c.verifyURL, c.verifySQLite, c.verifySpace, c.verifyKey, c.run); err != nil {
+		if vt, err = verify.Parse(c.verifyURL, c.verifySQLite, c.verifySpace, c.verifyKey, c.run, c.verifyCA); err != nil {
 			return nil, err
 		}
+	} else if c.verifyCA != "" {
+		return nil, errors.New("--verify-tls-ca needs --verify-url")
+	}
+	if c.pcapFlows && (c.proxySrc != "" || c.proxyDst != "") {
+		// Each flow announces its captured addresses (SPEC §6.8): one
+		// override for all of them would undo what --pcap-flows is for.
+		return nil, errors.New("--proxy-src/--proxy-dst cannot be given with --pcap-flows: each flow announces its captured addresses")
 	}
 	r := &runner{c: c, report: c.reportFmt, info: map[string]string{}, verify: vt}
 	switch {
@@ -453,6 +462,9 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 		ocancel()
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: verify: %v\n", Name, err)
+			if errors.Is(err, verify.ErrRunPresent) {
+				return ExitUsage // nothing sent (SPEC §8.5)
+			}
 			return ExitVerify
 		}
 		defer check.Close()
