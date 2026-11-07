@@ -48,6 +48,10 @@ type Stats struct {
 	SkippedBytes  uint64 // bytes dropped while resynchronizing
 	LostFrames    uint64 // frames cut by a capture gap or by the end of the stream
 	LongLines     uint64 // non-transparent lines cut at MaxFrame
+	// ClosedPartial counts octet-counting frames cut by a closed end (FIN
+	// or RST) and replayed with what arrived, as the server delivered them
+	// (SPEC §6.6).
+	ClosedPartial uint64
 }
 
 // Datagram reports whether a UDP payload is taken as a message. Strict (no
@@ -116,8 +120,14 @@ func (s *Stream) Gap(int) {
 	}
 }
 
-// End implements pcap.StreamHandler.
-func (s *Stream) End() {
+// End implements pcap.StreamHandler. What is left is the last frame, without
+// its end; how it is taken depends on how the direction ended (SPEC §6.6,
+// from go-gelf-injector G12, 2026-11-07). closed (a FIN with every byte
+// before it, or a RST with no hole before it) proves the sender stopped
+// there: the frame is read as the server reads it at EOF. Otherwise (the
+// capture stopped, the direction went idle) the cut may have fallen
+// anywhere, and the rule from before applies.
+func (s *Stream) End(closed bool) {
 	if s.mode == ModeIgnore {
 		return
 	}
@@ -126,16 +136,36 @@ func (s *Stream) End() {
 		s.count()
 		return
 	}
-	if s.mode == ModeLF && !s.resync {
+	switch {
+	case s.mode == ModeLF && !s.resync:
 		// The server delivers a last line without terminator whole (its
-		// SPEC §5.3), so the replay does too.
+		// SPEC §5.3), so the replay does too -- closed or not: a line has
+		// no length to prove it whole, and this was always the rule.
 		s.out(s.buf)
-	} else {
+	case s.mode == ModeOctet && !s.resync && closed && s.octetTail():
+		// Closed in the middle of a frame: go-syslog-server delivers what
+		// arrived (marked truncated, its SPEC §5.4), so the replay sends it.
+	default:
+		// A RELP frame without its trailer is never read by a RELP server;
+		// an octet frame of a direction cut by the capture end cannot be
+		// told from one the sender finished; what a resync left is no frame.
 		s.st.LostFrames++
 		s.st.SkippedBytes += uint64(len(s.buf))
 	}
 	s.buf = nil
 	s.count()
+}
+
+// octetTail replays the content of an octet-counting frame cut by a closed
+// end, when its header and at least one byte of message arrived.
+func (s *Stream) octetTail() bool {
+	h, _, st := octetHeader(s.buf)
+	if st != hOK || h >= len(s.buf) {
+		return false
+	}
+	s.st.ClosedPartial++
+	s.out(s.buf[h:])
+	return true
 }
 
 func (s *Stream) count() {

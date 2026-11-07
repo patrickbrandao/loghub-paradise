@@ -32,7 +32,9 @@ type Config struct {
 	// Timeout bounds the connection check at Open and, in Check, the wait
 	// for the accepted requests to show up.
 	Timeout time.Duration
-	// Since is the start of the window: records older are not read.
+	// Since is the start of the PostgreSQL and SQLite window: records
+	// older are not read. NATS and Redis start after the stream's last
+	// entry at Open instead (SPEC §8.6.3).
 	Since time.Time
 }
 
@@ -42,8 +44,9 @@ const readBound = time.Minute
 // finalRead is the pause before the read after the complete one.
 const finalRead = time.Second
 
-// Margin is how far before the start of the run the window opens (clock
-// skew between the injector and the server, SPEC §8.6.3).
+// Margin is how far before the start of the run the PostgreSQL and SQLite
+// window opens (clock skew between the injector and the server, SPEC
+// §8.6.3).
 const Margin = time.Minute
 
 // Kind of a destination, from the URL scheme.
@@ -136,7 +139,7 @@ func Open(ctx context.Context, cfg Config, run string) (*Verifier, error) {
 	switch kind {
 	case "nats":
 		var r *natsReader
-		r, err = openNATS(ctx, cfg.URL, cfg.Stream, since, cfg.Timeout)
+		r, err = openNATS(ctx, cfg.URL, cfg.Stream, cfg.Timeout)
 		if err == nil {
 			v.dest += " stream " + r.stream
 			v.r = r
@@ -153,7 +156,7 @@ func Open(ctx context.Context, cfg Config, run string) (*Verifier, error) {
 		} else {
 			v.dest += " streams " + redisPattern
 		}
-		v.r, err = openRedis(ctx, cfg.URL, cfg.Stream, since)
+		v.r, err = openRedis(ctx, cfg.URL, cfg.Stream)
 	}
 	if err != nil {
 		return nil, err

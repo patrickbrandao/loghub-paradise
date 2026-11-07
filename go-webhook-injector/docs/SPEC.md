@@ -520,6 +520,11 @@ ressincronização).
   candidato, guarda só os últimos 64 bytes, e o corte nunca cai no meio de uma
   palavra maiúscula — o pedaço final dela viraria um candidato que nunca foi, e
   o resultado dependeria de quando o corte aconteceu (achado do `FuzzStream`).
+  Quando a palavra é maior que a janela (um método de 70 letras aos pedaços
+  de 1 byte), o corte cai no fim do buffer, e o primeiro byte que chegar
+  depois **continua** a palavra cortada: não é candidato (regra de
+  2026-11-07, portada do `go-gelf-injector`, cujo `FuzzStream` achou a cauda
+  do método virando uma requisição que o fluxo inteiro não tinha).
   O pulado é contado (`http_skipped_bytes`, `http_resyncs`); a requisição
   atingida por uma lacuna ou pelo fim do fluxo também (`http_requests_lost`).
 - **Candidato grande** (desde 2026-11-07, pendência 6): todo limite que
@@ -687,7 +692,7 @@ servidor gravou, com as bibliotecas e versões dos servidores (§2.1).
 
 | Destino | Servidores | O que é lido |
 |---|---|---|
-| `nats://`, `tls://` (NATS JetStream; vírgula separa servidores, como no `nats.go`) | W, F, N com `sink=nats` | as mensagens do stream (o `Data` é o JLH, W SPEC §3.8), por um *consumer* ordenado efêmero que começa no tempo da janela |
+| `nats://`, `tls://` (NATS JetStream; vírgula separa servidores, como no `nats.go`) | W, F, N com `sink=nats` | as mensagens do stream (o `Data` é o JLH, W SPEC §3.8), por um *consumer* ordenado efêmero que começa depois da última sequência do stream na checagem (§8.6.3) |
 | `postgres://`, `postgresql://` (o `pgx`; `PGPASSWORD` e as demais variáveis do libpq valem) | W, F, P com `sink=postgres` | `uuid` e `payload->'content'` da fila `loghub.inbox` (W SPEC §3.6) |
 | `redis://`, `rediss://`, `valkey://`, `valkeys://` (o `rueidis`; `valkey` é alias de `redis`) | W, F com `sink=redis` | o campo `e` (o JLH) das entradas do stream (W SPEC §3.3), por `XRANGE` |
 | `--verify-sqlite <arquivo>` (só leitura) | W, F com `sink=sqlite` | `uuid` e `payload->content` (o `payload` do JLH, em texto) da tabela `inbox` (W SPEC §3.7) |
@@ -697,7 +702,8 @@ tabela existem (`--verify-timeout` limita essa espera); se não, sai com `4` sem
 enviar nada — uma conferência impossível descoberta depois de uma carga de uma
 hora desperdiçaria a carga. No Redis só a conexão (`PING`) e, com
 `--verify-stream`, que a chave é um stream ou ainda não existe: o stream nasce
-no primeiro `XADD` do servidor. Com `sink=sqlite` e `rotate=daily|hourly`,
+no primeiro `XADD` do servidor. Nessa checagem o injetor anota também o ponto
+de partida dos streams (§8.6.3). Com `sink=sqlite` e `rotate=daily|hourly`,
 aponte o arquivo do período da execução.
 
 #### 8.6.2 Nome do stream, da chave e da tabela
@@ -715,10 +721,23 @@ aponte o arquivo do período da execução.
 
 #### 8.6.3 Janela e marcadores
 
-- **Janela**: só registros a partir de **1 min antes** do início da execução
-  (folga para o relógio): no PostgreSQL e no SQLite pelo tempo do UUIDv7
-  (`uuid >= <limite>`), no Redis pelo ID da entrada (`<ms>-0`), no NATS pelo
-  tempo do stream. Registros mais antigos não são lidos.
+- **Ponto de partida dos streams** (regra de 2026-11-07, portada do
+  `go-gelf-injector`): NATS e Redis/Valkey são lidos **depois da última
+  entrada que o stream tinha na checagem de antes do envio** — a sequência do
+  JetStream (`DeliverByStartSequence`, última + 1) e, em cada stream do Redis
+  que já existia, o ID do `XREVRANGE … COUNT 1` (a leitura continua com
+  `(<id>`); um stream que nasce depois da checagem é lido inteiro. Tudo da
+  execução vem depois, sem relógio nenhum, e nada do passado é lido. Antes era
+  a janela de tempo abaixo também para eles, e num stream movimentado ela relia
+  tudo do último minuto a cada conferência (o GI achou ~250 000 mensagens numa
+  janela de 10 min, e a leitura passava do `--verify-timeout`). Limite: um
+  stream NATS apagado e recriado entre a checagem e o fim do envio recomeça as
+  sequências, e o que foi gravado nele antes da última sequência anotada não é
+  lido (conta `lost`).
+- **Janela** (PostgreSQL e SQLite, que não têm ordem de chegada): só registros
+  a partir de **1 min antes** do início da execução (folga para o relógio),
+  pelo tempo do UUIDv7 (`uuid >= <limite>`). Registros mais antigos não são
+  lidos.
 - **Aceitas**: cada resposta final `2xx` registra o `seq` e o `X-LogHub-UUID`
   (o uuid do envelope gravado). São as **esperadas**.
 - Um registro é **da execução** quando o seu `uuid` é de uma aceita, ou quando
@@ -798,3 +817,7 @@ conta como `lost`. A memória é ~100 bytes por requisição aceita.
    limite do protocolo, não do extrator.
 10. **Conferência em ClickHouse e MySQL** (sinks de W e F) não existe (§1.2):
     fora do pedido de 2026-11-07.
+11. *Corrigido em 2026-11-07 (porte entre injetores):* palavra maiúscula maior
+    que a janela de ressincronização não vira candidato pela cauda (§6.6, do
+    GI); NATS e Redis/Valkey conferidos depois da última entrada na checagem
+    (§8.6.3, do GI).

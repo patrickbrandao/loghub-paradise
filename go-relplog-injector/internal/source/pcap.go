@@ -33,8 +33,8 @@ type endHandler struct {
 	id uint64
 }
 
-func (h *endHandler) End() {
-	h.Stream.End()
+func (h *endHandler) End(closed bool) {
+	h.Stream.End(closed)
 	h.p.queue = append(h.p.queue, Message{endOf: h.id})
 }
 
@@ -294,6 +294,7 @@ func (p *Pcap) accumulate() {
 	x.SkippedBytes += e.SkippedBytes
 	x.LostFrames += e.LostFrames
 	x.LongLines += e.LongLines
+	x.ClosedPartial += e.ClosedPartial
 	p.ext = extract.Stats{}
 	if p.asm != nil {
 		p.addAsm(p.asm.Stats)
@@ -346,6 +347,7 @@ func (p *Pcap) Stats() map[string]uint64 {
 		"pcap_ip_datagrams_snaplen": d.SnaplenDatagrams + cur.SnaplenDatagrams,
 		"pcap_duplicates":           p.dups,
 		"tcp_long_lines":            e.LongLines + ce.LongLines,
+		"tcp_closed_partial_frames": e.ClosedPartial + ce.ClosedPartial,
 		"messages_replayed":         p.sent,
 	}
 	if p.asm != nil {

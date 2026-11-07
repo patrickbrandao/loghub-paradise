@@ -332,7 +332,11 @@ pcapng (seções, várias interfaces, `if_tsresol`, blocos EPB, SPB e o obsoleto
 PB; os demais blocos são pulados). Enlaces: Ethernet (com 802.1Q/802.1ad),
 Linux cooked v1 (`-i any` antigo) e **v2** (`-i any` atual), loopback BSD
 (`NULL`, `LOOP`), raw IPv4/IPv6 (101, 12, 14, 228, 229) e **PKTAP** do macOS
-(`-i any` no Mac). Outro enlace é contado (`pcap_not_ip`) e pulado. Um arquivo
+(`-i any` no Mac). No PKTAP o enlace de dentro vem de `pth_dlt`; até
+2026-11-07 vinha de `pth_type_next`, que vale 1 em todo pacote, e uma captura
+do loopback (`DLT_NULL`) não decodificava (achado do `go-relplog-injector`,
+portado). Um registro PKTAP cujo `pth_type_next` não é 1 não é pacote
+(`pcap_not_ip`). Outro enlace é contado (`pcap_not_ip`) e pulado. Um arquivo
 cortado no meio de um registro (tcpdump ainda escrevendo, ou morto) reproduz
 tudo até ali e conta `pcap_cut_at_end`.
 
@@ -344,7 +348,9 @@ remontados — uma mensagem UDP acima do MTU só existe inteira depois disso —
 com limites: 64 KiB e 128 fragmentos por datagrama, 1024 datagramas abertos, 30
 s de janela em tempo de captura; o fragmento repetido idêntico (o `-i any` vê o
 quadro em duas interfaces) é ignorado; sobreposição é recusada (RFC 5722). O
-que se perde é contado (`pcap_ip_fragments_lost`). Pacote cortado pelo snaplen
+que se perde é contado (`pcap_ip_fragments_lost`), inclusive os fragmentos que
+ainda esperam o datagrama quando a passada acaba (desde 2026-11-07, portado do
+`go-relplog-injector`: antes sumiam sem contar). Pacote cortado pelo snaplen
 é marcado: um datagrama cortado **não** é reproduzido (`frames_lost`).
 
 **Fragmento cortado pelo snaplen** (regra de 2026-11-07, pendência 4): o
@@ -373,6 +379,13 @@ mesma quádrupla é conexão nova; uma direção ociosa por 10 min de captura é
 encerrada; no máximo 131 072 direções abertas (as excedentes são ignoradas,
 contadas). Uma direção cuja captura começou depois do SYN é **midstream**
 (`tcp_midstream`): seu primeiro byte não é início de quadro.
+
+**Como a direção terminou** (regra de 2026-11-07, portada do
+`go-gelf-injector`, decisão G12 de lá) decide o último quadro (§6.6): ela é
+**fechada** quando a captura prova o fim — um FIN com todos os bytes antes
+dele entregues, ou um RST sem buraco antes dele (um RST adiante do que foi
+entregue diz que faltam bytes); é **cortada** no fim da captura, quando fica
+ociosa ou quando a quádrupla é reusada sem o fim da anterior.
 
 Uma direção que termina com a captura sem FIN nem RST conta em
 `tcp_unterminated`: o fim dela pode faltar **sem lacuna visível** (o tcpdump
@@ -406,10 +419,24 @@ Decididas **uma vez por fluxo**, nos primeiros bytes, como o servidor decide
 | outra coisa (estrito) | ignorado (`tcp_streams_not_syslog`) |
 
 - **Octet**: exatamente `MSG-LEN` octetos, nada removido. **LF**: termina no LF
-  ou NUL, `CR` finais saem, quadros vazios pulados; a última linha sem
-  terminador no fim do fluxo é entregue (como o servidor). **RELP**:
+  ou NUL, `CR` finais saem, quadros vazios pulados. **RELP**:
   `TXNR SP COMANDO SP DATALEN [SP DADOS] LF`; os dados de `syslog` são a
   mensagem.
+- **O último quadro, sem o seu fim** (regra de 2026-11-07, do GI): numa
+  direção **fechada** (§6.4) ele é lido como o servidor o lê no EOF; numa
+  **cortada**, vale a regra de antes. Por moldura:
+  - LF: a última linha sem terminador é mensagem **nas duas** (o
+    `go-syslog-server` a entrega inteira no EOF, SPEC dele §5.3; uma linha não
+    tem tamanho que prove o corte, e era a regra de sempre);
+  - octet: **fechada**, o que chegou do quadro (com o cabeçalho e ao menos um
+    byte da mensagem) é mensagem — o servidor entrega o frame parcial no EOF
+    (marcado `truncated`, SPEC dele §5.4) — e conta em
+    `tcp_closed_partial_frames`; o replay manda esses bytes como mensagem
+    inteira, sem a marca. **Cortada**: perdido (`frames_lost`), como antes: a
+    captura pode ter parado antes do resto;
+  - RELP: o quadro sem o LF final nunca é lido por um servidor RELP: perdido
+    nas duas;
+  - o que uma ressincronização deixou não é quadro: perdido nas duas.
 - **Ressincronização** — depois de uma lacuna, de um quadro inválido, ou desde
   o início de um fluxo midstream — descarta bytes até a primeira posição que
   **comprovadamente** começa um quadro:
@@ -434,8 +461,13 @@ Decididas **uma vez por fluxo**, nos primeiros bytes, como o servidor decide
   segmento), a busca só se repete quando o buffer chega ao tamanho de que o
   candidato pendente precisa (o fim do quadro que ele declara); antes disso, as
   posições anteriores a ele já foram recusadas de vez e a resposta não muda.
-  Sem candidato, guarda só os últimos 64 bytes; com um candidato pendente,
-  guarda a partir dele (o buffer não passa de 16 MiB mais um cabeçalho). Tudo o
+  Sem candidato, guarda só os últimos 64 bytes e a próxima busca começa
+  depois deles; com um candidato pendente, guarda a partir dele (o buffer não
+  passa de 16 MiB mais um cabeçalho). Até 2026-11-07 o código não fazia o que
+  esta frase diz: sem candidato, guardava o buffer inteiro até 16 MiB e o
+  procurava de novo desde o início a cada segmento — quadrático num fluxo
+  midstream que não é syslog (o `go-relplog-injector` achou e corrigiu,
+  `TestResyncLinearCost`; portado). Tudo o
   que foi pulado é contado (`tcp_skipped_bytes`, `tcp_resyncs`), e o quadro
   perdido também (`frames_lost`).
 - Quadro acima de 16 MiB não é quadro (ressincroniza); linha LF acima disso é
@@ -448,7 +480,9 @@ Decididas **uma vez por fluxo**, nos primeiros bytes, como o servidor decide
 - O IP de origem (§1.2): sai do endereço do injetor. Com `--pcap-flows` e
   `--proxy-protocol`, cada fluxo anuncia o seu (§6.8); sem `--pcap-flows`, um
   endereço por execução.
-- As cópias do `-i any` (§6.9), salvo as que o NAT mudou na porta de origem.
+- As cópias do `-i any` (§6.9), salvo as que o NAT mudou na porta de origem;
+  a repetição do próprio emissor (o mesmo pacote no mesmo ponto de captura)
+  **é** reproduzida.
 - Direções de servidor e mensagens de outros protocolos na mesma porta.
 
 ### 6.8 Uma conexão por fluxo original (`--pcap-flows`)
@@ -492,14 +526,27 @@ cópia TCP com outra quádrupla virava um segundo fluxo inteiro.
   ou PKTAP, ou quando a seção pcapng declara mais de uma interface; `on` liga
   sempre, `off` nunca. Numa captura de uma interface só, um pacote repetido é
   retransmissão de verdade, e a remontagem TCP já cuida dela.
+- **Ponto de captura** (desde 2026-11-07): a interface pcapng do pacote e o
+  que o cabeçalho do enlace diz — no SLL2 o índice da interface **e** o tipo do
+  pacote (enviado, para nós, ...: o loopback mostra cada pacote duas vezes na
+  mesma interface, uma por sentido), no SLL o tipo do pacote e o endereço de
+  enlace (o v1 não grava a interface), no PKTAP o `pth_ifname`.
 - **Chave**: protocolo, IP ID (IPv4; 0 no IPv6, que não tem), porta de
   origem, no TCP o número de sequência, o de confirmação e as flags, o tamanho
   no fio e um hash FNV-1a 64 do conteúdo capturado. **Endereços e porta de
   destino ficam fora**, porque o NAT os troca; o IP ID, a sequência e a porta
   de origem ele preserva.
-- Um pacote cuja chave apareceu até **50 ms** antes, em tempo de captura, é
-  cópia: descartado antes da remontagem TCP e contado em
-  `pcap_any_duplicates`. As cópias de um pacote estão a microssegundos uma da
+- Um pacote é cópia quando a sua chave é a de um pacote **original** visto até
+  **50 ms** antes ou depois, em tempo de captura, **noutro** ponto de captura;
+  e cada original absorve **no máximo uma cópia por ponto**. Assim o emissor
+  que manda os mesmos bytes duas vezes (até com o IP ID 0 que o Linux usa com
+  DF) aparece duas vezes em cada ponto e é reproduzido duas vezes; no mesmo
+  ponto nunca há cópia. Até 2026-11-07 bastava a chave, e a segunda mensagem
+  legítima igual sumia (regra do RI, decisão 22, e do GI, G15, alinhada aqui).
+  A cópia é descartada antes da remontagem TCP e contada em
+  `pcap_any_duplicates`; a pergunta é feita **depois** do filtro de
+  `--pcap-port`, para que a cópia que o filtro recusa (o NAT pode trocar a
+  porta de destino) não esconda a que ele aceita. As cópias de um pacote estão a microssegundos uma da
   outra (é o mesmo `skb` passando de interface em interface); uma
   retransmissão TCP real leva outro IP ID e espera ao menos o RTO mínimo do
   Linux (200 ms).
@@ -508,7 +555,7 @@ cópia TCP com outra quádrupla virava um segundo fluxo inteiro.
   datagramas inteiros iguais, e o segundo sai como cópia.
 - **Limites, aceitos**: o masquerade que troca a porta de origem (só numa
   colisão) faz a cópia passar; no IPv6, dois datagramas idênticos da mesma
-  porta em 50 ms numa captura de várias interfaces viram um. Se a ordem das
+  porta em 50 ms, vistos em pontos diferentes, viram um. Se a ordem das
   cópias variar entre pacotes de uma conexão TCP (ora a veth primeiro, ora a
   eth0), os segmentos se dividem entre as duas quádruplas e aparecem como
   lacunas nas duas.
@@ -581,7 +628,8 @@ excedentes, bytes retransmitidos, fora de ordem, lacunas e seus bytes,
 `tcp_unterminated`, fluxos por moldura, comandos RELP sem mensagem,
 ressincronizações, bytes pulados, linhas longas, mensagens), `frames_lost`,
 `messages_replayed`, e desde 2026-11-07 `pcap_ip_datagrams_snaplen` (§6.3),
-`pcap_any_duplicates` (§6.9) e `pcap_flows` (§6.8). São a prova de que o replay
+`pcap_any_duplicates` (§6.9), `pcap_flows` (§6.8) e
+`tcp_closed_partial_frames` (§6.6). São a prova de que o replay
 entregou tudo o que a captura tinha — ou do que faltou nela.
 
 ### 8.5 Conferência no destino (`--verify-url`, `--verify-sqlite`)
@@ -631,9 +679,22 @@ linhas da primeira e não via as cópias); uma duplicata que chegue depois disso
 não é vista. `lost > 0` ou `duplicated > 0` → código 1; erro → código 4
 (§3.3). Interrompido (130), ou alvo inalcançável (3), não confere.
 
-**Destinos** — lidos a partir de **5 min antes do início** da execução, pelo
-relógio do destino (folga de relógio entre as máquinas; um destino atrasado
-mais que isso perde mensagens da leitura e as conta como perdidas):
+**Ponto de partida** (regra de 2026-11-07, portada do `go-gelf-injector`):
+NATS e Redis/Valkey são lidos **depois da última entrada que o stream tinha na
+conexão de antes do envio** — a sequência do JetStream (`DeliverByStartSequence`
+com a última + 1) e o ID do `XREVRANGE … COUNT 1` (o stream que ainda não
+existe é lido inteiro). Tudo da execução vem depois, sem relógio e sem ler
+nada do passado. Antes era a janela de tempo abaixo também para eles, e num
+stream movimentado ela relia tudo dos últimos 5 min a cada conferência (o GI
+achou ~250 000 mensagens numa janela de 10 min, e a leitura passava do
+`--verify-timeout`). Limite: um stream NATS apagado e recriado no meio do envio
+recomeça as sequências, e o que for gravado nele abaixo da anotada não é lido
+(conta como perdido). PostgreSQL e SQLite não têm essa ordem: lidos a partir
+de **5 min antes do início** da execução, pelo relógio do destino (folga de
+relógio entre as máquinas; um destino atrasado mais que isso perde mensagens
+da leitura e as conta como perdidas).
+
+**Destinos**:
 
 - **NATS** (`nats://`, `tls://`; a URL inteira vai ao `nats.go`, como o
   `sink.nats.urls` do servidor, lista com vírgula). JetStream: o stream é
@@ -643,14 +704,15 @@ mais que isso perde mensagens da leitura e as conta como perdidas):
   deixa nada no servidor) lê desse subject a partir da hora acima, de forma
   incremental (com `Fetch`: o `FetchNoWait` do `nats.go` recomeça o consumidor
   ordenado do início a cada chamada, e a primeira prova contou cada mensagem
-  dezenas de vezes; a sequência do stream já contada também é pulada); o
+  dezenas de vezes; a sequência do stream já contada também é pulada) a partir
+  do ponto de partida acima; o
   `Data` de cada mensagem é o JLH. `sink.nats.mode=core` não tem stream:
   código 4.
 - **Redis e Valkey** (`redis://`, `rediss://`; `valkey://` = `redis://`,
   `valkeys://` = `rediss://`; usuário, senha e banco pela URL, como o
   `rueidis.ParseURL` lê). O stream é `--verify-key` ou `loghub.<space>.syslog`
-  (o padrão do `sink.redis.stream`); `XRANGE` desde a hora acima em páginas de
-  1000, incremental pelo último ID; o JLH está no campo `e` (SPEC do servidor
+  (o padrão do `sink.redis.stream`); `XRANGE` desde o ponto de partida acima em
+  páginas de 1000, incremental pelo último ID; o JLH está no campo `e` (SPEC do servidor
   §3.6). Stream inexistente é código 4 (o sink grava em outro lugar).
 - **PostgreSQL** (`postgres://`, `postgresql://`, pelo `pgx`). A tabela é
   `--verify-key` ou `loghub.inbox`; `SELECT payload->>'message',
@@ -684,3 +746,9 @@ host. Para outro `space` que não `default`, `--verify-space`.
    reconstrução é impossível, e o motivo está em §6.3.
 5. *Corrigido em 2026-11-07:* candidato de ressincronização acima de 64 KiB
    segura a decisão — regra em §6.6.
+6. *Corrigido em 2026-11-07 (porte entre injetores):* PKTAP pelo `pth_dlt` e
+   fragmentos à espera no fim da passada contados (§6.2, §6.3, do RI); cópia do
+   `-i any` só de outro ponto de captura, uma por ponto (§6.9, do RI e do GI);
+   último quadro de direção fechada lido como no EOF do servidor (§6.4, §6.6,
+   do GI); ressincronização sem candidato linear (§6.6, do RI); NATS e
+   Redis/Valkey conferidos depois da última entrada na checagem (§8.5, do GI).

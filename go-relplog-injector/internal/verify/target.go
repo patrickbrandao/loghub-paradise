@@ -40,6 +40,8 @@ type Target struct {
 	spaceSet bool
 	table    string
 	file     string
+
+	start streamStart // set by Probe (SPEC §8.5)
 }
 
 // Defaults of the destinations (go-relplog-server SPEC §3.6, §3.7.1, §3.8).

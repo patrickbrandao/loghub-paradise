@@ -53,16 +53,31 @@ func parseJLH(b []byte) (Entry, bool) {
 	return Entry{Message: e.Payload.Message, Raw: e.Payload.Raw, RawEncoding: e.Payload.RawEncoding, UUID: e.UUID}, true
 }
 
-// Margin is how far before the start of the run the readers look, for clocks
-// that disagree between the injector and the destination.
+// Margin is how far before the start of the run the PostgreSQL reader looks,
+// for clocks that disagree between the injector and the destination. NATS
+// and Redis start after the stream's last entry at the Probe instead (SPEC
+// §8.5).
 const Margin = 10 * time.Minute
 
-func open(ctx context.Context, t *Target, since time.Time, run string) (reader, error) {
+// Where the streams were when Probe ran, before the first send (SPEC §8.5;
+// ported from go-gelf-injector, 2026-11-07): everything of the run lands
+// after it. Starting there needs no clock and reads nothing of the past; the
+// time window minus Margin re-read every message of the last 10 minutes of a
+// busy stream (~250 000 in the GI's run, past --verify-timeout).
+type streamStart struct {
+	marked    bool
+	natsAfter uint64 // the stream's last sequence
+	redisFrom string // the XRANGE start: "(<last id>", or "-" for no entry
+}
+
+// open connects a reader; mark (Probe, before the send) records where the
+// streams are, the start of every later read.
+func open(ctx context.Context, t *Target, since time.Time, run string, mark bool) (reader, error) {
 	switch t.Kind {
 	case KindNATS:
-		return openNATS(ctx, t, since)
+		return openNATS(ctx, t, since, mark)
 	case KindRedis:
-		return openRedis(ctx, t, since)
+		return openRedis(ctx, t, since, mark)
 	case KindPostgres:
 		return openPostgres(ctx, t, since, run)
 	case KindSQLite:
@@ -95,7 +110,7 @@ type natsReader struct {
 	last uint64
 }
 
-func openNATS(ctx context.Context, t *Target, since time.Time) (reader, error) {
+func openNATS(ctx context.Context, t *Target, since time.Time, mark bool) (reader, error) {
 	opts := []nats.Option{nats.Name("go-relplog-injector verify"), nats.MaxReconnects(-1)}
 	if t.tls {
 		tc := &tls.Config{MinVersion: tls.VersionTLS12}
@@ -117,17 +132,39 @@ func openNATS(ctx context.Context, t *Target, since time.Time) (reader, error) {
 		nc.Close()
 		return nil, fmt.Errorf("nats: %w", err)
 	}
-	start := since.Add(-Margin)
-	cons, err := js.OrderedConsumer(ctx, t.stream, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{"loghub." + t.space + ".syslog", "loghub." + t.space + ".syslog.>"},
-		DeliverPolicy:  jetstream.DeliverByStartTimePolicy,
-		OptStartTime:   &start,
-	})
+	if mark {
+		st, err := js.Stream(ctx, t.stream)
+		if err != nil {
+			nc.Close()
+			return nil, fmt.Errorf("nats stream %s: %w", t.stream, err)
+		}
+		info, err := st.Info(ctx)
+		if err != nil {
+			nc.Close()
+			return nil, fmt.Errorf("nats stream %s: %w", t.stream, err)
+		}
+		t.start = streamStart{marked: true, natsAfter: info.State.LastSeq}
+	}
+	cfg := natsStart(t, since)
+	cons, err := js.OrderedConsumer(ctx, t.stream, cfg)
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("nats stream %s: %w", t.stream, err)
 	}
 	return &natsReader{nc: nc, cons: cons}, nil
+}
+
+// natsStart is the consumer's start: after the sequence marked by Probe, or,
+// with no Probe (never in a run), the time window.
+func natsStart(t *Target, since time.Time) jetstream.OrderedConsumerConfig {
+	cfg := jetstream.OrderedConsumerConfig{FilterSubjects: []string{"loghub." + t.space + ".syslog", "loghub." + t.space + ".syslog.>"}}
+	if !t.start.marked {
+		start := since.Add(-Margin)
+		cfg.DeliverPolicy, cfg.OptStartTime = jetstream.DeliverByStartTimePolicy, &start
+		return cfg
+	}
+	cfg.DeliverPolicy, cfg.OptStartSeq = jetstream.DeliverByStartSequencePolicy, t.start.natsAfter+1
+	return cfg
 }
 
 func (r *natsReader) Incremental() bool { return true }
@@ -172,7 +209,7 @@ type redisReader struct {
 	next   string // XRANGE start
 }
 
-func openRedis(ctx context.Context, t *Target, since time.Time) (reader, error) {
+func openRedis(ctx context.Context, t *Target, since time.Time, mark bool) (reader, error) {
 	opt, err := rueidis.ParseURL(t.url)
 	if err != nil {
 		return nil, errors.New("redis: the URL is not valid") // rueidis quotes it
@@ -189,11 +226,26 @@ func openRedis(ctx context.Context, t *Target, since time.Time) (reader, error) 
 	if err != nil {
 		return nil, fmt.Errorf("redis: %w", cleanErr(err, t.url))
 	}
+	stream := t.redisStream()
+	if mark {
+		last, err := c.Do(ctx, c.B().Xrevrange().Key(stream).End("+").Start("-").Count(1).Build()).AsXRange()
+		if err != nil && !rueidis.IsRedisNil(err) {
+			c.Close()
+			return nil, fmt.Errorf("redis XREVRANGE: %w", cleanErr(err, t.url))
+		}
+		t.start = streamStart{marked: true, redisFrom: "-"} // a stream not born yet is read whole
+		if len(last) == 1 {
+			t.start.redisFrom = "(" + last[0].ID
+		}
+	}
+	if t.start.marked {
+		return &redisReader{c: c, stream: stream, next: t.start.redisFrom}, nil
+	}
 	start := since.Add(-Margin).UnixMilli()
 	if start < 0 {
 		start = 0
 	}
-	return &redisReader{c: c, stream: t.redisStream(), next: strconv.FormatInt(start, 10) + "-0"}, nil
+	return &redisReader{c: c, stream: stream, next: strconv.FormatInt(start, 10) + "-0"}, nil
 }
 
 func (r *redisReader) Incremental() bool { return true }
@@ -358,7 +410,7 @@ func (r *sqliteReader) Read(ctx context.Context, fn func(Entry)) error {
 // Probe opens the destination and reads it once, before anything is sent
 // (SPEC §8.5): a check that cannot run makes the run pointless.
 func Probe(ctx context.Context, t *Target, run string) error {
-	r, err := open(ctx, t, time.Now(), run)
+	r, err := open(ctx, t, time.Now(), run, true)
 	if err != nil {
 		return err
 	}

@@ -429,6 +429,13 @@ encerrada; no máximo 131 072 direções abertas (as excedentes são ignoradas,
 contadas). Uma direção cuja captura começou depois do SYN é **midstream**
 (`tcp_midstream`): seu primeiro byte não é início de quadro.
 
+**Como a direção terminou** (regra de 2026-11-07, portada do
+`go-gelf-injector`, decisão G12 de lá) decide o último quadro (§6.6): ela é
+**fechada** quando a captura prova o fim — um FIN com todos os bytes antes
+dele entregues, ou um RST sem buraco antes dele (um RST adiante do que foi
+entregue diz que faltam bytes); é **cortada** no fim da captura, quando fica
+ociosa ou quando a quádrupla é reusada sem o fim da anterior.
+
 Uma direção que termina com a captura sem FIN nem RST conta em
 `tcp_unterminated`: o fim dela pode faltar **sem lacuna visível** (o tcpdump
 parou antes de ler o buffer do kernel). Foi o que a primeira prova real
@@ -461,10 +468,23 @@ Decididas **uma vez por fluxo**, nos primeiros bytes, como o servidor decide
 | outra coisa (estrito) | ignorado (`tcp_streams_not_syslog`) |
 
 - **Octet**: exatamente `MSG-LEN` octetos, nada removido. **LF**: termina no LF
-  ou NUL, `CR` finais saem, quadros vazios pulados; a última linha sem
-  terminador no fim do fluxo é entregue (como o servidor). **RELP**:
+  ou NUL, `CR` finais saem, quadros vazios pulados. **RELP**:
   `TXNR SP COMANDO SP DATALEN [SP DADOS] LF`; os dados de `syslog` são a
   mensagem.
+- **O último quadro, sem o seu fim** (regra de 2026-11-07, do GI; a mesma do
+  SI): numa direção **fechada** (§6.4) ele é lido como o servidor que recebia
+  a captura o lê no EOF; numa **cortada**, vale a regra de antes. Por moldura:
+  - LF: a última linha sem terminador é mensagem **nas duas** (o
+    `go-syslog-server` a entrega inteira no EOF, SPEC dele §5.3; uma linha não
+    tem tamanho que prove o corte, e era a regra de sempre);
+  - octet: **fechada**, o que chegou do quadro (com o cabeçalho e ao menos um
+    byte da mensagem) é mensagem — o `go-syslog-server` entrega o frame
+    parcial no EOF (marcado `truncated`, SPEC dele §5.4) — e conta em
+    `tcp_closed_partial_frames`; o replay manda esses bytes como mensagem
+    inteira, sem a marca. **Cortada**: perdido (`frames_lost`), como antes;
+  - RELP: o quadro sem o LF final nunca é lido pelo `librelp` nem pelo
+    `go-relplog-server` (não há o que confirmar): perdido nas duas;
+  - o que uma ressincronização deixou não é quadro: perdido nas duas.
 - **Ressincronização** — depois de uma lacuna, de um quadro inválido, ou desde
   o início de um fluxo midstream — descarta bytes até a primeira posição que
   **comprovadamente** começa um quadro:
@@ -519,7 +539,11 @@ A regra (`--pcap-dedup auto`, o padrão, é `on`; `off` desliga):
   protocolo, IP ID, porta de origem, sequência, confirmação e flags TCP,
   tamanho no fio e FNV-1a do conteúdo — a mesma chave do SI. Endereços e
   porta de destino ficam fora, porque o NAT os troca entre as cópias; o IP ID
-  e o ISN o NAT não troca. Um pacote cuja chave é igual à de um pacote
+  e o ISN o NAT não troca. A **interface** de um pacote é a do pcapng e a que
+  o enlace nomeia: no SLL2 o índice **e, desde 2026-11-07, o tipo do pacote**
+  (enviado, para nós, ...: no loopback o mesmo pacote aparece duas vezes na
+  mesma interface, uma por sentido; regra do GI), no SLL o tipo e o endereço
+  de enlace, no PKTAP o `pth_ifname`. Um pacote cuja chave é igual à de um pacote
   **original** visto há até **50 ms** de captura numa **outra interface** é
   cópia e é descartado (`pcap_duplicates`). A pergunta é feita depois do filtro
   de `--pcap-port`, para que a cópia que o filtro recusa (o NAT pode trocar a
@@ -655,7 +679,7 @@ excedentes, bytes retransmitidos, fora de ordem, lacunas e seus bytes,
 `tcp_unterminated`, fluxos por moldura, comandos RELP sem mensagem,
 ressincronizações, bytes pulados, linhas longas, mensagens), `frames_lost` e
 `messages_replayed`. Desde 2026-11-07: `pcap_ip_datagrams_snaplen` (§6.3),
-`pcap_duplicates` (§6.8). São a prova de que o
+`pcap_duplicates` (§6.8), `tcp_closed_partial_frames` (§6.6). São a prova de que o
 replay entregou tudo o que a captura tinha — ou do que faltou nela.
 
 ### 8.5 Conferência no destino (`--verify-url`, `--verify-sqlite`)
@@ -679,13 +703,23 @@ mesmo nos cortes `go-relplog-pg-server` e `go-relplog-nats-server`):
 
 | `--verify-*` | Lê | Parâmetros da URL (do injetor, retirados antes de conectar) |
 |---|---|---|
-| `nats://`, `tls://` | o stream JetStream (§3.8, §10.7 do servidor) por um consumidor ordenado efêmero, filtrado em `loghub.<space>.syslog` e `loghub.<space>.syslog.>`, a partir do início da execução menos 10 min; o JLH em `Data`. Usuário, senha e token vão na URL, como na `LOGHUB_EB_URL` | `stream` (padrão `LOGHUB_SYSLOG`), `space` (padrão `default`), `ca` (arquivo PEM; `tls://` sem ele usa as CAs do sistema) |
-| `redis://`, `rediss://`, `valkey://`, `valkeys://` | o stream (§3.6 do servidor) por `XRANGE`, a partir do id do início da execução menos 10 min, 1000 por vez; o JLH no campo `e`. `valkey://` é `redis://` e `valkeys://` é `rediss://` (o Valkey fala o mesmo protocolo); o banco vem do caminho (`/1`) | `stream` (padrão `loghub.<space>.syslog`), `space` (padrão `default`), `ca`, `db` |
+| `nats://`, `tls://` | o stream JetStream (§3.8, §10.7 do servidor) por um consumidor ordenado efêmero, filtrado em `loghub.<space>.syslog` e `loghub.<space>.syslog.>`, a partir da sequência seguinte à última do stream na sonda de antes do envio; o JLH em `Data`. Usuário, senha e token vão na URL, como na `LOGHUB_EB_URL` | `stream` (padrão `LOGHUB_SYSLOG`), `space` (padrão `default`), `ca` (arquivo PEM; `tls://` sem ele usa as CAs do sistema) |
+| `redis://`, `rediss://`, `valkey://`, `valkeys://` | o stream (§3.6 do servidor) por `XRANGE`, a partir do id seguinte à última entrada na sonda de antes do envio (inteiro, se o stream ainda não existia), 1000 por vez; o JLH no campo `e`. `valkey://` é `redis://` e `valkeys://` é `rediss://` (o Valkey fala o mesmo protocolo); o banco vem do caminho (`/1`) | `stream` (padrão `loghub.<space>.syslog`), `space` (padrão `default`), `ca`, `db` |
 | `postgres://`, `postgresql://` | a fila `loghub.inbox` (§3.7.1 do servidor): `payload->>'message'` e `payload->>'raw'` das linhas `type='syslog'` com `received_at` desde o início da execução menos 10 min e o `--run` no texto | `table` (padrão `loghub.inbox`, o `sink.postgres.table`); os demais (`sslmode`, `sslrootcert`, …) vão ao `pgx` |
 | `--verify-sqlite <arquivo>` | a tabela `syslog_events` do `events.db` (§3.7, §10.4 do servidor), só leitura, pelo `rowid`; o JLH em `env` | — |
 
-A janela de 10 min antes do início cobre relógios desencontrados entre o host
-do injetor e o do destino. O que os leitores **não** veem: uma `loghub.inbox`
+**Ponto de partida dos streams** (regra de 2026-11-07, portada do
+`go-gelf-injector`): a sonda que roda **antes do envio** anota a última
+sequência do stream NATS (`StreamInfo`) e o último ID do stream Redis
+(`XREVRANGE … COUNT 1`); a conferência lê depois deles. Tudo da execução vem
+depois, sem relógio e sem ler nada do passado. Antes, NATS e Redis também
+usavam a janela de 10 min, e num stream movimentado ela relia tudo desses 10
+min a cada conferência (o GI achou ~250 000 mensagens, e a leitura passava do
+`--verify-timeout`). Limite: um stream NATS apagado e recriado no meio do
+envio recomeça as sequências, e o que for gravado abaixo da anotada não é
+lido (conta como perdido). A janela de 10 min antes do início fica para o
+PostgreSQL (a fila não tem ordem de chegada) e cobre relógios desencontrados
+entre o host do injetor e o do destino. O que os leitores **não** veem: uma `loghub.inbox`
 que um consumidor já esvaziou (a fila é para ser consumida: confira antes de
 ligá-lo, ou num banco de teste), um arquivo SQLite já girado
 (`sink.sqlite.rotate`: confira o arquivo do período) e um NATS em
@@ -762,3 +796,7 @@ conta continua no relatório.
    Mac e o tráfego entre containers não passa pelo DNAT; o PKTAP corrigido só
    com cabeçalhos sintéticos (o tcpdump do macOS precisa de root no host de
    teste). Fica aberta até essas duas provas.
+8. *Corrigido em 2026-11-07 (porte entre injetores):* último quadro de direção
+   fechada lido como no EOF do servidor (§6.4, §6.6, do GI); tipo do pacote do
+   SLL2 no ponto de captura do `-i any` (§6.8, do GI); NATS e Redis/Valkey
+   conferidos depois da última entrada na sonda (§8.5, do GI).

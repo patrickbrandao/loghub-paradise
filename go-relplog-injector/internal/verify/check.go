@@ -197,7 +197,7 @@ func Check(ctx context.Context, t *Target, m *Matcher, sent uint64, acked []uint
 	for {
 		if r == nil {
 			var err error
-			if r, err = open(ctx, t, o.Since, o.Run); err != nil {
+			if r, err = open(ctx, t, o.Since, o.Run, false); err != nil {
 				r, lastErr = nil, err
 			}
 		}

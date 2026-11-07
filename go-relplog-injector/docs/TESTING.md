@@ -49,6 +49,10 @@ regra: a mutação indicada (a correção removida) o derruba — conferido.
 | `TestSnaplenFragmentCondemnsDatagram`, `TestFragmentsWaitingAtEndAreLost` (pcap) | fragmento cortado condena o datagrama na hora (3 fragmentos perdidos, 1 datagrama em `pcap_ip_datagrams_snaplen`), o seguinte remonta; o que esperava no fim da passada conta | sem `poison` |
 | `TestResyncLargeCandidateHolds`, `TestResyncLargeRELPCandidate` (extract) | candidato octet e RELP acima de 64 KiB segura a decisão: o mesmo resultado inteiro e em segmentos de 3, 7, 1460 e 65 536 bytes | o teto de 64 KiB de volta (octet e RELP, cada um) |
 | `TestResyncLinearCost` (extract) | um quadro de 6 MiB em segmentos de 1460 bytes com no máximo 10 buscas (eram ~4300, 12 s); um fluxo midstream sem candidato guarda ≤ 64 bytes | sem o limite `need`; sem o corte do buffer sem candidato |
+| `TestTCPEndClosed` (pcap, do GI, 2026-11-07) | §6.4: FIN = fechada; fim de captura = cortada; RST logo depois do último byte = fechada; RST adiante de um buraco = cortada | trocar cada um dos três `closed` |
+| `TestTailClosedVersusCut` (extract), `TestPcapClosedTail` (source) | §6.6: LF entrega a cauda nas duas; octet fechada entrega o parcial (`tcp_closed_partial_frames`), cortada perde; RELP sem o LF final perde nas duas; resto de ressincronização perde | entregar o parcial também na cortada; nunca entregar; o `endHandler` não repassar o `closed`. Sobrevive (equivalente) tirar o `!resync` da regra octet: no fim, uma ressincronização sem candidato já esvaziou o buffer |
+| `TestVantage` (pcap) | §6.8: SLL2 com o tipo do pacote (o loopback, enviado e recebido na mesma interface), SLL, pcapng | tirar o tipo do SLL2 |
+| `TestNATSStartsAfterLast`, `TestRedisStartsAfterLast` (verify; opt-in `RI_TEST_VERIFY_NATS`, `RI_TEST_VERIFY_REDIS` com Redis e Valkey) | §8.5: o que já estava no stream na sonda não é lido; o stream que nasce depois é lido inteiro; 1500 mensagens em mais de um `Fetch` | partir da sequência 1 ou do `-`; a sonda não anotar o ponto |
 
 A regra de pular as sequências do stream NATS já contadas (consumidor
 ordenado que se recria) não tem teste que a trave: exige um NATS real e a

@@ -22,8 +22,9 @@ import (
 )
 
 // withCopies returns frames with, after each one, the copy tcpdump -i any
-// records on a second interface 20 µs later, its destination rewritten by
-// DNAT (another address and port) -- same IP ID, same source port.
+// records on a second interface (SLL2 interface index 2) 20 µs later, its
+// destination rewritten by DNAT (another address and port) -- same IP ID,
+// same source port.
 func withCopies(t *testing.T, frames []pcaptest.Frame, natDst netip.AddrPort) []pcaptest.Frame {
 	t.Helper()
 	var out []pcaptest.Frame
@@ -33,7 +34,9 @@ func withCopies(t *testing.T, frames []pcaptest.Frame, natDst netip.AddrPort) []
 		copy(ip[16:20], natDst.Addr().AsSlice())
 		ip[22], ip[23] = byte(natDst.Port()>>8), byte(natDst.Port())
 		// Checksums are not checked by the decoder (nor kept by NAT here).
-		out = append(out, pcaptest.Frame{TS: f.TS.Add(20 * time.Microsecond), Data: pcaptest.Link(pcaptest.SLL2, ip)})
+		cp := pcaptest.Link(pcaptest.SLL2, ip)
+		cp[7] = 2 // another interface: a copy only counts from another vantage
+		out = append(out, pcaptest.Frame{TS: f.TS.Add(20 * time.Microsecond), Data: cp})
 	}
 	return out
 }
@@ -41,7 +44,9 @@ func withCopies(t *testing.T, frames []pcaptest.Frame, natDst netip.AddrPort) []
 // TestPcapDedupAnyCopies (SPEC §6.9, pendência 2): in a -i any capture (SLL2)
 // every packet appears twice, the copy with the destination rewritten by NAT.
 // The replay sends each message once; a real repeat (same text, another IP
-// ID) is kept; --pcap-dedup off sends the copies too.
+// ID) is kept, and so is one with the SAME IP ID (Linux sends 0 with DF):
+// each original absorbs at most one copy per other interface (2026-11-07,
+// the rule of RI and GI); --pcap-dedup off sends the copies too.
 func TestPcapDedupAnyCopies(t *testing.T) {
 	t0 := time.Unix(1700000000, 0)
 	cli := netip.MustParseAddr("10.1.1.1")
@@ -55,19 +60,21 @@ func TestPcapDedupAnyCopies(t *testing.T) {
 	udp(0, 100, "<13>udp-a")
 	udp(5, 101, "<13>same")
 	udp(6, 102, "<13>same") // a real repeat: another IP ID
+	udp(7, 0, "<13>twice")
+	udp(8, 0, "<13>twice") // a real repeat with the same IP ID
 	c := pcaptest.Conn{Link: pcaptest.SLL2, Src: netip.AddrPortFrom(cli, 40001), Dst: srv, ISN: 7, T0: t0.Add(10 * time.Millisecond)}
 	frames = append(frames, c.Frames(c.Split([]byte("9 <13>tcp-19 <13>tcp-2"), 6), false, false)...)
 	frames = withCopies(t, frames, nat)
 	file := filepath.Join(t.TempDir(), "any.pcap")
 	os.WriteFile(file, pcaptest.Classic(pcaptest.SLL2, frames), 0o600)
-	want := "<13>udp-a|<13>same|<13>same|<13>tcp-1|<13>tcp-2"
+	want := "<13>udp-a|<13>same|<13>same|<13>twice|<13>twice|<13>tcp-1|<13>tcp-2"
 
 	addr, s := streamServer(t, false, false, nil)
 	code, sum := runJSON(t, "--target", addr, "--pcap", file)
 	if code != ExitOK {
 		t.Fatalf("exit %d %+v", code, sum)
 	}
-	if got := strings.Join(waitFor(t, s, 5), "|"); got != want || sum.OK != 5 {
+	if got := strings.Join(waitFor(t, s, 7), "|"); got != want || sum.OK != 7 {
 		t.Fatalf("replayed %q (ok %d), want %q", got, sum.OK, want)
 	}
 	if n := sum.Source["pcap_any_duplicates"]; n != uint64(len(frames)/2) {
@@ -75,10 +82,39 @@ func TestPcapDedupAnyCopies(t *testing.T) {
 	}
 
 	addr2, s2 := streamServer(t, false, false, nil)
-	if code, sum := runJSON(t, "--target", addr2, "--pcap", file, "--pcap-dedup", "off"); code != ExitOK || sum.OK != 10 {
-		t.Fatalf("dedup off: exit %d ok %d, want the 10 copies", code, sum.OK)
+	if code, sum := runJSON(t, "--target", addr2, "--pcap", file, "--pcap-dedup", "off"); code != ExitOK || sum.OK != 14 {
+		t.Fatalf("dedup off: exit %d ok %d, want the 14 copies", code, sum.OK)
 	}
-	waitFor(t, s2, 10)
+	waitFor(t, s2, 14)
+}
+
+// TestPcapDedupAfterPortFilter (SPEC §6.9): the copy the --pcap-port filter
+// refuses must not shadow the one it keeps. Here the capture sees each packet
+// first before DNAT (port 38514) and then after it (514); with --pcap-port
+// 514 the second copy is the one replayed. Asked before the filter, the
+// refused first copy became the original and the kept one was dropped.
+func TestPcapDedupAfterPortFilter(t *testing.T) {
+	t0 := time.Unix(1700000000, 0)
+	cli := netip.MustParseAddr("10.1.1.1")
+	ext := netip.MustParseAddrPort("192.0.2.10:38514")
+	nat := netip.MustParseAddrPort("172.17.0.2:514")
+	var frames []pcaptest.Frame
+	ip := pcaptest.IP(cli, ext.Addr(), 17, pcaptest.UDP(5000, ext.Port(), []byte("<13>udp")), 100)
+	frames = append(frames, pcaptest.Frame{TS: t0, Data: pcaptest.Link(pcaptest.SLL2, ip)})
+	c := pcaptest.Conn{Link: pcaptest.SLL2, Src: netip.AddrPortFrom(cli, 40001), Dst: ext, ISN: 7, T0: t0.Add(10 * time.Millisecond)}
+	frames = append(frames, c.Frames(c.Split([]byte("7 <13>tcp"), 100), false, false)...)
+	frames = withCopies(t, frames, nat)
+	file := filepath.Join(t.TempDir(), "dnat.pcap")
+	os.WriteFile(file, pcaptest.Classic(pcaptest.SLL2, frames), 0o600)
+
+	addr, s := streamServer(t, false, false, nil)
+	code, sum := runJSON(t, "--target", addr, "--pcap", file, "--pcap-port", "514")
+	if code != ExitOK {
+		t.Fatalf("exit %d %+v", code, sum)
+	}
+	if got := strings.Join(waitFor(t, s, 2), "|"); got != "<13>udp|<13>tcp" || sum.OK != 2 {
+		t.Fatalf("replayed %q (ok %d)", got, sum.OK)
+	}
 }
 
 // flowServer records, per connection, its PROXY header and its messages.

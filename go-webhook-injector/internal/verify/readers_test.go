@@ -141,25 +141,35 @@ func testRedis(t *testing.T, env string) {
 		t.Skip(env + " not set")
 	}
 	ctx := context.Background()
-	r, err := openRedis(ctx, url, "", time.Now().Add(-Margin))
+	opt, _ := rueidis.ParseURL(strings.Replace(strings.Replace(url, "valkeys://", "rediss://", 1), "valkey://", "redis://", 1))
+	opt.DisableCache = true
+	cl, err := rueidis.NewClient(opt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.close()
+	defer cl.Close()
 	key := fmt.Sprintf("loghub.witest%d.webhook.request", time.Now().UnixNano())
 	other := key + "x" // matches the pattern too
-	t.Cleanup(func() { r.c.Do(context.Background(), r.c.B().Del().Key(key, other).Build()) })
+	t.Cleanup(func() { cl.Do(context.Background(), cl.B().Del().Key(key, other).Build()) })
 	add := func(k, u string, seq int) {
-		if err := r.c.Do(ctx, r.c.B().Xadd().Key(k).Id("*").FieldValue().FieldValue("e", envJLH(u, seq)).Build()).Error(); err != nil {
+		if err := cl.Do(ctx, cl.B().Xadd().Key(k).Id("*").FieldValue().FieldValue("e", envJLH(u, seq)).Build()).Error(); err != nil {
 			t.Fatal(err)
 		}
 	}
 	now := time.Now()
+	// An entry already there at the check is not read, however recent
+	// (SPEC §8.6.3): the read starts after the stream's last entry.
+	add(key, v7(now, 9), 9)
+	r, err := openRedis(ctx, url, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.close()
 	add(key, v7(now, 1), 1)
 	add(other, v7(now, 2), 2)
 	got := collect(t, r)
-	if !contains(got, v7(now, 1)+" 1") || !contains(got, v7(now, 2)+" 2") {
-		t.Fatalf("%q", got)
+	if !contains(got, v7(now, 1)+" 1") || !contains(got, v7(now, 2)+" 2") || contains(got, v7(now, 9)+" 9") {
+		t.Fatalf("%q (the entry before the check must not be read; the stream born after it is read whole)", got)
 	}
 	// The same envelope again: a second entry, read after the cursor.
 	add(key, v7(now, 1), 1)
@@ -169,7 +179,7 @@ func testRedis(t *testing.T, env string) {
 	// A key that is not a stream is refused with --verify-stream.
 	r.c.Do(ctx, r.c.B().Set().Key(key+"str").Value("x").Build())
 	t.Cleanup(func() { r.c.Do(context.Background(), r.c.B().Del().Key(key+"str").Build()) })
-	if _, err := openRedis(ctx, url, key+"str", now); err == nil {
+	if _, err := openRedis(ctx, url, key+"str"); err == nil {
 		t.Fatal("string key accepted")
 	}
 	_ = rueidis.Nil
@@ -206,24 +216,31 @@ func TestNATSReader(t *testing.T) {
 	}
 	t.Cleanup(func() { js.DeleteStream(context.Background(), name) })
 	now := time.Now()
+	// Messages already in the stream at the check are not read, however
+	// recent (SPEC §8.6.3): the consumer starts after the last sequence.
+	for i := 9001; i <= 9003; i++ {
+		if _, err := js.Publish(ctx, subj, []byte(envJLH(v7(now, i), i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := openNATS(ctx, url, name, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.close()
 	for i := 1; i <= 2500; i++ {
 		if _, err := js.Publish(ctx, subj, []byte(envJLH(v7(now, i), i))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	r, err := openNATS(ctx, url, name, now.Add(-Margin), 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.close()
-	if got := collect(t, r); len(got) != 2500 {
-		t.Fatalf("%d records", len(got))
+	if got := collect(t, r); len(got) != 2500 || !strings.HasSuffix(got[0], " 1") {
+		t.Fatalf("%d records (want the 2500 after the check)", len(got))
 	}
 	js.Publish(ctx, subj, []byte(envJLH(v7(now, 1), 1)))
 	if got := collect(t, r); len(got) != 1 || got[0] != v7(now, 1)+" 1" {
 		t.Fatalf("second read: %q", got)
 	}
-	if _, err := openNATS(ctx, url, name+"_NOPE", now, 2*time.Second); err == nil {
+	if _, err := openNATS(ctx, url, name+"_NOPE", 2*time.Second); err == nil {
 		t.Fatal("missing stream accepted")
 	}
 }
