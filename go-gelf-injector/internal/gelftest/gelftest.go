@@ -631,6 +631,9 @@ func (h *HTTP) Close() { h.srv.Close() }
 // ServeHTTP implements http.Handler.
 func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.C.Count("requests")
+	if len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked" {
+		h.C.Count("chunked")
+	}
 	if n, ok := r.Context().Value(connCount{}).(*atomic.Int64); ok && h.MaxPerConn > 0 && n.Add(1) >= int64(h.MaxPerConn) {
 		w.Header().Set("Connection", "close")
 	}

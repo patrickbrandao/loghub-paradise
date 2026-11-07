@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/verify"
 )
 
 // Hist is a log-linear latency histogram: 32 sub-buckets per power of two,
@@ -150,6 +152,8 @@ type Report struct {
 	End    time.Time
 	// OKOutcomes names the outcomes that count as success, in print order.
 	OKOutcomes []string
+	// Verify is the destination check (SPEC §10.4), when there was one.
+	Verify *verify.Result
 }
 
 // New returns an empty report.
@@ -221,6 +225,7 @@ type Summary struct {
 	Conns      Conns             `json:"connections"`
 	Events     map[string]uint64 `json:"events,omitempty"`
 	Source     map[string]uint64 `json:"source,omitempty"`
+	Verify     *verify.Result    `json:"verify,omitempty"`
 }
 
 // Latency is in microseconds.
@@ -271,6 +276,7 @@ func (r *Report) Summarize() Summary {
 		Conns:      Conns{Opened: r.dials.Load(), DialErrors: r.dialErrs.Load(), Broken: r.broken.Load()},
 		Events:     ev,
 		Source:     r.Source,
+		Verify:     r.Verify,
 	}
 	s.Messages = s.OK + s.Failed
 	if el > 0 {
@@ -331,6 +337,42 @@ func (r *Report) WriteText(w io.Writer) error {
 		b.WriteString("source:\n")
 		for _, k := range sortedKeys(s.Source) {
 			fmt.Fprintf(&b, "  %-24s %d\n", k, s.Source[k])
+		}
+	}
+	if v := s.Verify; v != nil {
+		b.WriteString("verify:\n")
+		fmt.Fprintf(&b, "  %-24s %s\n", "destination", v.Destination)
+		state := "complete"
+		switch {
+		case v.Failed:
+			state = "FAILED: the destination could not be read"
+		case !v.Complete:
+			state = "incomplete (timeout)"
+		}
+		fmt.Fprintf(&b, "  %-24s %s after %.3fs, %d reads\n", "state", state, v.Waited, v.Reads)
+		if !v.Failed {
+			for _, kv := range []struct {
+				k string
+				n uint64
+			}{{"expected", v.Expected}, {"found", v.Found}, {"lost", v.Lost}, {"duplicated", v.Duplicated},
+				{"extra_copies", v.ExtraCopies}, {"failed_found", v.FailedFound}, {"failed_missing", v.FailedMissing},
+				{"unexpected", v.Unexpected}, {"unparsable", v.Unparsable}} {
+				fmt.Fprintf(&b, "  %-24s %d\n", kv.k, kv.n)
+			}
+			for _, kv := range []struct {
+				k string
+				v []uint64
+			}{{"duplicated_sample", v.DuplicatedSample}, {"unexpected_sample", v.UnexpectedSample}} {
+				if len(kv.v) > 0 {
+					fmt.Fprintf(&b, "  %-24s %v\n", kv.k, kv.v)
+				}
+			}
+			if len(v.LostSeqs) > 0 {
+				fmt.Fprintf(&b, "  %-24s %s\n", "lost_seqs", strings.Join(v.LostSeqs, ","))
+			}
+		}
+		if v.Error != "" {
+			fmt.Fprintf(&b, "  %-24s %s\n", "error", v.Error)
 		}
 	}
 	_, err := io.WriteString(w, b.String())

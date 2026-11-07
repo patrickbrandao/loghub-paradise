@@ -13,6 +13,12 @@ import (
 )
 
 func feed(strict, mid bool, chunk int, in []byte, gaps map[int]bool) ([]string, Stats) {
+	return feedEnd(strict, mid, chunk, in, gaps, false)
+}
+
+// feedEnd ends the direction as closed (FIN/RST seen) or cut (the capture
+// ended first).
+func feedEnd(strict, mid bool, chunk int, in []byte, gaps map[int]bool, closed bool) ([]string, Stats) {
 	var st Stats
 	var out []string
 	s := NewStream(strict, mid, &st, func(d Doc) { out = append(out, string(d.Data)) })
@@ -22,7 +28,7 @@ func feed(strict, mid bool, chunk int, in []byte, gaps map[int]bool) ([]string, 
 		}
 		s.Data(in[off:min(off+chunk, len(in))], time.Time{})
 	}
-	s.End()
+	s.End(closed)
 	return out, st
 }
 
@@ -153,15 +159,16 @@ func TestDatagrams(t *testing.T) {
 // FuzzStream: whatever the input, the split and the mode, nothing panics and
 // the documents are the same whole or fed in pieces of 1..32 bytes.
 func FuzzStream(f *testing.F) {
-	f.Add([]byte("{\"a\":1}\x00{\"b\":2}\x00{\"c\""), uint8(3), true, false)
-	f.Add([]byte("x\x00 {\"a\":1}\x00"), uint8(1), true, true)
-	f.Add([]byte("body}POST /gelf HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"), uint8(4), true, true)
-	f.Add([]byte("POST /gelf HTTP/1.1\r\nContent-Length: 7\r\n\r\n{\"a\":1}"), uint8(2), false, false)
-	f.Add([]byte("1.1\" 200\"}\x00{\"m\":\"GET / HTTP/1.1\"}\x00{\"a\":1}\x00"), uint8(5), true, true)
-	f.Add([]byte("x HTTP/1.1 HTTP/1.1\n\nPOST /gelf HTTP/1.1\nContent-Length: 2\n\n{}"), uint8(3), true, true)
-	f.Fuzz(func(t *testing.T, in []byte, chunk uint8, strict, mid bool) {
-		a, _ := feed(strict, mid, len(in)+1, in, nil)
-		b, _ := feed(strict, mid, int(chunk%32)+1, in, nil)
+	f.Add([]byte("{\"a\":1}\x00{\"b\":2}\x00{\"c\""), uint8(3), true, false, false)
+	f.Add([]byte("x\x00 {\"a\":1}\x00"), uint8(1), true, true, false)
+	f.Add([]byte("body}POST /gelf HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"), uint8(4), true, true, false)
+	f.Add([]byte("POST /gelf HTTP/1.1\r\nContent-Length: 7\r\n\r\n{\"a\":1}"), uint8(2), false, false, false)
+	f.Add([]byte("1.1\" 200\"}\x00{\"m\":\"GET / HTTP/1.1\"}\x00{\"a\":1}\x00"), uint8(5), true, true, false)
+	f.Add([]byte("x HTTP/1.1 HTTP/1.1\n\nPOST /gelf HTTP/1.1\nContent-Length: 2\n\n{}"), uint8(3), true, true, false)
+	f.Add([]byte("{\"a\":1}\x00{\"b\":2} "), uint8(2), true, false, true)
+	f.Fuzz(func(t *testing.T, in []byte, chunk uint8, strict, mid, closed bool) {
+		a, _ := feedEnd(strict, mid, len(in)+1, in, nil, closed)
+		b, _ := feedEnd(strict, mid, int(chunk%32)+1, in, nil, closed)
 		if !reflect.DeepEqual(a, b) {
 			t.Fatalf("split %d changed the documents: %q vs %q", chunk%32+1, a, b)
 		}

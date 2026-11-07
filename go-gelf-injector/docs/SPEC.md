@@ -28,16 +28,26 @@ código, depois o teste.
   descomprimidos), TCP e HTTP.
 - Relatório honesto: cada mensagem tem **um** desfecho (§8.2), e o código de
   saída diz se alguma falhou.
+- **Conferência no destino** (§10, decisão 4 revista em 2026-11-07): depois do
+  envio, ler o destino do servidor (NATS JetStream, `loghub.inbox` do
+  PostgreSQL, stream Redis/Valkey, `gelf_events` do SQLite) e contar, pelos
+  `_seq` da execução, o que se perdeu e o que chegou repetido. Sem ela, no
+  UDP/TCP o relatório é "o kernel aceitou" e no HTTP é a resposta do servidor
+  (`202` = o ring guardou).
 
 ### 1.2 Não-objetivos (v1)
 
-- **Conferir a entrega no destino** (NATS, PostgreSQL...) (decisão 4;
-  pendência 1). No UDP/TCP o relatório é "o kernel aceitou"; no HTTP é a
-  resposta do servidor (`202` = o ring guardou).
-- Captura ao vivo; reproduzir o IP de origem (só anunciável pelo PROXY); TLS
-  capturado (cifrado).
-- HTTP/2 e socket unix (decisão G1; pendência 4).
+- Captura ao vivo; reproduzir o IP de origem (só anunciável pelo PROXY, que o
+  replay por fluxo anuncia, §6.8); TLS capturado (cifrado).
+- Socket unix (decisão G1).
+- **HTTP/2** no envio (decisão G1, revista em 2026-11-07): nenhum servidor da
+  família G o aceita — o `go-gelf-server` (sua SPEC §4.5), e os cortes que o
+  copiam, anunciam só `http/1.1` no ALPN e deixam o `TLSNextProto` vazio, e
+  não há h2c. Um h2 que o servidor recusa não testa nada; o envio é
+  HTTP/1.1, com `Content-Length` ou `chunked` (§4.3).
 - Validar o JSON do usuário: arquivo e modelo saem como estão (decisão G8).
+- Conferir no destino documentos que não trazem os marcadores da execução
+  (`--file`, `--pcap`): não há como reconhecê-los (§10.1).
 
 ### 1.3 Família
 
@@ -65,6 +75,12 @@ fonte ──> produtor ──> fila (4 × concorrência) ──> N workers ─�
   quebrada é fechada e o worker disca de novo (100 ms dobrando até 2 s). Uma
   conexão HTTP pode **devolver** mensagens que o servidor garantidamente não
   processou (§4.4): o worker as manda primeiro na próxima conexão.
+- Com `--pcap-flows` (§6.8) a fila única dá lugar a **uma fila e um worker
+  por fluxo original** da captura, cada um com a sua conexão; `--concurrency`
+  passa a ser o teto de fluxos abertos ao mesmo tempo.
+- Com `--verify-url`/`--verify-sqlite` (§10), depois do fim do envio o
+  conferidor lê o destino até achar toda mensagem enviada com sucesso ou até
+  `--verify-timeout`.
 - O documento viaja **sem compressão e sem moldura** da fonte até a conexão; o
   transporte comprime, fatia em chunks ou enquadra.
 - Contrato de toda conexão (`sched.Conn`): o callback de desfecho é chamado
@@ -89,6 +105,7 @@ internal/
   sched/      produtor, workers, ritmo, devolução, interrupção (do WI)
   transport/  UDP (chunks), TCP/TLS (\0), HTTP/1.1 (do WI), PROXY (do SI)
   report/     contadores, histograma, texto/JSON, progresso
+  verify/     conferência no destino: NATS, PostgreSQL, Redis/Valkey, SQLite
   gelftest/   receptores GELF estritos e independentes, para os testes
 ```
 
@@ -122,6 +139,7 @@ go-gelf-injector [flags]
 | `--retries` | `0` | reenvios de `429`/`503` |
 | `--retry-max-wait` | `5s` | maior espera de um reenvio (`>= 0`; `0` reenvia sem esperar) |
 | `--response-timeout` | `30s` | espera por cada resposta HTTP |
+| `--http-chunked` | `0` | corpo em `Transfer-Encoding: chunked`, em pedaços de N bytes (`1..16777216`); `0` = `Content-Length` (§4.3) |
 | `--count` | 1; sem limite com `--duration`; a fonte inteira com `--file`/`--pcap` | mensagens; `0` = sem limite |
 | `--duration` | `0` | para depois deste tempo |
 | `--rate` | `0` | mensagens/s somando as conexões; `0` = o máximo |
@@ -139,6 +157,14 @@ go-gelf-injector [flags]
 | `--pcap-proto` | `udp,tcp` | protocolos da captura (`tcp` inclui o HTTP) |
 | `--pcap-timing` | `asap` | `asap` ou `original` |
 | `--pcap-speed` | `1` | fator de `original` |
+| `--pcap-flows` | `false` | uma conexão por fluxo original da captura, com o PROXY anunciando a origem e o destino capturados (§6.8) |
+| `--verify-url` | — | conferir no destino (§10): `nats://`, `tls://`, `postgres://`, `postgresql://`, `redis://`, `rediss://`, `valkey://`, `valkeys://` |
+| `--verify-sqlite` | — | conferir no `events.db` do `sink=sqlite` (§10) |
+| `--verify-timeout` | `30s` | espera máxima da conferência, contada do fim do envio |
+| `--verify-space` | `default` | espaço LogHub: subject NATS e stream Redis `loghub.<space>.gelf`, coluna `space` do PostgreSQL e do SQLite |
+| `--verify-key` | — | stream Redis/Valkey (padrão `loghub.<space>.gelf`) ou stream NATS (padrão `LOGHUB_GELF`) |
+| `--pcap-dedup` | `auto` | cópias de um datagrama na captura: `auto` (pelo ponto de captura), `on` (toda cópia em 50 ms) ou `off` (§6.3.1) |
+| `--verify-tls-ca` | — | CAs (PEM) que verificam o destino em `tls://` e `rediss://`/`valkeys://` (padrão: as do sistema) |
 | `--report` | `text` | `text` ou `json` no stdout |
 | `--progress` | `auto` | intervalo da linha de progresso no stderr (duração Go); `0`/`off` desliga; outro valor é erro de uso |
 | `--version` | | imprime a versão e sai |
@@ -157,7 +183,17 @@ com fonte que não é o gerador; `--loop` sem `--file`/`--pcap` ou com stdin;
 `--pcap-port`/`--pcap-proto`/`--pcap-speed`/`--pcap-timing original` sem
 `--pcap`; `--rate` com `original`; `--run` fora de `[A-Za-z0-9._:-]{1,64}`; `--progress`
 que não é `auto`, `off` nem duração `>= 0`; marcador desconhecido; captura que
-não é pcap/pcapng; argumento posicional. Tudo conferido **antes** do primeiro envio.
+não é pcap/pcapng; argumento posicional; `--http-chunked` fora de http/https ou
+fora de `0..16777216`; `--pcap-flows` sem `--pcap`, ou com
+`--proxy-src`/`--proxy-dst` (o fluxo anuncia os seus); `--verify-url` e
+`--verify-sqlite` juntos; esquema de `--verify-url` fora da lista, URL sem
+host, `nats://` com parâmetros (§10.2); `--verify-space` fora da gramática de
+espaço, `--verify-key` com PostgreSQL ou SQLite; `--verify-timeout <= 0`, ou
+`--verify-tls-ca`/`--verify-space`/`--verify-key`/`--verify-timeout` sem
+conferência; `--pcap-dedup` sem `--pcap` ou fora de `auto|on|off`; conferência com `--file`/`--pcap`, ou com um
+`--template` sem `"_seq"`, `{seq}`, `"_run"` e `{run}` (§10.1). Tudo conferido
+**antes** do primeiro envio. A mensagem de erro de `--verify-url` nunca repete
+a URL (pode ter senha).
 
 ### 3.3 Códigos de saída
 
@@ -167,7 +203,14 @@ não é pcap/pcapng; argumento posicional. Tudo conferido **antes** do primeiro 
 | `1` | alguma falhou, ou a fonte deu erro no meio |
 | `2` | uso |
 | `3` | alvo inalcançável: houve mensagens e nenhuma conexão abriu |
+| `4` | conferência impossível (§10.3): o destino não abriu antes do envio (e **nada foi enviado**), não tem a tabela/stream, ou nenhuma leitura deu certo |
 | `130` | interrompido (SIGINT/SIGTERM) |
+
+Precedência: `130`, `3`, `4`, `1`. Uma mensagem enviada com sucesso que não
+está no destino, um `_seq` repetido ou desconhecido no destino (§10.1) é
+**`1`**, como uma falha de transporte: o relatório separa as duas. Os códigos
+são os do `go-syslog-injector` (alinhamento da rodada de 2026-11-07; a
+primeira versão deste módulo tinha `4` para perda e `5` para impossível).
 
 ---
 
@@ -226,6 +269,13 @@ O cliente HTTP/1.1 do WI (sua SPEC §4.1, §4.3–§4.5), sobre `net.Conn` próp
   corpo gzip e `Content-Encoding: gzip`; com `zlib`, corpo zlib e
   `Content-Encoding: deflate` (decisão G4). O corpo é comprimido uma vez; um
   reenvio leva os mesmos bytes.
+- **`--http-chunked N`** (2026-11-07, pendência 4): em vez de
+  `Content-Length`, `Transfer-Encoding: chunked` com o corpo (já comprimido)
+  em pedaços de N bytes, o último menor, e o pedaço final `0` sem trailers. É
+  o que um emissor que transmite sem saber o tamanho manda; o `net/http` do
+  servidor o aceita, e o teto do corpo vale do mesmo jeito (o `413` antecipado
+  por `Content-Length` não existe, o `413` pelo que foi lido sim). Sem efeito
+  no desfecho nem nos reenvios.
 - Keep-alive, uma conexão por worker, `TCP_NODELAY`; TLS com ALPN `http/1.1`.
 - **Pipelining** (`--pipeline N`): até N requisições em voo; o buffer é
   empurrado antes de esperar uma vaga (sem isso, impasse). Uma goroutine
@@ -241,6 +291,20 @@ O cliente HTTP/1.1 do WI (sua SPEC §4.1, §4.3–§4.5), sobre `net.Conn` próp
   descartadas pelo servidor e voltam ao worker (com 32, ~30× o tráfego).
   `--pipeline > 1` serve a servidores com keep-alive; com teto N por conexão,
   cada conexão perde no máximo o que estava em voo atrás da N-ésima.
+- **Adaptação automática** (2026-11-07, pendência 7): quando **2 conexões
+  seguidas** (de qualquer worker) recebem `Connection: close` já na 1ª
+  resposta, as conexões abertas dali em diante usam pipeline **1** — evento
+  `adapted: server closes every connection, pipeline 1`. Uma conexão que
+  depois receba uma 2ª resposta (o servidor voltou a manter a conexão, ou
+  era um shutdown passageiro) restaura `--pipeline` nas seguintes — evento
+  `adapted: server keeps connections, pipeline N`. Só existe com
+  `--pipeline > 1`; com 1 não há o que adaptar (a vaga só é liberada depois
+  de marcar a conexão fechando, então nada é escrito atrás do fechamento).
+  Dois e não um: um `Connection: close` isolado é o teto por conexão ou o
+  shutdown, e o primeiro fechamento custa no máximo `--pipeline − 1`
+  requisições devolvidas. As conexões já abertas mantêm o pipeline com que
+  nasceram; o que elas escreverem atrás do fechamento volta ao worker como
+  antes (sem perda, sem duplicata).
 - A vaga do pipeline só é liberada **depois** de a conexão ser marcada como
   fechando, quando a resposta traz `Connection: close`: o worker que esperava
   a vaga devolve a requisição sem escrevê-la (antes de 2026-10-31 ela ia a um
@@ -279,7 +343,9 @@ devolvem: não há como saber.
 conexão tcp, tls, http ou https, **antes** do handshake TLS. Anuncia o par real
 (local como origem, o discado como destino) ou `--proxy-src`/`--proxy-dst`.
 Famílias diferentes saem como IPv6 (IPv4 mapeado). Serve para testar
-`proxy.protocol`/`proxy.trusted` do servidor e atribuir outra origem.
+`proxy.protocol`/`proxy.trusted` do servidor e atribuir outra origem. Com
+`--pcap-flows`, cada conexão anuncia a origem e o destino capturados do seu
+fluxo (§6.8).
 
 ---
 
@@ -359,6 +425,29 @@ remontados com limites; datagrama cortado pelo snaplen não é reproduzido
 (`frames_lost`); TCP por direção em ordem de sequência, retransmissões e fora
 de ordem tratados, buraco = lacuna, `tcp_midstream`, `tcp_unterminated`.
 
+Portado do `go-relplog-injector` em 2026-11-07: o PKTAP (o `-i any` do
+macOS) lê o tipo de enlace interno de `pth_dlt` — lia de `pth_type_next`,
+sempre 1 (Ethernet), e o loopback (`DLT_NULL`) nunca decodificava —, e um
+registro que não é pacote (`pth_type_next` ≠ 1) é `pcap_not_ip`; fragmentos
+ainda esperando o datagrama no fim de uma passada contam em
+`pcap_ip_fragments_lost` (sumiam sem contar).
+
+**Fragmentos numa captura real** (pendência 6, fechada em 2026-11-07). O
+loopback não fragmenta (MTU 64 KiB); uma ponte Docker sim (MTU 1500): o
+injetor num container manda ao receptor estrito em outro, e o `tcpdump -i
+eth0` do receptor grava os fragmentos antes de o kernel remontá-los. Datagramas
+de 8192 (chunks gzip de documentos de 20 KB) e de 5000 sem chunk viram 6 e 4
+fragmentos IPv4. Medido: 800 documentos (500 chunked + 300 sem compressão em
+chunks de 3000), 6500 fragmentos, 1600 datagramas remontados, nenhum perdido,
+800 de 800 idênticos ao que o receptor vivo aceitou, reproduzidos em TCP, UDP
+e HTTP. Uma captura pequena dessa forma (30 documentos, 240 fragmentos) fica
+em `internal/app/testdata/captures/ip-fragments.pcap` (`TestRealCaptures`).
+Com o `-i any` do host da ponte, cada fragmento aparece duas vezes (em cada
+`veth`): a cópia de mesmo deslocamento e tamanho é ignorada enquanto o
+datagrama está aberto, e o datagrama remontado de novo pelas cópias tardias é
+uma cópia do primeiro (§6.3.1 ou, se for chunk, a regra da remontagem).
+IPv6 fragmentado continua provado só com capturas sintéticas.
+
 ### 6.3 UDP
 
 Decisão G9. Um datagrama que começa com `0x1e 0x0f` é chunk:
@@ -385,6 +474,64 @@ Completo (ou datagrama sem magic), o payload é descomprimido pelos primeiros
 bytes: gzip `1f 8b`, zlib `78 xx` com `(b0<<8|b1) % 31 == 0` (método 8), senão
 JSON cru. Falha de descompressão: `decompress_errors`.
 
+#### 6.3.1 Duplicatas do `-i any` em datagramas sem chunk
+
+Corrigido em 2026-11-07 (pendência 2). O `tcpdump -i any` grava o mesmo
+datagrama mais de uma vez: no loopback, uma cópia de saída e uma de entrada;
+numa máquina que roteia ou faz ponte (Docker), uma por interface. Um emissor
+que repete de propósito o mesmo documento também gera datagramas idênticos, e
+esses **não** podem sumir. O que separa os dois é o **ponto de captura**
+(`vantage`) de cada cópia, que a captura registra:
+
+| Enlace | Ponto de captura |
+|---|---|
+| Linux cooked v2 (`-i any` moderno) | índice da interface + tipo do pacote (de saída, para o host, ...) |
+| Linux cooked v1 | tipo do pacote |
+| pcapng | a interface do bloco (IDB), mais o acima quando o enlace é cooked |
+| PKTAP (macOS `-i any`) | o nome da interface (`pth_ifname`), como o `go-relplog-injector` |
+| outros (Ethernet de uma interface, loopback BSD, raw) | um só: nunca há cópia |
+
+Chave (a mesma do `go-syslog-injector`): porta de origem, identificação IP
+(IPv4, ou o id do fragmento IPv6; as cópias de um pacote a têm igual, o
+próximo pacote do emissor não), tamanho e FNV-1a 64 dos bytes. Endereços e
+porta de destino ficam **fora**: um NAT entre dois pontos de captura os
+reescreve. `--pcap-dedup`:
+
+- `auto` (padrão): cada ponto de captura tem a sua contagem de cópias da
+  chave; a cópia que leva a
+contagem do **seu** ponto acima da maior contagem dos **outros** pontos é uma
+mensagem nova (reproduzida); senão é a cópia de uma já vista
+(`udp_datagrams_duplicate`, não reproduzida). Assim saída+entrada de um envio
+dão um documento, e o mesmo documento enviado duas vezes (saída, entrada,
+saída, entrada) dá dois — mesmo com a identificação IP igual (IPv4 com DF
+pode mandar 0 sempre), e inclusive se uma cópia de algum ponto se perdeu no
+buffer do tcpdump. Numa captura de um ponto só, nada é descartado;
+  É a regra do `go-relplog-injector` dita de outro jeito: cada original
+  absorve no máximo uma cópia por **outro** ponto de captura, então uma
+  mensagem enviada de fato duas vezes é reproduzida duas vezes;
+- `on`: toda repetição da chave dentro da janela é cópia, qualquer que seja o
+  ponto — para capturas que não registram o ponto (Ethernet de várias
+  interfaces juntadas com `mergecap`), ao risco de uma repetição do emissor
+  com a mesma identificação IP;
+- `off`: nada é descartado.
+
+A chave esquece **50 ms de tempo de captura** depois da sua última cópia (as
+cópias de um mesmo pacote vêm a microssegundos umas das outras; o mesmo prazo
+do `go-syslog-injector`), e há no máximo 65 536 chaves (acima disso a mais antiga é esquecida
+antes do prazo). Só datagramas **sem** magic de chunk: os chunks já têm a
+regra da remontagem (acima), que continua a mesma. Vale com e sem
+`--pcap-port`, antes da checagem de conteúdo.
+
+Prova real (2026-11-07, `internal/app/testdata/captures/any-bridge.pcap`):
+`tcpdump -i any` no host de uma ponte Docker, entre dois containers, grava
+cada datagrama duas vezes (as duas `veth`, índices diferentes). 50 documentos
+do gerador, a mesma linha mandada 5 vezes de propósito e 10 documentos de 20
+KB em chunks fragmentados: 310 pacotes, 55 cópias de datagramas sem chunk
+descartadas, 20 chunks repetidos ignorados, e os 65 documentos que o receptor
+vivo aceitou — as 5 repetições inclusive — reproduzidos exatamente uma vez
+cada. No loopback de um container o Docker Desktop (kernel 6.x) grava uma
+cópia só: o `-i any` não duplica em toda máquina, e a regra não depende disso.
+
 ### 6.4 TCP: GELF com `\0`
 
 Decisão G10. Uma direção decide o protocolo uma vez, nos primeiros bytes
@@ -402,8 +549,21 @@ depois de espaços e `\0`:
   que não começa com `{` é `tcp_frames_not_gelf`.
 - Quadro acima de 16 MiB: `docs_too_large`, descartado até o próximo `\0`
   sem acumular.
-- **Fim da direção** (decisão G12): o quadro final sem `\0` é documento
-  (estrito) só se começar com `{` e terminar com `}`; senão `frames_lost`.
+- **Fim da direção** (decisão G12, revista em 2026-11-07, pendência 5): o
+  quadro final sem `\0` depende de **como** a direção terminou na captura:
+  - **fechada** — `FIN` (com todos os bytes até ele, sem lacuna no fim) ou
+    `RST`: é o que o servidor leu no EOF (ou no erro de leitura) e entregou
+    como documento (go-gelf-server SPEC §5.3). O replay faz o mesmo: no
+    estrito, basta começar com `{` (senão `tcp_frames_not_gelf`); um
+    documento com espaço interno no fim, ou malformado de propósito, sai como
+    está e o servidor o marca como marcaria o original;
+  - **sem fim** (`tcp_unterminated`: a captura parou, ou a direção ficou
+    ociosa 10 min): o corte pode ter caído em qualquer byte, então só é
+    documento (estrito) se começar com `{` e terminar com `}`; senão
+    `frames_lost`. Um quadro cortado logo depois de um `}` interno ainda
+    passa: é o limite do que se prova sem ler o JSON.
+  Com `--pcap-port` (não estrito) o quadro final não vazio é sempre
+  documento, fechada a direção ou não, como antes.
 - **Lacuna**: o quadro atingido é perdido (`frames_lost`), e os bytes são
   pulados até o próximo `\0` (`tcp_resyncs`, `tcp_skipped_bytes`).
 - **Midstream** (e lacuna antes da decisão): varre byte a byte; a primeira
@@ -444,9 +604,43 @@ passadas 1 ms depois da última mensagem; atraso de mais de 100 ms é contado
 
 ### 6.7 O que não é reproduzido
 
-TLS/HTTPS capturado; o IP de origem (pendência 3); as duplicatas do `-i any`
-de datagramas **sem** chunk (pendência 2; os chunks repetidos são ignorados);
-HTTP/2; direções de servidor.
+TLS/HTTPS capturado; o IP de origem como origem do socket (o PROXY o anuncia,
+§6.8); HTTP/2; direções de servidor.
+
+### 6.8 Uma conexão por fluxo (`--pcap-flows`)
+
+Corrigido em 2026-11-07 (pendência 3). Sem a flag, os documentos da captura
+inteira se dividem entre as `--concurrency` conexões, na ordem em que um
+worker fica livre: o servidor vê poucas conexões, nenhuma com a forma das
+originais. Com `--pcap-flows`:
+
+- **Fluxo** = o par (origem `ip:porta`, destino `ip:porta`) capturado de onde o
+  documento saiu: uma direção TCP (GELF `\0` ou HTTP) ou os datagramas UDP de
+  um par. Cada fluxo tem a **sua** fila e o seu worker, com uma conexão (ou
+  socket UDP) só dele, aberta no primeiro documento do fluxo. A ordem dentro
+  de um fluxo é a da captura; entre fluxos, cada um anda no seu passo.
+- **Fim do fluxo**: a conexão é fechada (depois de escrever o que tem e
+  esperar as respostas, como no fim da execução) quando a direção TCP
+  termina na captura (`FIN`, `RST`, ou o fim da passada para as que ficaram
+  abertas), e, no UDP, no fim de cada passada. Um documento do mesmo par
+  depois disso (porta reusada, ou a passada seguinte do `--loop`) abre uma
+  conexão nova. O fim é entregue em ordem: só depois do último documento do
+  fluxo.
+- **Teto**: `--concurrency` × **256** fluxos abertos ao mesmo tempo (os 256
+  por worker do `go-syslog-injector`; com o padrão 1, 256). No teto, o fluxo
+  usado há mais tempo é fechado como se tivesse terminado (evento `flow
+  closed at --concurrency`), e um documento dele depois disso reabre a
+  conexão.
+- **PROXY** (`--proxy-protocol v1|v2`): cada conexão anuncia a origem e o
+  destino **capturados** do seu fluxo (inclusive IPv6, ou famílias
+  diferentes como IPv6 mapeado, §4.5). `--proxy-src`/`--proxy-dst` são
+  recusados junto (exit 2): cada fluxo tem os seus. É o único modo de o
+  servidor atribuir a cada documento o emissor original (`src_ip`,
+  `x-proxy`); sem PROXY (e sempre no UDP), o fluxo só preserva a separação em
+  conexões.
+- `--rate` e `--pcap-timing original` continuam globais (o produtor é um só).
+  Os desfechos, os reenvios HTTP e o relatório são os de sempre; os workers
+  de fluxo dividem os mesmos contadores.
 
 ---
 
@@ -478,8 +672,8 @@ Igual ao SI/WI:
 (injetor, execução, alvo, compressão, `chunk_size`, protocolo HTTP, PROXY,
 fonte, plano), `start`, `elapsed_sec`, `messages`, `ok`, `failed`, `outcomes`,
 `bytes` (dos documentos, sem compressão), `rate_msgs_per_sec`,
-`rate_bytes_per_sec`, `latency` (µs, só dos sucessos), `connections`, `events`
-e `source` (§8.4).
+`rate_bytes_per_sec`, `latency` (µs, só dos sucessos), `connections`, `events`,
+`source` (§8.4) e, com conferência, `verify` (§10.4).
 
 ### 8.2 Desfechos
 
@@ -505,7 +699,7 @@ Uma linha por intervalo no stderr; `auto` só num terminal.
 Arquivo: `file_lines`, `file_empty_lines`, `file_long_lines`, `file_passes`.
 
 Captura: `pcap_*` (do SI), `udp_datagrams` (documentos de um datagrama),
-`udp_not_gelf`, `udp_chunked_messages`, `udp_chunks`, `udp_chunks_invalid`,
+`udp_not_gelf`, `udp_datagrams_duplicate` (§6.3.1), `udp_chunked_messages`, `udp_chunks`, `udp_chunks_invalid`,
 `udp_chunks_duplicate`, `udp_chunks_overflow`, `udp_chunked_incomplete`,
 `udp_chunks_dropped`, `compressed_gzip`/`_zlib`/`_deflate`,
 `decompress_errors`, `docs_too_large`, `tcp_*` do remontador (do SI),
@@ -519,21 +713,139 @@ Captura: `pcap_*` (do SI), `udp_datagrams` (documentos de um datagrama),
 
 ## 9. Pendências conhecidas
 
-1. **Conferência no destino** (decisão 4): ler NATS/PostgreSQL/SQLite e contar
-   os `_seq` da execução.
-2. **Duplicatas do `-i any`** de datagramas sem chunk (§6.7), como no SI.
-3. **Uma conexão por fluxo original** no replay, com o PROXY da origem
-   capturada.
-4. **HTTP/2** (h2 via TLS, se o `go-gelf-server` o tiver) e **HTTP/1.1
-   chunked** no envio: hoje sempre `Content-Length`.
-5. **Último quadro TCP sem `\0`** que não termina em `}` (§6.4): um documento
-   inteiro com espaço final interno ou malformado de propósito no fim de uma
-   conexão é contado como perdido no modo estrito.
-6. **Fragmentos IP numa captura real**: o código existe (SI), mas o loopback
-   não fragmenta; os chunks GELF de 8192 sobre Ethernet (MTU 1500) só serão
-   provados numa captura de rede real.
-7. **Adaptação a servidor que fecha toda conexão** (sugestão da revisão de
-   2026-10-31): o worker poderia notar que as primeiras conexões respondem
-   `Connection: close` à 1ª requisição e passar a mandar uma por conexão. Não
-   feito: a §4.3 manda usar `--concurrency` contra esse servidor, e o
-   desperdício do `--pipeline > 1` fica visível nos eventos do relatório.
+1. *Corrigido em 2026-11-07:* conferência no destino (NATS, PostgreSQL,
+   Redis/Valkey, SQLite) pelos `_seq` da execução; regra em §10.
+2. *Corrigido em 2026-11-07:* duplicatas do `-i any` de datagramas sem chunk,
+   pelo ponto de captura de cada cópia; regra em §6.3.1.
+3. *Corrigido em 2026-11-07:* uma conexão por fluxo original no replay, com o
+   PROXY da origem capturada (`--pcap-flows`); regra em §6.8.
+4. *Corrigido em 2026-11-07:* HTTP/1.1 `chunked` no envio (`--http-chunked`,
+   §4.3); HTTP/2 virou decisão (o `go-gelf-server` não o aceita, §1.2).
+5. *Corrigido em 2026-11-07:* último quadro TCP sem `\0` de uma direção
+   fechada (`FIN`/`RST`) é documento como no servidor; regra em §6.4.
+6. *Corrigido em 2026-11-07:* fragmentos IP provados numa captura real
+   (`tcpdump -i eth0` numa ponte Docker de MTU 1500, emissor em outro
+   container); regra e prova em §6.2.
+7. *Corrigido em 2026-11-07:* adaptação a servidor que fecha toda conexão
+   (pipeline 1 depois de 2 conexões fechadas na 1ª resposta); regra em §4.3.
+
+---
+
+## 10. Conferência no destino
+
+Decisão 4, revista pelo usuário em 2026-11-07: o relatório do transporte diz
+o que saiu ("o kernel aceitou", "o servidor respondeu `202`"); só o destino
+diz o que chegou. Com `--verify-url` (ou `--verify-sqlite`), depois do envio o
+injetor lê o que o servidor gravou e conta, pelos marcadores da execução, o
+que se perdeu e o que chegou repetido. Usa as **mesmas bibliotecas e
+versões** dos servidores (`go-gelf-server/go.mod`): `nats.go` (pacote
+`jetstream`), `pgx/v5`, `rueidis` e `modernc.org/sqlite` (sem cgo: o binário
+continua estático, decisão 6 revista).
+
+### 10.1 O que é conferido
+
+- **Marcadores**: o documento do gerador traz `"_seq":N` e `"_run":"R"`
+  (§5.1), que todo servidor da família grava em `payload.fields.seq` e
+  `payload.fields.run` do JLH `type=gelf` (go-gelf-server SPEC §3.2, §6.6). O
+  conferidor lê os JLH cujo `fields.run` é o `--run` desta execução e conta
+  cada `fields.seq` — número inteiro positivo, ou string de dígitos (um modelo
+  pode pôr `"_seq":"{seq}"`); outro valor conta em `unparsable`.
+- **Fontes**: o gerador; um `--template` que contém `"_seq"`, `{seq}`, `"_run"`
+  e `{run}` (o usuário escreve `"_seq":{seq},"_run":"{run}"`; o conferidor
+  não analisa o modelo além disso). `--file` e `--pcap` são recusados (exit 2):
+  os documentos não trazem os marcadores desta execução.
+- **Execução**: o `--run` padrão é aleatório, então duas execuções não se
+  misturam; reusar um `--run` dentro da janela de §10.3 mistura as duas, e o
+  relatório acusa duplicatas.
+- **Classificação**, para os `seq` produzidos (de 1 ao último que entrou na
+  fila, §7):
+
+| Contador | Significado | Erro (exit 1)? |
+|---|---|---|
+| `expected` | desfecho de sucesso (`sent`, `2xx`) | — |
+| `found` | dos `expected`, os achados no destino (distintos) | — |
+| `lost` | `expected` que não estão no destino | **sim** |
+| `duplicated` | `seq` achados mais de uma vez (`extra_copies`: as cópias além da 1ª) | **sim** |
+| `failed_found` | desfecho de falha, mas o servidor guardou (um `no_response` ou `timeout` que ele processou) | não: a falha já está no relatório |
+| `failed_missing` | desfecho de falha e ausente | não |
+| `unexpected` | `seq` desta execução que nunca foi produzido (`0`, ou além do último) | **sim** |
+| `unparsable` | JLH desta execução com `fields.seq` que não é inteiro positivo | **sim** |
+
+  O relatório lista as perdidas em até 20 faixas (`lost_seqs`: `"4"`,
+  `"10-19"`) e até 10 `seq` repetidos e desconhecidos (`duplicated_sample`,
+  `unexpected_sample`).
+
+### 10.2 Destinos
+
+O formato que cada destino grava é o da SPEC do `go-gelf-server` (§3.6–§3.8,
+§10.3–§10.7), o mesmo nos cortes `go-gelf-pg-server` (só PostgreSQL) e
+`go-gelf-nats-server` (só NATS).
+
+| URL | Lê | Como |
+|---|---|---|
+| `nats://`, `tls://` (lista separada por vírgula, como o `nats.go`) | JetStream, stream `--verify-key` (padrão `LOGHUB_GELF`, o `sink.nats.stream`; §3.8 do servidor), subject `loghub.<--verify-space>.gelf` | consumidor **ordenado e efêmero** (nada fica no servidor) com `DeliverByStartSequence` (a última sequência na checagem + 1) e o filtro de subject, `Fetch` com `FetchMaxWait` até `NumPending = 0`; uma sequência do stream já contada nunca conta de novo (um consumidor ordenado que se reinicia recomeça do ponto de partida; o `go-syslog-injector` viu o `FetchNoWait` fazer isso a cada chamada); o JLH está em `Data` |
+| `postgres://`, `postgresql://` | `loghub.inbox` (§3.7.1) | `SELECT payload->'fields'->>'seq' FROM loghub.inbox WHERE uuid >= $1 AND type = 'gelf' AND space = $3 AND payload->'fields'->>'run' = $2`; o limite inferior do `uuid` (UUIDv7, ordem de tempo) usa a chave primária |
+| `redis://`, `rediss://`, `valkey://`, `valkeys://` | stream `--verify-key` (padrão `loghub.<--verify-space>.gelf`, o `sink.redis.stream` com `{space}` expandido; §3.6), campo `e` | `XRANGE` desde depois do último ID na checagem, em páginas de 1000, continuando do último ID lido |
+| `--verify-sqlite <arquivo>` | `gelf_events` do `events.db` (§3.7) | aberto **só leitura**; `uuid >= $1` (texto canônico, mesma ordem), `space = $2` e `json_extract(CAST(env AS TEXT), '$.payload.fields.run')` (o `env` é BLOB, e um SQLite que o lesse como JSONB recusaria a linha) |
+
+`--verify-space` (padrão `default`) e `--verify-key` são os nomes do
+`go-syslog-injector`. A URL vai inteira ao driver: `nats://` não aceita
+parâmetros (exit 2); no `redis://` o banco vem do caminho (`/1`) e os
+parâmetros são os do `rueidis.ParseURL` (`dial_timeout`, `protocol`, ...);
+`valkey://` e `valkeys://` são `redis://` e `rediss://` (decisão da rodada
+Valkey de 2026-11-07: o protocolo é o mesmo); no `postgres://` todos vão ao
+`pgx` (`sslmode`, `sslrootcert`, ...), e a tabela é sempre `loghub.inbox`
+(`--verify-key` recusado). Usuário e senha (ou token NATS) na URL;
+`--verify-tls-ca` dá as CAs de `tls://` e `rediss://`.
+
+Limites de cada destino, que a conferência mostra mas não contorna:
+
+- **`loghub.inbox` é uma fila**: um consumidor que já removeu linhas faz a
+  conferência acusar `lost`. Confira com o consumidor parado.
+- **NATS `sink.nats.mode = core`** não guarda nada: não há o que ler.
+- **Redis com `sink.redis.maxlen`**: o que o trimming descartou é `lost` (e é
+  mesmo: o destino não o tem mais). O mesmo para o `max_age`/`max_msgs` do
+  stream NATS.
+- **SQLite com `sink.sqlite.rotate`**: só o arquivo dado é lido.
+- O usuário da conferência precisa de leitura: `SELECT` na `loghub.inbox`
+  (o papel do servidor tem só `SELECT (uuid)`), consumidor no stream NATS,
+  `XRANGE` no Redis.
+
+### 10.3 Espera e janela
+
+- **Antes do primeiro envio** o destino é aberto e conferido (o stream existe,
+  a tabela existe, o arquivo abre): falha é exit 4 sem enviar nada — uma URL
+  errada não gasta uma carga.
+- **Ponto de partida**: NATS e Redis/Valkey são lidos **depois da última
+  entrada do stream no momento da checagem** (a sequência do JetStream, o ID
+  do `XREVRANGE … COUNT 1`): tudo da execução vem depois, sem relógio
+  nenhum, e nada do passado é lido. A primeira versão partia do início da
+  execução menos 10 min e, num stream com ~250 000 mensagens nessa janela,
+  uma leitura passava do `--verify-timeout`. PostgreSQL e SQLite não têm essa
+  ordem de chegada: **janela** do início da execução menos **10 min** pelo
+  UUIDv7 (que vem do relógio do servidor; a folga cobre relógios de máquinas
+  diferentes).
+- **Espera**: depois do fim do envio (drenagem incluída, §7), lê o destino a
+  cada 250 ms — NATS e Redis continuando do ponto lido (stream só cresce);
+  PostgreSQL e SQLite relendo a janela inteira (uma linha de `uuid` menor pode
+  ser gravada depois, por outro worker do sink). Termina quando todo
+  `expected` foi achado, com **uma leitura a mais 1 s depois** (uma
+  duplicata do at-least-once chega logo atrás; o `go-syslog-injector` perdia
+  duplicatas no PostgreSQL sem ela), ou em `--verify-timeout`
+  (padrão 30 s, contado do fim do envio): aí `complete` é `false` e o que
+  falta é `lost`.
+- Uma leitura que falha é tentada de novo na próxima volta; sem nenhuma
+  leitura boa até o prazo, exit 4 com o erro.
+- Interrompido (SIGINT) durante a espera: o relatório sai com o que foi
+  contado, `complete: false`, exit 130.
+
+### 10.4 Relatório
+
+O objeto `verify` do JSON (e a seção `verify:` do texto), com os nomes do
+`go-syslog-injector` onde existem: `destination` (**só esquema e host** da URL,
+nunca usuário, senha, caminho ou parâmetros, mais o stream ou a tabela; ou o
+arquivo), `run`, `reads`, `waited` (segundos, do fim do envio), `complete`,
+`expected`, `found`, `lost`, `duplicated`, `unexpected`, `lost_seqs`, os
+demais contadores de §10.1, as amostras e `error` (a última falha de leitura).
+Nenhuma mensagem ecoa a URL: o texto de erro dos drivers passa por uma troca
+da senha por `xxxxx` antes de sair.

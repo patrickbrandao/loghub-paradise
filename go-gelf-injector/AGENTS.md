@@ -11,7 +11,7 @@ loghub-paradise/                  <- monorepo, SEM go.mod
     go.mod                        module github.com/patrickbrandao/loghub-paradise/go-gelf-injector
     cmd/go-gelf-injector/
     internal/
-    docs/DECISOES.md              decisões herdadas dos injetores (1-19) e as do GELF (G1-G12)
+    docs/DECISOES.md              decisões herdadas dos injetores (1-19) e as do GELF (G1-G12), revisões de 2026-11-07
     docs/SPEC.md                  fonte da verdade do comportamento
     docs/TESTING.md               como testar e o que ainda não é provado
     docker/Dockerfile
@@ -36,7 +36,11 @@ carga. Não é parte do pipeline LogHub: não gera envelope JLH, não lê config
   `transport/proxy.go` vieram do SI; `sched`, `tmpl`, `httpx` e o cliente de
   `transport/http.go` vieram do WI. Uma correção num deles vale para os
   irmãos: registre no `CHANGELOG.md` da raiz o que ficou "a portar".
-- **Zero dependências** fora da stdlib (decisão 6).
+- **Dependências** (decisão 6, revista em 2026-11-07): só a conferência no
+  destino (`internal/verify`) usa bibliotecas fora da stdlib — `nats.go`,
+  `pgx/v5`, `rueidis`, `modernc.org/sqlite` — nas **mesmas versões** do
+  `go-gelf-server/go.mod` (subiu lá, sobe aqui). Só `internal/verify` (e os
+  testes) as importa; o binário continua estático (`CGO_ENABLED=0`).
 - Git (commit, branch, tag, remoto) é do nível do monorepo, e só com pedido
   explícito do usuário. Tags: `go-gelf-injector/vX.Y.Z`.
 

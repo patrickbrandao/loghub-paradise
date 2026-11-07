@@ -26,6 +26,7 @@ const MaxDoc = 16 << 20
 type Stats struct {
 	Datagrams       uint64 // UDP datagrams taken as GELF (unchunked)
 	DatagramsSkip   uint64 // UDP datagrams that do not look like GELF
+	DatagramsDup    uint64 // unchunked datagrams that are a capture's copy of one taken (§6.3.1)
 	Chunked         uint64 // messages rebuilt from chunks
 	Compressed      [4]uint64
 	DecompressError uint64 // payloads that did not inflate
@@ -110,11 +111,31 @@ type Datagrams struct {
 	St     *Stats
 	Strict bool
 	R      *gelf.Reassembler
+	Dedup  DedupMode
+	dup    *dedup
 }
 
-// Add takes one datagram; ok when it completes a document.
+// Add takes one datagram of a capture with a single vantage and no IP
+// identification; ok when it completes a document.
 func (d *Datagrams) Add(src netip.AddrPort, b []byte, ts time.Time) (Doc, bool) {
+	return d.AddFrom(src, 0, 0, b, ts)
+}
+
+// AddFrom takes one datagram with its IP identification, seen at vantage
+// (pcap.Segment). An unchunked datagram that is a copy of one already taken
+// (tcpdump -i any) is counted and dropped (SPEC §6.3.1); chunks keep the
+// reassembler's own rule.
+func (d *Datagrams) AddFrom(src netip.AddrPort, ipid uint32, vantage uint64, b []byte, ts time.Time) (Doc, bool) {
 	chunks := 0
+	if !gelf.IsChunk(b) {
+		if d.dup == nil {
+			d.dup = newDedup(d.Dedup)
+		}
+		if d.dup.copyOf(src.Port(), ipid, vantage, b, ts) {
+			d.St.DatagramsDup++
+			return Doc{}, false
+		}
+	}
 	if gelf.IsChunk(b) {
 		msg, n, ok := d.R.Add(src, b, ts)
 		if !ok {

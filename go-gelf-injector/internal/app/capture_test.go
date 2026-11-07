@@ -15,9 +15,26 @@ import (
 // live strict receiver accepted while the capture ran (the .jsonl next to
 // each capture): the injector's own UDP chunked+gzip, UDP zlib, TCP and HTTP
 // gzip traffic; Docker's gelf log driver (UDP gzip, chunked, and TCP); and
-// fluent-bit's gelf output (UDP gzip, chunked, and TCP).
+// fluent-bit's gelf output (UDP gzip, chunked, and TCP); real IP fragments
+// (2026-11-07: tcpdump -i eth0 on a Docker bridge, MTU 1500, the injector in
+// another container: chunks of 8192 and unchunked datagrams of 5000 bytes
+// fragmented by the kernel, SPEC §6.2); and tcpdump -i any on loopback,
+// where every datagram is captured twice (outgoing and incoming) and a
+// sender repeats one document five times (SPEC §6.3.1).
 func TestRealCaptures(t *testing.T) {
-	for _, name := range []string{"injector", "docker-gelf-driver", "fluent-bit"} {
+	check := map[string]func(t *testing.T, src map[string]uint64){
+		"ip-fragments": func(t *testing.T, src map[string]uint64) {
+			if src["pcap_ip_fragments"] < 100 || src["pcap_ip_reassembled"] != 50 || src["pcap_ip_fragments_lost"] != 0 {
+				t.Fatalf("fragments: %v", src)
+			}
+		},
+		"any-bridge": func(t *testing.T, src map[string]uint64) {
+			if src["udp_datagrams_duplicate"] != 55 || src["udp_datagrams"] != 55 {
+				t.Fatalf("copies: %v", src)
+			}
+		},
+	}
+	for _, name := range []string{"injector", "docker-gelf-driver", "fluent-bit", "ip-fragments", "any-bridge"} {
 		t.Run(name, func(t *testing.T) {
 			base := filepath.Join("testdata", "captures", name)
 			b, err := os.ReadFile(base + ".jsonl")
@@ -62,6 +79,9 @@ func TestRealCaptures(t *testing.T) {
 				}
 				if col.N() != total || s.Source["frames_lost"] != 0 || s.Source["udp_chunked_incomplete"] != 0 {
 					t.Fatalf("%s: %d documents, want %d; source %v", tr, col.N(), total, s.Source)
+				}
+				if c := check[name]; c != nil {
+					c(t, s.Source)
 				}
 			}
 		})

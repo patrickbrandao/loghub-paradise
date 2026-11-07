@@ -2,7 +2,8 @@
 #
 # go-gelf-injector -- imagem do injetor GELF (cliente de teste e carga).
 #
-# Binario estatico (CGO_ENABLED=0, so' a stdlib). Util para injetar de dentro
+# Binario estatico (CGO_ENABLED=0; as bibliotecas da conferencia no destino,
+# nats.go, pgx, rueidis e modernc.org/sqlite, sao Go puro). Util para injetar de dentro
 # da rede de um compose, onde o servidor e' alcancado pelo nome do servico:
 #
 #   docker build -f docker/Dockerfile -t go-gelf-injector:local .
@@ -16,20 +17,22 @@ ARG ALPINE_VERSION=3.22
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 ARG VERSION=dev
 ARG COMMIT=none
 ARG TARGETOS
 ARG TARGETARCH
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -tags osusergo,netgo \
       -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
       -o /app/go-gelf-injector ./cmd/go-gelf-injector
 
 FROM alpine:${ALPINE_VERSION}
-# ca-certificates: verificacao do servidor no --transport tls e https.
+# ca-certificates: verificacao do servidor no --transport tls e https, e do
+# destino em tls://, rediss:// e postgres://...?sslmode=verify-full.
 RUN apk add --no-cache ca-certificates
 COPY --from=build /app/go-gelf-injector /app/go-gelf-injector
 USER 65532:65532

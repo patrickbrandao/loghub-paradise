@@ -21,6 +21,12 @@ type PcapOptions struct {
 	// UDP and TCP enable each protocol (TCP covers GELF over TCP and HTTP).
 	UDP, TCP bool
 	Loop     bool
+	// Flows emits a Message with FlowEnd after the last document of every
+	// flow: at the end of a TCP direction, and for UDP pairs at the end of
+	// each pass (--pcap-flows, SPEC §6.8).
+	Flows bool
+	// Dedup is --pcap-dedup (SPEC §6.3.1).
+	Dedup extract.DedupMode
 }
 
 // Pcap replays the GELF documents of a capture, in capture order.
@@ -44,6 +50,8 @@ type Pcap struct {
 	// --loop (a capture rewritten empty between passes would spin forever).
 	passSent uint64
 	cut      uint64
+
+	udpFlows map[[2]netip.AddrPort]bool // UDP pairs of the pass (Flows)
 
 	decTotal   pcap.Stats
 	asmTotal   pcap.AsmStats
@@ -78,20 +86,37 @@ func (p *Pcap) open() error {
 	}
 	p.f, p.rd = f, rd
 	p.dec = pcap.NewDecoder()
-	p.dg = &extract.Datagrams{St: &p.ext, Strict: p.strict(), R: gelf.NewReassembler()}
+	p.dg = &extract.Datagrams{St: &p.ext, Strict: p.strict(), R: gelf.NewReassembler(), Dedup: p.opt.Dedup}
 	p.asm = pcap.NewAssembler(func(k pcap.FlowKey, mid bool) pcap.StreamHandler {
 		if !p.wantPort(k.Dst.Port()) {
 			return nil
 		}
 		src, dst := k.Src, k.Dst
-		return extract.NewStream(p.strict(), mid, &p.ext, func(d extract.Doc) {
+		s := extract.NewStream(p.strict(), mid, &p.ext, func(d extract.Doc) {
 			p.push(d.Data, d.TS, src, dst)
 		})
+		if !p.opt.Flows {
+			return s
+		}
+		return flowEnd{s, func() { p.queue = append(p.queue, Message{At: -1, Src: src, Dst: dst, FlowEnd: true}) }}
 	})
+	p.udpFlows = map[[2]netip.AddrPort]bool{}
 	p.first = time.Time{}
 	p.pass++
 	p.passSent = 0
 	return nil
+}
+
+// flowEnd tells the end of a TCP direction after the extractor's own End
+// (which may still emit its last document).
+type flowEnd struct {
+	*extract.Stream
+	ended func()
+}
+
+func (f flowEnd) End(closed bool) {
+	f.Stream.End(closed)
+	f.ended()
 }
 
 func (p *Pcap) push(b []byte, ts time.Time, src, dst netip.AddrPort) {
@@ -129,8 +154,10 @@ func (p *Pcap) Next(_ uint64, _ time.Time) (Message, error) {
 	m := p.queue[0]
 	p.queue[0] = Message{}
 	p.queue = p.queue[1:]
-	p.sent++
-	p.passSent++
+	if !m.FlowEnd {
+		p.sent++
+		p.passSent++
+	}
 	return m, nil
 }
 
@@ -146,6 +173,10 @@ func (p *Pcap) step() error {
 		if errors.Is(err, io.EOF) && p.asm != nil {
 			p.asm.Flush()
 			p.dg.R.Flush()
+			p.dec.Flush()
+			for f := range p.udpFlows {
+				p.queue = append(p.queue, Message{At: -1, Src: f[0], Dst: f[1], FlowEnd: true})
+			}
 			p.addTotals()
 			p.asm = nil
 			if len(p.queue) > 0 {
@@ -170,8 +201,11 @@ func (p *Pcap) step() error {
 			p.ext.LostFrames++ // a datagram cut by the snaplen is not replayed
 			return nil
 		}
-		if d, ok := p.dg.Add(seg.Src, seg.Payload, seg.TS); ok {
+		if d, ok := p.dg.AddFrom(seg.Src, seg.IPID, seg.Vantage, seg.Payload, seg.TS); ok {
 			p.push(d.Data, d.TS, seg.Src, seg.Dst)
+			if p.opt.Flows {
+				p.udpFlows[[2]netip.AddrPort{seg.Src, seg.Dst}] = true
+			}
 		}
 	case pcap.ProtoTCP:
 		if p.opt.TCP {
@@ -259,6 +293,7 @@ func (p *Pcap) Stats() map[string]uint64 {
 		"pcap_ip_fragments_lost":  d.FragmentsLost + cur.FragmentsLost,
 		"udp_datagrams":           e.Datagrams,
 		"udp_not_gelf":            e.DatagramsSkip,
+		"udp_datagrams_duplicate": e.DatagramsDup,
 		"udp_chunked_messages":    e.Chunked,
 		"udp_chunks":              r.Chunks,
 		"udp_chunks_invalid":      r.Invalid,

@@ -108,6 +108,17 @@ func (d *defrag) add(k fragKey, off int, more bool, data []byte, ts time.Time) (
 	return buf, true, lost
 }
 
+// flush drops every open datagram (end of a pass) and returns the fragments
+// they held.
+func (d *defrag) flush() int {
+	lost := 0
+	for k, g := range d.open {
+		lost += len(g.parts)
+		delete(d.open, k)
+	}
+	return lost
+}
+
 func (d *defrag) expire(now time.Time) int {
 	lost := 0
 	for k, g := range d.open {
