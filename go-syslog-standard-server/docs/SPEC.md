@@ -2888,6 +2888,16 @@ mensagem nomeando as duas chaves e nunca os valores (qualquer um pode ser uma
 senha). Entre fontes vale a precedência de §15.1 sem mudança: o alias conta
 como a mesma chave na sua fonte.
 
+**O que se compara é o último valor de cada grafia** (corrigido em 2026-11-07,
+revisão independente). Dentro de uma fonte a última ocorrência de uma grafia é
+a que vale, então a comparação é feita **uma vez, no fim da fonte**, entre o
+último valor de `sink.redis.<chave>` e o último de `sink.valkey.<chave>`:
+`--sink.valkey.db=1 --sink.redis.db=2 --sink.valkey.db=2` passa (os dois
+terminam em 2). Comparando a cada ocorrência, como o código fazia, a segunda
+flag era recusada contra um valor que a terceira já tinha substituído, e o
+resultado dependia da ordem. Um erro do INI nomeia o arquivo, não a linha (a
+comparação é do arquivo inteiro).
+
 Sem `gopkg.in/ini.v1` e sem `spf13/pflag`, pela mesma razão do serviço irmão:
 unir essas bibliotecas numa precedência coerente daria mais código de cola que o
 registry inteiro, e sem o `--help` e o dump gerados da mesma fonte.
@@ -3706,3 +3716,4 @@ correção, e um trecho portado leva a correção junto, não o defeito.
 26. *Corrigido em 2026-11-07 (revisão independente):* erros de parse de valor e de validação (`invalid integer %q`, `sink.type: %q`, `validateDBName`, `checkQuotedName` e os demais) ecoavam o valor; agora nomeiam chave e problema; regra em §15.1.
 27. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a sonda do `sink=sqlite` reportava saudável para sempre uma escritora travada; agora o limite é `sink.op_timeout + sink.health_timeout` no relógio monotônico; regra em §10.4.
 28. *Corrigido em 2026-11-07 (revisão independente):* colisões residuais com o go-syslog-server — `SYSLOG_IMAGE`/`SYSLOG_IMAGE_TAG` viraram `SLSTD_IMAGE`/`SLSTD_IMAGE_TAG`, contêineres `slstd-emit-*`, diagrama com `slstd-emg-`, comentário do `main.go`, portas padrão dos compose Valkey fora das faixas dele; regra em §17.5.
+29. *Corrigido em 2026-11-07 (revisão independente):* o conflito do alias `valkey` comparava a cada ocorrência e dependia da ordem; agora compara o último valor de cada grafia, uma vez no fim da fonte; regra em §15.2.

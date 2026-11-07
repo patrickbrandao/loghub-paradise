@@ -68,3 +68,26 @@ func TestConfigErrorsNeverEchoTheValue(t *testing.T) {
 		}
 	}
 }
+
+// Item 29 (SPEC §15.2): the alias rule compares the LAST value of each
+// spelling in the source, once, at its end. Compared at every occurrence,
+// `--sink.valkey.db=1 --sink.redis.db=2 --sink.valkey.db=2` was refused over a
+// value the third flag had already replaced.
+func TestValkeyAliasComparesTheLastValueOfEachSpelling(t *testing.T) {
+	l := mustLoad(t, []string{"--sink.valkey.db=1", "--sink.redis.db=2", "--sink.valkey.db=2"}, nil)
+	if l.Config.SinkRedis.DB != 2 {
+		t.Fatalf("db = %d, want 2", l.Config.SinkRedis.DB)
+	}
+	mustLoad(t, []string{"--config", writeINI(t, "[sink.valkey]\ndb = 1\n[sink.redis]\ndb = 2\n[sink.valkey]\ndb = 2\n")}, nil)
+
+	// The last values still have to agree.
+	for _, args := range [][]string{
+		{"--sink.valkey.db=2", "--sink.redis.db=2", "--sink.valkey.db=1"},
+		{"--sink.redis.db=2", "--sink.valkey.db=2", "--sink.redis.db=3"},
+		{"--config", writeINI(t, "[sink.redis]\ndb = 2\n[sink.valkey]\ndb = 2\n[sink.redis]\ndb = 4\n")},
+	} {
+		if _, err := load(t, args, nil); err == nil {
+			t.Fatalf("%v accepted with different last values", args)
+		}
+	}
+}

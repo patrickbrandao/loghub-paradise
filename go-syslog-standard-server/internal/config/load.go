@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -126,11 +127,12 @@ func Load(opts Options) (*Loaded, error) {
 			if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
 				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, p.Name(), err)
 			}
-			if err := seen.note(p, "["+e.Sec+"] "+e.Key, e.Name != p.Name(), "the ini file"); err != nil {
-				return nil, fmt.Errorf("%s line %d: %w", file, e.Line, err)
-			}
+			seen.note(p, "["+e.Sec+"] "+e.Key, e.Name != p.Name())
 			l.Source[p.Name()] = FromFile
 			l.SetIn[p.Name()] = true
+		}
+		if err := seen.check("the ini file"); err != nil {
+			return nil, fmt.Errorf("%s: %w", file, err)
 		}
 		l.File = file
 	}
@@ -152,12 +154,13 @@ func Load(opts Options) (*Loaded, error) {
 			if err := setValue(p.Kind, p.Ptr, v); err != nil {
 				return nil, fmt.Errorf("%s: %w", name, err)
 			}
-			if err := envSeen.note(p, name, i == 1, "the environment"); err != nil {
-				return nil, err
-			}
+			envSeen.note(p, name, i == 1)
 			l.Source[p.Name()] = FromEnv
 			l.SetIn[p.Name()] = true
 		}
+	}
+	if err := envSeen.check("the environment"); err != nil {
+		return nil, err
 	}
 
 	// --- command line -------------------------------------------------------
@@ -171,11 +174,12 @@ func Load(opts Options) (*Loaded, error) {
 		if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
 			return nil, fmt.Errorf("%s: %w", spelled, err)
 		}
-		if err := flagSeen.note(p, spelled, e.Spelled != "" && e.Spelled != e.Name, "the command line"); err != nil {
-			return nil, err
-		}
+		flagSeen.note(p, spelled, e.Spelled != "" && e.Spelled != e.Name)
 		l.Source[p.Name()] = FromFlag
 		l.SetIn[p.Name()] = true
+	}
+	if err := flagSeen.check("the command line"); err != nil {
+		return nil, err
 	}
 
 	if err := derive(cfg, opts); err != nil {
@@ -198,6 +202,13 @@ func Load(opts Options) (*Loaded, error) {
 // spellings, never a value: either may be a password. Across sources the
 // precedence of §15.1 stands unchanged; the alias counts as the same key in its
 // source.
+//
+// What is compared is the LAST value of each spelling in the source, once, at
+// the end of it (check): within one source the last occurrence of a spelling
+// is the one that counts, so `--sink.valkey.db=1 --sink.redis.db=2
+// --sink.valkey.db=2` agrees. Comparing at every occurrence refused it over a
+// value that a later occurrence had already replaced (independent review of
+// 2026-11-07).
 type aliasTracker map[string]map[bool]aliasSet
 
 type aliasSet struct {
@@ -206,23 +217,36 @@ type aliasSet struct {
 }
 
 // note records the value p holds now, set under spelled (alias says whether
-// spelled is the alias spelling), and refuses it when the other spelling set
-// a different value earlier in the same source.
-func (t aliasTracker) note(p *Param, spelled string, alias bool, source string) error {
+// spelled is the alias spelling), replacing what that spelling set earlier in
+// the same source.
+func (t aliasTracker) note(p *Param, spelled string, alias bool) {
 	if p.AliasName() == "" {
-		return nil
+		return
 	}
-	v := formatValue(p.Kind, p.Ptr)
 	byAlias := t[p.Name()]
 	if byAlias == nil {
 		byAlias = map[bool]aliasSet{}
 		t[p.Name()] = byAlias
 	}
-	if other, ok := byAlias[!alias]; ok && other.value != v {
-		return fmt.Errorf("%s and %s are the same parameter (valkey is an alias of redis) and %s "+
-			"sets them to different values; set one of them", other.spelled, spelled, source)
+	byAlias[alias] = aliasSet{spelled: spelled, value: formatValue(p.Kind, p.Ptr)}
+}
+
+// check runs once, at the end of the source: the last value of each spelling
+// must agree. Names are visited in order so the error is deterministic.
+func (t aliasTracker) check(source string) error {
+	names := make([]string, 0, len(t))
+	for n := range t {
+		names = append(names, n)
 	}
-	byAlias[alias] = aliasSet{spelled: spelled, value: v}
+	sort.Strings(names)
+	for _, n := range names {
+		canon, ok1 := t[n][false]
+		alias, ok2 := t[n][true]
+		if ok1 && ok2 && canon.value != alias.value {
+			return fmt.Errorf("%s and %s are the same parameter (valkey is an alias of redis) and %s "+
+				"sets them to different values; set one of them", canon.spelled, alias.spelled, source)
+		}
+	}
 	return nil
 }
 
