@@ -49,12 +49,12 @@ func Validate(c *Config) (warnings []string, err error) {
 	// Any other value asks for a feature that is not here, and starting
 	// without it would be the silent surprise these checks exist to prevent.
 	if c.Ring.Mode != RingMemory {
-		return nil, fmt.Errorf("ring.mode: %q is not available: go-webhook-nats-server has only the "+
-			"memory ring (SPEC §0); use go-webhook-fast-server for sqlite or none", c.Ring.Mode)
+		return nil, fmt.Errorf("ring.mode: the value is not available: go-webhook-nats-server has only the " +
+			"memory ring (SPEC §0); use go-webhook-fast-server for sqlite or none")
 	}
 	if c.Sink.Type != SinkNATSType {
-		return nil, fmt.Errorf("sink.type: %q is not available: go-webhook-nats-server publishes only to "+
-			"NATS (SPEC §0); use go-webhook-fast-server or go-webhook-pg-server for other destinations", c.Sink.Type)
+		return nil, fmt.Errorf("sink.type: the value is not available: go-webhook-nats-server publishes only to " +
+			"NATS (SPEC §0); use go-webhook-fast-server or go-webhook-pg-server for other destinations")
 	}
 	if c.RateLimit.Enabled {
 		return nil, fmt.Errorf("ratelimit.enabled=true: go-webhook-nats-server has no rate limiter " +
@@ -65,21 +65,21 @@ func Validate(c *Config) (warnings []string, err error) {
 			"(SPEC §8.7.9); put NATS on a trusted network and set it to false or remove it")
 	}
 	if c.SinkNATS.Subject != NATSSubjectTemplate {
-		return nil, fmt.Errorf("sink.nats.subject: %q is not available: the subject is always "+
+		return nil, fmt.Errorf("sink.nats.subject: the value is not available: the subject is always "+
 			"loghub.<space>.webhook, the JLH rule (SPEC §3.8); set it to %s or remove it",
-			c.SinkNATS.Subject, NATSSubjectTemplate)
+			NATSSubjectTemplate)
 	}
 
 	// --- enums --------------------------------------------------------------
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
-		return nil, fmt.Errorf("log.level: %q is not one of debug, info, warn, error", c.Log.Level)
+		return nil, fmt.Errorf("log.level: the value is not one of debug, info, warn, error")
 	}
 	switch c.Log.Format {
 	case "json", "text":
 	default:
-		return nil, fmt.Errorf("log.format: %q is not one of json, text", c.Log.Format)
+		return nil, fmt.Errorf("log.format: the value is not one of json, text")
 	}
 
 	// --- ranges -------------------------------------------------------------
@@ -227,7 +227,7 @@ func Validate(c *Config) (warnings []string, err error) {
 		// error, and net.Listen then picked a random one -- with ":" on every
 		// interface, the exposure the empty bind was refused for (W 40).
 		if _, port, err := net.SplitHostPort(c.Admin.Bind); err != nil || !validPort(port) {
-			return nil, fmt.Errorf("admin.bind: %q is not host:port with a port 1..65535", c.Admin.Bind)
+			return nil, fmt.Errorf("admin.bind: the value is not host:port with a port 1..65535")
 		}
 	}
 
@@ -301,12 +301,12 @@ func validateNATS(c *Config) error {
 	switch n.Mode {
 	case NATSModeJetStream:
 		if !natsToken.MatchString(n.Stream) {
-			return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
-				"(no whitespace, dots, wildcards or slashes)", n.Stream)
+			return fmt.Errorf("sink.nats.stream: the value is not a valid stream name " +
+				"(no whitespace, dots, wildcards or slashes)")
 		}
 	case NATSModeCore:
 	default:
-		return fmt.Errorf("sink.nats.mode: %q is not one of jetstream, core", n.Mode)
+		return fmt.Errorf("sink.nats.mode: the value is not one of jetstream, core")
 	}
 	// The client library accepts every credential it is given and picks one
 	// at connect time. Two of them in one configuration is a mistake nobody
@@ -337,8 +337,8 @@ func validateNATS(c *Config) error {
 	}
 	for _, tok := range strings.Split(ns, ".") {
 		if !natsToken.MatchString(tok) {
-			return fmt.Errorf("loghub.ctl_namespace: %q is not a publishable subject prefix "+
-				"(dot-separated tokens, no whitespace, no * or >)", ns)
+			return fmt.Errorf("loghub.ctl_namespace: the value is not a publishable subject prefix " +
+				"(dot-separated tokens, no whitespace, no * or >)")
 		}
 	}
 	return nil
@@ -369,7 +369,7 @@ func MaxEventBytes(c *Config) int64 {
 // Addresses are unmapped first, so "::ffff:10.0.0.5" and "10.0.0.5" agree.
 func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(list))
-	for _, raw := range list {
+	for i, raw := range list {
 		s := strings.TrimSpace(raw)
 		if s == "" {
 			continue
@@ -377,7 +377,8 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		if strings.Contains(s, "/") {
 			p, err := netip.ParsePrefix(s)
 			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR %q: %w", raw, err)
+				// netip's error quotes the entry: not wrapped (SPEC §13.2).
+				return nil, fmt.Errorf("entry %d is not a valid CIDR", i+1)
 			}
 			// Masked() drops host bits so "10.0.0.5/24" behaves as "10.0.0.0/24"
 			// instead of never matching.
@@ -386,7 +387,7 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		}
 		a, err := netip.ParseAddr(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid address %q: %w", raw, err)
+			return nil, fmt.Errorf("entry %d is not a valid address or CIDR", i+1)
 		}
 		a = a.Unmap()
 		out = append(out, netip.PrefixFrom(a, a.BitLen()))

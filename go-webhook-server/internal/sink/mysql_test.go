@@ -562,3 +562,19 @@ func TestNewMySQLRejectsBadConfig(t *testing.T) {
 		})
 	}
 }
+
+// SPEC §13.2 (independent review of 2026-11-07): the constructors' copy of
+// the database-name rule names the problem, never the name.
+func TestCheckQuotedNameNeverEchoesTheName(t *testing.T) {
+	const m = "Hunter2Marker"
+	for _, name := range []string{m + "`x", m + "\\x", m + "\x01", strings.Repeat(m, 10)} {
+		err := checkQuotedName("sink mysql: database", name)
+		if err == nil {
+			t.Errorf("%d bytes accepted", len(name))
+			continue
+		}
+		if strings.Contains(err.Error(), m) || !strings.Contains(err.Error(), "sink mysql: database") {
+			t.Errorf("error %q: must name the key and not the value", err)
+		}
+	}
+}

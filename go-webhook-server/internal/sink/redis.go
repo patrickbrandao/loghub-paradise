@@ -282,30 +282,33 @@ func (r *Redis) Health(ctx context.Context) error {
 	// INFO memory rides in the same pipeline as the probe: the eviction check
 	// (checkEviction) then costs no round trip of its own, and the probe's
 	// latency, which sink.health_timeout bounds, stays one round trip.
-	cmds := rueidis.Commands{
-		r.client.B().Xlen().Key(r.stream.own).Build(),
-		r.client.B().Xadd().Key(r.probeKey).Nomkstream().Id("*").
-			FieldValue().FieldValue("p", "1").Build(),
-	}
+	xlen := r.client.B().Xlen().Key(r.stream.own).Build()
+	xadd := r.client.B().Xadd().Key(r.probeKey).Nomkstream().Id("*").
+		FieldValue().FieldValue("p", "1").Build()
+	var policy []rueidis.Completed
 	mode := r.policyRead.Load()
 	switch mode {
 	case policyByInfo:
-		cmds = append(cmds, r.client.B().Info().Section("memory").Build())
+		policy = append(policy, r.client.B().Info().Section("memory").Build())
 	case policyByConfig:
-		cmds = append(cmds, r.client.B().ConfigGet().Parameter("maxmemory-policy").Build())
+		policy = append(policy, r.client.B().ConfigGet().Parameter("maxmemory-policy").Build())
 	}
 	ops := [2]string{"xlen", "writeprobe"}
 	var resps []rueidis.RedisResult
-	if len(cmds) > 2 && r.client.Mode() == rueidis.ClientModeCluster {
-		// The cluster client of rueidis PANICS on a DoMulti that mixes keyed
-		// commands with a keyless one ("Mixing no-slot and cross slot
-		// commands"): against any cluster, db 0 included, the first probe
-		// brought the process down (found by the Valkey round, SPEC
-		// §8.2.5). The policy command goes on its own there, to the node the
-		// client picks -- one round trip more, in cluster mode only.
-		resps = append(r.client.DoMulti(ctx, cmds[:2]...), r.client.Do(ctx, cmds[2]))
+	if r.client.Mode() == rueidis.ClientModeCluster {
+		// In cluster mode a keyless command sent with Do goes to whichever
+		// node rueidis picks -- a replica, or another shard than the
+		// stream's -- so the policy read could be a node the stream does not
+		// live on (SPEC §8.2.5). In a DoMulti with keyed commands of ONE slot
+		// it goes to that slot's primary (rueidis _pickMulti); with keyed
+		// commands of DIFFERENT slots it panics ("Mixing no-slot and cross
+		// slot commands"). So: XLEN <own stream> with the policy command in
+		// one DoMulti, and the probe's XADD, whose key is another slot, on
+		// its own.
+		own := r.client.DoMulti(ctx, append([]rueidis.Completed{xlen}, policy...)...)
+		resps = append([]rueidis.RedisResult{own[0], r.client.Do(ctx, xadd)}, own[1:]...)
 	} else {
-		resps = r.client.DoMulti(ctx, cmds...)
+		resps = r.client.DoMulti(ctx, append([]rueidis.Completed{xlen, xadd}, policy...)...)
 	}
 	for i, resp := range resps[:2] {
 		err := resp.Error()
@@ -349,7 +352,7 @@ func (r *Redis) Health(ctx context.Context) error {
 // unreadable policy (an ACL without INFO and CONFIG) is a WARN with the
 // premise, once, and the check passes.
 func (r *Redis) checkEviction(ctx context.Context, info string, ierr error) error {
-	policy, src, err := evictionFromInfo(ctx, r.client, info, ierr)
+	policy, src, err := evictionFromInfo(ctx, r.client, r.stream.own, info, ierr)
 	switch {
 	case src == policyByConfig:
 		r.policyRead.Store(policyByConfig)
@@ -433,17 +436,30 @@ func policyFromInfo(info string) (string, bool) {
 // "unreadable", not "retry": NOPERM or "unknown command" does not change by
 // waiting, and retrying it would hold the boot until sink.boot_timeout over a
 // check that is a precaution. With Sentinel the client's node is the primary,
-// the one that holds the streams.
-func checkRedisEviction(ctx context.Context, c rueidis.Client) (string, error) {
-	info, ierr := c.Do(ctx, c.B().Info().Section("memory").Build()).ToString()
-	policy, _, err := evictionFromInfo(ctx, c, info, ierr)
+// the one that holds the streams; in cluster mode, the primary of the slot of
+// key (doOnPrimaryOf).
+func checkRedisEviction(ctx context.Context, c rueidis.Client, key string) (string, error) {
+	info, ierr := doOnPrimaryOf(ctx, c, key, c.B().Info().Section("memory").Build()).ToString()
+	policy, _, err := evictionFromInfo(ctx, c, key, info, ierr)
 	return policy, err
+}
+
+// doOnPrimaryOf sends a keyless command (INFO, CONFIG GET) to the primary that
+// holds key (SPEC §8.2.5). Standalone and with Sentinel there is one primary,
+// and it is a plain Do. In cluster mode a Do of a keyless command goes to an
+// arbitrary node, replicas included; paired in a DoMulti with XLEN key -- one
+// slot -- rueidis sends both to that slot's primary.
+func doOnPrimaryOf(ctx context.Context, c rueidis.Client, key string, cmd rueidis.Completed) rueidis.RedisResult {
+	if c.Mode() != rueidis.ClientModeCluster {
+		return c.Do(ctx, cmd)
+	}
+	return c.DoMulti(ctx, c.B().Xlen().Key(key).Build(), cmd)[1]
 }
 
 // evictionFromInfo is checkRedisEviction from an INFO memory reply already in
 // hand (the probe pipelines it): CONFIG GET is asked only when INFO did not
-// answer the policy.
-func evictionFromInfo(ctx context.Context, c rueidis.Client, info string, ierr error) (string, int32, error) {
+// answer the policy. key is the stream whose primary is asked (doOnPrimaryOf).
+func evictionFromInfo(ctx context.Context, c rueidis.Client, key, info string, ierr error) (string, int32, error) {
 	if ierr == nil {
 		if policy, ok := policyFromInfo(info); ok {
 			return policy, policyByInfo, evictionVerdict(policy)
@@ -451,7 +467,7 @@ func evictionFromInfo(ctx context.Context, c rueidis.Client, info string, ierr e
 	} else if !redisReplyRefused(ierr) {
 		return "", policyByInfo, ierr
 	}
-	kv, cerr := c.Do(ctx, c.B().ConfigGet().Parameter("maxmemory-policy").Build()).AsStrMap()
+	kv, cerr := doOnPrimaryOf(ctx, c, key, c.B().ConfigGet().Parameter("maxmemory-policy").Build()).AsStrMap()
 	policy, err := evictionFromConfig(kv, cerr, ierr)
 	if errors.Is(err, ErrPolicyUnknown) || (cerr != nil && !redisReplyRefused(cerr)) {
 		return policy, policyByInfo, err
@@ -549,9 +565,10 @@ func identityFromInfo(info string) (server, version string) {
 
 // identify asks INFO server once, for the boot log. Any failure -- an ACL
 // without INFO, a proxy, the deadline -- is "unknown" and never an error: the
-// identity is observability, not a condition to start.
+// identity is observability, not a condition to start. In cluster mode it is
+// the primary of the own stream, like the policy (SPEC §8.2.6).
 func (r *Redis) identify(ctx context.Context) {
-	info, err := r.client.Do(ctx, r.client.B().Info().Section("server").Build()).ToString()
+	info, err := doOnPrimaryOf(ctx, r.client, r.stream.own, r.client.B().Info().Section("server").Build()).ToString()
 	if err != nil {
 		r.server, r.serverVersion = ServerUnknown, ""
 		return

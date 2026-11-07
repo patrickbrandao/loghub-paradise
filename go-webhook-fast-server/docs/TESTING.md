@@ -337,6 +337,16 @@ Valkey 9.0 `DB index is out of range` (~1 ms); Valkey 9.0 com
 do rueidis na sonda em cluster (SPEC §8.2.5): o processo caía contra qualquer
 cluster.
 
+**Um cluster de um nó não distingue nós**: todo slot é do mesmo primário, então
+o teste opt-in passa com a política lida em qualquer nó. Quem trava a rota
+(política e identidade no primário do stream da sonda, SPEC §8.2.5) é o
+`TestRedisClusterProbeRoutesThePolicyToTheStreamPrimary`, sem servidor: um
+cliente falso em modo cluster (o *builder* de cluster do rueidis, forjado e
+conferido) aplica a regra do `_pickMulti` e registra para onde foi cada
+comando sem chave — nenhum `DoMulti` mistura sem-chave com chaves de slots
+diferentes, nenhum sai num `Do` para um nó qualquer, e `INFO memory`, `CONFIG
+GET` (no *pipeline* e de recuo) e `INFO server` vão ao slot do stream.
+
 ### 5.1.1 Verificação manual
 
 Ainda útil para inspecionar os bytes com o olho:
@@ -895,9 +905,10 @@ Registradas por honestidade, não por esquecimento:
     (SPEC §10.1 passo 5; revisão independente de 2026-10-14): aceito (o boot
     seguinte retenta), sem teste.
 
-52. **Redis Cluster**: a sonda confere a `maxmemory-policy` de um nó por
-    checagem (SPEC §8.2.5); não há teste de cluster, e um nó isolado com
-    `allkeys-*` só é pego quando sorteado.
+52. **Redis Cluster**: a sonda confere a `maxmemory-policy` do primário do
+    stream da sonda (SPEC §8.2.5, desde 2026-11-07; antes era um nó sorteado),
+    não a dos shards dos streams de outros `space`/`type`; a rota é travada sem
+    servidor, e o cluster real de mais de um nó não foi exercitado (§5.1).
 
 53. **Proxy Redis que responde o `INFO` com tipo inesperado** vira erro de
     transporte e `exit 3` "not reachable" no boot, em vez do `WARN` de
@@ -1404,7 +1415,22 @@ primeira execução, um *panic* do rueidis: a sonda de saúde pedia `XLEN` e
 de cluster recusa misturar os dois com `panic`. Contra qualquer cluster, `db 0`
 inclusive, o processo caía na primeira sonda. Em cluster o comando da política
 sai num `Do` à parte (SPEC §8.2.5); a mutação (voltar ao `DoMulti` único)
-derruba o teste com o mesmo *panic*. O teste de Sentinel mostrou a janela de
+derruba o teste com o mesmo *panic*. A revisão independente da rodada
+achou o resto: no `Do` à parte a política (e a identidade) iam a um nó
+qualquer, réplicas incluídas; agora vão no `DoMulti` com o `XLEN` do stream
+(um slot só, que o rueidis manda ao primário dele), e o
+`TestRedisClusterProbeRoutesThePolicyToTheStreamPrimary` trava a rota sem
+servidor (mutações: o `Do` sem chave, e o `DoMulti` único de antes, derrubam o
+teste). Na configuração, a mesma
+revisão achou o `aliasGuard` dependente da ordem (`--sink.valkey.db=1
+--sink.redis.db=2 --sink.valkey.db=2` saía com 1): agora compara o último
+valor de cada grafia no fim da fonte (`TestValkeyAliasComparesTheLastValueOfEachSpelling`;
+mutação: conferir a cada linha, nas flags e no INI, derruba o teste); e
+erros de configuração que ecoavam o valor (`invalid integer %q`, `sink.type:
+%q`, o nome do banco, o erro do `netip`) nomeiam só a chave e o problema
+(`TestConfigErrorsNeverEchoTheValue`, `TestCheckQuotedNameNeverEchoesTheName`;
+mutações: o `%q` de volta no inteiro, no `sink.type`, no nome do banco e no
+construtor, e o erro do `netip` embrulhado, cada uma derruba o teste). O teste de Sentinel mostrou a janela de
 replicação assíncrona (SPEC §8.2.6): escritas confirmadas pelo primário antigo
 entre a promoção e o rebaixamento somem. Os testes novos que travam regra
 (alias, conflito, identidade, `db` ausente, compose Valkey) passaram por

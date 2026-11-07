@@ -117,20 +117,22 @@ const (
 // characters (a dash, a dot, UTF-8) are legal inside backticks and stay
 // accepted. Config checks the same rule (SPEC §8.6.3); this is the copy for a
 // caller that bypasses it (W pendência of 2026-10-11, ported from the
-// syslog/RELP family, 2026-10-13).
+// syslog/RELP family, 2026-10-13). Like every configuration error, it names
+// the problem and never the name (SPEC §13.2).
 func checkQuotedName(what, name string) error {
 	if name == "" {
 		return fmt.Errorf("%s is empty", what)
 	}
 	if n := utf8.RuneCountInString(name); n > mysqlMaxNameChars {
-		return fmt.Errorf("%s %q has %d characters; the limit is %d", what, name, n, mysqlMaxNameChars)
+		return fmt.Errorf("%s has %d characters; the limit is %d", what, n, mysqlMaxNameChars)
 	}
 	for i := 0; i < len(name); i++ {
 		switch c := name[i]; {
 		case c == '`' || c == '\\':
-			return fmt.Errorf("%s %q has %q, which cannot appear between the backticks of the INSERT", what, name, c)
+			return fmt.Errorf("%s has a backtick or a backslash, which cannot appear between the backticks "+
+				"of the INSERT", what)
 		case c < 0x20 || c == 0x7f:
-			return fmt.Errorf("%s %q has the control byte 0x%02x", what, name, c)
+			return fmt.Errorf("%s has a control byte", what)
 		}
 	}
 	return nil

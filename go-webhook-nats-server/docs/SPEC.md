@@ -2375,6 +2375,21 @@ a revisão do `go-relplog-server`, do `go-relplog-pg-server` e do
   fixava: o diretório de emergência deixava de seguir `ring.data_dir` — para fora da única área gravável
   (§13.6). Um valor explícito continua chave.
 
+**Erros de validação sem eco do valor** (revisão independente de 2026-11-07,
+portado do `go-webhook-server`; regra do projeto: "mensagens de erro de config
+nunca ecoam valores, que podem ser segredo"). Os erros de interpretação
+(`invalid integer`, número, duração, tamanho, booleano) e os de validação (os
+seletores `ring.mode` e `sink.type`, `log.level`, `log.format`, `admin.bind`,
+`sink.nats.stream`, `sink.nats.mode`, o seletor `sink.nats.subject`,
+`loghub.ctl_namespace`, `loghub.beacon_interval`, `proxy.trusted`) nomeiam **a chave** (a flag, a variável ou a linha do INI)
+e **o problema** — o valor esperado, a posição da entrada numa lista —,
+**nunca o valor** digitado, nem o texto de erro de `strconv` ou `netip`, que o
+repete. Números já interpretados que a validação compara com um teto
+continuam na mensagem, e o `WARN` de `admin.bind` fora do loopback também (o
+valor já passou como `host:porta`). Travado por
+`TestConfigErrorsNeverEchoTheValue` (mutações: o `%q` de volta no inteiro e
+num enum derrubam o teste).
+
 ### 13.3 Recarga por `SIGHUP` — retirada
 
 Decisão 1 do P (2026-10-07). A configuração é lida **uma vez**, no boot; mudar

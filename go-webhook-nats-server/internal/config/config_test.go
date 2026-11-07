@@ -664,18 +664,18 @@ func TestCompatibilitySelectorsAcceptTheirValue(t *testing.T) {
 // without it.
 func TestCompatibilitySelectorsRefuseRetiredFeatures(t *testing.T) {
 	cases := []struct{ arg, want string }{
-		{"--ring.mode=sqlite", `ring.mode: "sqlite" is not available`},
-		{"--ring.mode=none", `ring.mode: "none" is not available`},
-		{"--sink.type=redis", `sink.type: "redis" is not available`},
-		{"--sink.type=valkey", `sink.type: "valkey" is not available`},
-		{"--sink.type=sqlite", `sink.type: "sqlite" is not available`},
-		{"--sink.type=mysql", `sink.type: "mysql" is not available`},
-		{"--sink.type=postgres", `sink.type: "postgres" is not available`},
-		{"--sink.type=clickhouse", `sink.type: "clickhouse" is not available`},
-		{"--sink.type=none", `sink.type: "none" is not available`},
+		{"--ring.mode=sqlite", `ring.mode: the value is not available`},
+		{"--ring.mode=none", `ring.mode: the value is not available`},
+		{"--sink.type=redis", `sink.type: the value is not available`},
+		{"--sink.type=valkey", `sink.type: the value is not available`},
+		{"--sink.type=sqlite", `sink.type: the value is not available`},
+		{"--sink.type=mysql", `sink.type: the value is not available`},
+		{"--sink.type=postgres", `sink.type: the value is not available`},
+		{"--sink.type=clickhouse", `sink.type: the value is not available`},
+		{"--sink.type=none", `sink.type: the value is not available`},
 		{"--ratelimit.enabled=true", "has no rate limiter"},
 		{"--sink.nats.tls=true", "has no TLS to NATS"},
-		{"--sink.nats.subject=webhooks.in", `sink.nats.subject: "webhooks.in" is not available`},
+		{"--sink.nats.subject=webhooks.in", `sink.nats.subject: the value is not available`},
 		{"--sink.nats.subject=loghub.{space}.webhook", "is not available"},
 	}
 	for _, tc := range cases {

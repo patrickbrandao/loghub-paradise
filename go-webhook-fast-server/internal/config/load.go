@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -123,11 +124,12 @@ func Load(opts Options) (*Loaded, error) {
 			if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
 				return nil, fmt.Errorf("%s line %d: %s: %w", file, e.Line, p.Name(), err)
 			}
-			if err := guard.check(p, "["+e.Sec+"] "+e.Key); err != nil {
-				return nil, fmt.Errorf("%s line %d: %w", file, e.Line, err)
-			}
+			guard.record(p, "["+e.Sec+"] "+e.Key)
 			l.Source[p.Name()] = FromFile
 			l.SetIn[p.Name()] = true
+		}
+		if err := guard.verify(); err != nil {
+			return nil, fmt.Errorf("%s: %w", file, err)
 		}
 		l.File = file
 	}
@@ -149,12 +151,13 @@ func Load(opts Options) (*Loaded, error) {
 			if err := setValue(p.Kind, p.Ptr, v); err != nil {
 				return nil, fmt.Errorf("%s: %w", name, err)
 			}
-			if err := envGuard.check(p, name); err != nil {
-				return nil, err
-			}
+			envGuard.record(p, name)
 			l.Source[p.Name()] = FromEnv
 			l.SetIn[p.Name()] = true
 		}
+	}
+	if err := envGuard.verify(); err != nil {
+		return nil, err
 	}
 
 	// --- command line -------------------------------------------------------
@@ -164,11 +167,12 @@ func Load(opts Options) (*Loaded, error) {
 		if err := setValue(p.Kind, p.Ptr, e.Raw); err != nil {
 			return nil, fmt.Errorf("--%s: %w", e.Spelled, err)
 		}
-		if err := flagGuard.check(p, "--"+e.Spelled); err != nil {
-			return nil, err
-		}
+		flagGuard.record(p, "--"+e.Spelled)
 		l.Source[p.Name()] = FromFlag
 		l.SetIn[p.Name()] = true
+	}
+	if err := flagGuard.verify(); err != nil {
+		return nil, err
 	}
 
 	// What is still empty or zero here is derived below, by derive or by
@@ -252,25 +256,49 @@ func derive(c *Config, opts Options) error {
 // ("1MiB" and "1048576" agree) and never printed: one may be the password.
 // Across sources nothing changes: the precedence decides, and the alias is
 // the same key in its source.
-type aliasGuard map[string]map[string]string // canonical name -> spelling -> value
+//
+// What is compared is the LAST value of each spelling, once, at the end of
+// the source (verify): repeating a spelling is "the last one wins", as it
+// always was, so --sink.valkey.db=1 --sink.redis.db=2 --sink.valkey.db=2
+// agrees. Checked at every line it was refused by the order of the lines
+// (independent review of the Valkey round, 2026-11-07).
+type aliasGuard map[string]map[string]string // canonical name -> spelling -> last value
 
-// check runs right after p was set from the name spelled.
-func (g aliasGuard) check(p *Param, spelled string) error {
+// record runs right after p was set from the name spelled.
+func (g aliasGuard) record(p *Param, spelled string) {
 	if aliasOf(p.Sec) == "" {
-		return nil
+		return
 	}
-	v := formatValue(p.Kind, p.Ptr)
 	seen := g[p.Name()]
 	if seen == nil {
 		seen = map[string]string{}
 		g[p.Name()] = seen
 	}
-	for other, ov := range seen {
-		if other != spelled && ov != v {
-			return fmt.Errorf("%s and %s are set to different values; they are the same parameter "+
-				"(valkey is an alias of redis): set only one, or both to the same value", other, spelled)
+	seen[spelled] = formatValue(p.Kind, p.Ptr)
+}
+
+// verify runs once the source is read. The first conflict in name order is
+// reported, so the message is the same at every run.
+func (g aliasGuard) verify() error {
+	names := make([]string, 0, len(g))
+	for name := range g {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		seen := g[name]
+		spellings := make([]string, 0, len(seen))
+		for sp := range seen {
+			spellings = append(spellings, sp)
+		}
+		sort.Strings(spellings)
+		for i := 1; i < len(spellings); i++ {
+			if seen[spellings[i]] != seen[spellings[0]] {
+				return fmt.Errorf("%s and %s are set to different values; they are the same parameter "+
+					"(valkey is an alias of redis): set only one, or both to the same value",
+					spellings[0], spellings[i])
+			}
 		}
 	}
-	seen[spelled] = v
 	return nil
 }

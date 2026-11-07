@@ -223,8 +223,11 @@ opt-in). O nome `redis` designa o protocolo; `valkey` é alias em
 `sink.type`, `[sink.valkey]`, `--sink.valkey.*` e `WHS_SINK_VALKEY_*`
 (§13.2), sempre normalizado para `redis`. Nunca decida um recurso por
 `redis_version`: o Valkey responde `7.2.4` fixo. E nada de `DoMulti` que
-misture comando com chave e comando sem chave: o cliente de cluster do
-rueidis entra em *panic* (§8.2.5).
+misture um comando sem chave com comandos com chave de slots **diferentes**:
+o cliente de cluster do rueidis entra em *panic* (§8.2.5). Sem chave junto de
+chaves de **um** slot é permitido e vai ao primário desse slot — é assim que a
+política e a identidade são lidas no primário do stream (`doOnPrimaryOf`); um
+`Do` sem chave em cluster vai a um nó qualquer.
 
 Destino PostgreSQL — **os testes pulam sem um servidor**, e o servidor não cria a
 fila (a suíte cria as dela, cada uma num esquema próprio, a partir de

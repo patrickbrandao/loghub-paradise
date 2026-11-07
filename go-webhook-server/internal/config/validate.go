@@ -119,12 +119,12 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	switch c.Ring.Mode {
 	case RingMemory, RingSQLiteMode, RingNone:
 	default:
-		return nil, fmt.Errorf("ring.mode: %q is not one of memory, sqlite, none", c.Ring.Mode)
+		return nil, fmt.Errorf("ring.mode: the value is not one of memory, sqlite, none")
 	}
 	switch c.Sink.Type {
 	case SinkRedisType, SinkSQLiteType, SinkPostgresType, SinkMySQLType, SinkNATSType, SinkClickHouseType, SinkNoneType:
 	default:
-		return nil, fmt.Errorf("sink.type: %q is not one of redis, sqlite, postgres, mysql, nats, clickhouse, none", c.Sink.Type)
+		return nil, fmt.Errorf("sink.type: the value is not one of redis, sqlite, postgres, mysql, nats, clickhouse, none")
 	}
 	if err := checkSynchronous("ring.sqlite.synchronous", c.RingSQL.Synchronous); err != nil {
 		return nil, err
@@ -135,17 +135,17 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 	switch c.SinkSQL.Rotate {
 	case "none", "hourly", "daily":
 	default:
-		return nil, fmt.Errorf("sink.sqlite.rotate: %q is not one of none, hourly, daily", c.SinkSQL.Rotate)
+		return nil, fmt.Errorf("sink.sqlite.rotate: the value is not one of none, hourly, daily")
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
-		return nil, fmt.Errorf("log.level: %q is not one of debug, info, warn, error", c.Log.Level)
+		return nil, fmt.Errorf("log.level: the value is not one of debug, info, warn, error")
 	}
 	switch c.Log.Format {
 	case "json", "text":
 	default:
-		return nil, fmt.Errorf("log.format: %q is not one of json, text", c.Log.Format)
+		return nil, fmt.Errorf("log.format: the value is not one of json, text")
 	}
 
 	// --- ranges -------------------------------------------------------------
@@ -377,10 +377,10 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 		// whole sink.boot_timeout (ported from the syslog/RELP family,
 		// 2026-10-13). The comma is the list's separator: there is no Redis
 		// URL here whose host could hold one.
-		for _, a := range c.SinkRedis.Addrs {
+		for i, a := range c.SinkRedis.Addrs {
 			host, port, err := net.SplitHostPort(a)
 			if err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host) {
-				return nil, fmt.Errorf("sink.redis.addrs: %q is not host:port (one server, port 1..65535)", a)
+				return nil, fmt.Errorf("sink.redis.addrs: entry %d is not host:port (one server, port 1..65535)", i+1)
 			}
 		}
 		if c.SinkRedis.Stream == "" {
@@ -454,7 +454,7 @@ func Validate(c *Config, setIn map[string]bool) (warnings []string, err error) {
 		// error, and net.Listen then picked a random one -- with ":" on every
 		// interface, the exposure the empty bind was refused for (W §19.1 item 40).
 		if _, port, err := net.SplitHostPort(c.Admin.Bind); err != nil || !validPort(port) {
-			return nil, fmt.Errorf("admin.bind: %q is not host:port with a port 1..65535", c.Admin.Bind)
+			return nil, fmt.Errorf("admin.bind: the value is not host:port with a port 1..65535")
 		}
 	}
 
@@ -504,8 +504,8 @@ func validatePostgres(c *Config, setIn map[string]bool, warn func(string, ...any
 		return fmt.Errorf("sink.postgres.database: cannot be empty when sink.type=postgres")
 	}
 	if !pgIdent.MatchString(pg.Table) {
-		return fmt.Errorf("sink.postgres.table: %q is not a plain identifier "+
-			"(name or schema.name; lowercase letters, digits and _; up to 63 chars each)", pg.Table)
+		return fmt.Errorf("sink.postgres.table: the value is not a plain identifier " +
+			"(name or schema.name; lowercase letters, digits and _; up to 63 chars each)")
 	}
 	if pg.TLSCA != "" && !pg.TLS {
 		// Someone who points at a CA believes TLS is on. Silently connecting
@@ -513,7 +513,7 @@ func validatePostgres(c *Config, setIn map[string]bool, warn func(string, ...any
 		return fmt.Errorf("sink.postgres.tls_ca is set but sink.postgres.tls=false: enable tls or drop the CA")
 	}
 	if pg.TLS && strings.HasPrefix(pg.Addr, "/") {
-		return fmt.Errorf("sink.postgres.tls=true with a unix socket address (%s): TLS is a TCP feature", pg.Addr)
+		return fmt.Errorf("sink.postgres.tls=true with a unix socket address in sink.postgres.addr: TLS is a TCP feature")
 	}
 
 	// The registry default of 8 workers is right for Redis and wrong here:
@@ -604,14 +604,14 @@ func validateMySQL(c *Config, setIn map[string]bool, warn func(string, ...any)) 
 		return err
 	}
 	if !mysqlIdent.MatchString(my.Table) {
-		return fmt.Errorf("sink.mysql.table: %q is not a plain identifier "+
-			"(name or database.name; letters, digits and _; up to 64 chars each)", my.Table)
+		return fmt.Errorf("sink.mysql.table: the value is not a plain identifier " +
+			"(name or database.name; letters, digits and _; up to 64 chars each)")
 	}
 	if my.TLSCA != "" && !my.TLS {
 		return fmt.Errorf("sink.mysql.tls_ca is set but sink.mysql.tls=false: enable tls or drop the CA")
 	}
 	if my.TLS && strings.HasPrefix(my.Addr, "/") {
-		return fmt.Errorf("sink.mysql.tls=true with a unix socket address (%s): TLS is a TCP feature", my.Addr)
+		return fmt.Errorf("sink.mysql.tls=true with a unix socket address in sink.mysql.addr: TLS is a TCP feature")
 	}
 	// Ten placeholders per row against the protocol's ceiling of 65 535
 	// per statement. The sink never splits a batch beyond what the server's
@@ -656,9 +656,10 @@ func validateClickHouse(c *Config, setIn map[string]bool, warn func(string, ...a
 	if len(ch.Addrs) == 0 {
 		return fmt.Errorf("sink.clickhouse.addrs: at least one address is required when sink.type=clickhouse")
 	}
-	for _, a := range ch.Addrs {
+	for i, a := range ch.Addrs {
+		// net's error quotes the address: not wrapped (SPEC §13.2).
 		if _, _, err := net.SplitHostPort(a); err != nil {
-			return fmt.Errorf("sink.clickhouse.addrs: %q is not host:port: %w", a, err)
+			return fmt.Errorf("sink.clickhouse.addrs: entry %d is not host:port", i+1)
 		}
 	}
 	if ch.Username == "" {
@@ -671,8 +672,8 @@ func validateClickHouse(c *Config, setIn map[string]bool, warn func(string, ...a
 		return err
 	}
 	if !chIdent.MatchString(ch.Table) {
-		return fmt.Errorf("sink.clickhouse.table: %q is not a plain identifier "+
-			"(name or database.name; letters, digits and _, not starting with a digit; up to 64 chars each)", ch.Table)
+		return fmt.Errorf("sink.clickhouse.table: the value is not a plain identifier " +
+			"(name or database.name; letters, digits and _, not starting with a digit; up to 64 chars each)")
 	}
 	if ch.TLSCA != "" && !ch.TLS {
 		return fmt.Errorf("sink.clickhouse.tls_ca is set but sink.clickhouse.tls=false: enable tls or drop the CA")
@@ -727,10 +728,10 @@ func validateDBName(key, v string) error {
 	for i := 0; i < len(v); i++ {
 		switch c := v[i]; {
 		case c == '`' || c == '\\':
-			return fmt.Errorf("%s: %q holds a backtick or a backslash, which would break the "+
-				"quoting of the name in every statement", key, v)
+			return fmt.Errorf("%s: the name holds a backtick or a backslash, which would break the "+
+				"quoting of the name in every statement", key)
 		case c < 0x20 || c == 0x7f:
-			return fmt.Errorf("%s: %q holds a control byte", key, v)
+			return fmt.Errorf("%s: the name holds a control byte", key)
 		}
 	}
 	return nil
@@ -747,16 +748,16 @@ func validateNATS(c *Config) error {
 		return err
 	}
 	if !natsToken.MatchString(n.Stream) {
-		return fmt.Errorf("sink.nats.stream: %q is not a valid stream name "+
-			"(no whitespace, dots, wildcards or slashes)", n.Stream)
+		return fmt.Errorf("sink.nats.stream: the value is not a valid stream name " +
+			"(no whitespace, dots, wildcards or slashes)")
 	}
 	if n.Subject == "" {
 		return fmt.Errorf("sink.nats.subject: cannot be empty when sink.type=nats")
 	}
 	for _, tok := range strings.Split(n.Subject, ".") {
 		if !natsToken.MatchString(tok) {
-			return fmt.Errorf("sink.nats.subject: %q is not a publishable subject "+
-				"(dot-separated tokens, no whitespace, no * or >)", n.Subject)
+			return fmt.Errorf("sink.nats.subject: the value is not a publishable subject " +
+				"(dot-separated tokens, no whitespace, no * or >)")
 		}
 	}
 	// The client library accepts every credential it is given and picks one
@@ -794,19 +795,19 @@ func validatePostgresAddr(addr string) error {
 		// A comma would be a second socket directory to libpq ("/run/pg,/x"),
 		// which pgx then tries as a list: refused like "h1,h2" below.
 		if strings.ContainsAny(addr, ",\t ") {
-			return fmt.Errorf("sink.postgres.addr: %q: a socket directory names one server, "+
-				"with no comma or blank", addr)
+			return fmt.Errorf("sink.postgres.addr: a socket directory names one server, " +
+				"with no comma or blank")
 		}
 		if err != nil {
 			return nil // a bare socket directory: port 5432
 		}
 		if !validPort(port) {
-			return fmt.Errorf("sink.postgres.addr: %q: the port after the socket directory "+
-				"must be 1..65535", addr)
+			return fmt.Errorf("sink.postgres.addr: the port after the socket directory " +
+				"must be 1..65535")
 		}
 	case err != nil || host == "" || strings.ContainsAny(host, ", \t") || !validPort(port) || !oneHost(host):
-		return fmt.Errorf("sink.postgres.addr: %q is neither host:port (one server, port "+
-			"1..65535) nor a unix socket directory starting with /", addr)
+		return fmt.Errorf("sink.postgres.addr: the value is neither host:port (one server, port " +
+			"1..65535) nor a unix socket directory starting with /")
 	}
 	return nil
 }
@@ -835,7 +836,7 @@ func checkSynchronous(name, v string) error {
 	case "FULL", "NORMAL", "OFF":
 		return nil
 	}
-	return fmt.Errorf("%s: %q is not one of FULL, NORMAL, OFF", name, v)
+	return fmt.Errorf("%s: the value is not one of FULL, NORMAL, OFF", name)
 }
 
 // ParsePrefixes parses a list of CIDRs, accepting a bare address as a
@@ -843,7 +844,7 @@ func checkSynchronous(name, v string) error {
 // Addresses are unmapped first, so "::ffff:10.0.0.5" and "10.0.0.5" agree.
 func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(list))
-	for _, raw := range list {
+	for i, raw := range list {
 		s := strings.TrimSpace(raw)
 		if s == "" {
 			continue
@@ -851,7 +852,8 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		if strings.Contains(s, "/") {
 			p, err := netip.ParsePrefix(s)
 			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR %q: %w", raw, err)
+				// netip's error quotes the entry: not wrapped (SPEC §13.2).
+				return nil, fmt.Errorf("entry %d is not a valid CIDR", i+1)
 			}
 			// Masked() drops host bits so "10.0.0.5/24" behaves as "10.0.0.0/24"
 			// instead of never matching.
@@ -860,7 +862,7 @@ func ParsePrefixes(list []string) ([]netip.Prefix, error) {
 		}
 		a, err := netip.ParseAddr(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid address %q: %w", raw, err)
+			return nil, fmt.Errorf("entry %d is not a valid address or CIDR", i+1)
 		}
 		a = a.Unmap()
 		out = append(out, netip.PrefixFrom(a, a.BitLen()))
