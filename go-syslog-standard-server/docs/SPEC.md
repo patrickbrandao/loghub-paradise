@@ -5,7 +5,7 @@ Data: 2026-09-12
 Revisão: 2026-09-14 — posse de buffer nos caminhos de erro do `Enqueue` (§9.4, §9.5, §12.3, §14.2); leitura incremental do frame declarado (§5.5); sonda de saúde do `sink=sqlite` por heartbeat (§10.4); quarentena de linhas indecodificáveis do `ring.db` (§9.4, §13.1); tetos de conexão por transporte, não por listener (§4.4); duas referências na recarga por `SIGHUP` (§15.3); durações zero recusadas na validação (§15.5); métricas mortas alimentadas ou separadas, sobras do `ring=sqlite` não contam como perda (§12.3, §13.1); nome do dump com nanossegundos (§11.1) e invariante do parser como igualdade (§3.2, §17.2); aviso de `GOMEMLIMIT` por modo de ring (§14.4)
 Revisão: 2026-09-15 — revisão independente das correções: recusa permanente na discagem ou na sonda é fatal na hora (§10.3); `ring=none` devolve o buffer ao pool após o `Write` (§14.2); tabela `health` no esquema (§3.5); `syslog_sink_errors_total{kind}` com `timeout`, `syslog_config_info` com os rótulos reais e séries de conexão só para tcp e relp (§13.1); quarentena sem teto documentada e guarda do dreno na tabela de códigos de saída (§9.4, §12.4); `sink.retry_backoff_max` recusa zero e `sink.fail_timeout = 0` documentado (§15.5); tetos de conexão descritos na tabela `[relp]` (§15.5); §17.5 sem prometer suítes que não existem
 Revisão: 2026-09-15 — `sink=mysql` e `sink=nats` saem do roteiro pós-v1 (§20) e entram na v1, a pedido do dono do projeto e no molde que o `go-webhook-server` validou contra servidores reais no mesmo dia: tabela MySQL (§3.7) e mensagem JetStream (§3.8), os dois destinos (§10.7, §10.8), o teto de evento conferido no boot contra `max_allowed_packet` e `max_payload` (§3.9), o envelope no corpo da mensagem NATS e não num header, porque o JetStream recusa header acima de 64 KiB (§3.8), a matriz com dezoito combinações (§2.1, §18), a configuração (§12.1, §15.5), as métricas (§13.1), seis dependências (§16.3) e dois invariantes (§19)
-Revisão: 2026-11-07 — todas as pendências abertas de §21.1 corrigidas e paridade Redis/Valkey: custo fixo por conexão (§5.5), teto global das cópias em voo do RELP (§4.5), `sink.nats.urls` validada e redigida (§10.8.9), erros de configuração sem eco (§15.1), coluna extra obrigatória recusada no boot (§10.5.5), validação sob `sink.op_timeout` (§10.5.5, §10.7.4), ambiente libpq fora do pool (§10.5.2), `sink.mysql.database` validado (§10.7.1), política de despejo no boot e em toda sonda, cluster com `db != 0`, identidade do servidor, alias `valkey`, Sentinel (§10.3, §15.2), gauges de emergência recontados (§11.2), abort durante o dump (§12.3), sonda do `sink=sqlite` com trava por contexto (§10.4), prazo único de boot do sink (§12.1), `syslog_conns_refused_total` (§13.1), nomes próprios — imagem, `slstd-`, `relp_software`, dumps `slstd-emg-` (§4.5, §11.1, §17.5)
+Revisão: 2026-11-07 — todas as pendências abertas de §21.1 corrigidas e paridade Redis/Valkey: custo fixo por conexão (§5.5), teto global das cópias em voo do RELP (§4.5), `sink.nats.urls` validada e redigida (§10.8.9), erros de configuração sem eco (§15.1), coluna extra obrigatória recusada no boot (§10.5.5), validação sob `sink.op_timeout` (§10.5.5, §10.7.4), ambiente libpq fora do pool (§10.5.2), `sink.mysql.database` validado (§10.7.1), política de despejo no boot e em toda sonda, cluster com `db != 0`, identidade do servidor, alias `valkey`, Sentinel (§10.3, §15.2), gauges de emergência recontados (§11.2), abort durante o dump (§12.3), sonda do `sink=sqlite` com trava por contexto (§10.4), prazo único de boot do sink (§12.1), `syslog_conns_refused_total` (§13.1), nomes próprios — imagem, `slstd-`, `relp_software`, dumps `slstd-emg-` (§4.5, §11.1, §17.5); revisão independente (§21.1, 21–29): recontagem de emergência em fluxo (§11.2), política e identidade no primário da stream em cluster (§10.3), orçamento RELP antes do payload e FIFO (§4.5), buffer de frame entre frames com o leitor vazio (§5.5), nenhuma tentativa passa do prazo de boot (§12.1), validação sem eco (§15.1), escritora sqlite travada (§10.4), `SLSTD_IMAGE` e portas Valkey (§17.5), alias pelo último valor (§15.2)
 Revisão: 2026-10-11 — recusa por IP em laço, keep-alive sob o limitador e padrão `0` dos tetos de conexão como decisão (§4.4); fase 3 do RELP sem `serverclose`, como o código faz (§12.3); arquivo inválido no `SIGHUP` (§15.3); dump falho conta só `emergency_failed` (§11.3); pendências conhecidas desta referência (§21)
 Linguagem: Go 1.25+
 Repositório: `https://github.com/patrickbrandao/loghub-paradise` (monorepo)
@@ -114,7 +114,7 @@ As dezoito combinações são válidas e têm significado distinto (§18).
                  final)       partilhado)    partilhado)   "SYSLOG"      puro)
 
  emergência: ring=memory não-vazio + sink FATAL
-             => dump em <emergency.dir>/emg-<node>-<unixnano>.bin  (§11)
+             => dump em <emergency.dir>/slstd-emg-<node>-<unixnano>.bin  (§11)
 
  +------------------------------------------------------------------+
  | porta admin (admin.bind, padrão 127.0.0.1:9102)                   |
@@ -885,6 +885,23 @@ servidor 0 serverclose 0
   `syslog_relp_inflight_bytes` mostra o que está em voo. Antes de 2026-11-07 a
   cópia vinha antes da vaga: até `relp.window + 1` cópias de até
   `relp.max_frame_bytes` por conexão, cerca de 2 GiB com os padrões.
+- **A vaga e os bytes vêm antes do payload** (corrigido em 2026-11-07, revisão
+  independente). O leitor lê o cabeçalho do frame (`TXNR`, `COMMAND`,
+  `DATALEN`, já conferido contra `relp.max_frame_bytes`) e, num `syslog` com
+  dados, pega a vaga na janela e `2 × DATALEN + 8 KiB` do teto **antes** de ler
+  um byte do payload; depois rearma o `relp.idle_timeout` (a espera pode tê-lo
+  passado) e lê o payload. Adquirir depois do frame inteiro deixava o payload
+  de cada conexão em espera no buffer do leitor, fora do teto: N conexões ×
+  `relp.max_frame_bytes` com `relp.max_conns = 0`. Antes de estacionar numa das
+  duas esperas o leitor solta o buffer de frame acima de 16 KiB (§5.5): o frame
+  anterior já foi copiado. Um par que declara `DATALEN` e não manda o payload
+  segura a conta declarada até o `idle_timeout`, como seguraria a conexão.
+- **O teto é justo** (mesma revisão). As esperas são atendidas em **ordem de
+  chegada**: um recém-chegado não passa à frente de quem espera, mesmo que a
+  conta dele caiba na folga. Sem a ordem, uma conta reduzida ao teto (que
+  precisa dele vazio) morria de inanição atrás de uma sequência de contas
+  pequenas, cada uma cabendo no espaço que a liberação anterior deixou. Quem
+  desiste da espera (cancelamento) sai da fila e deixa o seguinte entrar.
 - `COMMAND` desconhecido recebe `500` e a conexão continua. Um `DATALEN` que não
   couber em `relp.max_frame_bytes`, ou uma moldura que não fecha, **fecha a
   conexão**: o fluxo está dessincronizado e não há como recuperar.
@@ -1027,9 +1044,22 @@ paradas a 64 KiB mais o bloco de 64 KiB da leitura contada levavam o contêiner
 ao OOM kill — e com `ring=memory` o backlog confirmado junto. O maior `Peek` do
 código é de um byte (a detecção da moldura); o resto é `ReadByte`, `ReadSlice`
 e a leitura contada, uma recarga por vez. E um buffer de frame que cresceu além
-de 16 KiB (uma mensagem grande) é largado antes do frame seguinte: o que uma
-conexão ociosa segura é limitado pelas mensagens pequenas, não pela maior que
-ela já mandou.
+de 16 KiB (uma mensagem grande) é largado **entre frames, com o leitor vazio**,
+antes da leitura que pode esperar: o que uma conexão ociosa segura é limitado
+pelas mensagens pequenas, não pela maior que ela já mandou.
+
+**Com o próximo frame já no leitor, o buffer fica** (corrigido em 2026-11-07,
+revisão independente; a regra do `go-syslog-server`, SPEC dele §5.4). Largar
+depois de todo frame acima de 16 KiB, como este código fazia, fazia um fluxo de
+frames de 20–64 KiB realocar o buffer umas cinco vezes por frame (a leitura
+contada dobra a partir de 2 KiB); o irmão mediu 9× o tempo e 60× a alocação
+com frames de 12 KiB. A soltura vale para as três molduras (octet, LF e RELP)
+e é conferida na entrada de cada leitura (`Framer.Next`, `RELPReader.ReadHead`)
+só com `Buffered() == 0`. O limite herdado do irmão vale aqui também: um par
+que manda um frame grande seguido de **um** byte do próximo e se cala segura o
+buffer grande até o `idle_timeout` (não é perda de dado, e soltar dentro do
+frame foi medido e recusado lá). O RELP solta o buffer também antes de esperar
+pela janela ou pelo teto (§4.5).
 
 ---
 
@@ -1732,10 +1762,21 @@ então para ela um `volatile-*` no teto age como `noeviction`) — e conferida
   fora todo ACL de privilégio mínimo; uma resposta de erro a ambos não é
   "retentar" (não muda esperando);
 - com Sentinel a leitura vai ao primário, o nó que guarda a stream;
-- **em cluster** o rueidis recusa (com `panic`) um `DoMulti` que mistura um
-  comando sem chave (`INFO`, `CONFIG GET`) com comandos com chave, então lá a
-  leitura da política é uma ida e volta própria, depois da sonda (achado contra
-  um cluster de um nó em 2026-11-07; `TestRedisIntegrationClusterDB`).
+- **em cluster** a leitura vai ao **primário do slot da stream** (corrigido em
+  2026-11-07, revisão independente). O rueidis entra em `panic` ("Mixing
+  no-slot and cross slot commands") só quando um `DoMulti` com um comando sem
+  chave (`INFO`, `CONFIG GET`) traz comandos com chave de **slots diferentes**
+  — a sonda tem dois, `XLEN` da stream e `XADD` da chave da sonda; um comando
+  sem chave junto de comandos com chave de **um** slot é permitido e vai,
+  inteiro, ao primário desse slot (`_pickMulti`). Então em cluster a sonda é
+  `DoMulti(XLEN <stream>, <leitura da política>)` mais um `Do(XADD sonda)`
+  à parte, e o `CONFIG GET` de recurso e o `INFO server` da identidade também
+  vão num `DoMulti` com `XLEN <stream>` (resposta ignorada). Um `Do` sozinho de
+  comando sem chave vai a um nó **arbitrário** (o primeiro de um mapa, réplicas
+  incluídas, outro a cada chamada): lia a política de outro shard, e um shard
+  da stream em `allkeys-lru` passava pela checagem. Travado sem servidor por
+  `TestRedisClusterPolicyIsReadOnTheStreamPrimary` (um cluster falso de dois
+  primários); `TestRedisIntegrationClusterDB` prova contra um real.
 
 `sink.redis.maxlen` (padrão `0`, desligado) aplica `MAXLEN ~ N`. Desligado por
 padrão porque trimming descarta eventos em silêncio, que é o oposto de tudo o
@@ -1795,10 +1836,16 @@ Destino final append-only no esquema de §3.5.
   por lentidão. Agora, se o prazo passa com a **escritora** segurando a trava,
   o banco está sendo escrito naquele instante e o resultado daquela escrita é o
   que os workers classificam: a sonda reporta saudável em vez de inventar uma
-  falha. Uma trava presa por qualquer outra coisa ainda é falha. A escritora
-  não segura para sempre: toda escrita roda sob `sink.op_timeout`, e um disco
-  quebrado faz cada uma falhar rápido, soltar a trava e deixar a próxima sonda
-  ver o erro.
+  falha. Uma trava presa por qualquer outra coisa ainda é falha.
+- **"Ocupada" tem limite** (corrigido em 2026-11-07, revisão independente; a
+  regra do `go-syslog-server` e do `go-webhook-server`, item 36 lá). Uma
+  escrita que segura a trava há mais de `sink.op_timeout +
+  sink.health_timeout`, medido no **relógio monotônico** desde que ela pegou a
+  trava, está **presa**, e a sonda falha (`network`, os fusíveis seguem). O
+  `COMMIT` não recebe contexto, e um `fsync` travado num disco que parou
+  deixava a sonda reportar a escritora como saudável para sempre. O relógio é
+  o monotônico porque um passo do relógio de parede (NTP) para trás daria uma
+  idade negativa e manteria o sink UP.
 
 ### 10.5 `sink.type = postgres`
 
@@ -1876,7 +1923,8 @@ por padrão: com o banco a uns 60 ms ela nunca terminava, o prazo fechava a
 conexão, cada tentativa recomeçava do zero e o processo saía com 3 depois de
 `sink.boot_timeout` dizendo que o banco não respondeu. O contexto da validação
 se desliga do **prazo** da checagem que a iniciou, mas continua seguindo o
-**cancelamento** do boot (um shutdown, um boot abortado).
+**cancelamento** do boot (um shutdown, um boot abortado), e no boot nunca passa
+do fim de `sink.boot_timeout` (§12.1).
 
 #### 10.5.6 Durabilidade
 
@@ -2377,6 +2425,14 @@ momento: um arquivo deixado para trás (ilegível, ou com a remoção ou a
 quarentena falha) conta como um, e um alerta sobre `> 0` dispara. As mensagens
 de um arquivo ilegível são desconhecíveis e contam como zero.
 
+**A recontagem não decodifica o dump** (corrigido em 2026-11-07, revisão
+independente; porte do `countFile` do `go-syslog-server`). `Count` lê cada
+arquivo em fluxo: decodifica o cabeçalho de cada registro (a contagem é de
+mensagens que voltarão de fato) e **pula** a linha crua com `Discard`, sem
+alocá-la. Ler o dump inteiro com `Read` logo depois de escrevê-lo dobrava o pico
+de heap justamente no shutdown com backlog, e alargava a janela do abort de
+§12.3.
+
 ### 11.3 Falha do próprio dump
 
 Se o dump falhar (disco cheio, sem permissão, `emergency.enabled = false`): log
@@ -2429,6 +2485,19 @@ só é criado durante o incidente falha durante o incidente.
 `sink.boot_timeout` conta do início do passo 4: a discagem do `sink=redis` e o
 `WaitReady` que vem depois dividem o mesmo prazo. Antes cada um recebia o prazo
 inteiro, e um Redis que oscilasse entre os dois passos dobrava a espera.
+
+**E nenhuma tentativa passa do prazo** (corrigido em 2026-11-07, revisão
+independente). O prazo era conferido só entre tentativas, e uma tentativa
+sozinha o atravessava: cada discagem do `sink=redis` tinha `sink.op_timeout`
+inteiro, cada checagem do `WaitReady` `sink.health_timeout` inteiro e a
+validação do PostgreSQL/MySQL (§10.5.5) `sink.op_timeout` inteiro, desligada
+do prazo do pai. Agora cada tentativa recebe `min(prazo próprio, o que falta
+até o fim de sink.boot_timeout)` — a discagem, a checagem e a validação —, a
+espera entre tentativas também é cortada no prazo, e com o prazo esgotado o
+boot sai com 3 sem nova tentativa. A validação continua seguindo o
+cancelamento do boot (§10.5.5); o prazo do boot chega a ela pelo contexto da
+checagem do `WaitReady` (fora do boot, nas sondas do monitor, não há prazo de
+boot e ela tem `sink.op_timeout` inteiro).
 
 A porta admin aberta durante todo o processo é o ponto: mesmo num crashloop por
 sink indisponível, o operador tem `/readyz` com o motivo exato e `/metrics` com
@@ -2562,7 +2631,10 @@ segundo sinal que chegava enquanto o dump era escrito lia o ring quase vazio e
 contava uma fração de uma perda que era o dump inteiro — o `exit 130` corta a
 escrita. Agora a fase 4 registra, sob uma trava, quantas mensagens recolheu e
 ainda não despejou, e o abort soma esse número ao que o ring ainda conta; o
-dump concluído (ou contado como `emergency_failed`) zera o registro. Um dump
+dump concluído (ou contado como `emergency_failed`) zera o registro. O zero vem
+**logo depois de o arquivo estar durável** (ou de a escrita falhar), antes da
+recontagem dos gauges de §11.2: um segundo sinal durante a recontagem não conta
+como perdido o que já está no disco. Um dump
 cortado pelo abort pode deixar um arquivo truncado, que o boot seguinte
 reingere até o último registro íntegro (§11.2): essas mensagens foram contadas
 como perdidas e voltam — erro para o lado de contar perda a mais, nunca a
@@ -2744,6 +2816,10 @@ esconderia um estouro de uma delas atrás da folga da outra.
   coletor de lixo do Go não sabe do teto do contêiner e o OOM killer chega
   antes do GC. Os compose de `docker/` definem `GOMEMLIMIT` **e** o limite de
   memória do contêiner, o segundo acima do primeiro.
+- O RELP soma, fora de `ring.max_bytes`, as cópias das transações em voo, com
+  teto global em `relp.inflight_max_bytes` (§4.5), tomado antes da leitura do
+  payload; o que uma conexão em espera segura fora dele é o leitor de 4 KiB e um
+  buffer de frame de até 16 KiB (§5.5).
 - `GOGC` no padrão. Um valor mais alto troca memória por CPU e só faz sentido
   depois de medir.
 - `GOMAXPROCS` no padrão do runtime, que a partir do Go 1.25 respeita o limite
@@ -2778,6 +2854,22 @@ valor de outra flag (`--sink.workers --sink.nats.password=x`); e um nome que
 começa com o nome de um parâmetro e continua (`--sink.nats.passwordx`) não é
 citado.
 
+**E a validação também não ecoa** (corrigido em 2026-11-07, revisão
+independente). Os erros do parse de valor (`invalid integer`, `invalid byte
+size`, `invalid duration`, `invalid bool`, `invalid file mode`) e os das regras
+de validação (enumerações como `sink.type`, `listen.*` que não é `host:port`,
+`listen.unix`, `filter.*`, `ratelimit.exempt`, os caminhos SQLite iguais,
+`sink.postgres.table`, `sink.mysql.table`/`database`/`addr`, `sink.nats.stream`/
+`subject`) e o `checkQuotedName` do construtor do `sink=mysql` nomeiam a
+**chave e o problema** (a classe do caractere, o tamanho, a entrada da lista
+pela posição), nunca o texto do valor: um segredo digitado na chave errada, ou
+um valor que é ele mesmo um segredo, chegava ao stderr e, num `SIGHUP`, ao log
+(o `validateDBName` e o `checkQuotedName` vieram do `go-syslog-server` com o
+mesmo defeito). Números **já parseados** (uma contagem abaixo de 1, um tamanho
+abaixo do mínimo) continuam na mensagem: depois do parse são só um número.
+`TestConfigErrorsNeverEchoTheValue` passa um segredo por cada uma dessas
+recusas.
+
 ### 15.2 Registry único
 
 Uma **única tabela** declara, para cada parâmetro: seção, chave, tipo, valor
@@ -2795,6 +2887,16 @@ tipo: `yes` e `true` concordam) são iguais e é `exit 1` se diferem, com a
 mensagem nomeando as duas chaves e nunca os valores (qualquer um pode ser uma
 senha). Entre fontes vale a precedência de §15.1 sem mudança: o alias conta
 como a mesma chave na sua fonte.
+
+**O que se compara é o último valor de cada grafia** (corrigido em 2026-11-07,
+revisão independente). Dentro de uma fonte a última ocorrência de uma grafia é
+a que vale, então a comparação é feita **uma vez, no fim da fonte**, entre o
+último valor de `sink.redis.<chave>` e o último de `sink.valkey.<chave>`:
+`--sink.valkey.db=1 --sink.redis.db=2 --sink.valkey.db=2` passa (os dois
+terminam em 2). Comparando a cada ocorrência, como o código fazia, a segunda
+flag era recusada contra um valor que a terceira já tinha substituído, e o
+resultado dependia da ordem. Um erro do INI nomeia o arquivo, não a linha (a
+comparação é do arquivo inteiro).
 
 Sem `gopkg.in/ini.v1` e sem `spf13/pflag`, pela mesma razão do serviço irmão:
 unir essas bibliotecas numa precedência coerente daria mais código de cola que o
@@ -3361,6 +3463,22 @@ do servidor LogHub, e subir os compose daqui retagueava a imagem dele e
 assumia as pilhas e os volumes dele. `TestComposeValkeyFiles` e
 `TestComposeNamesAreThisServers` conferem.
 
+**E as variáveis e as portas também** (corrigido em 2026-11-07, revisão
+independente). A imagem vem de `SLSTD_IMAGE`/`SLSTD_IMAGE_TAG` (`common.yml`,
+`.env.example`), não do `SYSLOG_IMAGE`/`SYSLOG_IMAGE_TAG` do servidor LogHub:
+um `.env` comum às duas pilhas construía uma imagem com o nome da outra. Os
+contêineres da suíte de emissores são `slstd-emit-*`. As portas padrão dos três
+`compose.*-valkey.yml` (que eram 5158–5160, 20618–20620, 19118–19120 e
+16320/16324/16328; o syslog, o admin e o 16324 dentro das faixas do
+`go-syslog-server`) passaram a 5191–5193 (syslog), 20691–20693 (RELP),
+19191–19193 (admin) e 16391–16393 (Valkey), fora das faixas publicadas por ele
+(syslog 5141–5167, admin 19101–19127, Redis/Valkey 16301–16329 e 16418–16427);
+`TestComposeImageVariablesAreThisServers` e `TestComposeValkeyPortsAreFree`
+conferem. Os compose de Redis, SQLite, PostgreSQL, MySQL, NATS e `none`
+continuam nas portas de antes, que coincidem com as do `go-syslog-server`
+(5141–5157, 19101–19117): subir os dois ao mesmo tempo exige fixar as portas
+pelo `.env`.
+
 A de MySQL e a de NATS existem desde a entrada dos dois destinos, pulam sem a
 variável e criam a própria tabela ou o próprio stream **a partir do arquivo que o
 operador aplica** (`docker/mysql/schema.sql`, `docker/nats/stream.json`), para
@@ -3590,3 +3708,12 @@ correção, e um trecho portado leva a correção junto, não o defeito.
     `natsio/nats-box:0.20.0` nos três compose de NATS e no `.env.example`,
     conferido por `TestComposeNATSBoxIsPinned`; regra em §17.5.
 20. *Corrigido em 2026-11-07:* nomes próprios — imagem e binário `go-syslog-standard-server`, prefixo `slstd-` nos compose, `relp_software` e `--version` com o nome, dumps `slstd-emg-*` (os `emg-*` do go-syslog-server não são lidos); regra em §4.5, §11.1 e §17.5.
+21. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a recontagem dos gauges depois do dump lia o arquivo inteiro com `Read`; agora conta em fluxo, pulando o cru, e o registro do abort é zerado assim que o arquivo é durável, antes da recontagem; regra em §11.2 e §12.3.
+22. *Corrigido em 2026-11-07 (revisão independente):* em cluster a política (`INFO memory`/`CONFIG GET`) e a identidade (`INFO server`) eram lidas num `Do` solto, que vai a um nó arbitrário; agora num `DoMulti` com `XLEN` da stream, no primário do slot dela, e o `XADD` da sonda à parte; regra em §10.3.
+23. *Corrigido em 2026-11-07 (revisão independente):* o RELP pegava a vaga e os bytes de `relp.inflight_max_bytes` depois de ler o frame inteiro, e a espera não era justa; agora depois do `DATALEN` e antes do payload, com fila FIFO; regra em §4.5 e §14.4.
+24. *Corrigido em 2026-11-07 (revisão independente; regra do go-syslog-server):* o buffer de frame acima de 16 KiB era largado a cada frame; agora só entre frames com o leitor vazio; regra em §5.5.
+25. *Corrigido em 2026-11-07 (revisão independente):* uma tentativa (discagem do Redis, checagem do `WaitReady`, validação do PostgreSQL/MySQL) passava do prazo único de boot; agora cada uma recebe o mínimo entre o próprio prazo e o que falta; regra em §12.1.
+26. *Corrigido em 2026-11-07 (revisão independente):* erros de parse de valor e de validação (`invalid integer %q`, `sink.type: %q`, `validateDBName`, `checkQuotedName` e os demais) ecoavam o valor; agora nomeiam chave e problema; regra em §15.1.
+27. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a sonda do `sink=sqlite` reportava saudável para sempre uma escritora travada; agora o limite é `sink.op_timeout + sink.health_timeout` no relógio monotônico; regra em §10.4.
+28. *Corrigido em 2026-11-07 (revisão independente):* colisões residuais com o go-syslog-server — `SYSLOG_IMAGE`/`SYSLOG_IMAGE_TAG` viraram `SLSTD_IMAGE`/`SLSTD_IMAGE_TAG`, contêineres `slstd-emit-*`, diagrama com `slstd-emg-`, comentário do `main.go`, portas padrão dos compose Valkey fora das faixas dele; regra em §17.5.
+29. *Corrigido em 2026-11-07 (revisão independente):* o conflito do alias `valkey` comparava a cada ocorrência e dependia da ordem; agora compara o último valor de cada grafia, uma vez no fim da fonte; regra em §15.2.

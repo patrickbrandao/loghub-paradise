@@ -20,7 +20,7 @@ services:
         COMMIT: ${SYSLOG_COMMIT:-none}
         GO_VERSION: ${SYSLOG_GO_VERSION:-1.25}
         ALPINE_VERSION: ${SYSLOG_ALPINE_VERSION:-3.22}
-    image: ${SYSLOG_IMAGE:-go-syslog-standard-server}:${SYSLOG_IMAGE_TAG:-local}
+    image: ${SLSTD_IMAGE:-go-syslog-standard-server}:${SLSTD_IMAGE_TAG:-local}
 
     restart: unless-stopped
 

@@ -146,8 +146,25 @@ func NewRedis(ctx context.Context, cfg RedisConfig, log *slog.Logger, m *obs.Met
 		client.Close()
 		return nil, err
 	}
-	r.server, r.serverVersion = serverIdentity(ctx, client)
+	r.server, r.serverVersion = serverIdentity(r.onStreamPrimary(ctx, client.B().Info().Section("server").Build()))
 	return r, nil
+}
+
+// onStreamPrimary sends one keyless command (INFO, CONFIG GET) to the node
+// that holds the stream (SPEC §10.3). Outside a cluster that is the one node
+// the client talks to (with Sentinel, the primary). In a cluster rueidis
+// sends a lone keyless command to an arbitrary node -- the first of a map,
+// replicas included, a different one from call to call -- so the policy of
+// the shard that holds the stream was never the one read. A DoMulti of the
+// keyless command beside a keyed command of ONE slot is allowed (rueidis
+// panics only on keyed commands of DIFFERENT slots, _pickMulti) and goes, as
+// a whole, to that slot's primary: XLEN of the stream rides along, its answer
+// ignored.
+func (r *Redis) onStreamPrimary(ctx context.Context, cmd rueidis.Completed) rueidis.RedisResult {
+	if r.client.Mode() != rueidis.ClientModeCluster {
+		return r.client.Do(ctx, cmd)
+	}
+	return r.client.DoMulti(ctx, r.client.B().Xlen().Key(r.cfg.Stream).Build(), cmd)[1]
 }
 
 // Server is what INFO server said at boot: the flavour ("redis", "valkey" or
@@ -189,8 +206,8 @@ func newRedisClient(ctx context.Context, opt rueidis.ClientOption) (rueidis.Clie
 // INFO server is the reliable source, and NOTHING here is ever decided by
 // redis_version. An ACL without INFO, or a proxy, is "unknown", never an
 // error: the identity is for the log.
-func serverIdentity(ctx context.Context, c rueidis.Client) (string, string) {
-	info, err := c.Do(ctx, c.B().Info().Section("server").Build()).ToString()
+func serverIdentity(res rueidis.RedisResult) (string, string) {
+	info, err := res.ToString()
 	if err != nil {
 		return "unknown", ""
 	}
@@ -335,11 +352,18 @@ func (r *Redis) Health(ctx context.Context) error {
 	ops := [2]string{"xlen", "writeprobe"}
 	var resps []rueidis.RedisResult
 	if len(cmds) > 2 && r.client.Mode() == rueidis.ClientModeCluster {
-		// rueidis refuses (panics on) a DoMulti that mixes a keyless command
-		// -- INFO, CONFIG GET -- with keyed ones in cluster mode, so there the
-		// policy is read in a round trip of its own (found against a one-node
-		// cluster, 2026-11-07).
-		resps = append(r.client.DoMulti(ctx, cmds[:2]...), r.client.Do(ctx, cmds[2]))
+		// In a cluster rueidis panics on a DoMulti whose keyed commands are of
+		// DIFFERENT slots once a keyless one (INFO, CONFIG GET) is in it, and
+		// the probe key is not the stream's slot. A keyless command beside
+		// keyed ones of ONE slot is allowed and goes to that slot's primary:
+		// so the policy rides with XLEN of the stream, read on the node that
+		// holds it, and the probe is a Do of its own. A lone Do of the policy
+		// went to an arbitrary node, replicas included (revisão independente
+		// de 2026-11-07; SPEC §10.3; locked by
+		// TestRedisClusterPolicyIsReadOnTheStreamPrimary).
+		withStream := r.client.DoMulti(ctx, cmds[0], cmds[2])
+		probe := r.client.Do(ctx, cmds[1])
+		resps = []rueidis.RedisResult{withStream[0], probe, withStream[1]}
 	} else {
 		resps = r.client.DoMulti(ctx, cmds...)
 	}
@@ -384,7 +408,9 @@ func (r *Redis) Health(ctx context.Context) error {
 // unreadable policy (an ACL without INFO and CONFIG) is a WARN with the
 // premise, once, and the check passes.
 func (r *Redis) checkEviction(ctx context.Context, info string, ierr error) error {
-	policy, src, err := evictionFromInfo(ctx, r.client, info, ierr)
+	policy, src, err := evictionFromInfo(info, ierr, func() rueidis.RedisResult {
+		return r.onStreamPrimary(ctx, r.client.B().ConfigGet().Parameter("maxmemory-policy").Build())
+	})
 	switch {
 	case src == policyByConfig:
 		r.policyRead.Store(policyByConfig)
@@ -468,9 +494,10 @@ func policyFromInfo(info string) (string, bool) {
 // INFO is narrower than that of CONFIG (@admin). Any other error REPLY to both
 // is "unreadable", not "retry": NOPERM or "unknown command" does not change by
 // waiting, and retrying it would hold the boot until sink.boot_timeout over a
-// check that is a precaution. With Sentinel the client's node is the primary,
-// the one that holds the stream.
-func evictionFromInfo(ctx context.Context, c rueidis.Client, info string, ierr error) (string, int32, error) {
+// check that is a precaution. configGet sends CONFIG GET to the node that
+// holds the stream (onStreamPrimary): with Sentinel the primary, in a cluster
+// the primary of the stream's slot.
+func evictionFromInfo(info string, ierr error, configGet func() rueidis.RedisResult) (string, int32, error) {
 	if ierr == nil {
 		if policy, ok := policyFromInfo(info); ok {
 			return policy, policyByInfo, evictionVerdict(policy)
@@ -478,7 +505,7 @@ func evictionFromInfo(ctx context.Context, c rueidis.Client, info string, ierr e
 	} else if !redisReplyRefused(ierr) {
 		return "", policyByInfo, ierr
 	}
-	kv, cerr := c.Do(ctx, c.B().ConfigGet().Parameter("maxmemory-policy").Build()).AsStrMap()
+	kv, cerr := configGet().AsStrMap()
 	policy, err := evictionFromConfig(kv, cerr, ierr)
 	if errors.Is(err, ErrPolicyUnknown) || (cerr != nil && !redisReplyRefused(cerr)) {
 		return policy, policyByInfo, err

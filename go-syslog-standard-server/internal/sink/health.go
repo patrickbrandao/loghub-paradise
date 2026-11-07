@@ -2,6 +2,7 @@ package sink
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -208,6 +209,27 @@ func (h *Health) onFailure(err error) {
 	}
 }
 
+type bootDeadlineKey struct{}
+
+// WithBootDeadline marks ctx with the end of sink.boot_timeout. WaitReady sets
+// it on every boot check, and the SQL validation (validationContext), which
+// detaches from the check's own deadline, still never runs past it (SPEC
+// §12.1). The app's redis dial loop clamps its own attempts with BootClamp.
+func WithBootDeadline(ctx context.Context, deadline time.Time) context.Context {
+	return context.WithValue(ctx, bootDeadlineKey{}, deadline)
+}
+
+// BootClamp is min(d, time left until the boot deadline in ctx); d itself
+// when ctx carries none.
+func BootClamp(ctx context.Context, d time.Duration) time.Duration {
+	if t, ok := ctx.Value(bootDeadlineKey{}).(time.Time); ok {
+		if left := time.Until(t); left < d {
+			return left
+		}
+	}
+	return d
+}
+
 // WaitReady blocks until the sink answers a health check or the deadline passes.
 //
 // It is the boot gate of SPEC §12.1 step 4: no transport opens while the
@@ -215,13 +237,30 @@ func (h *Health) onFailure(err error) {
 // service, because an open UDP socket in front of a dead sink would swallow
 // datagrams with no way to refuse them -- the only defence is not to be
 // listening, and let the emitter see ICMP port unreachable.
+//
+// No attempt runs past the deadline (SPEC §12.1): each check gets
+// min(sink.health_timeout, what is left), the boot deadline rides in its
+// context for the validation of the SQL sinks (WithBootDeadline), and the
+// sleep between attempts is cut at the deadline too. Checked only between
+// attempts, one attempt crossed it.
 func (h *Health) WaitReady(ctx context.Context, timeout, backoffMin, backoffMax time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	backoff := backoffMin
 	var lastErr error
 
 	for attempt := 1; ; attempt++ {
-		cctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+		per := h.cfg.Timeout
+		left := time.Until(deadline)
+		if left <= 0 {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("sink %s: sink.boot_timeout exhausted before the first check", h.sink.Type())
+			}
+			return lastErr
+		}
+		if per <= 0 || left < per {
+			per = left
+		}
+		cctx, cancel := context.WithTimeout(WithBootDeadline(ctx, deadline), per)
 		err := h.sink.Health(cctx)
 		cancel()
 
@@ -252,10 +291,14 @@ func (h *Health) WaitReady(ctx context.Context, timeout, backoffMin, backoffMax 
 			"sink", h.sink.Type(), "attempt", attempt, "error", err,
 			"retry_in", backoff.String())
 
+		wait := backoff
+		if left := time.Until(deadline); left < wait {
+			wait = left
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
 		if backoff *= 2; backoff > backoffMax {
 			backoff = backoffMax

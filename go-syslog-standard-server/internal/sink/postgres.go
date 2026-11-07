@@ -633,8 +633,12 @@ func (p *Postgres) validate(ctx context.Context) error {
 // detached from the deadline of the health check that started it, but still
 // cancelled when the parent is CANCELLED -- a shutdown or an aborted boot --
 // rather than merely past its deadline. Shared by the PostgreSQL and MySQL
-// sinks (SPEC §10.5.5, §10.7.4).
+// sinks (SPEC §10.5.5, §10.7.4). At boot the timeout is also clamped to what
+// is left of sink.boot_timeout, which WaitReady puts in the parent
+// (WithBootDeadline): detached from the check's deadline, the validation
+// used to run its whole sink.op_timeout past the boot's (SPEC §12.1).
 func validationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	timeout = BootClamp(parent, timeout)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
 	stop := context.AfterFunc(parent, func() {
 		if !errors.Is(context.Cause(parent), context.DeadlineExceeded) {

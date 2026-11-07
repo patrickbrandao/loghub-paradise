@@ -8,12 +8,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server/internal/emergency"
+	"github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server/internal/envelope"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server/internal/obs"
 	"github.com/patrickbrandao/loghub-paradise/go-syslog-standard-server/internal/sink"
 )
@@ -184,5 +187,77 @@ func TestSinkBootHasOneDeadline(t *testing.T) {
 	}
 	if elapsed > boot+400*time.Millisecond {
 		t.Fatalf("the boot gave up after %v with sink.boot_timeout=%v: the wait got its own budget", elapsed, boot)
+	}
+}
+
+// Revisão independente de 2026-11-07, STD item 1: the registry of what the
+// shutdown collected is cleared as soon as the dump file is durable, BEFORE
+// the gauges are recounted from the directory -- a second signal during the
+// recount does not count as lost what is already on disk (SPEC §12.3).
+func TestCollectedIsClearedBeforeTheRecount(t *testing.T) {
+	dir := t.TempDir()
+	a := &App{
+		log:     obs.NewLogger(io.Discard, "text", "error"),
+		metrics: obs.NewMetrics("memory", "none", "tcp", obs.BuildInfo{}),
+		emg:     emergency.NewStore(dir, "recount"),
+	}
+	items := []*envelope.Item{envelope.NewItem(envelope.Head{ID: "019823f1-7a2c-7b3d-8e4f-000000000001"}, []byte("x"), -1)}
+	a.collected = len(items)
+	seen := -1
+	a.beforeRecount = func() {
+		a.lossMu.Lock()
+		seen = a.collected
+		a.lossMu.Unlock()
+	}
+	if !a.dumpEmergency(items) {
+		t.Fatal("the dump failed")
+	}
+	if seen != 0 {
+		t.Fatalf("collected = %d while the gauges were recounted: an abort there counts the dump on disk as lost", seen)
+	}
+	if got := a.metrics.EmergencyEventsPending.Load(); got != 1 {
+		t.Fatalf("syslog_emergency_events_pending = %d, want 1", got)
+	}
+}
+
+// Revisão independente de 2026-11-07, STD item 4: the redis dial loop of the
+// boot never runs past sink.boot_timeout in one attempt. Against an address
+// that accepts TCP and never speaks, each attempt had the whole
+// sink.op_timeout (5 s here) with a 1 s boot deadline.
+func TestRedisBootAttemptStopsAtTheBootDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // held open, silent
+		}
+	}()
+	const boot = time.Second
+	start := time.Now()
+	code := runContext(context.Background(), []string{
+		"--ring.data_dir=" + t.TempDir(),
+		"--admin.bind=" + freeAddr(t),
+		"--listen.udp=",
+		"--listen.tcp=" + freeAddr(t),
+		"--sink.type=redis",
+		"--sink.redis.addrs=" + ln.Addr().String(),
+		"--sink.op_timeout=5s",
+		"--sink.boot_timeout=" + boot.String(),
+		"--log.level=error",
+		"--node.id=redisdeadline",
+	}, func(a *App) { a.abort = make(chan os.Signal, 1) })
+	elapsed := time.Since(start)
+	if code != ExitSink {
+		t.Fatalf("exit %d, want %d", code, ExitSink)
+	}
+	if elapsed > boot+700*time.Millisecond {
+		t.Fatalf("the boot gave up after %v with sink.boot_timeout=%v: a dial attempt crossed it", elapsed, boot)
 	}
 }

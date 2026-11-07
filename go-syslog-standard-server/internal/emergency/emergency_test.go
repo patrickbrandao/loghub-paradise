@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -266,12 +267,22 @@ func FuzzRead(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		res := &ReadResult{}
-		err := readFrom(bufio.NewReader(bytes.NewReader(data)), int64(len(data)), res)
+		err := readFrom(bufio.NewReader(bytes.NewReader(data)), int64(len(data)), res, false)
 		if err != nil {
 			return
 		}
 		if res.TruncatedBytes < 0 {
 			t.Fatalf("negative truncated bytes: %d", res.TruncatedBytes)
+		}
+		// The streaming count of the gauges (SPEC §11.2) agrees with what a
+		// reingestion would bring back.
+		cnt := &ReadResult{}
+		if err := readFrom(bufio.NewReader(bytes.NewReader(data)), int64(len(data)), cnt, true); err != nil {
+			t.Fatalf("count failed where read did not: %v", err)
+		}
+		if len(cnt.Items) != len(res.Items) || cnt.Truncated != res.Truncated || cnt.Undecodable != res.Undecodable {
+			t.Fatalf("count %d/%v/%d, read %d/%v/%d", len(cnt.Items), cnt.Truncated, cnt.Undecodable,
+				len(res.Items), res.Truncated, res.Undecodable)
 		}
 		for _, it := range res.Items {
 			if it.Head.ID == "" {
@@ -286,4 +297,41 @@ func FuzzRead(f *testing.F) {
 			_ = it.Head.Severity()
 		}
 	})
+}
+
+// Count streams the dump: it decodes the heads (an undecodable record does
+// not count) and skips the raw lines without allocating them. Reading the
+// whole dump with Read right after writing it doubled the heap peak of the
+// shutdown (SPEC §11.2, revisão independente de 2026-11-07).
+func TestCountDoesNotAllocateTheRawLines(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, "node")
+	big := string(bytes.Repeat([]byte("x"), 64<<10))
+	items := make([]*envelope.Item, 128) // 8 MiB of raw lines
+	for i := range items {
+		items[i] = item(i, big)
+	}
+	if _, err := s.Write(items); err != nil {
+		t.Fatal(err)
+	}
+	// One record whose head does not decode: it will not come back, so it
+	// is not counted.
+	if err := os.WriteFile(filepath.Join(dir, "slstd-emg-node-1.bin"), []byte("8 4\nnot!jsonabcd"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	files, events, err := s.Count()
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files != 2 || events != int64(len(items)) {
+		t.Fatalf("files=%d events=%d, want 2 and %d", files, events, len(items))
+	}
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("Count allocated %d bytes for an 8 MiB dump: it decoded the raw lines", got)
+	}
 }

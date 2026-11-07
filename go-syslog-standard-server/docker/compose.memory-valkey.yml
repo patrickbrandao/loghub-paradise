@@ -8,8 +8,8 @@
 #
 #   docker compose -f compose.memory-valkey.yml up -d --build
 #
-# Publicado no host: syslog 5158/udp e 5158/tcp, RELP 20618/tcp, admin
-# 127.0.0.1:19118. Defaults distintos por combinacao para que varias rodem lado
+# Publicado no host: syslog 5191/udp e 5191/tcp, RELP 20691/tcp, admin
+# 127.0.0.1:19191. Defaults distintos por combinacao para que varias rodem lado
 # a lado; SYSLOG_PORT, SYSLOG_RELP_PORT e SYSLOG_ADMIN_PORT fixam.
 
 name: slstd-memory-valkey
@@ -60,11 +60,11 @@ services:
 
     ports:
       # 514 do host na 1514 do container: a imagem nao abre porta privilegiada.
-      - "${SYSLOG_PORT:-5158}:1514/udp"
-      - "${SYSLOG_PORT:-5158}:1514/tcp"
-      - "${SYSLOG_RELP_PORT:-20618}:20514/tcp"
+      - "${SYSLOG_PORT:-5191}:1514/udp"
+      - "${SYSLOG_PORT:-5191}:1514/tcp"
+      - "${SYSLOG_RELP_PORT:-20691}:20514/tcp"
       # Admin so' no loopback do host: /metrics e /readyz nunca ficam expostos.
-      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19118}:9102"
+      - "127.0.0.1:${SYSLOG_ADMIN_PORT:-19191}:9102"
 
     volumes:
       - slstd-data:/data
@@ -88,7 +88,7 @@ services:
     volumes:
       - slstd-valkey-data:/data
     ports:
-      - "127.0.0.1:${SYSLOG_VALKEY_PORT:-16320}:6379"
+      - "127.0.0.1:${SYSLOG_VALKEY_PORT:-16391}:6379"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s

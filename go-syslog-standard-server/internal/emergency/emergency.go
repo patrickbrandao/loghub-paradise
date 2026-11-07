@@ -201,15 +201,16 @@ func (s *Store) Read(path string) (*ReadResult, error) {
 		return nil, err
 	}
 	res := &ReadResult{}
-	if err := readFrom(bufio.NewReaderSize(f, 1<<20), fi.Size(), res); err != nil {
+	if err := readFrom(bufio.NewReaderSize(f, 1<<20), fi.Size(), res, false); err != nil {
 		return res, err
 	}
 	return res, nil
 }
 
 // readFrom is Read without the file, so the fuzz target can drive it from a
-// byte slice.
-func readFrom(r *bufio.Reader, size int64, res *ReadResult) error {
+// byte slice. With countOnly the raw lines are skipped, not allocated, and
+// res.Items receives nil placeholders whose number is the count (SPEC §11.2).
+func readFrom(r *bufio.Reader, size int64, res *ReadResult, countOnly bool) error {
 	var consumed int64
 
 	for {
@@ -249,8 +250,18 @@ func readFrom(r *bufio.Reader, size int64, res *ReadResult) error {
 			res.TruncatedBytes = remaining
 			return nil
 		}
-		raw := make([]byte, rawLen)
-		if _, err := io.ReadFull(r, raw); err != nil {
+		var raw []byte
+		if countOnly {
+			// The count needs the head (a record whose head does not decode
+			// will not come back), never the raw line: skipping it keeps the
+			// post-dump recount from holding a second copy of the whole dump
+			// in memory during the shutdown (SPEC §11.2).
+			_, err = r.Discard(rawLen)
+		} else {
+			raw = make([]byte, rawLen)
+			_, err = io.ReadFull(r, raw)
+		}
+		if err != nil {
 			res.Truncated = true
 			res.TruncatedBytes = remaining - int64(headLen)
 			return nil
@@ -263,6 +274,11 @@ func readFrom(r *bufio.Reader, size int64, res *ReadResult) error {
 			// lengths located them exactly. Skipping is strictly better than
 			// abandoning the rest of the file.
 			res.Undecodable++
+			continue
+		}
+
+		if countOnly {
+			res.Items = append(res.Items, nil)
 			continue
 		}
 
@@ -305,21 +321,42 @@ func (s *Store) Quarantine(path string) (string, error) {
 }
 
 // Count reports how many files are pending and how many messages they hold, for
-// the syslog_emergency_* gauges.
+// the syslog_emergency_files and syslog_emergency_events_pending gauges. It
+// decodes the heads, so the count is of messages that will really come back,
+// but skips the raw lines without allocating them (SPEC §11.2; ported from
+// go-syslog-server). Decoding the whole dump with Read right after writing it
+// doubled the heap peak of a shutdown with a backlog.
 func (s *Store) Count() (files int, events int64, err error) {
 	paths, err := s.List()
 	if err != nil {
 		return 0, 0, err
 	}
 	for _, p := range paths {
-		res, err := s.Read(p)
+		n, err := countFile(p)
 		if err != nil {
 			continue
 		}
 		files++
-		events += int64(len(res.Items))
+		events += n
 	}
 	return files, events, nil
+}
+
+func countFile(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	res := &ReadResult{}
+	if err := readFrom(bufio.NewReaderSize(f, 1<<16), fi.Size(), res, true); err != nil {
+		return 0, err
+	}
+	return int64(len(res.Items)), nil
 }
 
 // syncDir fsyncs a directory so a newly created filename is durable.

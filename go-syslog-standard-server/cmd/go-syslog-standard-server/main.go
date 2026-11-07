@@ -1,4 +1,4 @@
-// Command go-syslog-server is the syslog ingestion server described in
+// Command go-syslog-standard-server is the syslog ingestion server described in
 // docs/SPEC.md.
 //
 // Everything of substance lives in internal/app, so the integration tests build

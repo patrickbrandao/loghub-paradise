@@ -30,9 +30,21 @@ type Budget struct {
 	max int64
 	m   *obs.Metrics
 
-	mu     sync.Mutex
-	used   int64
-	notify chan struct{} // closed and replaced on every release
+	mu   sync.Mutex
+	used int64
+	// waiters is the FIFO of readers parked in Acquire. Bytes are granted
+	// strictly in arrival order: a newcomer never jumps the queue, even
+	// when its charge would fit. Without the order a charge clamped to the
+	// ceiling (it needs used == 0) starved behind a stream of small ones,
+	// each fitting in the gap the last release left (revisão independente de
+	// 2026-11-07; SPEC §4.5).
+	waiters []*budgetWaiter
+}
+
+type budgetWaiter struct {
+	n       int64
+	ready   chan struct{} // closed once granted
+	granted bool          // under mu
 }
 
 // txnOverhead is what one in-flight transaction holds beyond the copies of its
@@ -58,7 +70,14 @@ func NewBudget(max int64, m *obs.Metrics) *Budget {
 	if max <= 0 {
 		max = DefaultInflightMaxBytes
 	}
-	return &Budget{max: max, m: m, notify: make(chan struct{})}
+	return &Budget{max: max, m: m}
+}
+
+// waiting is how many readers are parked in Acquire (for tests).
+func (b *Budget) waiting() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.waiters)
 }
 
 // Max is the ceiling.
@@ -71,38 +90,83 @@ func (b *Budget) Used() int64 {
 	return b.used
 }
 
-// Acquire takes n bytes, waiting while the ceiling is exhausted. It returns
-// the amount actually charged -- n clamped to the ceiling -- which the caller
-// hands back to Release, or false when ctx ended first (nothing is charged
-// then).
+// Acquire takes n bytes, waiting while the ceiling is exhausted or another
+// reader waits ahead of this one (FIFO). It returns the amount actually
+// charged -- n clamped to the ceiling -- which the caller hands back to
+// Release, or false when ctx ended first (nothing is charged then).
 func (b *Budget) Acquire(ctx context.Context, n int64) (int64, bool) {
+	return b.AcquireWait(ctx, n, nil)
+}
+
+// AcquireWait is Acquire with onWait, run once (outside the lock) when the
+// caller is about to park; the RELP reader drops its frame buffer there.
+func (b *Budget) AcquireWait(ctx context.Context, n int64, onWait func()) (int64, bool) {
 	if n > b.max {
 		n = b.max
 	}
-	waited := false
-	for {
-		b.mu.Lock()
-		if b.used+n <= b.max {
-			b.used += n
-			b.mu.Unlock()
-			if b.m != nil {
-				b.m.RELPInflightBytes.Add(n)
-			}
-			return n, true
-		}
-		ch := b.notify
+	b.mu.Lock()
+	if len(b.waiters) == 0 && b.used+n <= b.max {
+		b.used += n
 		b.mu.Unlock()
-		if !waited {
-			waited = true
-			if b.m != nil {
-				b.m.RELPInflightWaitsTotal.Inc()
+		if b.m != nil {
+			b.m.RELPInflightBytes.Add(n)
+		}
+		return n, true
+	}
+	w := &budgetWaiter{n: n, ready: make(chan struct{})}
+	b.waiters = append(b.waiters, w)
+	b.mu.Unlock()
+	if b.m != nil {
+		b.m.RELPInflightWaitsTotal.Inc()
+	}
+	if onWait != nil {
+		onWait()
+	}
+
+	select {
+	case <-w.ready:
+		return n, true
+	case <-ctx.Done():
+	}
+	b.mu.Lock()
+	if w.granted {
+		// Granted while the context ended: hand the bytes back, which may
+		// grant the next in line.
+		b.used -= n
+		if b.m != nil {
+			b.m.RELPInflightBytes.Add(-n)
+		}
+	} else {
+		for i, x := range b.waiters {
+			if x == w {
+				b.waiters = append(b.waiters[:i], b.waiters[i+1:]...)
+				break
 			}
 		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return 0, false
+	}
+	// Leaving the head of the queue may let the next one in.
+	b.grantLocked()
+	b.mu.Unlock()
+	return 0, false
+}
+
+// grantLocked hands bytes to the waiters at the head of the queue, in order,
+// while they fit. It stops at the first that does not: the order is the
+// fairness.
+func (b *Budget) grantLocked() {
+	for len(b.waiters) > 0 {
+		w := b.waiters[0]
+		if b.used+w.n > b.max {
+			return
 		}
+		b.used += w.n
+		if b.m != nil {
+			b.m.RELPInflightBytes.Add(w.n)
+		}
+		w.granted = true
+		close(w.ready)
+		b.waiters[0] = nil
+		b.waiters = b.waiters[1:]
 	}
 }
 
@@ -113,10 +177,9 @@ func (b *Budget) Release(n int64) {
 	}
 	b.mu.Lock()
 	b.used -= n
-	close(b.notify)
-	b.notify = make(chan struct{})
-	b.mu.Unlock()
 	if b.m != nil {
 		b.m.RELPInflightBytes.Add(-n)
 	}
+	b.grantLocked()
+	b.mu.Unlock()
 }

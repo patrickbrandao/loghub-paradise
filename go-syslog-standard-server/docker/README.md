@@ -78,9 +78,9 @@ Os três compose de Redis têm gêmeos Valkey, com nomes próprios
 
 | arquivo | ring | sink | portas padrão (syslog / RELP / admin / Valkey) |
 |---|---|---|---|
-| `compose.memory-valkey.yml` | memory | valkey (= redis) | 5158 / 20618 / 19118 / 16320 |
-| `compose.sqlite-valkey.yml` | sqlite | valkey (= redis) | 5159 / 20619 / 19119 / 16324 |
-| `compose.none-valkey.yml` | none | valkey (= redis) | 5160 / 20620 / 19120 / 16328 |
+| `compose.memory-valkey.yml` | memory | valkey (= redis) | 5191 / 20691 / 19191 / 16391 |
+| `compose.sqlite-valkey.yml` | sqlite | valkey (= redis) | 5192 / 20692 / 19192 / 16392 |
+| `compose.none-valkey.yml` | none | valkey (= redis) | 5193 / 20693 / 19193 / 16393 |
 
 A imagem vem de `SYSLOG_VALKEY_IMAGE` (padrão `valkey/valkey:8.1-alpine`;
 testados 7.2, 8.1 e 9.0, `docs/TESTING.md` §6.1). O serviço roda

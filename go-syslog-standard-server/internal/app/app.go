@@ -175,6 +175,10 @@ type App struct {
 	// beforeDump, when set, runs right before the shutdown's emergency dump.
 	// It is nil in the binary; a test lands a second signal there.
 	beforeDump func()
+	// beforeRecount, when set, runs after the dump file is durable and right
+	// before the gauges are recounted. Nil in the binary; a test reads what
+	// an abort would count there.
+	beforeRecount func()
 
 	// abort replaces the OS signal channel that shutdown watches for a second
 	// interrupt. It is nil in the binary; the integration tests set it.
@@ -393,6 +397,7 @@ func (a *App) buildSink(ctx context.Context) int {
 			Synchronous:       a.cfg.SinkSQL.Synchronous,
 			BusyTimeout:       a.cfg.SinkSQL.BusyTimeout,
 			WALAutocheckpoint: a.cfg.SinkSQL.WALAutocheckpoint,
+			StuckAfter:        a.cfg.Sink.OpTimeout + a.cfg.Sink.HealthTimeout,
 		}, a.log.Logger, a.metrics)
 		if err != nil {
 			a.log.Error("cannot open the events database", "error", err)
@@ -498,7 +503,11 @@ func (a *App) buildSink(ctx context.Context) int {
 		}
 		backoff := 100 * time.Millisecond
 		for attempt := 1; ; attempt++ {
-			octx, cancel := context.WithTimeout(ctx, a.cfg.Sink.OpTimeout)
+			// Each attempt gets min(sink.op_timeout, what is left of the one
+			// boot deadline): checked only between attempts, one dial crossed
+			// it by a whole op_timeout (SPEC §12.1).
+			octx, cancel := context.WithTimeout(ctx,
+				sink.BootClamp(sink.WithBootDeadline(ctx, deadline), a.cfg.Sink.OpTimeout))
 			s, err := sink.NewRedis(octx, sink.RedisConfig{
 				Addrs:               a.cfg.SinkRedis.Addrs,
 				Username:            a.cfg.SinkRedis.Username,
@@ -544,10 +553,14 @@ func (a *App) buildSink(ctx context.Context) int {
 			}
 			a.log.Warn("Redis not reachable yet, retrying",
 				"attempt", attempt, "error", err, "retry_in", backoff.String())
+			wait := backoff
+			if left := time.Until(deadline); left < wait {
+				wait = left
+			}
 			select {
 			case <-ctx.Done():
 				return ExitAborted
-			case <-time.After(backoff):
+			case <-time.After(wait):
 			}
 			if backoff *= 2; backoff > 5*time.Second {
 				backoff = 5 * time.Second
