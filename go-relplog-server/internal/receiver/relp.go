@@ -205,32 +205,42 @@ func (ss *relpSession) readLoop(br *bufio.Reader) (closeHint bool) {
 			// librelp retransmits them.
 			return !ss.broken.Load()
 		}
-		armReadDeadline(ss.c, s.cfg.IdleTimeout, &s.closing)
-		if ss.ctx.Err() != nil {
-			// abort cancels FIRST and expires the deadline AFTER; a reader
-			// that renewed it in between would park for a whole idle_timeout
-			// (forever with 0). Checking after arming closes that window, the
-			// same ordering armReadDeadline keeps with closing.
-			_ = ss.c.SetReadDeadline(time.Now())
-		}
-		f, err := rd.ReadFrame()
+		ss.armRead()
+		h, err := rd.ReadHead()
 		if err != nil {
-			hint := s.relpFrameError(err, ss.a)
-			if hint && ss.ctx.Err() == nil && !ss.parentDone() {
-				// The server ended a session its peer is still on (a bad
-				// frame, the idle timeout): what it leaves unanswered is not a
-				// lost connection. An idle timeout that fires while a
-				// transaction is held -- the idle below
-				// relp.backpressure_timeout -- ends a session that was waiting
-				// on the ring, the sink or the rate-limit: that is
-				// backpressure (SPEC §5.4).
-				if isTimeout(err) && ss.held.Load() > 0 {
-					ss.setReason(obs.UnansweredBackpressure)
-				} else {
-					ss.setReason(obs.UnansweredServerClosed)
-				}
+			return ss.readError(err)
+		}
+
+		// A syslog frame of an open session takes its slot in the window and
+		// its bytes of relp.inflight_max_bytes from the DECLARED length,
+		// BEFORE a byte of the payload is read (SPEC §5.6). Taken after the
+		// whole frame, as until 2026-11-07, every waiting connection held one
+		// frame in its reader's buffer outside the ceiling -- unbounded with
+		// max_conns = 0.
+		var charged int64
+		reserved := false
+		if h.Command == obs.RELPSyslog && ss.opened {
+			var ok bool
+			if charged, ok = ss.reserve(rd, h); !ok {
+				// The session ended while this frame waited: it arrived, so it
+				// counts like any frame that never got a goroutine (SPEC
+				// §5.4), and the rest of it stays unread.
+				s.m.RELPFramesTotal[obs.RELPSyslog].Inc()
+				ss.notDispatched()
+				return !ss.broken.Load()
 			}
-			return hint
+			reserved = true
+			// The wait may have outlasted the idle timeout; the payload is
+			// read from now on, so the idle clock restarts here.
+			ss.armRead()
+		}
+		f, err := rd.ReadBody(h)
+		if err != nil {
+			if reserved {
+				s.budget.Release(charged)
+				<-ss.sem
+			}
+			return ss.readError(err)
 		}
 		// The one clock sample of the message: the last octet of the frame was
 		// just read, and nothing has parsed it yet (SPEC §3.1).
@@ -266,9 +276,7 @@ func (ss *relpSession) readLoop(br *bufio.Reader) (closeHint bool) {
 				ss.send(f.Txnr, rspDisabled)
 				continue
 			}
-			if !ss.dispatch(&f, now) {
-				return !ss.broken.Load()
-			}
+			ss.dispatch(&f, now, charged)
 
 		default:
 			// An unknown command is a client extension this server does not
@@ -279,19 +287,58 @@ func (ss *relpSession) readLoop(br *bufio.Reader) (closeHint bool) {
 	}
 }
 
-// dispatch hands one syslog frame to a transaction goroutine. It waits for a
-// slot in the window and for the bytes of the copy in the process-wide budget,
-// in that order, and only then copies: the copy is what both ceilings bound
-// (SPEC §5.6). It returns false when the session ended while waiting.
-func (ss *relpSession) dispatch(f *RELPFrame, now time.Time) bool {
+// armRead arms the read deadline for the next read without undoing an abort:
+// abort cancels FIRST and expires the deadline AFTER, and a reader that
+// renewed it in between would park for a whole idle_timeout (forever with 0).
+// Checking after arming closes that window, the same ordering armReadDeadline
+// keeps with closing.
+func (ss *relpSession) armRead() {
+	armReadDeadline(ss.c, ss.s.cfg.IdleTimeout, &ss.s.closing)
+	if ss.ctx.Err() != nil {
+		_ = ss.c.SetReadDeadline(time.Now())
+	}
+}
+
+// readError counts what ended the reader and reports whether a serverclose
+// hint is due.
+func (ss *relpSession) readError(err error) bool {
+	hint := ss.s.relpFrameError(err, ss.a)
+	if hint && ss.ctx.Err() == nil && !ss.parentDone() {
+		// The server ended a session its peer is still on (a bad frame, the
+		// idle timeout): what it leaves unanswered is not a lost connection.
+		// An idle timeout that fires while a transaction is held -- the idle
+		// below relp.backpressure_timeout -- ends a session that was waiting
+		// on the ring, the sink or the rate-limit: that is backpressure (SPEC
+		// §5.4).
+		if isTimeout(err) && ss.held.Load() > 0 {
+			ss.setReason(obs.UnansweredBackpressure)
+		} else {
+			ss.setReason(obs.UnansweredServerClosed)
+		}
+	}
+	return hint
+}
+
+// reserve waits for a slot in the window and for the bytes of h's copy in the
+// process-wide budget, in that order, after the frame's head and before its
+// payload: both ceilings bound what the transaction will hold (SPEC §5.6).
+// Before parking on either wait the reader lets go of a large frame buffer:
+// the previous frame is already copied, and a waiting connection holds
+// nothing outside the budget but its reader. It returns false, holding
+// nothing, when the session ended while waiting.
+func (ss *relpSession) reserve(rd *RELPReader, h RELPHead) (int64, bool) {
 	s := ss.s
 	select {
 	case ss.sem <- struct{}{}:
-	case <-ss.ctx.Done():
-		ss.notDispatched()
-		return false
+	default:
+		rd.DropBuffer()
+		select {
+		case ss.sem <- struct{}{}:
+		case <-ss.ctx.Done():
+			return 0, false
+		}
 	}
-	charged, ok := s.budget.Acquire(ss.ctx, txnCharge(len(f.Data)))
+	charged, ok := s.budget.AcquireWait(ss.ctx, txnCharge(rd.Kept(h)), rd.DropBuffer)
 	if !ok || ss.ctx.Err() != nil {
 		// A select with two ready cases picks at random, and Acquire looks at
 		// the budget before the context: the session may have ended while
@@ -299,10 +346,17 @@ func (ss *relpSession) dispatch(f *RELPFrame, now time.Time) bool {
 		// would be enqueued behind the back of librelp's retransmission.
 		s.budget.Release(charged)
 		<-ss.sem
-		ss.notDispatched()
-		return false
+		return 0, false
 	}
+	return charged, true
+}
 
+// dispatch hands one syslog frame to a transaction goroutine. Its slot in the
+// window and its charge were taken by reserve before the payload was read,
+// and only now is the line copied: the copy is what both ceilings bound (SPEC
+// §5.6).
+func (ss *relpSession) dispatch(f *RELPFrame, now time.Time, charged int64) {
+	s := ss.s
 	// The frame buffer is reused by the next ReadFrame, so a transaction
 	// that outlives this iteration needs its own copy: the one copy RELP pays
 	// that a TCP reader does not, and the price of the window.
@@ -339,7 +393,6 @@ func (ss *relpSession) dispatch(f *RELPFrame, now time.Time) bool {
 			ss.unanswered()
 		}
 	}()
-	return true
 }
 
 // decide runs the pipeline for one transaction and returns its answer, or

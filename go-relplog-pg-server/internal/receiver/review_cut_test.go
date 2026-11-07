@@ -4,6 +4,7 @@ package receiver
 // 2026-10-13 (SPEC §5.4, §5.6, §5.7; TESTING §9.3).
 
 import (
+	"bufio"
 	"context"
 	"net/netip"
 	"strings"
@@ -85,10 +86,12 @@ func TestIngestEndedSessionIsNotEnqueued(t *testing.T) {
 	}
 }
 
-// A frame dispatched by a session that already ended must never start a
-// transaction (SPEC §5.7). The window select picks at random when both cases
-// are ready, so about half the iterations reach Acquire with the session over:
-// the context check after Acquire is what stops them (relp.go dispatch).
+// A frame of a session that already ended must never start a transaction
+// (SPEC §5.7). The window select picks at random when both cases are ready, so
+// about half the iterations reach Acquire with the session over: the context
+// check after Acquire is what stops them (relp.go reserve, which since
+// 2026-11-07 runs after the frame's head and before its payload, SPEC §5.6),
+// and a refused reservation holds neither the slot nor the bytes.
 func TestDispatchAfterSessionEndStartsNothing(t *testing.T) {
 	h := newHarness(t, 1000)
 	tr := startTCP(t, h, TCPConfig{})
@@ -99,11 +102,18 @@ func TestDispatchAfterSessionEndStartsNothing(t *testing.T) {
 		ss := &relpSession{s: tr, a: connAddrs{src: src, peer: src}, parent: context.Background(),
 			ctx: ctx, cancel: cancel, acks: make(chan ack, 8), sem: make(chan struct{}, 4),
 			writerDone: make(chan struct{})}
-		f := RELPFrame{Txnr: 1, Command: obs.RELPSyslog, Data: []byte("<13>late"), Size: 8}
-		started := ss.dispatch(&f, time.Now())
+		rd := NewRELPReader(bufio.NewReader(strings.NewReader("<13>late\n")), 0, 0)
+		charged, started := ss.reserve(rd, RELPHead{Txnr: 1, Command: obs.RELPSyslog, Size: 8})
+		if started {
+			f := RELPFrame{Txnr: 1, Command: obs.RELPSyslog, Data: []byte("<13>late"), Size: 8}
+			ss.dispatch(&f, time.Now(), charged)
+		}
 		ss.inFlight.Wait()
 		if started {
 			t.Fatalf("iteration %d: a transaction started after its session ended", i)
+		}
+		if len(ss.sem) != 0 || tr.budget.Used() != 0 {
+			t.Fatalf("iteration %d: a refused reservation kept %d slots and %d bytes", i, len(ss.sem), tr.budget.Used())
 		}
 	}
 	if n := h.ring.Stats().Items; n != 0 {
@@ -131,7 +141,14 @@ func TestCopyComesAfterTheWindowAndTheBudget(t *testing.T) {
 	data := []byte("<13>before")
 	f := RELPFrame{Txnr: 1, Command: obs.RELPSyslog, Data: data, Size: len(data)}
 	done := make(chan bool, 1)
-	go func() { done <- ss.dispatch(&f, time.Now()) }()
+	go func() {
+		rd := NewRELPReader(bufio.NewReader(strings.NewReader("")), 0, 0)
+		charged, ok := ss.reserve(rd, RELPHead{Txnr: 1, Command: obs.RELPSyslog, Size: int64(len(data))})
+		if ok {
+			ss.dispatch(&f, time.Now(), charged)
+		}
+		done <- ok
+	}()
 	waitFor(t, "the dispatch holding its window slot", func() bool { return len(ss.sem) == 1 })
 	time.Sleep(50 * time.Millisecond) // and waiting on the budget
 	select {

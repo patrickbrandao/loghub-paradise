@@ -92,7 +92,52 @@ func NewRELPReader(r *bufio.Reader, maxFrame int64, maxMsg int) *RELPReader {
 	return &RELPReader{r: r, maxFrame: maxFrame, maxMsg: maxMsg}
 }
 
-// ReadFrame decodes the next frame.
+// RELPHead is a frame read up to its DATALEN: everything but the payload and
+// the trailer. Size is the declared DATALEN, already checked against
+// relp.max_frame_bytes.
+type RELPHead struct {
+	Txnr    int64
+	Command obs.RELPCommand
+	Size    int64
+	sep     byte
+}
+
+// DropBuffer lets go of a frame buffer that grew past relpKeepBlock, whatever
+// the bufio.Reader holds. The session calls it before it parks on the window
+// or on relp.inflight_max_bytes (SPEC §5.6): the previous frame was already
+// copied, and a connection waiting for the budget must not hold a large
+// buffer outside it.
+func (rd *RELPReader) DropBuffer() {
+	if cap(rd.buf) > relpKeepBlock {
+		rd.buf = nil
+	}
+}
+
+// Kept is how many bytes of h's DATA the reader will keep: DATALEN cut at
+// syslog.max_message_bytes, the length of the Data ReadBody returns and of
+// the transaction's copy.
+func (rd *RELPReader) Kept(h RELPHead) int {
+	if h.Size > int64(rd.maxMsg) {
+		return rd.maxMsg
+	}
+	return int(h.Size)
+}
+
+// ReadFrame decodes the next frame: ReadHead, then ReadBody.
+func (rd *RELPReader) ReadFrame() (RELPFrame, error) {
+	h, err := rd.ReadHead()
+	if err != nil {
+		return RELPFrame{Txnr: h.Txnr, Command: h.Command}, err
+	}
+	return rd.ReadBody(h)
+}
+
+// ReadHead reads TXNR, COMMAND and DATALEN and stops before the payload. The
+// split is what lets the session take its window slot and its bytes of
+// relp.inflight_max_bytes from the DECLARED length before a byte of the
+// payload is read (SPEC §5.6): reading the whole frame first left one frame
+// per waiting connection in the reader's buffer, outside the ceiling
+// (independent review of go-syslog-standard-server, 2026-11-07).
 //
 // It returns io.EOF only for a connection that ended cleanly BETWEEN frames,
 // and the reader's own error (a timeout, a reset) untouched when nothing of a
@@ -100,8 +145,8 @@ func NewRELPReader(r *bufio.Reader, maxFrame int64, maxMsg int) *RELPReader {
 // stream. Inside a frame, the end of the stream is io.ErrUnexpectedEOF: a half
 // frame was never answered, so librelp will retransmit it, and nothing of it
 // is kept.
-func (rd *RELPReader) ReadFrame() (RELPFrame, error) {
-	var f RELPFrame
+func (rd *RELPReader) ReadHead() (RELPHead, error) {
+	var h RELPHead
 	// A buffer a large frame grew is let go only when nothing of the next
 	// frame is buffered: the read below may then park for the whole idle
 	// timeout, and an idle connection must not hold 64 KiB for as long as it
@@ -117,15 +162,15 @@ func (rd *RELPReader) ReadFrame() (RELPFrame, error) {
 
 	txnr, err := rd.readUint(relpMaxTxnrDigits, true)
 	if err != nil {
-		return f, err
+		return h, err
 	}
-	f.Txnr = txnr
+	h.Txnr = txnr
 
 	n := 0
 	for {
 		c, err := rd.readByte()
 		if err != nil {
-			return f, err
+			return h, err
 		}
 		if c == ' ' {
 			break
@@ -133,34 +178,42 @@ func (rd *RELPReader) ReadFrame() (RELPFrame, error) {
 		// The command is an ASCII word. Anything else means the framing is
 		// off, and there is no way to find the next frame boundary.
 		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') || n >= relpMaxCommandBytes {
-			return f, ErrRELPFrame
+			return h, ErrRELPFrame
 		}
 		rd.cmd[n] = c
 		n++
 	}
 	if n == 0 {
-		return f, ErrRELPFrame
+		return h, ErrRELPFrame
 	}
-	f.Command = commandOf(rd.cmd[:n])
+	h.Command = commandOf(rd.cmd[:n])
 
 	// DATALEN ends at a space when there is data, or at the trailer when there
 	// is none. Both spellings exist in the field.
 	size, sep, err := rd.readLen()
 	if err != nil {
-		return f, err
+		return h, err
 	}
 	if size > rd.maxFrame {
 		// The length was DECLARED: refused before a byte of payload is read.
-		return f, ErrFrameTooLarge
+		return h, ErrFrameTooLarge
 	}
-	f.Size = clampInt(size)
+	if size > 0 && sep != ' ' {
+		return h, ErrRELPFrame
+	}
+	h.Size, h.sep = size, sep
+	return h, nil
+}
 
-	if size == 0 {
+// ReadBody reads the payload and the trailer of the frame h announced.
+func (rd *RELPReader) ReadBody(h RELPHead) (RELPFrame, error) {
+	f := RELPFrame{Txnr: h.Txnr, Command: h.Command, Size: clampInt(h.Size)}
+	if h.Size == 0 {
 		// "3 close 0\n" and "3 close 0 \n" are both in the field: emitters
 		// disagree about whether the space before an absent DATA is written.
 		// Accepting only one would refuse half the installed base over one
 		// byte.
-		if sep == ' ' {
+		if h.sep == ' ' {
 			c, err := rd.readByte()
 			if err != nil {
 				return f, err
@@ -172,21 +225,15 @@ func (rd *RELPReader) ReadFrame() (RELPFrame, error) {
 		f.Data = rd.buf[:0]
 		return f, nil
 	}
-	if sep != ' ' {
-		return f, ErrRELPFrame
-	}
 
-	keep := size
-	if keep > int64(rd.maxMsg) {
-		keep = int64(rd.maxMsg)
-	}
-	if err := rd.readKept(int(keep)); err != nil {
+	keep := rd.Kept(h)
+	if err := rd.readKept(keep); err != nil {
 		return f, err
 	}
 	// What passes syslog.max_message_bytes is consumed WITHOUT being stored
 	// (SPEC §5.3), and the connection stays: truncation is not an error.
-	if size > keep {
-		if err := discard(rd.r, size-keep); err != nil {
+	if h.Size > int64(keep) {
+		if err := discard(rd.r, h.Size-int64(keep)); err != nil {
 			return f, midFrame(err)
 		}
 	}

@@ -92,7 +92,7 @@ real, com um ring de teste que deixa segurar e soltar linhas pelo conteúdo.
 | Moldura (§5.1–§5.3) | `TestRELPFrames`, `TestRELPZeroLengthBothSpellings`, `TestRELPHeaderAndTrailerAreNotTheMessage`, `TestRELPMalformed`, `TestRELPFrameCeiling`, `TestRELPTruncationKeepsSync`, `TestRELPFrameGrowsWithTheBytesNotTheCount`, `TestRELPReaderReleasesALargeBuffer`, `TestAppendRSPAndServerClose`, `FuzzFrame` | as duas grafias de `DATALEN = 0`; o fusível antes de ler o corpo; o truncamento que mantém a sincronia; `0 serverclose 0\n` |
 | Diálogo (§5.4) | `TestRELPSessionHappyPath`, `TestRELPOpenAdvertisesTheSoftware`, `TestOpenResponseOffers`, `TestRELPCommandOrder`, `TestRELPUnknownCommandKeepsTheConnection`, `TestRELPCloseWaitsForTransactionsInFlight`, `TestRELPEmptyIsAcknowledged` | `relp_software=go-relplog-pg-server,...`; `syslog` antes do `open` e o segundo `open`; o `close` que espera as transações em voo; `200` para a vazia |
 | Garantia | `TestRELPAcknowledgesOnlyAfterTheRing`, `TestEndToEndEnvelopesAreValidJLH` | nenhum `200` antes do ring |
-| Janela e teto (§5.5, §5.6) | `TestRELPWindowAllowsConcurrentTransactions`, `TestRELPWindowStopsTheReader`, `TestRELPInflightBudgetIsGlobal`, `TestBudgetAcquireRelease`, `TestTxnChargeCoversTheTransaction`, `TestCopyComesAfterTheWindowAndTheBudget` | um teto para o processo inteiro; a conta `2 × classe + 8 KiB` (RP-7); a cópia só depois da vaga e do teto (invariante 24) |
+| Janela e teto (§5.5, §5.6) | `TestRELPWindowAllowsConcurrentTransactions`, `TestRELPWindowStopsTheReader`, `TestRELPInflightBudgetIsGlobal`, `TestBudgetAcquireRelease`, `TestTxnChargeCoversTheTransaction`, `TestRELPTakesTheBudgetBeforeThePayload`, `TestBudgetIsFIFO`, `TestCopyComesAfterTheWindowAndTheBudget` | um teto para o processo inteiro; a conta `2 × classe + 8 KiB` (RP-7); a cópia só depois da vaga e do teto (invariante 24) |
 | Backpressure (§5.7) | `TestRELPFullRingIsHeldNotRefused`, `TestRELPBackpressureTimeoutClosesWithoutAnswering`, `TestRELPSinkDownIsHeld`, `TestRELPUnexpectedRingErrorIsHeldNotRefused`, `TestRELPVanishedPeerAbandonsHeldTransactions`, `TestReviewRetryAfterPeerLeft`, `TestIngestFullRingIsRefusedBeforeTheCopy`, `TestIngestByteCeilingIsRefusedBeforeTheCopy`, `TestIngestByteCeilingChargesTheTruncatedLine`, `TestIngestSinkDownFailsBeforeTheCopy`, `TestRetryDoesNotRecount`, `TestIngestEndedSessionIsNotEnqueued`, `TestDispatchAfterSessionEndStartsNothing` | segurar, nunca `500` (inclusive o erro inesperado do ring, RP-6); o estouro fecha sem resposta; a pré-conferência dos dois tetos sem `uuid` nem cópia; o fim da sessão vence até o `Enqueue` |
 | Fim de sessão (§5.8) | `TestRELPShutdownWithTransactionsInFlight`, `TestRELPShutdownReleasesAHeldTransaction`, `TestRELPIdleTimeout`, `TestRELPMalformedFrameClosesAfterTheAnswers`, `TestStreamCloseForceClosesAfterGrace`, `TestArmReadDeadlineLeavesTheWriteSide`, `TestReviewUnansweredReasonOnServerEnd`, `TestSecondOpenLeavesItsHeldTransactionServerClosed`, `TestReviewReconciliationAfterAbort` | as decididas saem antes do `serverclose`; `closeGrace`; os motivos de `relp_unanswered_total` (o segundo `open` inclusive) e a reconciliação de §5.4 |
 | Conexões | `TestRELPPerIPLimit`, `TestRELPGlobalLimitParksAndCounts`, `TestConnLimitsAreSharedAcrossListeners`, `TestTCPListenersShareOneLimiter`, `TestBothCeilingsAreReleasedExactlyOnce` | tetos por transporte, não por listener |
@@ -491,6 +491,30 @@ com o teste da linha falhando e a correção restaurada depois.
 Registrados sem código: comentário do `Memory.Enqueue` (D1); soltura do buffer do leitor entre frames (A5/D4 do S; §5.2); sobrecontagem pelo recuo de bytes (D3 do syslog; §13.4). Aqui o `Accept` do ring em memória é instantâneo: o A2 entra para o código comum não divergir do R.
 
 Rodadas: `tasks/run2.sh go-relplog-pg-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh` e banco próprio `whs_rp`), logs em `tasks/logs/go-relplog-pg-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*. Fuzz: nenhum, por instrução da rodada.
+
+### 9.7 Porte do orçamento RELP do `go-syslog-standard-server` (2026-11-07)
+
+Entrada: item 23 da §21.1 da SPEC do STD (commit `c6fa5b4`; os testes
+`TestRELPTakesTheBudgetBeforeThePayload` e `TestBudgetIsFIFO` de lá, portados).
+Regra em SPEC §5.6 (e §5.2, §5.4, §15.3a, invariante 24); testes em
+`internal/receiver/review20261107_test.go`. **Mutação:** cada parte revertida
+sozinha (`fxg/mutate.py` da rodada, o arquivo restaurado depois), com o teste da
+linha falhando pelo motivo certo (nenhum mutante morreu por compilação).
+
+| Parte | Mutante | Teste que o mata |
+|---|---|---|
+| Vaga e bytes pelo `DATALEN` antes do payload (`ReadHead`/`ReadBody`) | `ReadBody` antes do `reserve` | `TestRELPTakesTheBudgetBeforeThePayload` ("timed out waiting for the reader waiting for the budget before the payload arrived") |
+| Prazo de leitura rearmado depois da espera | sem o `armRead` depois do `reserve` | `TestRELPIdleClockRestartsAfterTheBudgetWait` (`serverclose` no lugar do `200 OK`) |
+| Teto FIFO | atalho sem olhar a fila | `TestBudgetIsFIFO` ("a small charge jumped ahead of the clamped one waiting") |
+| Quem desiste sai da fila e deixa o seguinte entrar | sem o `grantLocked` no cancelamento | `TestBudgetIsFIFO` ("the waiter behind a cancelled head was never granted") |
+| Buffer grande solto antes de estacionar | `DropBuffer` vazio | `TestRELPReaderDropsTheBufferBeforeAWait` |
+| A conta é a da linha que fica (`DATALEN` cortado em `syslog.max_message_bytes`) | `Kept` sem o corte | `TestRELPHeadChargeIsTheKeptLength` |
+
+`TestDispatchAfterSessionEndStartsNothing` e `TestCopyComesAfterTheWindowAndTheBudget` (`review_cut_test.go`) passaram a chamar `reserve` e depois `dispatch`, a divisão nova; o primeiro confere também que uma reserva recusada não segura vaga nem bytes.
+
+Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...`
+sem servidores: verdes. `FuzzFrame` 35 s (o alvo de `relpframe.go`): limpo.
+`BenchmarkRELPReaderFrames`: 0 alocações por frame em 200 B a 60 KiB, como antes.
 
 ---
 
