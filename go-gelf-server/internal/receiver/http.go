@@ -164,8 +164,8 @@ func newHTTP(ctx context.Context, t item.Transport, cfg HTTPConfig, tc *tls.Conf
 		// connection; a scanner on the port would flood the log. Nothing is
 		// logged as is: serverLog counts the handshake failures of https in
 		// gelf_tls_handshake_errors_total{transport="https"} (with a sampled
-		// WARN, as the tls transport does) and discards every other line
-		// (SPEC §4.7, §14.1). ConnState cannot see a failed handshake: it
+		// WARN, as the tls transport does), except a PROXY refusal, and
+		// discards every other line (SPEC §4.6, §4.7, §14.1). ConnState cannot see a failed handshake: it
 		// reports StateNew before the handshake and StateClosed after, the
 		// same as a client that connected and sent nothing.
 		ErrorLog: log.New(serverLog{h}, "", 0),
@@ -195,7 +195,15 @@ var handshakeErrorPrefix = []byte("http: TLS handshake error from ")
 type serverLog struct{ h *HTTP }
 
 func (l serverLog) Write(p []byte) (int, error) {
-	if l.h.transport == item.TransportHTTPS && bytes.HasPrefix(p, handshakeErrorPrefix) {
+	if l.h.transport == item.TransportHTTPS && bytes.HasPrefix(p, handshakeErrorPrefix) &&
+		!bytes.Contains(p, proxyRefusedText) {
+		// A connection the PROXY protocol refused fails the handshake with
+		// errProxyRefused (proxyConn.init, before any TLS byte): it is
+		// counted in gelf_proxy_headers_total, not here, as the tls
+		// transport does (SPEC §4.6, §4.7). The line is matched by our own
+		// sentinel's text: the ErrorLog gets the line, not the connection,
+		// and a mark keyed by peer address would be a map that leaks when
+		// the line never comes (a shutdown).
 		l.h.handshakeFailed(bytes.TrimRight(p[len(handshakeErrorPrefix):], "\n"))
 	}
 	return len(p), nil
@@ -657,6 +665,10 @@ func (c *proxyConn) Read(p []byte) (int, error) {
 }
 
 var errProxyRefused = errors.New("receiver: connection refused by proxy.protocol")
+
+// proxyRefusedText is how errProxyRefused shows inside the ErrorLog's
+// handshake line (serverLog.Write skips that line).
+var proxyRefusedText = []byte(errProxyRefused.Error())
 
 func (c *proxyConn) init() {
 	px := c.h.cfg.Proxy
