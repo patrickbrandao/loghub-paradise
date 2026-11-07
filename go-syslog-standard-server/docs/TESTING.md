@@ -160,8 +160,17 @@ variável dele.
 A rodada contra o cluster achou um defeito na porta da checagem de política
 (e no irmão de onde ela veio): o rueidis entra em `panic` ("Mixing no-slot and
 cross slot commands in DoMulti is prohibited") quando o pipeline da sonda mistura
-`INFO`/`CONFIG GET` com `XLEN`/`XADD`. Em cluster a política vai numa ida e
-volta própria (SPEC §10.3); `TestRedisIntegrationClusterDB` trava a regra.
+`INFO`/`CONFIG GET` com `XLEN`/`XADD` (slots diferentes). A primeira correção
+mandou a política num `Do` à parte, que em cluster vai a um nó arbitrário; a
+revisão independente de 2026-11-07 a trocou por `DoMulti(XLEN <stream>,
+política)`, que vai ao primário do slot da stream (SPEC §10.3), com o `XADD` da
+sonda num `Do` próprio; idem `CONFIG GET` e `INFO server`.
+
+**O cluster de um nó não distingue** o nó certo de um arbitrário: só há um.
+`TestRedisIntegrationClusterDB` prova que não há `panic` e que a sonda passa;
+quem trava o roteamento é `TestRedisClusterPolicyIsReadOnTheStreamPrimary`, sem
+servidor, contra um cluster falso de dois primários (RESP2, `CLUSTER SLOTS`)
+que registra em que nó cada `INFO`/`CONFIG GET` chegou.
 
 Verificado **à mão** antes da suíte (2026-09), com a combinação de referência,
 contra um Redis 7.4 real:
@@ -500,7 +509,7 @@ correção revertida (mutação por script, 26 mutantes, todos mortos).
 | 18 recusa por IP | `TestPerIPRefusalIsCounted` | sem o `Inc` |
 | 20 nomes | `TestRELPAdvertisesItsOwnName`, `TestEmergencyGaugesCountWhatIsLeftOnDisk` (o `emg-*` do S intocado), `TestComposeNamesAreThisServers`, `TestComposeValkeyFiles` | `relp_software` antigo; prefixo `emg-` |
 | alias `valkey` | `TestValkeyAliasEverySource`, `TestValkeySinkTypeNormalises`, `TestValkeyAliasConflict`, `TestUsageNamesTheValkeyAlias` | conflito ignorado; `sink.type=valkey` sem normalizar |
-| cluster | `TestClassifyClusterDBRepliesAreFatal`, `TestRedisIntegrationClusterDB` | sem a classificação; sem o `Do` separado em cluster (`panic`) |
+| cluster | `TestClassifyClusterDBRepliesAreFatal`, `TestRedisIntegrationClusterDB`, `TestRedisClusterPolicyIsReadOnTheStreamPrimary` | sem a classificação; sem a separação em cluster (`panic`); política/identidade num `Do` solto (nó arbitrário) |
 
 Servidores: Redis 7.4.12, Valkey 7.2.15/8.1.11/9.0.7 (§6.1), PostgreSQL 18,
 MySQL 8.4 (`SYSLOG_TEST_MYSQL_DSN`, 34 testes `PASS`), `nats-server` v2.14.6

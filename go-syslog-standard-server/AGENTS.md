@@ -239,9 +239,11 @@ docker rm -f slstd-test-redis slstd-test-redis-lru
 ```
 
 Nunca decida recurso por `redis_version` (o Valkey responde `7.2.4` sempre;
-SPEC §10.3), e em cluster nunca misture um comando sem chave (`INFO`,
-`CONFIG`) com comandos com chave no mesmo `DoMulti`: o rueidis entra em
-`panic`.
+SPEC §10.3). Em cluster, um comando sem chave (`INFO`, `CONFIG`) num
+`DoMulti` com comandos com chave de slots **diferentes** faz o rueidis entrar em
+`panic`; com comandos de **um** slot ele vai ao primário desse slot, e é assim
+que a política e a identidade são lidas no nó da stream (`DoMulti(XLEN
+<stream>, INFO …)`). Um `Do` solto de comando sem chave vai a um nó arbitrário.
 
 Destino PostgreSQL — suíte opt-in desde 2026-11-07 (`docs/TESTING.md` §6.2). O
 servidor não cria a tabela; a suíte cria as dela a partir de

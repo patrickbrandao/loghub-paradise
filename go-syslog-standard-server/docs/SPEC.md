@@ -1732,10 +1732,21 @@ então para ela um `volatile-*` no teto age como `noeviction`) — e conferida
   fora todo ACL de privilégio mínimo; uma resposta de erro a ambos não é
   "retentar" (não muda esperando);
 - com Sentinel a leitura vai ao primário, o nó que guarda a stream;
-- **em cluster** o rueidis recusa (com `panic`) um `DoMulti` que mistura um
-  comando sem chave (`INFO`, `CONFIG GET`) com comandos com chave, então lá a
-  leitura da política é uma ida e volta própria, depois da sonda (achado contra
-  um cluster de um nó em 2026-11-07; `TestRedisIntegrationClusterDB`).
+- **em cluster** a leitura vai ao **primário do slot da stream** (corrigido em
+  2026-11-07, revisão independente). O rueidis entra em `panic` ("Mixing
+  no-slot and cross slot commands") só quando um `DoMulti` com um comando sem
+  chave (`INFO`, `CONFIG GET`) traz comandos com chave de **slots diferentes**
+  — a sonda tem dois, `XLEN` da stream e `XADD` da chave da sonda; um comando
+  sem chave junto de comandos com chave de **um** slot é permitido e vai,
+  inteiro, ao primário desse slot (`_pickMulti`). Então em cluster a sonda é
+  `DoMulti(XLEN <stream>, <leitura da política>)` mais um `Do(XADD sonda)`
+  à parte, e o `CONFIG GET` de recurso e o `INFO server` da identidade também
+  vão num `DoMulti` com `XLEN <stream>` (resposta ignorada). Um `Do` sozinho de
+  comando sem chave vai a um nó **arbitrário** (o primeiro de um mapa, réplicas
+  incluídas, outro a cada chamada): lia a política de outro shard, e um shard
+  da stream em `allkeys-lru` passava pela checagem. Travado sem servidor por
+  `TestRedisClusterPolicyIsReadOnTheStreamPrimary` (um cluster falso de dois
+  primários); `TestRedisIntegrationClusterDB` prova contra um real.
 
 `sink.redis.maxlen` (padrão `0`, desligado) aplica `MAXLEN ~ N`. Desligado por
 padrão porque trimming descarta eventos em silêncio, que é o oposto de tudo o
@@ -3602,3 +3613,4 @@ correção, e um trecho portado leva a correção junto, não o defeito.
     conferido por `TestComposeNATSBoxIsPinned`; regra em §17.5.
 20. *Corrigido em 2026-11-07:* nomes próprios — imagem e binário `go-syslog-standard-server`, prefixo `slstd-` nos compose, `relp_software` e `--version` com o nome, dumps `slstd-emg-*` (os `emg-*` do go-syslog-server não são lidos); regra em §4.5, §11.1 e §17.5.
 21. *Corrigido em 2026-11-07 (revisão independente; porte do go-syslog-server):* a recontagem dos gauges depois do dump lia o arquivo inteiro com `Read`; agora conta em fluxo, pulando o cru, e o registro do abort é zerado assim que o arquivo é durável, antes da recontagem; regra em §11.2 e §12.3.
+22. *Corrigido em 2026-11-07 (revisão independente):* em cluster a política (`INFO memory`/`CONFIG GET`) e a identidade (`INFO server`) eram lidas num `Do` solto, que vai a um nó arbitrário; agora num `DoMulti` com `XLEN` da stream, no primário do slot dela, e o `XADD` da sonda à parte; regra em §10.3.
