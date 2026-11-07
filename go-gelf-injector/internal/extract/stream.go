@@ -253,16 +253,18 @@ func (s *Stream) gelf(b []byte) {
 	}
 }
 
-// finish emits the frame held. At the end of the stream (last), a frame with
-// no NUL is a document only if it looks whole: the servers accept one at EOF,
-// but a capture that stopped early cuts the last frame anywhere.
-func (s *Stream) finish(last bool) {
+// finish emits the frame held. cut says the frame is the last one of a
+// direction the capture did not see end (no FIN or RST): it is a document
+// only if it looks whole, since a capture that stopped early cuts the last
+// frame anywhere. The last frame of a closed direction is what the server
+// read at EOF and took as a document, and so does the replay (SPEC §6.4).
+func (s *Stream) finish(cut bool) {
 	f := trim(s.frame)
 	if len(f) == 0 {
 		return
 	}
 	switch {
-	case last && s.strict && (!looksGELF(f) || f[len(f)-1] != '}'):
+	case cut && s.strict && (!looksGELF(f) || f[len(f)-1] != '}'):
 		s.st.LostFrames++
 		s.st.SkippedBytes += uint64(len(f))
 	case s.strict && !looksGELF(f):
@@ -302,14 +304,14 @@ func (s *Stream) Gap(n int) {
 }
 
 // End implements pcap.StreamHandler.
-func (s *Stream) End() {
+func (s *Stream) End(closed bool) {
 	switch s.mode {
 	case mDetect:
 		if len(trim(bytes.Trim(s.dbuf, "\x00"))) > 0 && !s.strict {
 			// Never decided (an unfinished first line, say): non-strict
 			// reads it as GELF, like the server would.
 			s.toGELF(s.dbuf)
-			s.End()
+			s.End(closed)
 			return
 		}
 		s.ignore()
@@ -318,7 +320,7 @@ func (s *Stream) End() {
 		s.ignore()
 	case mGELF:
 		if !s.skip {
-			s.finish(true)
+			s.finish(!closed)
 		}
 		s.frame = nil
 	case mHTTP:

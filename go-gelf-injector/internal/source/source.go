@@ -27,6 +27,10 @@ type Message struct {
 	At time.Duration
 	// Src and Dst are the addresses in the capture (pcap only).
 	Src, Dst netip.AddrPort
+	// FlowEnd marks no document but the end of the flow Src->Dst in the
+	// capture (pcap with Flows only, SPEC §6.8): it comes after the flow's
+	// last document, and the scheduler closes that flow's connection.
+	FlowEnd bool
 }
 
 // Source yields messages. Next returns io.EOF when a finite source ends.

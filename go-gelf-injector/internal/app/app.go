@@ -22,12 +22,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/extract"
 	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/gelf"
 	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/report"
 	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/sched"
 	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/source"
 	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/tmpl"
 	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/transport"
+	"github.com/patrickbrandao/loghub-paradise/go-gelf-injector/internal/verify"
 )
 
 // Exit codes (SPEC §3.3).
@@ -36,6 +38,10 @@ const (
 	ExitFailures    = 1
 	ExitUsage       = 2
 	ExitUnreachable = 3
+	// ExitVerifyError: the destination could not be read (SPEC §10.3). A
+	// destination that lost or duplicated messages is ExitFailures, as in
+	// go-syslog-injector.
+	ExitVerifyError = 4
 	ExitInterrupted = 130
 )
 
@@ -76,6 +82,7 @@ type config struct {
 	retries            int
 	retryMaxWait       time.Duration
 	respTimeout        time.Duration
+	httpChunked        int
 
 	count       int64
 	duration    time.Duration
@@ -92,6 +99,13 @@ type config struct {
 	pcapPorts, pcapProto     string
 	pcapTiming               string
 	pcapSpeed                float64
+	pcapFlows                bool
+
+	verifyURL, verifySQLite string
+	verifyTimeout           time.Duration
+	verifyCA                string
+	verifySpace, verifyKey  string
+	pcapDedup               string
 
 	reportFmt string
 	progress  string
@@ -125,6 +139,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.IntVar(&c.retries, "retries", 0, "http/https: resend a request answered 429 or 503 up to this many `times`, after its Retry-After")
 	fs.DurationVar(&c.retryMaxWait, "retry-max-wait", 5*time.Second, "http/https: longest wait before a resend, whatever Retry-After says")
 	fs.DurationVar(&c.respTimeout, "response-timeout", 30*time.Second, "http/https: wait for each response at most this long")
+	fs.IntVar(&c.httpChunked, "http-chunked", 0, "http/https: send the body with Transfer-Encoding: chunked, in chunks of this many `bytes` (0 = Content-Length)")
 
 	fs.Int64Var(&c.count, "count", -1, "messages to send; 0 = no limit (default: 1; no limit with --duration; the whole --file/--pcap)")
 	fs.DurationVar(&c.duration, "duration", 0, "stop after this `time` (0 = no limit)")
@@ -144,6 +159,15 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.pcapProto, "pcap-proto", "udp,tcp", "protocols to replay from the capture: `udp,tcp`, udp or tcp (tcp covers HTTP)")
 	fs.StringVar(&c.pcapTiming, "pcap-timing", "asap", "`asap` (paced by --rate) or original (the capture's own intervals)")
 	fs.Float64Var(&c.pcapSpeed, "pcap-speed", 1, "speed `factor` of --pcap-timing original (2 = twice as fast)")
+	fs.BoolVar(&c.pcapFlows, "pcap-flows", false, "one connection per original flow of the capture, the PROXY header announcing its captured addresses; --concurrency bounds the flows open at once")
+
+	fs.StringVar(&c.verifyURL, "verify-url", "", "after sending, count the run's _seq at the server's destination: nats://, tls://, postgres://, postgresql://, redis://, rediss://, valkey://, valkeys:// (`url`)")
+	fs.StringVar(&c.verifySQLite, "verify-sqlite", "", "after sending, count the run's _seq in the events.db `file` of sink=sqlite")
+	fs.DurationVar(&c.verifyTimeout, "verify-timeout", 30*time.Second, "longest wait for the destination to hold every message sent, from the end of the sending")
+	fs.StringVar(&c.verifySpace, "verify-space", "default", "LogHub `space` the server writes to (loghub.<space>.gelf; the space column of loghub.inbox and gelf_events)")
+	fs.StringVar(&c.verifyKey, "verify-key", "", "Redis/Valkey stream `key` (default loghub.<space>.gelf) or NATS stream name (default LOGHUB_GELF)")
+	fs.StringVar(&c.pcapDedup, "pcap-dedup", "auto", "copies of a datagram in the capture (tcpdump -i any): `auto` (by capture vantage), on (every copy within 50 ms) or off")
+	fs.StringVar(&c.verifyCA, "verify-tls-ca", "", "PEM `file` of the CAs that verify the destination of tls:// and rediss:// (default: system roots)")
 
 	fs.StringVar(&c.reportFmt, "report", "text", "final report on stdout: `text` or json")
 	fs.StringVar(&c.progress, "progress", "auto", "progress line on stderr every `interval`; 0 = off; auto = 1s on a terminal")
@@ -151,7 +175,7 @@ func newFlags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: %s [flags]\n\nSends GELF messages to a server, to test it or load it (docs/SPEC.md).\n\nFlags:\n", Name)
 		fs.PrintDefaults()
-		fmt.Fprintf(stderr, "\nExit: 0 all sent (or answered 2xx), 1 some failed, 2 usage, 3 target unreachable, 130 interrupted.\n")
+		fmt.Fprintf(stderr, "\nExit: 0 all sent (or answered 2xx), 1 some failed (or the destination lost or duplicated messages),\n2 usage, 3 target unreachable, 4 the destination could not be read, 130 interrupted.\n")
 	}
 	return fs
 }
@@ -192,6 +216,7 @@ type runner struct {
 	plan   sched.Plan
 	info   map[string]string
 	report string
+	verify *verify.Spec
 }
 
 func (c *config) any(names ...string) string {
@@ -283,7 +308,7 @@ func build(c *config) (*runner, error) {
 		return nil, fmt.Errorf("--chunk-size: want %d..%d", gelf.MinChunkSize, transport.MaxDatagram)
 	}
 	if !isHTTP {
-		if f := c.any("http-path", "http-host", "pipeline", "requests-per-conn", "retries", "retry-max-wait", "response-timeout"); f != "" {
+		if f := c.any("http-path", "http-host", "pipeline", "requests-per-conn", "retries", "retry-max-wait", "response-timeout", "http-chunked"); f != "" {
 			return nil, fmt.Errorf("--%s applies to --transport http or https", f)
 		}
 	} else {
@@ -299,6 +324,10 @@ func build(c *config) (*runner, error) {
 		}
 		o.ResponseTimeout, o.Pipeline, o.PerConn = c.respTimeout, c.pipeline, c.perConn
 		o.Retries, o.RetryMaxWait = c.retries, c.retryMaxWait
+		if c.httpChunked < 0 || c.httpChunked > 16<<20 {
+			return nil, fmt.Errorf("--http-chunked: want 0..%d bytes", 16<<20)
+		}
+		o.Chunked = c.httpChunked
 	}
 	if c.network == "tls" || c.network == "https" {
 		if o.TLS, err = tlsConfig(c); err != nil {
@@ -344,14 +373,27 @@ func build(c *config) (*runner, error) {
 		return nil, errors.New("--loop applies to --file and --pcap")
 	}
 	if c.pcapFile == "" {
-		if f := c.any("pcap-port", "pcap-proto", "pcap-speed"); f != "" {
+		if f := c.any("pcap-port", "pcap-proto", "pcap-speed", "pcap-flows", "pcap-dedup"); f != "" {
 			return nil, fmt.Errorf("--%s needs --pcap", f)
 		}
+	}
+	if c.pcapFlows && (c.proxySrc != "" || c.proxyDst != "") {
+		return nil, errors.New("--pcap-flows announces each flow's captured addresses: no --proxy-src/--proxy-dst")
 	}
 	r := &runner{c: c, report: c.reportFmt, info: map[string]string{}}
 	switch {
 	case c.pcapFile != "":
-		opt := source.PcapOptions{Loop: c.loop}
+		opt := source.PcapOptions{Loop: c.loop, Flows: c.pcapFlows}
+		switch c.pcapDedup {
+		case "auto":
+			opt.Dedup = extract.DedupAuto
+		case "on":
+			opt.Dedup = extract.DedupOn
+		case "off":
+			opt.Dedup = extract.DedupOff
+		default:
+			return nil, fmt.Errorf("--pcap-dedup: want auto, on or off, got %q", c.pcapDedup)
+		}
 		if opt.Ports, err = ports(c.pcapPorts); err != nil {
 			return nil, err
 		}
@@ -411,8 +453,12 @@ func build(c *config) (*runner, error) {
 			count = 0
 		}
 	}
+	if r.verify, err = verifySpec(c); err != nil {
+		return nil, err
+	}
 	r.plan.Count = uint64(count)
 	r.plan.Duration, r.plan.Rate, r.plan.Workers, r.plan.Drain = c.duration, c.rate, c.concurrency, c.drain
+	r.plan.FlowsPerWorker = sched.FlowsPerWorker
 	r.opt = o
 
 	r.info["injector"] = Name + " " + version
@@ -424,6 +470,9 @@ func build(c *config) (*runner, error) {
 		if c.perConn > 0 {
 			r.info["protocol"] += ", " + strconv.FormatUint(c.perConn, 10) + " requests per connection"
 		}
+		if c.httpChunked > 0 {
+			r.info["protocol"] += ", chunked " + strconv.Itoa(c.httpChunked)
+		}
 	}
 	if c.network == "udp" || isHTTP {
 		r.info["compression"] = o.Compress.String()
@@ -434,8 +483,65 @@ func build(c *config) (*runner, error) {
 	if o.Proxy != nil {
 		r.info["proxy_protocol"] = c.proxy
 	}
+	if c.pcapFlows {
+		r.info["flows"] = "one connection per captured flow, at most " + strconv.Itoa(c.concurrency*sched.FlowsPerWorker) + " open"
+	}
+	if r.verify != nil {
+		r.info["verify"] = r.verify.Display
+	}
 	r.info["plan"] = planText(r.plan)
 	return r, nil
+}
+
+// verifySpec checks the destination flags (SPEC §10): usage errors only; the
+// destination itself is opened before the first send.
+func verifySpec(c *config) (*verify.Spec, error) {
+	if c.verifyURL == "" && c.verifySQLite == "" {
+		if f := c.any("verify-timeout", "verify-tls-ca", "verify-space", "verify-key"); f != "" {
+			return nil, fmt.Errorf("--%s needs --verify-url or --verify-sqlite", f)
+		}
+		return nil, nil
+	}
+	if c.verifyURL != "" && c.verifySQLite != "" {
+		return nil, errors.New("--verify-url and --verify-sqlite are exclusive")
+	}
+	if c.verifyTimeout <= 0 {
+		return nil, errors.New("--verify-timeout must be > 0")
+	}
+	switch {
+	case c.file != "" || c.pcapFile != "":
+		return nil, errors.New("--verify-* needs the generator or a --template with the run's markers: --file and --pcap documents carry none")
+	case c.template != "":
+		for _, m := range []string{`"_seq"`, "{seq}", `"_run"`, "{run}"} {
+			if !strings.Contains(c.template, m) {
+				return nil, errors.New(`--verify-*: the --template needs "_seq":{seq} and "_run":"{run}" (SPEC §10.1)`)
+			}
+		}
+	}
+	var s *verify.Spec
+	var err error
+	if c.verifySQLite != "" {
+		if c.verifyKey != "" {
+			return nil, errors.New("--verify-key: the SQLite table is always gelf_events")
+		}
+		if s, err = verify.SQLite(c.verifySQLite, c.verifySpace); err != nil {
+			return nil, err
+		}
+	} else if s, err = verify.Parse(c.verifyURL, c.verifySpace, c.verifyKey); err != nil {
+		return nil, err
+	}
+	if c.verifyCA != "" {
+		pem, err := os.ReadFile(c.verifyCA)
+		if err != nil {
+			return nil, fmt.Errorf("--verify-tls-ca: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("--verify-tls-ca: no PEM certificate")
+		}
+		s.TLSRoots = pool
+	}
+	return s, nil
 }
 
 func planText(p sched.Plan) string {
@@ -463,13 +569,23 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 	rep.Info = r.info
 	rep.OKOutcomes = []string{transport.Sent, "200", "201", "202", "204"}
 	r.opt.OnDial = rep.Dial
+	r.opt.OnEvent = rep.Event
 	dial, err := transport.Dialer(r.opt)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", Name, err)
 		return ExitUsage
 	}
+	if r.c.pcapFlows {
+		if r.plan.FlowDial, err = transport.FlowDialer(r.opt); err != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", Name, err)
+			return ExitUsage
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	vctx, vcancel := context.WithCancel(context.Background())
+	defer vcancel()
+	var verifying atomic.Bool
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
@@ -481,12 +597,30 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 		interrupted.Store(true)
 		fmt.Fprintf(stderr, "%s: interrupted, draining (again to abort)\n", Name)
 		cancel()
+		if verifying.Load() {
+			vcancel() // the check reports what it counted so far
+		}
 		if _, ok := <-sig; ok {
 			rep.End = time.Now()
 			r.write(rep, stdout)
 			os.Exit(ExitInterrupted)
 		}
 	}()
+	var dest verify.Dest
+	var tracker *verify.Tracker
+	start := time.Now()
+	if r.verify != nil {
+		// Before the first send: a wrong destination must not cost a load
+		// (SPEC §10.3).
+		dest = r.verify.Open(r.c.run, start.Add(-verify.Window))
+		defer dest.Close()
+		if err := dest.Check(ctx); err != nil {
+			fmt.Fprintf(stderr, "%s: --verify: %v\n", Name, r.verify.Err(err))
+			return ExitVerifyError
+		}
+		tracker = &verify.Tracker{}
+		r.plan.Track = tracker.Done
+	}
 	rep.Start = time.Now()
 	stopProg := make(chan struct{})
 	if every := r.progressEvery(stderr); every > 0 {
@@ -502,6 +636,18 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 	if st.SourceErr != nil {
 		rep.Event("source_error: " + st.SourceErr.Error())
 	}
+	var vr *verify.Result
+	if dest != nil {
+		timeout := r.c.verifyTimeout
+		if interrupted.Load() {
+			timeout = 0 // interrupted while sending: one read, no wait
+		}
+		verifying.Store(true)
+		res := verify.Run(vctx, r.verify, dest, r.c.run, tracker, st.Produced, timeout)
+		verifying.Store(false)
+		vr = &res
+		rep.Verify = vr
+	}
 	r.write(rep, stdout)
 	ok, failed := rep.Totals()
 	switch {
@@ -509,6 +655,10 @@ func (r *runner) run(stdout, stderr io.Writer) int {
 		return ExitInterrupted
 	case ok+failed > 0 && rep.Dials() == 0:
 		return ExitUnreachable
+	case vr != nil && vr.Failed:
+		return ExitVerifyError
+	case vr != nil && vr.Bad():
+		return ExitFailures
 	case failed > 0 || st.SourceErr != nil:
 		return ExitFailures
 	}

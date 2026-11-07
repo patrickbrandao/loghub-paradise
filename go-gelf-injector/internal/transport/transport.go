@@ -12,6 +12,7 @@ import (
 	"fmt"
 	mrand "math/rand/v2"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -58,9 +59,16 @@ type Options struct {
 	PerConn         uint64 // requests per connection; 0 = no limit
 	Retries         int    // resends of a 429 or 503
 	RetryMaxWait    time.Duration
+	// Chunked > 0 sends the body with Transfer-Encoding: chunked, in chunks
+	// of this many bytes, instead of Content-Length (SPEC §4.3).
+	Chunked int
 
 	// OnDial is told of every connection attempt (the report counts them).
 	OnDial func(error)
+	// OnEvent is told of named events (the report counts them).
+	OnEvent func(string)
+
+	adapt *adaptive // shared by every connection of the run (SPEC §4.3)
 }
 
 // MaxDatagram is the largest UDP payload over IPv4 (65535 - 20 - 8).
@@ -70,6 +78,12 @@ const MaxDatagram = 65507
 func Dialer(o Options) (sched.Dialer, error) {
 	if o.OnDial == nil {
 		o.OnDial = func(error) {}
+	}
+	if o.OnEvent == nil {
+		o.OnEvent = func(string) {}
+	}
+	if o.adapt == nil {
+		o.adapt = &adaptive{pipe: max(o.Pipeline, 1), event: o.OnEvent}
 	}
 	switch o.Network {
 	case "udp":
@@ -104,6 +118,28 @@ func Dialer(o Options) (sched.Dialer, error) {
 		return func(ctx context.Context) (sched.Conn, error) { return dialHTTP(ctx, o) }, nil
 	}
 	return nil, fmt.Errorf("unknown transport %q", o.Network)
+}
+
+// FlowDialer returns, for --pcap-flows (SPEC §6.8), the dialer of each
+// captured flow: o's, with the PROXY header (when o has one) announcing the
+// flow's captured source and destination. The connections of every flow
+// share the run's adaptation to the server (SPEC §4.3).
+func FlowDialer(o Options) (func(src, dst netip.AddrPort) sched.Dialer, error) {
+	if _, err := Dialer(o); err != nil {
+		return nil, err
+	}
+	if o.OnEvent == nil {
+		o.OnEvent = func(string) {}
+	}
+	o.adapt = &adaptive{pipe: max(o.Pipeline, 1), event: o.OnEvent}
+	return func(src, dst netip.AddrPort) sched.Dialer {
+		fo := o
+		if o.Proxy != nil {
+			fo.Proxy = &ProxyHeader{Version: o.Proxy.Version, Src: src, Dst: dst}
+		}
+		d, _ := Dialer(fo) // o was checked above
+		return d
+	}, nil
 }
 
 // dialStream dials TCP, writes the PROXY header if any, then does the TLS

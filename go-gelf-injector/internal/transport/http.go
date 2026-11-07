@@ -28,12 +28,15 @@ type Req struct {
 	Host   string
 	Header [][2]string // in order; never Host, Content-Length or hop-by-hop
 	Body   []byte
+	// Chunk > 0 sends Body with Transfer-Encoding: chunked, in chunks of
+	// this many bytes (SPEC §4.3).
+	Chunk int
 }
 
 // build turns a document into a POST (SPEC §4.4). The body is compressed
 // here, once: a retry resends the same bytes.
 func (h *h1Conn) build(m *source.Message) Req {
-	r := Req{Method: "POST", URI: h.o.Path, Host: h.o.Host, Body: m.Data}
+	r := Req{Method: "POST", URI: h.o.Path, Host: h.o.Host, Body: m.Data, Chunk: h.o.Chunked}
 	r.Header = append(r.Header, [2]string{"Content-Type", "application/json"})
 	if h.o.Compress != gelf.None {
 		r.Body = append([]byte(nil), h.z.Compress(h.o.Compress, m.Data)...)
@@ -69,6 +72,22 @@ func AppendRequest(dst []byte, r *Req, closeConn bool) []byte {
 		dst = append(dst, ": "...)
 		dst = append(dst, h[1]...)
 		dst = append(dst, "\r\n"...)
+	}
+	if r.Chunk > 0 && len(r.Body) > 0 {
+		dst = append(dst, "Transfer-Encoding: chunked\r\n"...)
+		if closeConn {
+			dst = append(dst, "Connection: close\r\n"...)
+		}
+		dst = append(dst, "\r\n"...)
+		for b := r.Body; len(b) > 0; {
+			n := min(r.Chunk, len(b))
+			dst = strconv.AppendInt(dst, int64(n), 16)
+			dst = append(dst, "\r\n"...)
+			dst = append(dst, b[:n]...)
+			dst = append(dst, "\r\n"...)
+			b = b[n:]
+		}
+		return append(dst, "0\r\n\r\n"...)
 	}
 	// A body always carries its length; a bodiless GET or HEAD carries none,
 	// as a browser sends it.
@@ -123,11 +142,12 @@ type pend struct {
 // response, from fail when the connection dies, or from Close for a retry
 // that never went out again.
 type h1Conn struct {
-	o   Options
-	z   gelf.Compressor
-	c   net.Conn
-	bw  *bufio.Writer
-	buf []byte
+	o    Options
+	z    gelf.Compressor
+	c    net.Conn
+	bw   *bufio.Writer
+	buf  []byte
+	pipe int // requests in flight: --pipeline, or 1 when adapted (SPEC §4.3)
 
 	slots chan struct{} // one token per request in flight
 
@@ -146,8 +166,12 @@ type h1Conn struct {
 }
 
 func newH1(o Options, c net.Conn) *h1Conn {
-	h := &h1Conn{o: o, c: c, bw: bufio.NewWriterSize(c, 64<<10),
-		slots: make(chan struct{}, o.Pipeline), readerDone: make(chan struct{})}
+	pipe := max(o.Pipeline, 1)
+	if o.adapt != nil {
+		pipe = o.adapt.pipeline()
+	}
+	h := &h1Conn{o: o, c: c, bw: bufio.NewWriterSize(c, 64<<10), pipe: pipe,
+		slots: make(chan struct{}, pipe), readerDone: make(chan struct{})}
 	go h.read()
 	return h
 }
@@ -222,7 +246,7 @@ func (h *h1Conn) write(p *pend) error {
 	}
 	// With one request in flight there is nothing to batch: push it now, or
 	// the server waits for bytes still in our buffer.
-	if h.o.Pipeline == 1 || last {
+	if h.pipe == 1 || last {
 		if err := h.bw.Flush(); err != nil {
 			return h.writeErr(err)
 		}
@@ -461,6 +485,14 @@ func (h *h1Conn) read() {
 		h.queue[0] = nil
 		h.queue = h.queue[1:]
 		h.answers++
+		if a := h.o.adapt; a != nil {
+			switch {
+			case resp.Close && h.answers == 1 && !h.spent:
+				a.closedAtFirst()
+			case h.answers == 2:
+				a.keptAlive()
+			}
+		}
 		if resp.Close {
 			// Before the slot is freed below: a worker waiting for that
 			// slot must find the connection closing and give its request

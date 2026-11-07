@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -77,6 +78,15 @@ type Plan struct {
 	Workers  int
 	// Drain bounds the wait for in-flight messages at the end.
 	Drain time.Duration
+	// FlowDial, when set, runs one queue, worker and connection per original
+	// flow of the capture (--pcap-flows, SPEC §6.8): the dialer of the flow
+	// from src to dst. Workers × FlowsPerWorker is then the most flows open
+	// at once.
+	FlowDial       func(src, dst netip.AddrPort) Dialer
+	FlowsPerWorker int
+	// Track, when set, is told the outcome of every message by its seq (the
+	// destination check, SPEC §10). Called from any goroutine.
+	Track func(seq uint64, ok bool)
 }
 
 // Stats of the producer, for the report.
@@ -119,6 +129,9 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 	if p.Workers < 1 {
 		p.Workers = 1
 	}
+	if p.FlowDial != nil {
+		return runFlows(ctx, p, src, rep)
+	}
 	jobs := make(chan job, p.Workers*4)
 	var wg sync.WaitGroup
 	// Workers outlive ctx: they must drain what was produced. They stop on
@@ -133,10 +146,10 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(stopDial, jobs, dial, rep.NewShard(), rep, p.Drain)
+			worker(stopDial, jobs, dial, rep.NewShard(), rep, p.Drain, p.Track)
 		}()
 	}
-	st := produce(ctx, p, src, jobs)
+	st := produce(ctx, p, src, func(source.Message) chan<- job { return jobs }, nil)
 	close(jobs)
 	// What is still queued gets Drain to find a connection; past it, a
 	// worker that cannot dial gives up and its messages are not_sent.
@@ -146,7 +159,11 @@ func Run(ctx context.Context, p Plan, src source.Source, dial Dialer, rep *repor
 	return st
 }
 
-func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) Stats {
+// produce takes the messages from the source at the planned pace and hands
+// each to the channel route gives for it. A flow-end marker of the source
+// (Message.FlowEnd) is not a message: it goes to end, in order, and takes no
+// seq.
+func produce(ctx context.Context, p Plan, src source.Source, route func(source.Message) chan<- job, end func(source.Message)) Stats {
 	var st Stats
 	start := time.Now()
 	var deadline time.Time
@@ -179,6 +196,13 @@ func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) St
 			}
 			break
 		}
+		if m.FlowEnd {
+			if end != nil {
+				end(m)
+			}
+			seq-- // the next message takes this seq
+			continue
+		}
 		var due time.Time
 		switch {
 		case p.Original && m.At >= 0:
@@ -206,7 +230,7 @@ func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) St
 			}
 		}
 		select {
-		case jobs <- job{seq: seq, msg: m}:
+		case route(m) <- job{seq: seq, msg: m}:
 			st.Produced++
 		case <-ctx.Done():
 			return st
@@ -219,7 +243,7 @@ func produce(ctx context.Context, p Plan, src source.Source, jobs chan<- job) St
 	return st
 }
 
-func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard, rep *report.Report, drain time.Duration) {
+func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard, rep *report.Report, drain time.Duration, track func(uint64, bool)) {
 	var c Conn
 	var redo []Pending // given back by a closed connection, sent first
 	resent := map[uint64]int{}
@@ -328,6 +352,9 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 				p.Done("not_sent", false)
 			} else {
 				sh.Done("not_sent", false, 0, 0)
+				if track != nil {
+					track(j.seq, false)
+				}
 			}
 			continue
 		}
@@ -337,8 +364,12 @@ func worker(ctx context.Context, jobs <-chan job, dial Dialer, sh *report.Shard,
 		} else {
 			start := time.Now()
 			n := len(j.msg.Data)
+			seq := j.seq
 			err = c.Send(j.seq, &j.msg, func(outcome string, ok bool) {
 				sh.Done(outcome, ok, time.Since(start), n)
+				if track != nil {
+					track(seq, ok)
+				}
 			})
 		}
 		if err != nil {

@@ -3,6 +3,7 @@ package pcap
 import (
 	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"net/netip"
 	"time"
 )
@@ -37,6 +38,15 @@ type Segment struct {
 	Truncated bool
 	// WireLen is the payload length on the wire (>= len(Payload)).
 	WireLen int
+	// Vantage identifies where the capture saw the packet: the pcapng
+	// interface and, on Linux cooked framing (tcpdump -i any), the interface
+	// index and the packet type (outgoing, to us, ...). Two copies of one
+	// datagram differ here; a sender repeating itself does not (SPEC §6.3.1).
+	// Zero when the capture has a single vantage.
+	Vantage uint64
+	// IPID is the IPv4 identification (or the IPv6 fragment id): the copies
+	// of one packet share it, a sender's next packet does not.
+	IPID uint32
 }
 
 // Skip reasons counted by the Decoder (SPEC §6.3).
@@ -88,7 +98,37 @@ func (d *Decoder) Decode(p Packet) (Segment, bool) {
 		return Segment{}, false
 	}
 	seg.TS = p.TS
+	seg.Vantage = uint64(p.Iface)<<40 | linkVantage(p.LinkType, p.Data)
 	return seg, true
+}
+
+// linkVantage is the part of the vantage the link header holds: Linux
+// cooked v1 has the packet type, v2 the interface index too.
+func linkVantage(lt uint16, b []byte) uint64 {
+	switch lt {
+	case LinkSLL:
+		if len(b) >= 2 {
+			return uint64(binary.BigEndian.Uint16(b[0:2])) & 0xff
+		}
+	case LinkSLL2:
+		if len(b) >= 11 {
+			return uint64(binary.BigEndian.Uint32(b[4:8]))<<8 | uint64(b[10])
+		}
+	case LinkPKTAP:
+		// The interface name (pth_ifname), as go-relplog-injector does.
+		if len(b) >= 36 && binary.LittleEndian.Uint32(b[0:4]) >= 36 {
+			h := fnv.New32a()
+			h.Write(b[12:36])
+			return uint64(h.Sum32()) << 8
+		}
+	}
+	return 0
+}
+
+// Flush ends a pass: fragments still waiting for their datagram are lost
+// (ported from go-relplog-injector, 2026-11-07: they vanished uncounted).
+func (d *Decoder) Flush() {
+	d.Stats.FragmentsLost += uint64(d.frags.flush())
 }
 
 func (d *Decoder) count(err error) {
@@ -148,15 +188,23 @@ func linkPayload(lt uint16, b []byte) ([]byte, error) {
 		}
 		return etherIP(binary.BigEndian.Uint16(b[0:2]), b[20:])
 	case LinkPKTAP:
-		// struct pktap_header: pth_length (header size) then pth_type_next
-		// (the DLT of what follows), host order -- little-endian on every Mac.
-		if len(b) < 8 {
+		// xnu's struct pktap_header, host order (little-endian on every
+		// Mac): pth_length (header size), pth_type_next (1 = a packet
+		// follows), pth_dlt (the link type of what follows), pth_ifname[24].
+		// Ported from go-relplog-injector (2026-11-07): the inner link type
+		// was read from pth_type_next, always 1 (Ethernet), so the loopback
+		// (DLT_NULL) of a macOS -i any capture never decoded.
+		if len(b) < 12 {
 			return nil, errShort
 		}
 		hl := binary.LittleEndian.Uint32(b[0:4])
-		inner := binary.LittleEndian.Uint32(b[4:8])
-		if hl < 8 || int(hl) > len(b) || inner == LinkPKTAP {
+		next := binary.LittleEndian.Uint32(b[4:8])
+		inner := binary.LittleEndian.Uint32(b[8:12])
+		if hl < 12 || int(hl) > len(b) || inner == LinkPKTAP || inner > 0xffff {
 			return nil, errShort
+		}
+		if next != 1 {
+			return nil, errNotIP
 		}
 		return linkPayload(uint16(inner), b[hl:])
 	}
@@ -233,7 +281,9 @@ func (d *Decoder) ipv4(b []byte, ts time.Time, trunc bool) (Segment, error) {
 		d.scratch = append(d.scratch[:0], whole...)
 		body, wire = d.scratch, len(whole)
 	}
-	return l4(proto, src, dst, body, wire, trunc)
+	seg, err := l4(proto, src, dst, body, wire, trunc)
+	seg.IPID = uint32(binary.BigEndian.Uint16(b[4:6]))
+	return seg, err
 }
 
 func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
@@ -285,7 +335,9 @@ func (d *Decoder) ipv6(b []byte, ts time.Time, trunc bool) (Segment, error) {
 			}
 			d.Stats.Reassembled++
 			d.scratch = append(d.scratch[:0], whole...)
-			return l4(nh, src, dst, d.scratch, len(whole), false)
+			seg, err := l4(nh, src, dst, d.scratch, len(whole), false)
+			seg.IPID = key.id
+			return seg, err
 		default:
 			return l4(next, src, dst, body, wire, trunc)
 		}
