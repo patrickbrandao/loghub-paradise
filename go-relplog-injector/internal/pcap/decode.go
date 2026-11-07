@@ -101,7 +101,7 @@ func (d *Decoder) Decode(p Packet) (Segment, bool) {
 		return Segment{}, false
 	}
 	seg.TS = p.TS
-	seg.Iface = uint64(p.Iface)<<32 | uint64(link)
+	seg.Iface = uint64(p.Iface)<<40 | link
 	return seg, true
 }
 
@@ -125,7 +125,7 @@ func (d *Decoder) count(err error) {
 
 // linkPayload strips the link header and returns the IP packet and the
 // interface the link header names (0 when it names none).
-func linkPayload(lt uint16, b []byte) ([]byte, uint32, error) {
+func linkPayload(lt uint16, b []byte) ([]byte, uint64, error) {
 	switch lt {
 	case LinkEthernet:
 		if len(b) < 14 {
@@ -168,14 +168,16 @@ func linkPayload(lt uint16, b []byte) ([]byte, uint32, error) {
 			return nil, 0, errShort
 		}
 		ip, err := etherIP(binary.BigEndian.Uint16(b[14:16]), b[16:])
-		return ip, 1 | hash32(b[0:2], b[6:14]), err
+		return ip, 1 | uint64(hash32(b[0:2], b[6:14])), err
 	case LinkSLL2:
-		// Cooked v2: protocol, reserved, interface index, ...
+		// Cooked v2: protocol, reserved, interface index, hatype, packet
+		// type (outgoing, to us, ...): the loopback shows a packet twice on
+		// one interface, once per direction (2026-11-07, as the GI does).
 		if len(b) < 20 {
 			return nil, 0, errShort
 		}
 		ip, err := etherIP(binary.BigEndian.Uint16(b[0:2]), b[20:])
-		return ip, binary.BigEndian.Uint32(b[4:8]), err
+		return ip, uint64(binary.BigEndian.Uint32(b[4:8]))<<8 | uint64(b[10]), err
 	case LinkPKTAP:
 		// xnu's struct pktap_header, host order (little-endian on every
 		// Mac): pth_length, pth_type_next (1 = a packet follows), pth_dlt
@@ -192,9 +194,9 @@ func linkPayload(lt uint16, b []byte) ([]byte, uint32, error) {
 		if next != 1 {
 			return nil, 0, errNotIP
 		}
-		var name uint32
+		var name uint64
 		if hl >= 36 {
-			name = 1 | hash32(b[12:36])
+			name = 1 | uint64(hash32(b[12:36]))
 		}
 		ip, _, err := linkPayload(uint16(inner), b[hl:])
 		return ip, name, err

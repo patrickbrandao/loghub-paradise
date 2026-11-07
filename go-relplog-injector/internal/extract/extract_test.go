@@ -51,7 +51,7 @@ func run(t *testing.T, in string, strict, mid bool, chunks []int, gapAt int) ([]
 		off += n
 	}
 	m := s.Mode()
-	s.End()
+	s.End(false)
 	return got, st, m
 }
 
@@ -193,13 +193,13 @@ func FuzzStream(f *testing.F) {
 		var a, b []string
 		s1 := NewStream(strict, mid, &st1, func(m []byte, _ time.Time) { a = append(a, string(m)) })
 		s1.Data(in, time.Time{})
-		s1.End()
+		s1.End(false)
 		s2 := NewStream(strict, mid, &st2, func(m []byte, _ time.Time) { b = append(b, string(m)) })
 		n := int(chunk%32) + 1
 		for off := 0; off < len(in); off += n {
 			s2.Data(in[off:min(off+n, len(in))], time.Time{})
 		}
-		s2.End()
+		s2.End(false)
 		if !reflect.DeepEqual(a, b) {
 			t.Fatalf("split %d changed the messages: %q vs %q", n, a, b)
 		}

@@ -23,8 +23,12 @@ type StreamHandler interface {
 	// Gap reports n bytes (n > 0) the capture does not have, right before
 	// the next Data. n is a lower bound when the size is unknown.
 	Gap(n int)
-	// End is called once, at FIN/RST or at the end of the capture.
-	End()
+	// End is called once: closed is true at a FIN (every byte up to it
+	// delivered) or a RST with no hole before it, false at the end of the
+	// capture, when the direction went idle or when its 4-tuple was reused.
+	// Only a closed direction proves its last bytes are all there is (SPEC
+	// §6.4; from go-gelf-injector, 2026-11-07).
+	End(closed bool)
 }
 
 // NewStreamFunc is called for the first segment of a direction. midstream is
@@ -104,8 +108,9 @@ func (a *Assembler) Add(s Segment) {
 	f := a.flows[k]
 	syn := s.Flags&FlagSYN != 0
 	if f != nil && syn && f.h != nil && s.Seq+1 != f.next {
-		// A new connection on the same 4-tuple (port reuse).
-		a.end(k, f)
+		// A new connection on the same 4-tuple (port reuse): the old one's
+		// end was not seen.
+		a.end(k, f, false)
 		f = nil
 	}
 	if f == nil {
@@ -153,12 +158,14 @@ func (a *Assembler) Add(s Segment) {
 	}
 	if s.Flags&FlagRST != 0 {
 		a.deliver(f, seq, s.Payload, s.WireLen, s.TS)
-		a.end(k, f)
+		// A RST ahead of what was delivered says bytes before it are
+		// missing from the capture: the tail is not proven whole.
+		a.end(k, f, len(f.pend) == 0 && !seqLT(f.next, wireEnd))
 		return
 	}
 	a.deliver(f, seq, s.Payload, s.WireLen, s.TS)
 	if f.finSeen && !seqLT(f.next, f.finSeq) {
-		a.end(k, f)
+		a.end(k, f, true)
 	}
 }
 
@@ -236,12 +243,12 @@ func (a *Assembler) gap(f *flow, n int) {
 	f.h.Gap(n)
 }
 
-func (a *Assembler) end(k FlowKey, f *flow) {
+func (a *Assembler) end(k FlowKey, f *flow, closed bool) {
 	for len(f.pend) > 0 {
 		a.skipToPending(f)
 	}
 	if f.h != nil {
-		f.h.End()
+		f.h.End(closed)
 	}
 	delete(a.flows, k)
 }
@@ -275,6 +282,6 @@ func (a *Assembler) endWhere(match func(*flow) bool) {
 	sort.Slice(keys, func(i, j int) bool { return a.flows[keys[i]].id < a.flows[keys[j]].id })
 	for _, k := range keys {
 		a.countUnterminated(a.flows[k])
-		a.end(k, a.flows[k])
+		a.end(k, a.flows[k], false)
 	}
 }

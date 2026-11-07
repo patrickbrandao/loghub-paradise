@@ -43,7 +43,7 @@ func TestResyncLinearCost(t *testing.T) {
 	for off := 0; off < len(in); off += 1460 {
 		s0.Data([]byte(in[off:min(off+1460, len(in))]), time.Time{})
 	}
-	s0.End()
+	s0.End(false)
 	if len(got) != 2 || got[1] != "<13>next" || len(got[0]) != len(body) {
 		t.Fatalf("%d messages", len(got))
 	}
@@ -63,7 +63,7 @@ func TestResyncLinearCost(t *testing.T) {
 	if len(s.buf) > resyncWindow {
 		t.Fatalf("no-candidate buffer holds %d bytes", len(s.buf))
 	}
-	s.End()
+	s.End(false)
 	if st.SkippedBytes != uint64(2000*len(seg)) {
 		t.Fatalf("skipped %d of %d", st.SkippedBytes, 2000*len(seg))
 	}
