@@ -1917,7 +1917,8 @@ por padrão: com o banco a uns 60 ms ela nunca terminava, o prazo fechava a
 conexão, cada tentativa recomeçava do zero e o processo saía com 3 depois de
 `sink.boot_timeout` dizendo que o banco não respondeu. O contexto da validação
 se desliga do **prazo** da checagem que a iniciou, mas continua seguindo o
-**cancelamento** do boot (um shutdown, um boot abortado).
+**cancelamento** do boot (um shutdown, um boot abortado), e no boot nunca passa
+do fim de `sink.boot_timeout` (§12.1).
 
 #### 10.5.6 Durabilidade
 
@@ -2478,6 +2479,19 @@ só é criado durante o incidente falha durante o incidente.
 `sink.boot_timeout` conta do início do passo 4: a discagem do `sink=redis` e o
 `WaitReady` que vem depois dividem o mesmo prazo. Antes cada um recebia o prazo
 inteiro, e um Redis que oscilasse entre os dois passos dobrava a espera.
+
+**E nenhuma tentativa passa do prazo** (corrigido em 2026-11-07, revisão
+independente). O prazo era conferido só entre tentativas, e uma tentativa
+sozinha o atravessava: cada discagem do `sink=redis` tinha `sink.op_timeout`
+inteiro, cada checagem do `WaitReady` `sink.health_timeout` inteiro e a
+validação do PostgreSQL/MySQL (§10.5.5) `sink.op_timeout` inteiro, desligada
+do prazo do pai. Agora cada tentativa recebe `min(prazo próprio, o que falta
+até o fim de sink.boot_timeout)` — a discagem, a checagem e a validação —, a
+espera entre tentativas também é cortada no prazo, e com o prazo esgotado o
+boot sai com 3 sem nova tentativa. A validação continua seguindo o
+cancelamento do boot (§10.5.5); o prazo do boot chega a ela pelo contexto da
+checagem do `WaitReady` (fora do boot, nas sondas do monitor, não há prazo de
+boot e ela tem `sink.op_timeout` inteiro).
 
 A porta admin aberta durante todo o processo é o ponto: mesmo num crashloop por
 sink indisponível, o operador tem `/readyz` com o motivo exato e `/metrics` com
@@ -3650,3 +3664,4 @@ correção, e um trecho portado leva a correção junto, não o defeito.
 22. *Corrigido em 2026-11-07 (revisão independente):* em cluster a política (`INFO memory`/`CONFIG GET`) e a identidade (`INFO server`) eram lidas num `Do` solto, que vai a um nó arbitrário; agora num `DoMulti` com `XLEN` da stream, no primário do slot dela, e o `XADD` da sonda à parte; regra em §10.3.
 23. *Corrigido em 2026-11-07 (revisão independente):* o RELP pegava a vaga e os bytes de `relp.inflight_max_bytes` depois de ler o frame inteiro, e a espera não era justa; agora depois do `DATALEN` e antes do payload, com fila FIFO; regra em §4.5 e §14.4.
 24. *Corrigido em 2026-11-07 (revisão independente; regra do go-syslog-server):* o buffer de frame acima de 16 KiB era largado a cada frame; agora só entre frames com o leitor vazio; regra em §5.5.
+25. *Corrigido em 2026-11-07 (revisão independente):* uma tentativa (discagem do Redis, checagem do `WaitReady`, validação do PostgreSQL/MySQL) passava do prazo único de boot; agora cada uma recebe o mínimo entre o próprio prazo e o que falta; regra em §12.1.

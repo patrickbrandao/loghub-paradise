@@ -502,7 +502,11 @@ func (a *App) buildSink(ctx context.Context) int {
 		}
 		backoff := 100 * time.Millisecond
 		for attempt := 1; ; attempt++ {
-			octx, cancel := context.WithTimeout(ctx, a.cfg.Sink.OpTimeout)
+			// Each attempt gets min(sink.op_timeout, what is left of the one
+			// boot deadline): checked only between attempts, one dial crossed
+			// it by a whole op_timeout (SPEC §12.1).
+			octx, cancel := context.WithTimeout(ctx,
+				sink.BootClamp(sink.WithBootDeadline(ctx, deadline), a.cfg.Sink.OpTimeout))
 			s, err := sink.NewRedis(octx, sink.RedisConfig{
 				Addrs:               a.cfg.SinkRedis.Addrs,
 				Username:            a.cfg.SinkRedis.Username,
@@ -548,10 +552,14 @@ func (a *App) buildSink(ctx context.Context) int {
 			}
 			a.log.Warn("Redis not reachable yet, retrying",
 				"attempt", attempt, "error", err, "retry_in", backoff.String())
+			wait := backoff
+			if left := time.Until(deadline); left < wait {
+				wait = left
+			}
 			select {
 			case <-ctx.Done():
 				return ExitAborted
-			case <-time.After(backoff):
+			case <-time.After(wait):
 			}
 			if backoff *= 2; backoff > 5*time.Second {
 				backoff = 5 * time.Second

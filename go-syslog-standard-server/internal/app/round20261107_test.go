@@ -219,3 +219,45 @@ func TestCollectedIsClearedBeforeTheRecount(t *testing.T) {
 		t.Fatalf("syslog_emergency_events_pending = %d, want 1", got)
 	}
 }
+
+// Revisão independente de 2026-11-07, STD item 4: the redis dial loop of the
+// boot never runs past sink.boot_timeout in one attempt. Against an address
+// that accepts TCP and never speaks, each attempt had the whole
+// sink.op_timeout (5 s here) with a 1 s boot deadline.
+func TestRedisBootAttemptStopsAtTheBootDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // held open, silent
+		}
+	}()
+	const boot = time.Second
+	start := time.Now()
+	code := runContext(context.Background(), []string{
+		"--ring.data_dir=" + t.TempDir(),
+		"--admin.bind=" + freeAddr(t),
+		"--listen.udp=",
+		"--listen.tcp=" + freeAddr(t),
+		"--sink.type=redis",
+		"--sink.redis.addrs=" + ln.Addr().String(),
+		"--sink.op_timeout=5s",
+		"--sink.boot_timeout=" + boot.String(),
+		"--log.level=error",
+		"--node.id=redisdeadline",
+	}, func(a *App) { a.abort = make(chan os.Signal, 1) })
+	elapsed := time.Since(start)
+	if code != ExitSink {
+		t.Fatalf("exit %d, want %d", code, ExitSink)
+	}
+	if elapsed > boot+700*time.Millisecond {
+		t.Fatalf("the boot gave up after %v with sink.boot_timeout=%v: a dial attempt crossed it", elapsed, boot)
+	}
+}
