@@ -62,7 +62,15 @@ release: 10 min cada.
 ## 4. Benchmarks
 
 Os de G (`BenchmarkConvert`, `BenchmarkTCPReceive`, `BenchmarkIngestAccept`) e
-os de SN que vieram com os pacotes. Nenhum número de GN foi registrado: os
+os de SN que vieram com os pacotes. Os da remontagem UDP (`BenchmarkReassembler*`,
+`BenchmarkUDPChunkFlood`, `chunks_bench_test.go`) vieram com o porte dos shards
+de 2026-11-07; os números que decidiram estão em G (SPEC §5.2, TESTING §4), e o
+pacote é o mesmo:
+
+```bash
+go test -run XXX -bench 'Reassembler|ChunkFlood' -benchmem -cpu 1,2,4,8 ./internal/receiver
+```
+ Nenhum número de GN foi registrado: os
 alvos de SPEC §18.8 continuam **não medidos** (§8).
 
 ## 5. Integração em processo (`internal/app`)

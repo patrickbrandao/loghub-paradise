@@ -37,6 +37,10 @@ var connTransports = [...]Transport{TransportTCP, TransportTLS, TransportHTTP, T
 // https answer 503 instead and hold nothing.
 var streamTransports = [...]Transport{TransportTCP, TransportTLS}
 
+// tlsTransports run a TLS handshake: tls in the stream reader, https inside
+// net/http, counted through the server's ErrorLog (SPEC §4.7, §14.1).
+var tlsTransports = [...]Transport{TransportTLS, TransportHTTPS}
+
 func (t Transport) String() string {
 	if int(t) < len(transportNames) {
 		return transportNames[t]
@@ -200,7 +204,7 @@ type Metrics struct {
 	ConnsActive             [NumTransports]Gauge
 	ConnsTotal              [NumTransports]Counter
 	ConnsRefusedTotal       [NumTransports][numConnLimits]Counter
-	TLSHandshakeErrorsTotal Counter
+	TLSHandshakeErrorsTotal [NumTransports]Counter // tls and https only
 	ProxyHeadersTotal       [numProxyResults]Counter
 	BackpressureSecondsHund [NumTransports]Counter // hundredths of a second
 	UDPReceiveErrorsTotal   Counter
@@ -350,8 +354,11 @@ func (m *Metrics) WritePrometheus(w io.Writer) error {
 				lbl("transport", transportNames[t])+","+lbl("limit", name), m.ConnsRefusedTotal[t][l].Load())
 		}
 	}
-	x.header("gelf_tls_handshake_errors_total", "counter", "Failed or timed-out TLS handshakes.")
-	x.counter("gelf_tls_handshake_errors_total", "", "", m.TLSHandshakeErrorsTotal.Load())
+	x.header("gelf_tls_handshake_errors_total", "counter", "Failed or timed-out TLS handshakes, by transport.")
+	for _, t := range tlsTransports {
+		x.counter("gelf_tls_handshake_errors_total", "", lbl("transport", transportNames[t]),
+			m.TLSHandshakeErrorsTotal[t].Load())
+	}
 	x.header("gelf_proxy_headers_total", "counter", "What the PROXY protocol reader found, by result.")
 	for i, name := range proxyResultNames {
 		x.counter("gelf_proxy_headers_total", "", lbl("result", name), m.ProxyHeadersTotal[i].Load())

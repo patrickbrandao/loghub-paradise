@@ -72,7 +72,15 @@ rodada de 60 s seguinte passou. O arnês de G tem a mesma lacuna (§9).
 ## 4. Benchmarks
 
 Os de G vêm com os pacotes copiados (`BenchmarkConvert*`, `BenchmarkLevelOf`,
-os de `receiver`), e o `BenchmarkIngestAccept` de SP adaptado. **Nenhum número
+os de `receiver`), e o `BenchmarkIngestAccept` de SP adaptado. Os da remontagem
+UDP (`BenchmarkReassembler*`, `BenchmarkUDPChunkFlood`, `chunks_bench_test.go`)
+vieram com o porte dos shards de 2026-11-07; os números que decidiram estão em
+G (SPEC §5.2, TESTING §4), e o pacote é o mesmo:
+
+```bash
+go test -run XXX -bench 'Reassembler|ChunkFlood' -benchmem -cpu 1,2,4,8 ./internal/receiver
+```
+ **Nenhum número
 foi registrado nesta rodada**; os alvos de SPEC §18.8 nunca foram medidos (§8).
 
 ---

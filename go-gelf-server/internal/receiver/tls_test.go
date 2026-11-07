@@ -242,7 +242,7 @@ func TestTLSOptionalWithCARefusesAStranger(t *testing.T) {
 	if _, err := dialTLS(t, tr.Addr(), p, &p.stranger, 0); err == nil {
 		t.Fatal("a certificate from an unknown CA was accepted")
 	}
-	waitFor(t, "the handshake error", func() bool { return h.m.TLSHandshakeErrorsTotal.Load() == 1 })
+	waitFor(t, "the handshake error", func() bool { return h.m.TLSHandshakeErrorsTotal[obs.TransportTLS].Load() == 1 })
 }
 
 func TestTLSRequire(t *testing.T) {
@@ -253,7 +253,7 @@ func TestTLSRequire(t *testing.T) {
 	if _, err := dialTLS(t, tr.Addr(), p, nil, 0); err == nil {
 		t.Fatal("require accepted a client without a certificate")
 	}
-	waitFor(t, "the handshake error", func() bool { return h.m.TLSHandshakeErrorsTotal.Load() == 1 })
+	waitFor(t, "the handshake error", func() bool { return h.m.TLSHandshakeErrorsTotal[obs.TransportTLS].Load() == 1 })
 
 	c, err := dialTLS(t, tr.Addr(), p, &p.client, 0)
 	if err != nil {
@@ -332,7 +332,7 @@ func TestTLSHandshakeTimeout(t *testing.T) {
 	tr := startTLS(t, h, p, TLSConfig{ClientAuth: ClientAuthNone, HandshakeTimeout: 150 * time.Millisecond})
 	c := dial(t, tr.Addr())
 	expectClosed(t, c)
-	waitFor(t, "the handshake error", func() bool { return h.m.TLSHandshakeErrorsTotal.Load() == 1 })
+	waitFor(t, "the handshake error", func() bool { return h.m.TLSHandshakeErrorsTotal[obs.TransportTLS].Load() == 1 })
 }
 
 // SPEC §4.6: the PROXY header comes in clear BEFORE the handshake.

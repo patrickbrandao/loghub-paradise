@@ -85,14 +85,22 @@ número da seção.
 | Prazo de escrita HTTP (2026-10-31) | 10 s **contados da resposta**: o handler desarma o prazo que o `net/http` arma no fim dos cabeçalhos e o rearma antes de cada resposta. | Corpo lento + espera do ring passavam de 10 s: o documento entrava e o `202` se perdia (o cliente reenviava com outro `uuid`); correção do W de 2026-10-14 | §4.5 |
 | `chunk_overflow` (2026-10-31) | Uma vez por mensagem: a mensagem recusada pelo teto de bytes vira lápide (nova ou aberta); com `max_messages` cheio, cada chunk conta (não há onde lembrar). | Antes, até `count` descartes por mensagem e uma dupla contagem com `chunk_timeout`, justamente na saturação | §5.2 |
 | Número fora do `numeric` (2026-10-31, portado do GP) | Na cópia da `loghub.inbox`, o número de `fields`/`extra` que o `jsonb` não guarda vai como string do texto; mantissa toda zero cabe com qualquer expoente positivo. | `1e1000000` num campo era `22003` e derrubava o pedaço inteiro | §3.7.1 |
+| Remontagem UDP em shards (2026-11-07) | 64 shards por hash com semente de `(src-ip, src-port, id)`, um mutex cada; `max_bytes` e `max_messages` continuam globais, em contadores atômicos reservados por CAS. Portado igual a GP e GN. | Medido: com um mutex, 4 e 8 listeners não passavam da vazão de 1–2 (106–189 k chunks/s); com os shards, 210–291 k com 8, perto do teto sem compartilhamento | §5.2 |
+| Handshake do `https` contado (2026-11-07) | O `ErrorLog` do `http.Server` é um escritor que não loga: conta a linha `http: TLS handshake error from` em `gelf_tls_handshake_errors_total{transport="https"}`, com aviso amostrado. O contador ganhou o label `transport` (tls, https). | Handshake no listener serializaria o accept atrás do cliente mais lento; embrulhar a conexão depende de um `net/http` que reconheça TLS por interface | §4.7, §14.1 |
+| Validação dupla com filtro (2026-11-07) | Fica. Medida ponta a ponta: +1,1 a +1,6 µs de CPU por documento (~20–25 %) com o filtro ativo. | O `level` filtrado é o emitido por construção, e o descarte é antes do ring; guardar a varredura no cabeçalho mudaria o item em todos os rings e no dump | §7 |
+| Tipo do número no ClickHouse (2026-11-07) | `fields`/`extra` continuam `Map(String, String)`, texto exato; tipo, se um dia, por *hint* tipado de nomes conhecidos, nunca inferência. | A inferência reescreve o texto e recusa o pedaço com `1e400` | §3.7.2 |
+| `raw` em base64 na cópia da `loghub.inbox` (2026-11-07) | Um `raw` UTF-8 com NUL real sai em base64 só nessa cópia; o consumidor decodifica pelo `raw-encoding`. | O `jsonb` não guarda U+0000, e o `raw` é o único campo que precisa ser exato | §3.7.1 |
 
 ## 3. Riscos conhecidos
 
 - O `level` de topo é lido na recepção só com filtro ativo: com filtro, o
-  documento é validado duas vezes (recepção e dreno). Medido em
-  `BenchmarkScanLevel`.
-- A remontagem UDP é estado compartilhado sob um mutex: com `udp_listeners > 1`
-  e chunks em massa, ele é o ponto de contenção. Fragmentar em shards fica para
-  quando houver medida (SPEC §22.1).
+  documento é validado duas vezes (recepção e dreno). Medido em 2026-11-07:
+  `BenchmarkLevelOf` (0,55 µs contra 2,1 µs da conversão) e ponta a ponta
+  `TestMeasureFilterDoubleValidation` (+1,1 a +1,6 µs de CPU por documento,
+  ~20–25 %; SPEC §7). Aceito.
+- A remontagem UDP é estado compartilhado: desde 2026-11-07 em 64 shards, com
+  os tetos globais atômicos (SPEC §5.2). O que resta compartilhado por desenho
+  são os dois contadores dos tetos e o alocador.
 - `fields` como `Map(String, String)` no ClickHouse perde o tipo do número (vira
   o texto). O `env` (o JLH íntegro) fica no `payload` de qualquer forma.
+  Decisão (SPEC §3.7.2).

@@ -142,8 +142,9 @@ específicas do syslog (unix datagram, charset legado, RFC 3164, framing,
 - **Dump grande na saída.** Converter todo o ring pendente custa CPU e disco no
   momento do incidente (até ~6× o cru).
 - **Servidores GELF no mesmo host** colidem no `admin.bind` padrão (9104).
-- **A remontagem UDP** é um mapa sob um mutex só (G §3), compartilhado pelos
-  `udp_listeners`.
+- **A remontagem UDP** era um mapa sob um mutex só (G §3), compartilhado pelos
+  `udp_listeners`; desde 2026-11-07 são 64 shards com os tetos globais
+  atômicos, porte de G depois da medida (SPEC §5.2).
 
 ## 5. Ordem de entrega
 

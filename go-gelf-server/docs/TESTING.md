@@ -126,9 +126,48 @@ go test -run XXX -bench . -benchmem ./internal/convert ./internal/ratelimit ./in
 | `BenchmarkTCPReceive` | socket real + moldura `\0` + pipeline até o ring de memória |
 | `BenchmarkFramer12K` | quadros de 12 KiB pelo leitor de 4 KiB (as classes do buffer de quadro, SPEC §5.3) |
 | `BenchmarkAllowSameKey`, `BenchmarkAllowSpreadKeys` | rate-limit, um emissor e emissores espalhados |
+| `BenchmarkReassemblerParallel`, `…Interleaved` | a seção crítica da remontagem UDP (§5.2) com `-cpu N` emissores, `onelock` (o mapa único de antes) contra `sharded` |
+| `BenchmarkReassemblerSweep` | a varredura de um mapa cheio (16 384 mensagens abertas), nos dois arranjos |
+| `BenchmarkUDPChunkFlood` | N listeners de verdade em loopback, um emissor sem pausa por socket, leitura + `Add` como o `udpLoop`: `onelock`, `sharded` e `separate` (um remontador por listener, o teto) |
+| `TestMeasureFilterDoubleValidation` (`internal/app`, só com `GELF_MEASURE=1`) | ponta a ponta TCP → ring `memory` → dreno → `sink=none`, filtro desligado contra ligado: vazão e CPU por documento (SPEC §7) |
 
-Os números ainda não foram registrados neste módulo (lacuna 3). Não há
-benchmark da remontagem de chunks nem do servidor HTTP (lacuna 4).
+### Rodada de 2026-11-07 (remontagem, validação dupla)
+
+Apple M2 (8 núcleos, 4P+4E), 24 GB, macOS, Go 1.27.3. **A máquina estava
+carregada por outras suítes** (load 4–20): os números são faixas de 2–3
+rodadas, e a comparação vale entre colunas da mesma rodada, não como absoluto.
+
+```bash
+go test -run XXX -bench 'Reassembler' -benchmem -cpu 1,2,4,8 ./internal/receiver
+go test -run XXX -bench 'ChunkFlood' -benchtime 400000x -cpu 1,2,4,8 -count 3 ./internal/receiver
+go test -run XXX -bench 'ConvertDocker|LevelOf' -benchmem -count 3 ./internal/convert
+GELF_MEASURE=1 go test -run MeasureFilter -v -count=1 ./internal/app/
+```
+
+`BenchmarkUDPChunkFlood`, chunks/s (chunks de 1 408 B, 8 por mensagem):
+
+| `-cpu` | `onelock` | `sharded` | `separate` |
+|---|---|---|---|
+| 1 | 150–155 k | 98–148 k | 155–160 k |
+| 2 | 121–210 k | 183–242 k | 240–255 k |
+| 4 | 155–189 k | 225–243 k | 270–326 k |
+| 8 | 106–146 k | 210–291 k | 280–346 k |
+
+Seção crítica sem socket, ns/chunk (`onelock` → `sharded`):
+`ReassemblerParallel` 375→273 (`-cpu 4`), 406→355 (`-cpu 8`);
+`…Interleaved` 338→188 (`-cpu 4`), 398→360 (`-cpu 8`); 1 495 B e 2
+alocações por chunk nos dois (a cópia do chunk). `ReassemblerSweep`: 153–177 µs
+por varredura de 16 384 mensagens nos dois (com shards, a espera de um listener
+é a de um shard). Com `-cpu 1` os shards custam o hash a mais (~5–15 %, dentro do
+ruído desta rodada).
+
+Validação dupla (SPEC §7): `BenchmarkConvertDocker` 1 973–2 131 ns/op,
+`BenchmarkLevelOf` 527–557 ns/op (0 alocação); ponta a ponta, 200 000
+documentos de 444 B por uma conexão: filtro desligado 345–650 k docs/s e
+5,0–6,6 µs de CPU por documento, ligado 276–440 k docs/s e 7,3–7,9 µs.
+
+Os demais benchmarks desta tabela continuam sem números registrados (lacuna
+3). Não há benchmark do servidor HTTP (lacuna 4).
 
 ---
 
@@ -422,16 +461,20 @@ Registradas por honestidade, não por esquecimento.
 1. **Cobertura por pacote não medida** neste módulo.
 2. **Fuzz sem rodada registrada.** Os nove alvos existem e rodam; nenhuma
    rodada de 60 s nem de 10 min está anotada em §3.
-3. **Benchmarks sem números** deste módulo (§4).
-4. **Sem benchmark da remontagem de chunks nem do HTTP.** O mutex único da
-   remontagem (SPEC §22.1, item 1) é o candidato a gargalo com
-   `udp_listeners > 1`; nada mediu.
+3. **Benchmarks sem números** deste módulo (§4), fora os da remontagem e da
+   validação dupla (rodada de 2026-11-07), medidos numa máquina carregada.
+4. **Sem benchmark do servidor HTTP.** O da remontagem existe desde
+   2026-11-07 (§4); ele mede em loopback no macOS, com um socket por emissor
+   (o macOS não espalha UDP entre sockets `SO_REUSEPORT`): o espalhamento do
+   kernel Linux por 4-tupla não foi medido.
 5. **Os critérios de carga (SPEC §18.8) nunca foram medidos**, e a decisão de
    converter no dreno não foi medida contra a alternativa ponta a ponta. O
    `go-gelf-injector` existe para isso; `gelf_convert_duration_seconds` mede
    em produção.
-6. **Falhas de handshake do HTTPS não são contadas** (SPEC §22.1, item 2) e não
-   há teste de um cliente HTTPS com certificado errado no nível da app.
+6. **Falhas de handshake do HTTPS** são contadas desde 2026-11-07 (SPEC §4.7),
+   provadas no `receiver` (`TestHTTPSHandshakeErrorsAreCounted`: certificado
+   de outra CA, cliente que não confia no servidor, HTTP em claro); não há
+   teste no nível da app.
 7. **A bomba de descompressão** é provada pelo `FuzzDecompress` e por testes do
    leitor com teto; não há teste de memória de pico (RSS) com um gzip de
    razão 1000:1 chegando em paralelo por vários listeners.
