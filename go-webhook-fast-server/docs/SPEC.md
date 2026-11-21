@@ -2,7 +2,7 @@
 
 Status: **congelada para implementação** (escopo de 2026-10-06, abaixo)
 Data: 2026-10-06
-Linguagem: Go 1.25+
+Linguagem: Go 1.26+
 Repositório: `https://github.com/patrickbrandao/loghub-paradise` (monorepo)
 Module path: `github.com/patrickbrandao/loghub-paradise/go-webhook-fast-server`
 Binário: `go-webhook-fast-server`

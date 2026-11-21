@@ -42,7 +42,7 @@ Revisão: 2026-09-10 — `sink=postgres`, o quarto destino (§3.6, §8.5, §14.3
 Revisão: 2026-09-14 — posse de buffer nos caminhos de erro do `Enqueue` (§7.4, §7.5, §12.3); linhas repetidas de `X-Forwarded-For` e `X-Real-IP` (§5.2, §5.3); sonda de saúde do `sink=sqlite` por heartbeat (§8.3.5); erros permanentes do Redis são fatais (§8.2.4); tetos de conexão por servidor, não por listener (§13.5); duas referências na recarga por `SIGHUP` (§13.3); durações zero recusadas na validação (§13.5); `kind="timeout"` alimentado e sobras do `ring=sqlite` não contam como perda (§10.3, §11.1); nome do dump com nanossegundos (§9.1); aviso de `GOMEMLIMIT` por modo de ring (§12.4)
 Revisão: 2026-09-15 — revisão independente das correções: sonda do Redis por escrita (`XLEN` + `XADD NOMKSTREAM`), recusa permanente na discagem ou na sonda é fatal na hora (§8.2.4, §10.1); `ring=none` devolve os buffers ao pool após o `Write` (§12.3); tabela `health` no esquema (§3.3); `sink.retry_backoff_max` recusa zero e `sink.fail_timeout = 0` documentado (§13.5); aviso de `GOMEMLIMIT` qualificado por modo na tabela de §10.1
 Revisão: 2026-09-15 — `sink=mysql` e `sink=nats`, o quinto e o sexto destinos (§3.7, §3.8, §8.6, §8.7, §14.3): a matriz passa a dezoito combinações (§16); `sink.workers` rebaixado para 4 também com `sink=mysql` (§10.1)
-Linguagem: Go 1.25+ (desenvolvido e validado em 1.27)
+Linguagem: Go 1.26+ (desenvolvido e validado em 1.27)
 Repositório: `https://github.com/patrickbrandao/loghub-paradise` (monorepo)
 Module path: `github.com/patrickbrandao/loghub-paradise/go-webhook-server`
 Binário: `go-webhook-server`

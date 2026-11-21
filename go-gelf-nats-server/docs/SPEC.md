@@ -2,7 +2,7 @@
 
 Status: **congelada para implementação**
 Data: 2026-10-31
-Linguagem: Go 1.25+
+Linguagem: Go 1.26+
 Repositório: `https://github.com/patrickbrandao/loghub-paradise` (monorepo)
 Module path: `github.com/patrickbrandao/loghub-paradise/go-gelf-nats-server`
 Binário: `go-gelf-nats-server`
@@ -2685,9 +2685,9 @@ alvos de fuzz estão em §18.3.
 
 Transitivas que o `nats.go` põe no binário (`go list -deps ./cmd/go-gelf-nats-server`):
 `github.com/nats-io/nkeys` v0.4.15 (NKey e `.creds`), `github.com/nats-io/nuid`
-v1.0.1, `github.com/klauspost/compress` v1.18.5 (a compressão do transporte
+v1.0.1, `github.com/klauspost/compress` v1.20.2 (a compressão do transporte
 websocket do cliente, compilada mesmo com `ws://` recusado) e
-`golang.org/x/crypto` v0.49.0 (ed25519/nacl do `nkeys`).
+`golang.org/x/crypto` v0.59.0 (ed25519/nacl do `nkeys`).
 
 Só em teste: `github.com/santhosh-tekuri/jsonschema/v6` (contratos, §18.2).
 O `go.mod` é o de SN, sem mudança (`go mod tidy` não tira nem põe nada): gzip,
