@@ -12,7 +12,7 @@
 #
 # O contexto de build e' a raiz do modulo (go-gelf-nats-server/), NAO esta pasta.
 
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.27
 ARG ALPINE_VERSION=3.22
 
 # ----------------------------------------------------------------- build stage

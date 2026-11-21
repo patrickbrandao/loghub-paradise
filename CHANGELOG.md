@@ -20,6 +20,57 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-11-21 — Revisão completa; Go 1.26+ como piso, Go 1.27 nas imagens, dependências com CVE
+
+Pedido: revisão completa do projeto, um arquivo por problema ou proposta em
+`tasks/`. O relatório fica só na máquina local (a pasta é ignorada pelo git):
+`tasks/2026-11-21-000-indice.md` e 93 itens numerados por severidade (7 altos,
+40 médios, 46 baixos), mais os testes de reprodução dos revisores em
+`tasks/2026-11-21-reproducao/`. Doze revisões independentes por área, mais a
+verificação mecânica dos 18 módulos (fmt, vet, `-race`, `tidy`, govulncheck,
+golangci-lint), que passou limpa fora o que vai abaixo. 28 dos itens são
+correções ou testes presentes num irmão e ausentes noutro. Em seguida, as três
+trocas de versão do relatório (itens 005, 023 e 024) e, por decisão do usuário,
+o piso Go 1.26 em todos os módulos:
+
+- **Imagens (todos):** `ARG GO_VERSION=1.25` → `1.27` nos 18
+  `docker/Dockerfile`. O Go 1.25 saiu da janela de suporte com o lançamento do
+  1.27 e já não recebe correção de segurança da biblioteca padrão.
+- **Transitivas (14 módulos):** `klauspost/compress` → v1.20.2 (GO-2026-6865,
+  pânico em quadros de dois blocos) e, em W/F/S/R/G, `andybalholm/brotli` →
+  v1.2.7 (GO-2026-6888, alocação excessiva). Só eram alcançáveis em W/F/S/R/G,
+  pelo `clickhouse-go`; nos outros módulos a `klauspost` subiu também, para os
+  irmãos ficarem na mesma versão. O `clickhouse-go` fica na v2.48.0: a SPEC
+  §17.3 pede nova auditoria de posse de buffer a cada versão do driver.
+- **WI:** `golang.org/x/net` v0.57.0 → v0.63.0 (cinco CVEs de HTTP/2
+  alcançáveis pelo envio h2/h2c e pelo `Framer` do extrator). A versão corrigida
+  exige `go 1.26.0` (SPEC §2 do WI). O vet com a linguagem 1.26 reprovou dois
+  `t.Fatalf("%q", got)` sobre `[]rawReq` em `internal/app/round3_test.go`
+  (trocados por `%#v`; só a mensagem de falha).
+- **Piso Go 1.26 (todos, decisão do usuário):** `golang.org/x/crypto`
+  v0.49.0–v0.54.0 tinha GO-2026-6303, -6354, -6355 (`ssh`) e GO-2026-5932
+  (`openpgp`). Nenhum desses pacotes era linkado (da `x/crypto` só entram
+  `curve25519`, `blake2b` e `nacl`, pelo `nkeys` do NATS), mas um scanner de
+  imagem que olha só versões as acusaria, e a versão corrigida exige Go 1.26.
+  Os 18 `go.mod` passam a `go 1.26.0` (sem diretiva `toolchain`), com as mesmas
+  `x/crypto` v0.59.0, `x/sys` v0.50.0, `x/text` v0.44.0 e `x/sync` v0.25.0 em
+  todo módulo que as tem (nos cortes PG, sem `x/crypto`, a `x/text` subiu para
+  ficar igual). "Linguagem: Go 1.26+" nas 14 SPECs de servidor e no README
+  §6.1; as versões transitivas citadas nas SPECs de SN, RN e GN atualizadas.
+- **Lição:** o govulncheck padrão (modo fonte) só mostra o alcançável;
+  `-show verbose` lista também as vulnerabilidades dos módulos exigidos e não
+  chamados, e o modo binário num binário com `-s -w` (sem tabela de símbolos)
+  acusa pela versão do módulo, inclusive pacotes que nem estão linkados.
+- Verificação, depois do piso 1.26: fmt, build, vet, `tidy -diff`, `verify` e
+  `go test -race` verdes nos 18 módulos, e `govulncheck -show verbose` sem
+  achados nos 18 (nem no nível de símbolo, nem no de módulo). Um teste com prazo
+  do G (`TestTCPHeldMessageIsChargedOnce`) falhou uma vez numa rodada anterior,
+  com dois builds Docker ao lado, e passou 20 de 20 isolado e na rodada final.
+  As imagens do WI e do S foram construídas com `golang:1.27-alpine` (antes do
+  piso 1.26); os binários têm go1.27.4 e o do WI passa limpo em
+  `govulncheck -mode=binary`. `FuzzStream` do WI por 60 s (2,3 milhões de
+  execuções) sem crash.
+
 ## 2026-11-07 — Valkey ao lado do Redis; todas as pendências conhecidas fechadas
 
 Pedido: Valkey suportado no mesmo nível do Redis em todo lugar onde o Redis

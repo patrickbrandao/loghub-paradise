@@ -137,7 +137,7 @@ func TestReplayKeepsHeaderOrder(t *testing.T) {
 	want := []string{"Host: hooks.example", "X-Zeta: 1", "x-forwarded-for: 10.0.0.1, 10.0.0.2, 192.0.2.10", "content-type: text/plain",
 		"X-Alpha: a", "X-Zeta: 2", "X-Extra: e", "Content-Length: 2"}
 	if len(got) != 1 || strings.Join(got[0].fields, "|") != strings.Join(want, "|") || got[0].body != "ok" {
-		t.Fatalf("%q", got)
+		t.Fatalf("%#v", got)
 	}
 }
 
@@ -179,7 +179,7 @@ func TestReplayH2C(t *testing.T) {
 	if len(got) != 2 || got[0].line != "GET /h2/two HTTP/1.1" || got[1].line != "POST /h2/one HTTP/1.1" ||
 		strings.Join(got[1].fields, "|") != "Host: h2.example|x-b: 2|content-type: application/json|x-a: 1|Content-Length: 7" ||
 		got[1].body != `{"n":1}` {
-		t.Fatalf("%q", got)
+		t.Fatalf("%#v", got)
 	}
 	// And over HTTP/2 to an h2c server.
 	f := newFake(t, "h2c")

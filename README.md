@@ -3036,7 +3036,10 @@ flowchart LR
 
 ### 6.1 Requisitos comuns
 
-- **Go 1.25+**, só para compilar. Os binários não têm dependência de sistema.
+- **Go 1.26+**, só para compilar (as versões corrigidas de `golang.org/x/crypto`
+  e `golang.org/x/net` exigem 1.26). Os binários não têm dependência de sistema.
+  As imagens Docker compilam com Go 1.27 (`ARG GO_VERSION` de cada
+  `docker/Dockerfile`).
 - **Docker com Compose**, para as stacks de exemplo.
 - Cada destino precisa de uma versão mínima: PostgreSQL 18, MySQL 8.4,
   ClickHouse 25.8, Redis 7 e NATS 2.11+ com JetStream. No Redis, a

@@ -2,7 +2,7 @@
 
 Status: **congelada para implementação**
 Data: 2026-10-07
-Linguagem: Go 1.25+
+Linguagem: Go 1.26+
 Repositório: `https://github.com/patrickbrandao/loghub-paradise` (monorepo)
 Module path: `github.com/patrickbrandao/loghub-paradise/go-syslog-pg-server`
 Binário: `go-syslog-pg-server`

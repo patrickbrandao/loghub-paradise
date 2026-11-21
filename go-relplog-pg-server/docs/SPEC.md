@@ -2,7 +2,7 @@
 
 Status: **congelada para implementação**
 Data: 2026-10-13
-Linguagem: Go 1.25+
+Linguagem: Go 1.26+
 Repositório: `https://github.com/patrickbrandao/loghub-paradise` (monorepo)
 Module path: `github.com/patrickbrandao/loghub-paradise/go-relplog-pg-server`
 Binário: `go-relplog-pg-server`

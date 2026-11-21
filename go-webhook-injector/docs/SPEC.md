@@ -113,8 +113,13 @@ remontagem continuam só na biblioteca padrão (o HTTP/2 em claro usa
 os servidores já usam, **nas mesmas versões** do `go-webhook-server/go.mod`,
 para ler os destinos da conferência (§8.6) — `nats.go` v1.53.1, `pgx/v5`
 v5.11.0, `rueidis` v1.0.77, `modernc.org/sqlite` v1.58.0 (puro Go: o binário
-continua `CGO_ENABLED=0`) — e `golang.org/x/net` v0.57.0, cujo `http2.Framer`
-e `hpack` decodificam o h2c capturado (§6.8; decisão do usuário).
+continua `CGO_ENABLED=0`) — e `golang.org/x/net` v0.63.0, cujo `http2.Framer`
+e `hpack` decodificam o h2c capturado (§6.8; decisão do usuário). A v0.57.0
+original tinha cinco vulnerabilidades de HTTP/2 alcançáveis pelo envio h2/h2c e
+pelo `Framer` (GO-2026-6603, -6610, -6611, -6612, -6617, corrigidas na
+v0.60.0); a atualização de 2026-11-21 exige **Go 1.26** para compilar (o
+`go.mod` passou de `go 1.25.0` para `go 1.26.0`, como o dos outros módulos do
+monorepo na mesma data, pela `golang.org/x/crypto` corrigida).
 
 ---
 
