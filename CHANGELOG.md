@@ -63,13 +63,28 @@ o piso Go 1.26 em todos os módulos:
   acusa pela versão do módulo, inclusive pacotes que nem estão linkados.
 - Verificação, depois do piso 1.26: fmt, build, vet, `tidy -diff`, `verify` e
   `go test -race` verdes nos 18 módulos, e `govulncheck -show verbose` sem
-  achados nos 18 (nem no nível de símbolo, nem no de módulo). Um teste com prazo
+  achados nos 18 (nem no nível de símbolo, nem no de módulo). As suítes completas
+  dos 18 também rodaram contra PostgreSQL 18, MySQL 8.4, ClickHouse 25.8, Redis 7
+  e NATS reais (`tasks/infra`, com os emissores): seis pacotes falharam na
+  primeira rodada por ambiente — o certificado TLS do NATS de teste, gerado com
+  30 dias em 14/10, tinha vencido, e o `env.sh` aponta para o PostgreSQL de 100
+  conexões com um banco só — e passaram repetidos com certificado novo e o
+  ambiente do `tasks/run2.sh` (PostgreSQL de 600 conexões, banco por módulo).
+  Lição: o `up.sh` só gera o certificado quando ele não existe. Um teste com prazo
   do G (`TestTCPHeldMessageIsChargedOnce`) falhou uma vez numa rodada anterior,
   com dois builds Docker ao lado, e passou 20 de 20 isolado e na rodada final.
   As imagens do WI e do S foram construídas com `golang:1.27-alpine` (antes do
   piso 1.26); os binários têm go1.27.4 e o do WI passa limpo em
   `govulncheck -mode=binary`. `FuzzStream` do WI por 60 s (2,3 milhões de
   execuções) sem crash.
+- **Versões (patch em todos, sem mudança de comportamento):** S e R v1.3.1,
+  G v1.1.1, W e F v1.2.1, SP/SN/RP/RN v1.2.2, P e N v1.1.2, GP e GN v1.0.2,
+  SI/RI/WI/GI v0.2.1; a standard segue sem tag. Release do repositório
+  `v2026.11.21`, com os binários linux/darwin amd64/arm64 (agora com a versão
+  e o commit embutidos: os da `v2026.11.07` se identificavam como `dev`) e o
+  `SHA256SUMS`. Imagens `tmsoftbrasil/<módulo>:<versão>` e `:latest`,
+  multi-arch, para os 13 servidores e o GI (os repositórios que já existiam).
+  O exemplo de `go install` do README (§6.1) passa a usar `@latest`.
 
 ## 2026-11-07 — Valkey ao lado do Redis; todas as pendências conhecidas fechadas
 
