@@ -3052,10 +3052,11 @@ cd go-syslog-server
 CGO_ENABLED=0 go build -tags osusergo,netgo -o go-syslog-server ./cmd/go-syslog-server
 ```
 
-Ou instalar uma versão publicada:
+Ou instalar a versão publicada mais recente (`@latest` resolve a tag mais alta
+do módulo; para uma fixa, a tag `go-syslog-server/v1.3.1` vira `@v1.3.1`):
 
 ```bash
-go install github.com/patrickbrandao/loghub-paradise/go-syslog-server/cmd/go-syslog-server@v1.2.0
+go install github.com/patrickbrandao/loghub-paradise/go-syslog-server/cmd/go-syslog-server@latest
 ```
 
 Também há binários prontos em cada [release](https://github.com/patrickbrandao/loghub-paradise/releases), com `SHA256SUMS`.
