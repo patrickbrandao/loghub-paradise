@@ -93,7 +93,12 @@ sem nada contar.
   nunca passou dos 32 KiB que levam a escrita para dentro da publicação. E uma
   espera sem prazo no shutdown é um defeito mesmo quando "todo `Write` respeita
   o contexto": basta um que não respeite.
-- Nada versionado: sem tags nem release nesta rodada.
+- **Versões (patch nos 13 servidores com tag):** S e R v1.3.2, G v1.1.2, W e F
+  v1.2.2, SP/SN/RP/RN v1.2.3, P e N v1.1.3, GP e GN v1.0.3; a standard segue sem
+  tag, e os injetores, sem mudança, ficam na v0.2.1. Release do repositório
+  `v2026.11.23`, com os binários linux/darwin amd64/arm64 dos 13 servidores e o
+  `SHA256SUMS` (os dos injetores seguem na `v2026.11.21`). Imagens
+  `tmsoftbrasil/<módulo>:<versão>` e `:latest`, multi-arch, para os 13 servidores.
 
 ## 2026-11-21 — Revisão completa; Go 1.26+ como piso, Go 1.27 nas imagens, dependências com CVE
 
