@@ -236,11 +236,17 @@ nats --server nats://127.0.0.1:14222 sub 'loghub._ctl.beacon'     # o heartbeat
 ## 9. Armadilhas que já custaram bugs reais (herdadas do pai, do molde e da standard)
 
 - **`nats.go`: `WithRetryAttempts(0)`, `ReconnectBufSize(-1)`,
-  `WithPublishAsyncTimeout(sink.op_timeout)`.** A retentativa interna relê
+  `WithPublishAsyncTimeout(sink.op_timeout)`, `FlusherTimeout(sink.op_timeout)`
+  e a discagem própria (`sink/natsconn.go`).** A retentativa interna relê
   `msg.Data` depois de o `Write` voltar (corrida de posse de buffer); o buffer
   de reconexão é uma fila escondida fora do ring, do backpressure e do dump; um
-  futuro sem prazo segura o buffer do pedaço para sempre. Se você "simplificar",
-  os testes não reclamam.
+  futuro sem prazo segura o buffer do pedaço para sempre. O `FlusherTimeout`
+  padrão é **1 minuto** e a publicação não recebe contexto: sem ele o
+  `op_timeout` não limita a escrita num par que parou de ler, e sem o socket
+  fechado no primeiro prazo perdido cada worker espera o seu, em fila (item 001
+  da revisão de 2026-11-21, SPEC §10.7). Se você "simplificar", só o
+  `TestNATSOptionsBoundTheSocketWrite` e os testes do servidor falso de
+  `nats_stall_test.go` reclamam.
 - **O JLH vai em `Data`, nunca num header NATS.** O JetStream recusa headers
   acima de 64 KiB (`10097`): um hostname longo num header viraria o fim do
   processo. O bloco de headers é fixo, ≤ 256 B.
@@ -329,6 +335,13 @@ nats --server nats://127.0.0.1:14222 sub 'loghub._ctl.beacon'     # o heartbeat
 - **Lote retido não está no ring.** O shutdown coleta `Workers.Pending()`; o
   `hold` faz `append`, nunca atribuição. E os dois tetos do ring contam o lote
   retido.
+- **O shutdown espera os workers com prazo** (`WaitFor(sink.op_timeout)`,
+  SPEC §13.4), nunca com um `Wait` sem prazo: uma publicação NATS sem prazo de
+  escrita (e, no pai, um `COMMIT` preso num `fsync`) segurava o dump e o exit 3
+  para sempre (item 016 da revisão de 2026-11-21). Estourado o prazo, o
+  `Pending` toma o pedaço do worker preso, e o `settle` (sob o `holdMu`,
+  **antes** do `Commit` e do `Release`, dentro do `confirm`) faz o worker que
+  voltar tarde não resolver nada.
 - **Contar o que se segura:** o ring conta `cap(cru)` + `ItemOverhead` (256 B),
   não `len(cru)`. `TestItemOverheadCoversTheStruct` falha se a struct crescer.
 - **Fronteira de histograma como string** pré-formatada na inicialização.

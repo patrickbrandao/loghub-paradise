@@ -239,6 +239,12 @@ congelado gravou, ao voltar, 8 publicações que estavam no buffer TCP; a
 reingestão as viu como duplicatas (`whs_sink_nats_duplicates_total 8`) e o
 stream terminou com os 35 únicos.
 
+Os 20 eventos eram pequenos: nunca passaram dos 32 KiB que fazem o `nats.go`
+descarregar dentro da publicação, e por isso o `docker pause` não mostrou que a
+escrita esperava o minuto do `FlusherTimeout` padrão (item 001 da revisão de
+2026-11-21, SPEC §8.7.1). Esse caso é provado agora pelo servidor falso de
+`internal/sink/nats_stall_test.go`, não pelo compose.
+
 ## 6. Carga (SPEC §15.4)
 
 ```bash
@@ -617,3 +623,18 @@ uma vez; aqui não chegou a falhar. O `serve` registra o cliente sob a mesma
 trava da checagem de pausa, e o `pipe`, depois de discar, só segue se o cliente
 ainda está no mapa: um `Pause` (mesmo seguido de `Resume`) durante a discagem
 corta o par.
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Os dois achados do shutdown preso, corrigidos juntos porque o primeiro era o
+gatilho do segundo aqui. Ordem por item: SPEC (§8.7.1, §10.3, §14), teste
+falhando contra o código de antes, correção, mutação (só a parte revertida).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§8.7.1) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`) | `returned after 1m0.251s: publish: write tcp …: i/o timeout`; `Health with a 1s deadline returned after 59.743s` | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket (§8.7.1) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers, 16 envelopes de 2 MiB), `TestStallConnClosesAtTheFirstMissedWriteDeadline` | `the workers did not return within 5s of the cancel` (com o prazo e sem o fechamento; 0,2 s com ele) | sem `SetCustomDialer` |
+| 001 — as opções conferidas | `TestNATSOptionsNeverAskForTLS` | `CustomDialer is <nil>` | idem |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§10.3) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal,sigterm}` (destino cuja escrita ignora o contexto) | `exit -1 after 15.001s, want 3 with the dump`; `after 1m0.002s` | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o lote do dump (§10.3) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits … want 0`, `held item 0 was released`; o ramo `logic` sem `settle`: `3 events counted dropped` |
+

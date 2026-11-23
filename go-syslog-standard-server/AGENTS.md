@@ -368,6 +368,13 @@ Todas se aplicam aqui, porque o desenho é o mesmo.
   shutdown o mantém registrado; se o laço chamar `Dequeue` outra vez ele pode
   voltar com um segundo lote e gravá-lo por cima. `hold` faz `append`, nunca
   atribuição, e `deliver` devolve se a posse mudou de mãos.
+- **O shutdown espera os workers com prazo** (`WaitFor(sink.op_timeout)`,
+  `SPEC.md` §12.3), nunca com um `Wait` sem prazo: um `COMMIT` preso num
+  `fsync` segurava o dump e o exit 3 para sempre (item 016 da revisão de
+  2026-11-21). Estourado o prazo, o `Pending` toma o lote do worker preso, e o
+  `settle` (sob o `holdMu`, **antes** do `Commit` e do `Release`; aqui ele
+  apaga o registro do worker inteiro, que segura um lote por vez) faz o worker
+  que voltar tarde não resolver nada.
 - **Chave primária no `ring=sqlite`.** Perder a identidade do item na releitura
   já descartou 149 de 150 eventos por colisão. A coluna `id` é separada do
   `head` por isso.
@@ -392,6 +399,14 @@ Todas se aplicam aqui, porque o desenho é o mesmo.
   sozinho em segundo plano, relendo `msg.Data` depois do retorno.
   `WithRetryAttempts(0)`, sempre; quem retenta é o worker. E
   `ReconnectBufSize(-1)`: o ring é o único buffer.
+- **O `FlusherTimeout` padrão do `nats.go` é 1 minuto**, e a publicação não
+  recebe contexto: sem `FlusherTimeout(sink.op_timeout)` o `op_timeout` não
+  limita a escrita num par que parou de ler, e sem a discagem própria
+  (`sink/natsconn.go`, por baixo do TLS), que fecha o socket no primeiro prazo
+  perdido, cada worker espera o seu, em fila (item 001 da revisão de
+  2026-11-21, `SPEC.md` §10.8.1). Se você "simplificar", só o
+  `TestNATSOptionsBoundTheSocketWrite` e os testes do servidor falso de
+  `nats_stall_test.go` reclamam.
 
 ### E as que são desta pasta
 

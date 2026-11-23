@@ -51,6 +51,11 @@ type Workers struct {
 	// is what lets Pending() hand them to the emergency dump of SPEC §11.
 	holdMu sync.Mutex
 	held   map[int][]*envelope.Item
+
+	// surrendered is set, under holdMu, by Pending: from then on the
+	// registration belongs to the shutdown, and a worker whose write returns
+	// late settles nothing (settle, SPEC §12.3).
+	surrendered bool
 }
 
 func NewWorkers(r ring.Ring, s Sink, h *Health, cfg WorkerConfig, log *slog.Logger, m *obs.Metrics) *Workers {
@@ -84,11 +89,47 @@ func (w *Workers) Start(ctx context.Context) {
 // Wait blocks until every worker has returned.
 func (w *Workers) Wait() { w.wg.Wait() }
 
+// WaitFor waits up to d for every worker to return, and reports whether they
+// all did.
+//
+// The shutdown waits with this, not Wait (SPEC §12.3). Cancelling the
+// workers' context ends a write only if the write honours it, and not every
+// one does: a COMMIT stuck in fsync does not, and a NATS publish did not
+// until its socket had a deadline. An unbounded Wait held the shutdown there
+// -- no dump, no exit 3 -- until the orchestrator's SIGKILL took the ring
+// with nothing counting it (review of 2026-11-21, item 016). A false return
+// leaves those workers running; Pending then takes what they hold away from
+// them.
+func (w *Workers) WaitFor(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
 func (w *Workers) loop(ctx context.Context, id int) {
 	prep := NewPrep(w.cfg.NodeID, w.cfg.Parse, w.m)
 	defer prep.Release()
 
 	for {
+		if ctx.Err() != nil {
+			// The shutdown. Checked before every Dequeue, not left to it:
+			// Dequeue races the cancellation against a ring that still holds
+			// a backlog, and a worker that came back late from a stuck write
+			// (WaitFor gave up on it) would take a batch out of the ring
+			// after the shutdown collected what the workers hold -- in
+			// neither the ring nor the dump.
+			return
+		}
 		items, err := w.ring.Dequeue(ctx, w.cfg.Batch)
 		if err != nil {
 			// ring=none parks here until shutdown; every other mode only gets
@@ -166,6 +207,12 @@ func (w *Workers) deliver(ctx context.Context, prep *Prep, items []*envelope.Ite
 
 		if err == nil {
 			w.m.EventsWrittenTotal.Add(uint64(len(items)))
+			if !w.settle(id) {
+				w.log.Warn("a write the shutdown gave up on was delivered after all; "+
+					"its events were collected by the shutdown too",
+					"worker", id, "count", len(items))
+				return false
+			}
 			if err := w.ring.Commit(items); err != nil {
 				w.log.Error("ring commit failed after a successful write; "+
 					"the events are delivered but the ring may redeliver them",
@@ -177,7 +224,6 @@ func (w *Workers) deliver(ctx context.Context, prep *Prep, items []*envelope.Ite
 			for _, it := range items {
 				it.Release()
 			}
-			w.unhold(id)
 			return true
 		}
 
@@ -193,6 +239,12 @@ func (w *Workers) deliver(ctx context.Context, prep *Prep, items []*envelope.Ite
 			// The destination is alive and refused this data permanently.
 			// Retrying cannot help, so drop it -- loudly, and counted.
 			w.m.SinkErrorsTotal[obs.SinkErrLogic].Inc()
+			if !w.settle(id) {
+				// The shutdown already took the batch, refused messages
+				// included: counted here, they would count again when the
+				// reingestion meets the same refusal.
+				return false
+			}
 			w.m.EventsDroppedTotal[obs.EventDropSinkLogic].Add(uint64(len(items)))
 			ids := make([]string, 0, len(items))
 			for _, it := range items {
@@ -204,7 +256,6 @@ func (w *Workers) deliver(ctx context.Context, prep *Prep, items []*envelope.Ite
 				it.Release()
 			}
 			_ = w.ring.Commit(items)
-			w.unhold(id)
 			return true
 		}
 
@@ -268,10 +319,24 @@ func (w *Workers) hold(id int, items []*envelope.Item) {
 	w.holdMu.Unlock()
 }
 
-func (w *Workers) unhold(id int) {
+// settle takes a batch whose ownership is moving on out of the registration,
+// and reports whether it may move on. False means Pending has already taken
+// the registration while this worker was still inside its write (WaitFor gave
+// up on it): the batch is the shutdown's, and the caller must neither Commit
+// nor Release it -- a Release would hand buffers the dump reads back to the
+// pool, a Commit would delete rows ring=sqlite keeps for the next boot -- and
+// must stop (SPEC §12.3).
+//
+// It runs BEFORE the Commit and the Release, under the same lock as Pending,
+// so the two cannot both take a batch.
+func (w *Workers) settle(id int) bool {
 	w.holdMu.Lock()
+	defer w.holdMu.Unlock()
+	if w.surrendered {
+		return false
+	}
 	delete(w.held, id)
-	w.holdMu.Unlock()
+	return true
 }
 
 // Held counts the items the workers hold right now, without taking them: what
@@ -287,19 +352,29 @@ func (w *Workers) Held() int {
 	return n
 }
 
-// Pending returns the batches the workers were still holding when they stopped.
+// Pending hands over the batches the workers hold and ends the workers' claim
+// on them.
 //
-// Call it only after Wait: a running worker may still deliver its batch, and
-// taking the items from under it would either duplicate them or release their
-// buffers twice.
+// Call it after Wait, or after a WaitFor that gave up. In the second case a
+// worker may still be inside a write that ignores its context; settle makes
+// sure that when the write returns the worker neither commits nor releases
+// what is now the shutdown's, and every item is tainted, so that no Release
+// pools a buffer the stuck write may still be reading (SPEC §12.3, §14.2). A
+// write that still delivers puts its messages in the destination and in the
+// dump (or, with ring=sqlite, delivers them again at the next boot):
+// at-least-once.
 func (w *Workers) Pending() []*envelope.Item {
 	w.holdMu.Lock()
 	defer w.holdMu.Unlock()
+	w.surrendered = true
 
 	var out []*envelope.Item
 	for id, items := range w.held {
 		out = append(out, items...)
 		delete(w.held, id)
+	}
+	for _, it := range out {
+		it.Taint()
 	}
 	return out
 }

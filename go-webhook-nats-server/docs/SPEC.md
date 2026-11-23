@@ -916,6 +916,27 @@ publicar falha na hora com classe `network`, em vez de guardar mensagens dentro
 do cliente. O ring é o único buffer deste desenho, e uma fila escondida no
 cliente escaparia da contabilidade, do `429` e do dump.
 
+**A escrita no socket tem o prazo de `sink.op_timeout`, e o socket é fechado
+no primeiro prazo perdido** (item 001 da revisão de 2026-11-21). A publicação
+do `nats.go` não recebe contexto, e o prazo de escrita do cliente
+(`FlusherTimeout`) é de 1 minuto por padrão; acima de 32 KiB no buffer, o
+cliente descarrega na própria chamada, segurando a trava da conexão. Contra um
+par que para de ler sem RST (host congelado, contêiner pausado, partição que
+descarta pacotes), o primeiro worker esperava o minuto e recebia `i/o
+timeout`, a conexão continuava `CONNECTED` com um quadro meio escrito, e o
+worker seguinte esperava o seu minuto no mesmo socket cheio: 8 workers eram 8
+minutos em fila, com o `Health` e o `Close` atrás da mesma trava. O
+`sink.op_timeout` não limitava nada, e o shutdown estourava o
+`stop_grace_period` antes do dump. Agora o prazo é `FlusherTimeout(sink.op_timeout)`
+e a discagem é do próprio sink (`SetCustomDialer`), que embrulha o socket: a
+primeira escrita que perde o prazo o **fecha**, com um `WARN`. As escritas
+seguintes falham na hora (`network`, sem buffer de reconexão), a leitura do
+cliente vê o fechamento e reconecta, e o quadro meio escrito nunca é
+continuado. O pior caso de um lote em voo volta a ser um `sink.op_timeout`, não
+um por worker. Custo: o `nats.go` dividia o prazo de discagem entre os
+endereços de um nome com vários, e uma discagem própria não sabe quantos são;
+cada endereço tem o prazo inteiro.
+
 A desconexão é logada em `WARN` (a do próprio `Close` não: um `WARN` em todo
 desligamento limpo ensinaria o operador a ignorar o que significa uma queda); a
 reconexão conta em `whs_sink_nats_reconnects_total`, é logada em `WARN` e
@@ -1785,6 +1806,24 @@ começava o dump em duas vezes o `drain_timeout` — além de um
 respondido com `200`, sem nada contar. O pior caso até o dump começar é
 `pre_stop_delay + drain_timeout + sink.op_timeout` (o lote em voo de um worker),
 e o `stop_grace_period` precisa cobri-lo com folga para o próprio dump.
+
+**A espera pelos workers tem esse prazo** (item 016 da revisão de 2026-11-21).
+Parados os workers, o shutdown espera no máximo `sink.op_timeout` que voltem:
+uma escrita que respeita o cancelamento volta na hora. Uma que não respeita (a
+publicação NATS sem o prazo de §8.7.1, ou qualquer escrita futura presa abaixo
+do contexto) segurava um `Wait` sem prazo para sempre — nada de dump, nada de
+exit 3 —, até o `SIGKILL` do orquestrador levar o ring, respondido com `200`,
+sem nada contar. Estourado o prazo, um `ERROR` diz que a escrita ignorou o
+shutdown, e o recolhimento segue: o `Pending` toma dos workers presos o que
+eles seguram, sob a trava do registro, e o worker que um dia voltar da escrita
+não resolve nada — nem `Commit`, nem `Release` (que devolveria ao pool o buffer
+que o dump lê), nem perda contada —: o lote é do dump. Os itens recolhidos são
+contaminados (`Taint`, §12.3), e nenhum `Release` posterior os devolve ao pool.
+Uma escrita presa que acabe entregando deixa o lote no stream **e** no dump
+(at-least-once; a reingestão o deduplica dentro da `duplicate_window`). O
+`Close` do sink é pulado, porque pode esperar a trava da escrita presa; o
+processo está saindo. Um worker confere o cancelamento antes de cada `Dequeue`,
+e um que volte tarde nunca tira outro lote de um ring já recolhido.
 
 **O ring é selado antes do último `Drain`** (achado pela revisão independente
 do porte para o P, o fast e o W, 2026-10-11; aqui desde o porte de volta do
@@ -2778,9 +2817,11 @@ Acrescentar uma dependência de produção exige justificativa nesta seção.
   oficial, Go puro, e o pacote `jetstream` é a API atual.
 - **As opções que não são as padrões** (§8.7.1, §8.7.2) são parte da
   justificativa: `WithRetryAttempts(0)`, `ReconnectBufSize(-1)`,
-  `WithPublishAsyncTimeout` e o `TLSCertCB` que recusa. Uma versão nova do
-  cliente pede a mesma auditoria de posse de buffer (a biblioteca não pode ler
-  `msg.Data` depois de a publicação voltar) e de TLS automático.
+  `WithPublishAsyncTimeout`, `FlusherTimeout(sink.op_timeout)` com a discagem
+  própria que fecha o socket no primeiro prazo perdido, e o `TLSCertCB` que
+  recusa. Uma versão nova do cliente pede a mesma auditoria de posse de buffer
+  (a biblioteca não pode ler `msg.Data` depois de a publicação voltar), de TLS
+  automático e de onde a escrita no socket pode esperar sem prazo.
 - **Transitivas.** `nkeys` e `nuid` (do próprio projeto NATS),
   `klauspost/compress` (compressão do transporte websocket, que este servidor
   recusa) e `golang.org/x/crypto` (as chaves NKey). Nenhuma abre socket por

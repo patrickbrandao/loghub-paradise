@@ -275,6 +275,14 @@ DATADIR=/tmp/rlpg-data AGENT_NAME=go-relplog-pg-server HOSTNAME=dev-mac \
 - **Posse de buffer.** O item é dono do cru; volta ao pool **uma vez**, após a
   confirmação. Na dúvida, `Discard`/`Taint` e deixe para o GC.
 - **Lote retido não está no ring.** O shutdown coleta `Workers.Pending()`.
+- **O shutdown espera os workers com prazo** (`WaitFor(sink.op_timeout)`,
+  SPEC §13.4), nunca com um `Wait` sem prazo: no R, um `COMMIT` preso num
+  `fsync` segurava o dump e o exit 3 para sempre, com o `200` RELP já dado
+  (item 016 da revisão de 2026-11-21). O pgx respeita o contexto, mas o
+  shutdown não depende disso. Estourado o prazo, o `Pending` toma o pedaço do
+  worker preso, e o `settle` (sob o `holdMu`, **antes** do `Commit` e do
+  `Release`, dentro do `confirm`) faz o worker que voltar tarde não resolver
+  nada.
 - **O dump nasce com nome temporário** (`.emg-…jsonl.tmp`, `fsync`, `link` ou
   `rename` conferido, `fsync` do diretório); um `.tmp` que sobra nunca é listado
   e é informado no boot (`Leftovers`).

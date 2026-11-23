@@ -304,12 +304,16 @@ idênticas em toda instância.
 Registradas em `docs/TESTING.md` §9. As que mais reincidem:
 
 - **`nats.go`: `WithRetryAttempts(0)`, `ReconnectBufSize(-1)`,
-  `WithPublishAsyncTimeout(sink.op_timeout)`.** A retentativa interna relê
+  `WithPublishAsyncTimeout(sink.op_timeout)`, `FlusherTimeout(sink.op_timeout)`
+  e a discagem própria (`natsconn.go`).** A retentativa interna relê
   `msg.Data` depois de o `Write` voltar (corrida de posse de buffer); o buffer
   de reconexão é uma fila escondida fora do ring, do `429` e do dump; um futuro
-  sem prazo segura o buffer para sempre. Se você "simplificar", os testes de
-  comportamento não reclamam (só o `TestNATSOptionsNeverAskForTLS` confere o
-  `ReconnectBufSize`).
+  sem prazo segura o buffer para sempre. O `FlusherTimeout` padrão é **1
+  minuto** e a publicação não recebe contexto: sem ele o `op_timeout` não
+  limita a escrita num par que parou de ler, e sem o socket fechado no primeiro
+  prazo perdido cada worker espera o seu, em fila (item 001 da revisão de
+  2026-11-21). Se você "simplificar", só o `TestNATSOptionsNeverAskForTLS` e os
+  testes do servidor falso de `nats_stall_test.go` reclamam.
 - **Sem TLS, de propósito — e o `nats.go` tenta TLS sozinho.** Diante de um
   `tls_required` no `INFO`, o cliente se promove a TLS com as raízes do sistema.
   O `TLSCertCB` que recusa (e `errNATSServerRequiresTLS` fatal) é o que impede:
@@ -400,7 +404,11 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
 - **Posse de buffer.** O item do ring é dono de `Env`; volta ao pool exatamente
   uma vez, só após confirmação. Num retry o item **ainda é o dono**.
 - **Lote retido pelo worker não está no ring**, e o `hold` faz `append`, nunca
-  atribuição; o shutdown coleta `Workers.Pending()`.
+  atribuição; o shutdown coleta `Workers.Pending()`. A espera pelos workers é
+  `WaitFor(sink.op_timeout)`, nunca um `Wait` sem prazo: uma escrita que ignora
+  o contexto segurava o dump para sempre (item 016). Estourado o prazo, o
+  `Pending` toma o lote do worker preso, e o `settle` (sob o `holdMu`, **antes**
+  do `Commit` e do `Release`) faz o worker que voltar tarde não resolver nada.
 - **O beacon nunca toca a saúde do sink**, e o gancho de conexão nunca bloqueia
   (roda na goroutine de *callback* do cliente). O gancho é registrado **antes**
   da primeira conexão, ou o beacon dela se perde.

@@ -227,8 +227,14 @@ As de G §9 (GELF) e as de SN §9 (corte) valem inteiras. As mais caras:
 - **HTTP `4xx` é final para o cliente**: ring cheio, sink DOWN e shutdown são
   `503` com `Retry-After`.
 - **`nats.go`:** `WithRetryAttempts(0)`, `ReconnectBufSize(-1)`,
-  `WithPublishAsyncTimeout`. O JLH vai em `Data`, nunca num header.
-  `Nats-Msg-Id` é `<uuid>.<step>`.
+  `WithPublishAsyncTimeout`, `FlusherTimeout(sink.op_timeout)` e a discagem
+  própria (`sink/natsconn.go`). O `FlusherTimeout` padrão é **1 minuto** e a
+  publicação não recebe contexto: sem ele o `op_timeout` não limita a escrita
+  num par que parou de ler, e sem o socket fechado no primeiro prazo perdido
+  cada worker espera o seu, em fila (item 001 da revisão de 2026-11-21, SPEC
+  §10.7). Se você "simplificar", só o `TestNATSOptionsBoundTheSocketWrite` e
+  os testes do servidor falso de `nats_stall_test.go` reclamam. O JLH vai em
+  `Data`, nunca num header. `Nats-Msg-Id` é `<uuid>.<step>`.
 - **Sem TLS, de propósito — e o `nats.go` tenta TLS sozinho** diante de
   `tls_required`. O `TLSCertCB` que recusa é o que impede: não o remova.
 - **Nunca crie nem altere um stream**; valide-o no boot e em toda checagem.
@@ -240,6 +246,12 @@ As de G §9 (GELF) e as de SN §9 (corte) valem inteiras. As mais caras:
 - **Posse de buffer**, **lote retido não está no ring**, **perda do abort com
   um dono só**, **dump só salvo depois do `link` e do `fsync`**, **uma amostra
   de relógio**: como em SN.
+- **O shutdown espera os workers com prazo** (`WaitFor(sink.op_timeout)`,
+  SPEC §13.4), nunca com um `Wait` sem prazo: uma publicação presa segurava o
+  dump e o exit 3 para sempre (item 016 da revisão de 2026-11-21). Estourado o
+  prazo, o `Pending` toma o pedaço do worker preso, e o `settle` (sob o
+  `holdMu`, **antes** do `Commit` e do `Release`, dentro do `confirm`) faz o
+  worker que voltar tarde não resolver nada.
 - **Testes portados que passam vazios:** um teste de SN adaptado precisa ainda
   exercitar algo GELF; confira que não pula (`-v`).
 

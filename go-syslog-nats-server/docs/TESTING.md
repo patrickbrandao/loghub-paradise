@@ -657,3 +657,33 @@ com o teste da linha falhando e a correção restaurada depois.
 Registrados sem código: o "até 8 KiB" vale entre frames (A5, D4; medido no S e revertido; SPEC §5.4/§15.1); *pool* NATS só de servidores que exigem TLS e URL única com vários IPs (D2; D3 do RELP; §10.7); sobrecontagem do aborto pelo recuo de bytes (D3; §13.4); comentário do `Memory.Enqueue` (D1 do RELP). Sonda sqlite e `ring=none` não existem no corte.
 
 Rodadas: `tasks/run2.sh go-syslog-nats-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh`), logs em `tasks/logs/go-syslog-nats-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*; e o pacote `sink` com `SYSLOG_TEST_NATS_URL=nats://127.0.0.1:24226` (`max_payload` 1 MiB): **ok**. Fuzz: nenhum, por instrução da rodada.
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Os dois achados do shutdown preso. O 001 (publicação NATS sem prazo de
+escrita) foi reproduzido no `go-webhook-nats-server` e vale aqui igual; o 016
+(espera pelos workers sem prazo) foi reproduzido no `go-syslog-server` com o
+`sink=sqlite` real e um `COMMIT` preso injetado, e aqui o gatilho é a
+publicação NATS. Ordem por item: SPEC (§10.7, §13.4), teste falhando contra o
+código de antes, correção portada do pai, mutação (só a parte revertida).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§10.7) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`; 160 mensagens de 48 KiB) | `Write with sink.op_timeout = 1s returned after 1m0.005s: publish: write tcp …: i/o timeout`; `Health with a 1s deadline returned after 59.502s: stream: context deadline exceeded` | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket (§10.7) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers), `TestStallConnClosesAtTheFirstMissedWriteDeadline`, `TestNATSOptionsBoundTheSocketWrite` | `the workers did not return within 5s of the cancel` (com o prazo e sem o fechamento; 0,1 s com ele); `CustomDialer is <nil>, want the *stallDialer that closes a stalled socket` | sem `SetCustomDialer` |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory}` (o sink NATS real embrulhado, a segunda escrita presa ignorando o contexto; 2 workers; precisa de `SYSLOG_TEST_NATS_URL`) | `exit -1 after 20.002s, want 3` (FATAL); `the instance did not shut down within 60s` (SIGTERM) | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released: its buffer went back to the pool under the dump`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped for a batch the dump carries` |
+
+O teste de app solta a escrita presa no `Cleanup`: na primeira versão, sem
+isso, a mutação do `Wait` só morria por `panic: test timed out after 2m30s`, e o
+estouro do pacote pulava os `Cleanup` — o stream da fixture
+(`SLS_APP_17954063654313220004`, `loghub.t….syslog`) ficou no NATS
+compartilhado de `tasks/infra/` e, sobreposto a `loghub.>`, derrubou o
+`TestNATSBootValidationExitsThree` do `go-relplog-server` (TESTING de lá).
+Rodadas: `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem
+serviços: verdes (o teste de app pula sem `SYSLOG_TEST_NATS_URL`; os do
+servidor falso rodam sempre). Os mutantes da tabela: mortos (`mut001.sh` e
+`mut016.sh`, com o NATS de `tasks/infra/env.sh`), e o código restaurado.
+`tasks/run2.sh go-syslog-nats-server 001-016`, logs em
+`tasks/logs/go-syslog-nats-server-001-016-r{1,2}.log`: **verde duas vezes**
+(`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*.

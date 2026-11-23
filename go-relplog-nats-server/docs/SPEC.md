@@ -1106,7 +1106,8 @@ No shutdown (§13.4, fase 3):
   TLS, fechados em sequência, somavam dois `closeGrace`) fica no código, para que
   um segundo transporte nunca traga a sequência de volta.
 - O `stop_grace_period` do orquestrador precisa ser **maior** que
-  `pre_stop_delay + drain_timeout + closeGrace`. Menor significa ser morto no
+  `pre_stop_delay + drain_timeout + closeGrace + sink.op_timeout` (a espera
+  pelos workers, §13.4), com folga para o dump. Menor significa ser morto no
   meio do dreno, perdendo mensagens que já foram confirmadas por RELP.
 
 ### 5.9 Bugs que já custaram caro (não os repita)
@@ -1849,6 +1850,27 @@ esconde a senha e nada mais, e uma URL cujo usuário é um token
 (`nats://token@host`, §10.9) saía inteira no `INFO` de todo boot e no `WARN` de
 toda reconexão.
 
+**A escrita no socket tem o prazo de `sink.op_timeout`, e o socket é fechado
+no primeiro prazo perdido** (item 001 da revisão de 2026-11-21). A publicação
+do `nats.go` não recebe contexto, e o prazo de escrita do cliente
+(`FlusherTimeout`) é de 1 minuto por padrão; acima de 32 KiB no buffer, o
+cliente descarrega na própria chamada, segurando a trava da conexão. Contra um
+par que para de ler sem RST (host congelado, contêiner pausado, partição que
+descarta pacotes), o primeiro worker esperava o minuto e recebia `i/o
+timeout`, a conexão continuava `CONNECTED` com um quadro meio escrito, e cada
+worker seguinte esperava o seu minuto no mesmo socket cheio, com o `Health` e
+o `Close` atrás da mesma trava: o `sink.op_timeout` não limitava nada, e o
+shutdown passava do `stop_grace_period` antes do dump. Agora o prazo é
+`FlusherTimeout(sink.op_timeout)` e a discagem é do próprio sink
+(`SetCustomDialer`, `sink/natsconn.go`), que embrulha o socket: a primeira
+escrita que perde o prazo o **fecha**, com um `WARN`. As escritas seguintes
+falham na hora (`network`, sem buffer de reconexão), a leitura do cliente vê o
+fechamento e reconecta, e o quadro meio escrito nunca é continuado. O pior caso
+de um pedaço em voo volta a ser um `sink.op_timeout`, não um por worker. Custo:
+o `nats.go` dividia o prazo de discagem entre os endereços de um nome com
+vários, e uma discagem própria não sabe quantos são; cada endereço tem o prazo
+inteiro.
+
 **`sink.nats.mode = jetstream`** (padrão): um `PublishMsgAsync` por envelope, e só
 depois de os N futuros estarem no ar o worker espera as N confirmações, sob o
 `sink.op_timeout` do pedaço. Três opções que não são as padrões, e são as que
@@ -2572,6 +2594,25 @@ fase 5  o que sobrou vai para o dump (§12); para o beacon, fecha o ring e o
   FATAL no dreno): a espera termina na hora, em vez de gastar o `drain_timeout`
   num dreno que não acontece mais; o que sobrou vai para o dump, e a saída é
   **3**.
+- **A espera pelos workers tem o prazo de `sink.op_timeout`** (item 016 da
+  revisão de 2026-11-21). Parados os workers, uma escrita que respeita o
+  cancelamento volta na hora. Uma que não respeita — a publicação NATS, que
+  não recebe contexto, antes do prazo de escrita de §10.7 — segurava o
+  `workers.Wait` sem prazo para sempre: nada de dump, nada de exit 3,
+  transportes fechados, até o `SIGKILL` do orquestrador levar o ring sem nada
+  contar, mensagens que o emissor já tinha apagado com o `200` (§5.4).
+  Estourado o prazo, um `ERROR` diz que a escrita ignorou o shutdown, e
+  o recolhimento segue: o `Pending` toma dos workers presos o que eles seguram,
+  sob a trava do registro, e o worker que um dia voltar da escrita não resolve
+  nada — nem `Commit` (que tiraria da contagem do ring um pedaço que o dump
+  leva), nem `Release` (que devolveria ao pool o cru que o dump lê), nem perda
+  contada —: o pedaço é do shutdown. Os itens recolhidos são contaminados
+  (`Taint`, §15.2). Uma escrita presa que acabe entregando deixa as mensagens
+  no stream **e** no dump: at-least-once (em `jetstream`, a reingestão dentro
+  da `duplicate_window` é absorvida pelo `Nats-Msg-Id`, §10.7). O `Close` do
+  sink é pulado, porque pode esperar a trava da escrita presa; o processo está
+  saindo. Um worker confere o cancelamento antes de cada `Dequeue`, e um que
+  volte tarde nunca tira outro lote de um ring já recolhido.
 - **Shutdown por FATAL** (§13.3) começa sem sinal: o **primeiro**
   `SIGTERM`/`SIGINT` que chega nele (um `docker stop`, um deploy) é logado e
   **tolerado**, e o shutdown segue até o dump e o exit 3; o segundo aborta com
@@ -2651,7 +2692,8 @@ fase 5  o que sobrou vai para o dump (§12); para o beacon, fecha o ring e o
 - `shutdown.pre_stop_delay` existe para Kubernetes (5–10 s sugeridos): dá tempo
   ao balanceador de tirar a instância antes de as sessões fecharem. O
   `stop_grace_period` do orquestrador precisa ser **maior** que
-  `pre_stop_delay + drain_timeout + closeGrace`: menor significa ser morto no
+  `pre_stop_delay + drain_timeout + closeGrace + sink.op_timeout` (a espera
+  pelos workers), com folga para o dump: menor significa ser morto no
   meio do dreno, perdendo mensagens que já foram confirmadas por RELP.
 
 ### 13.5 Códigos de saída

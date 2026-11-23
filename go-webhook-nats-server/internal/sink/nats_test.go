@@ -705,6 +705,15 @@ func TestNATSOptionsNeverAskForTLS(t *testing.T) {
 		if o.ReconnectBufSize != -1 || o.MaxReconnect != -1 {
 			t.Errorf("ReconnectBufSize %d MaxReconnect %d, want -1 and -1", o.ReconnectBufSize, o.MaxReconnect)
 		}
+		// The write deadline is sink.op_timeout, not the library's minute,
+		// and the socket is the sink's own, closed at the first missed
+		// deadline (SPEC §8.7.1; review of 2026-11-21, item 001).
+		if o.FlusherTimeout != n.cfg.OpTimeout {
+			t.Errorf("FlusherTimeout %s, want sink.op_timeout %s", o.FlusherTimeout, n.cfg.OpTimeout)
+		}
+		if _, ok := o.CustomDialer.(*stallDialer); !ok {
+			t.Errorf("CustomDialer is %T, want the *stallDialer that closes a stalled socket", o.CustomDialer)
+		}
 	}
 }
 

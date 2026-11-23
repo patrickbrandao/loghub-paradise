@@ -276,6 +276,14 @@ Herdadas do corte (SP):
 - **Lote retido não está no ring.** O shutdown coleta `Workers.Pending()`; o
   `hold` faz `append`, nunca atribuição. E os dois tetos do ring contam o lote
   retido.
+- **O shutdown espera os workers com prazo** (`WaitFor(sink.op_timeout)`,
+  SPEC §13.4), nunca com um `Wait` sem prazo: nos irmãos, um `COMMIT` preso num
+  `fsync` ou uma publicação NATS segurava o dump e o exit 3 para sempre (item
+  016 da revisão de 2026-11-21); aqui o `pgx` respeita o contexto, e o prazo é
+  a defesa para a escrita que um dia não respeitar. Estourado o prazo, o
+  `Pending` toma o pedaço do worker preso, e o `settle` (sob o `holdMu`,
+  **antes** do `Commit` e do `Release`, dentro do `confirm`) faz o worker que
+  voltar tarde não resolver nada.
 - **Contar o que se segura:** o ring conta `cap(cru)` + `ItemOverhead` (288 B),
   não `len(cru)`. `TestItemOverheadCoversTheStruct` falha se a struct crescer.
 - **Fronteira de histograma como string** pré-formatada na inicialização.

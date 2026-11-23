@@ -1732,7 +1732,9 @@ segura a trava. A idade é medida no relógio **monotônico** (o tempo desde a a
 sink, não o instante de parede): com o relógio de parede, um passo do NTP para
 trás deixava a escritora presa em UP, e um para a frente dava DOWN com a
 escrita normal, pelo tamanho do passo (achado da revisão da família syslog,
-portado no mesmo dia).
+portado no mesmo dia). A sonda leva os fusíveis ao FATAL; o shutdown que vem
+depois não espera essa escrita além de `sink.op_timeout`, e o dump sai mesmo
+com ela presa (§10.3, item 016 da revisão de 2026-11-21).
 
 **A falha do próprio heartbeat conta como último `Write` com erro.** A sonda
 que toma a trava e falha no heartbeat (arquivo somente leitura, disco cheio)
@@ -2360,6 +2362,30 @@ desligado** (`ReconnectBufSize(-1)`): durante uma desconexão, publicar falha
 na hora com classe `network`, em vez de guardar mensagens dentro do cliente. O
 ring é o único buffer deste desenho, e uma fila escondida no cliente escaparia
 da contabilidade, do `429` e do dump.
+
+**A escrita no socket tem o prazo de `sink.op_timeout`, e o socket é fechado
+no primeiro prazo perdido** (item 001 da revisão de 2026-11-21, achado no
+`go-webhook-nats-server` e portado em 2026-11-23). A publicação do `nats.go`
+não recebe contexto, e o prazo de escrita do cliente (`FlusherTimeout`) é de 1
+minuto por padrão; acima de 32 KiB no buffer, o cliente descarrega na própria
+chamada, segurando a trava da conexão. Contra um par que para de ler sem RST
+(host congelado, contêiner pausado, partição que descarta pacotes), o primeiro
+worker esperava o minuto e recebia `i/o timeout`, a conexão continuava
+`CONNECTED` com um quadro meio escrito, e o worker seguinte esperava o seu
+minuto no mesmo socket cheio: 8 workers eram 8 minutos em fila, com o `Health`
+e o `Close` atrás da mesma trava. O `sink.op_timeout` não limitava nada, e o
+shutdown estourava o `stop_grace_period` antes do dump (§10.3). Agora o prazo é
+`FlusherTimeout(sink.op_timeout)` e a discagem é do próprio sink
+(`SetCustomDialer`), que embrulha o socket: a primeira escrita que perde o
+prazo o **fecha**, com um `WARN`. As escritas seguintes falham na hora
+(`network`, sem buffer de reconexão), a leitura do cliente vê o fechamento e
+reconecta, e o quadro meio escrito nunca é continuado. O pior caso de um lote
+em voo volta a ser um `sink.op_timeout`, não um por worker. A discagem própria
+só abre o TCP: o TLS de `sink.nats.tls` (§8.7.9), e o de `tls://` e `wss://`,
+continua sendo do `nats.go`, por cima do socket embrulhado — o prazo chega ao
+socket através dele, e o fechamento também. Custo: o `nats.go` dividia o prazo
+de discagem entre os endereços de um nome com vários, e uma discagem própria
+não sabe quantos são; cada endereço tem o prazo inteiro.
 
 A conexão só entra no estado `CLOSED` por ação deste processo ou por uma
 recusa de autenticação repetida; nesse estado o cliente nunca mais reconecta, e
@@ -3384,6 +3410,29 @@ para uma, e o `SIGKILL` levava o ring inteiro, respondido com `200`, sem nada
 contar. O pior caso até o dump começar é
 `pre_stop_delay + drain_timeout + sink.op_timeout` (o lote em voo de um worker),
 e o `stop_grace_period` precisa cobri-lo com folga para o próprio dump.
+
+**A espera pelos workers tem esse prazo** (item 016 da revisão de 2026-11-21,
+portado do `go-webhook-nats-server` em 2026-11-23). Parados os workers, o
+shutdown espera no máximo `sink.op_timeout` que voltem: uma escrita que
+respeita o cancelamento volta na hora. Uma que não respeita — o `COMMIT` do
+`sink=sqlite` preso no `fsync` de um volume travado (§8.3.5), a rotação, o
+`os.Stat` do gauge de tamanho, a publicação NATS sem o prazo de §8.7.1, ou
+qualquer escrita futura presa abaixo do contexto — segurava um `Wait` sem
+prazo para sempre: nada de dump, nada de exit 3, o `SIGTERM` do orquestrador
+tolerado no shutdown por FATAL, até o `SIGKILL` levar o ring, respondido com
+`200`, sem nada contar. Estourado o prazo, um `ERROR` diz que a escrita ignorou
+o shutdown, e o recolhimento segue: o `Pending` toma dos workers presos o que
+eles seguram, sob a trava do registro, e o worker que um dia voltar da escrita
+não resolve nada — nem `Commit`, nem `Release` (que devolveria ao pool o buffer
+que o dump lê), nem perda contada —: o lote é do dump. Os itens recolhidos são
+contaminados (`Taint`, §12.3), e nenhum `Release` posterior os devolve ao pool.
+Uma escrita presa que acabe entregando deixa o lote no destino **e** no dump
+(at-least-once: os mesmos `uuid`, absorvidos só onde o destino deduplica,
+§9.2). Com `ring=sqlite` não há dump: o lote do worker preso continua no
+`ring.db` (sem `Commit`) e é do próximo boot. O `Close` do sink é pulado,
+porque pode esperar a trava da escrita presa (a do `sink=sqlite`, a da conexão
+NATS); o processo está saindo. Um worker confere o cancelamento antes de cada
+`Dequeue`, e um que volte tarde nunca tira outro lote de um ring já recolhido.
 
 **O ring é selado antes do último `Drain`** (achado pela revisão independente
 do porte, 2026-10-11). Um upload que ainda lia o corpo quando a fase 3 estourou

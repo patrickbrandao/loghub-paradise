@@ -516,6 +516,34 @@ Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1
 sem servidores: verdes. `FuzzFrame` 35 s (o alvo de `relpframe.go`): limpo.
 `BenchmarkRELPReaderFrames`: 0 alocações por frame em 200 B a 60 KiB, como antes.
 
+### 9.8 Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Só o 016 vale aqui: o 001 (publicação NATS sem prazo de escrita) é do sink
+NATS, que este corte não tem. O 016 (espera pelos workers sem prazo) foi
+reproduzido no `go-syslog-server` com o `sink=sqlite` real e um `COMMIT` preso
+injetado; aqui a escrita do PostgreSQL respeita o contexto (o pgx arma o prazo
+do socket a partir dele), e a correção é a mesma defesa, para o shutdown não
+depender disso. Ordem: SPEC (§13.4), teste falhando contra o código de antes,
+correção portada do R, mutação (só a parte revertida). O teste de app fala
+RELP: 40 mensagens numa sessão, as respostas lidas à parte; exige que nenhuma
+seja respondida com outra coisa que `200 OK` e que toda mensagem respondida com
+`200` chegue à fila na vida seguinte (a reingestão do dump).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory}` (o sink PostgreSQL real embrulhado, a segunda escrita presa ignorando o contexto; 2 workers; precisa de `RELPLOG_TEST_PG_DSN`) | `exit -1 after 20.001s, want 3` (FATAL); `the instance did not shut down within 60s` (SIGTERM) | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released: its buffer went back to the pool under the dump`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped for a batch the dump carries` |
+
+Rodadas: `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem
+serviços: verdes (o teste de app pula sem `RELPLOG_TEST_PG_DSN`). Os mutantes
+da tabela: mortos (`mut016.sh`, com o PostgreSQL de `tasks/infra/env.sh`), e o
+código restaurado. Nos dois casos do teste de app, 40 aceitas, 40 respondidas
+com `200`, 4 escritas antes da escrita presa, 36 no dump e 40 na fila depois da
+reingestão.
+`tasks/run2.sh go-relplog-pg-server 001-016` (banco próprio `whs_rp`), logs em
+`tasks/logs/go-relplog-pg-server-001-016-r{1,2}.log`: **verde duas vezes**
+(`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*.
+
 ---
 
 ## 10. Resultado da rodada final (2026-10-13)

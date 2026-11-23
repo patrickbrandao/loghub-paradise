@@ -134,7 +134,7 @@ internal/
 | Pacote | Linhas | Onde mexer com mais cuidado |
 |---|---|---|
 | `app` | ~4.400 | ordem do boot e as cinco fases do shutdown |
-| `sink` | ~6.900 | posse de buffer nos caminhos de erro dos workers; em `postgres.go` e `mysql.go`, as tabelas de código de erro e o reset dos slices do pool; em `nats.go`, as três opções que não são as padrões da biblioteca (§8.7.2) |
+| `sink` | ~6.900 | posse de buffer nos caminhos de erro dos workers; em `postgres.go` e `mysql.go`, as tabelas de código de erro e o reset dos slices do pool; em `nats.go`, as opções que não são as padrões da biblioteca (§8.7.1, §8.7.2) |
 | `config` | ~2.900 | o registry é a fonte única; não duplique um parâmetro |
 | `server` | ~1.600 | ordem do pipeline em `handler.go` |
 | `ring` | ~1.500 | contabilidade de bytes e itens |
@@ -397,6 +397,14 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   ring com backlog, então isso acontece em cerca de metade dos desligamentos com
   fila. Por isso `deliver` devolve se a posse mudou de mãos e o `loop` para
   quando não mudou.
+- **O shutdown espera os workers com prazo** (`SPEC.md` §10.3, item 016 da
+  revisão de 2026-11-21): `WaitFor(sink.op_timeout)`, nunca um `Wait` sem
+  prazo — uma escrita que ignora o contexto (o `COMMIT` do `sink=sqlite` preso
+  em `fsync`, a publicação NATS) segurava o dump e o exit 3 para sempre.
+  Estourado o prazo, o `Pending` toma o lote do worker preso e marca
+  `surrendered`, e o `settle` (sob o `holdMu`, **antes** do `Commit` e do
+  `Release`) faz o worker que voltar tarde não resolver nada; o `Close` do sink
+  é pulado (`closeSink`).
 - **Nada é promovido ao lado do JLH.** Os destinos leem `space`, `type` e as
   colunas da `inbox` do próprio envelope (`envelope.ParseHead`, estrito). Um
   item que volta do `ring.db` ou de um dump é indistinguível do que entrou; a
@@ -438,14 +446,21 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   mesmo comando do dreno, numa transação revertida, e o esquema documenta
   `GRANT INSERT, UPDATE (uuid)`. E nunca `INSERT IGNORE`: ele trunca dados em
   silêncio (`SPEC.md` §8.6.3).
-- **Três opções do `nats.go` que não são as padrões, e o porquê**
-  (`SPEC.md` §8.7.2): `WithRetryAttempts(0)`, porque a retentativa interna da
-  biblioteca relê `msg.Data` depois de o `Write` ter retornado — a corrida de
-  posse de buffer de §12.3 num lugar novo; `ReconnectBufSize(-1)`, porque o
-  ring é o único buffer e uma fila escondida no cliente escaparia do `429` e do
-  dump; `WithPublishAsyncTimeout`, porque um futuro sem resposta seguraria a
-  mensagem e o buffer para sempre. Se você "simplificar" qualquer uma, os
-  testes não reclamam e o bug é silencioso.
+- **As opções do `nats.go` que não são as padrões, e o porquê**
+  (`SPEC.md` §8.7.1, §8.7.2): `WithRetryAttempts(0)`, porque a retentativa
+  interna da biblioteca relê `msg.Data` depois de o `Write` ter retornado — a
+  corrida de posse de buffer de §12.3 num lugar novo; `ReconnectBufSize(-1)`,
+  porque o ring é o único buffer e uma fila escondida no cliente escaparia do
+  `429` e do dump; `WithPublishAsyncTimeout`, porque um futuro sem resposta
+  seguraria a mensagem e o buffer para sempre; `FlusherTimeout(sink.op_timeout)`
+  e a discagem própria (`natsconn.go`, por baixo do TLS do cliente), porque o
+  prazo padrão de escrita no socket é **1 minuto** e a publicação não recebe
+  contexto: sem ele o `op_timeout` não limita a escrita num par que parou de
+  ler, e sem o socket fechado no primeiro prazo perdido cada worker espera o
+  seu, em fila (item 001 da revisão de 2026-11-21). Se você "simplificar" uma
+  das três primeiras, os testes não reclamam e o bug é silencioso; das duas
+  últimas, só o `TestNATSOptionsBoundTheSocketWrite` e os testes do servidor
+  falso de `nats_stall_test.go` reclamam.
 - **`sink=nats`: entrega parcial, veredito e contrato em toda checagem.**
   Uma recusa `logic` de **uma** mensagem (`ErrMaxPayload`, `10054`, um envelope
   que não mapeia) não encerra o lote: `Error.Delivered` diz o que o stream

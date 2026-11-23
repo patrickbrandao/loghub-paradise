@@ -306,6 +306,14 @@ Registradas em `docs/TESTING.md` §9. As que mais reincidem:
   shutdown o mantém registrado, e se o `loop` chamar `Dequeue` outra vez ele pode
   voltar com um segundo lote e gravá-lo por cima do primeiro. Por isso `deliver`
   devolve se a posse mudou de mãos e o `loop` para quando não mudou.
+- **O shutdown espera os workers com prazo** (`SPEC.md` §10.3, item 016 da
+  revisão de 2026-11-21): `WaitFor(sink.op_timeout)`, nunca um `Wait` sem
+  prazo. O pgx respeita o contexto, mas uma escrita que não respeitasse (um
+  defeito do driver, a publicação NATS do `go-webhook-nats-server`) segurava o
+  dump e o exit 3 para sempre. Estourado o prazo, o `Pending` toma o lote do
+  worker preso e marca `surrendered`, e o `settle` (sob o `holdMu`, **antes**
+  do `Commit` e do `Release`) faz o worker que voltar tarde não resolver nada;
+  o `Close` do sink é pulado (`closeSink`).
 - **Nada é promovido ao lado do JLH.** As colunas da `inbox` são lidas do próprio
   envelope (`envelope.ParseHead`, estrito). Um item que volta de um dump é
   indistinguível do que entrou.

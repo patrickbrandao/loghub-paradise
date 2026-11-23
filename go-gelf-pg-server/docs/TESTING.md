@@ -225,3 +225,21 @@ de corte carrega as de SP.
 - Suíte `-race` completa verde com a infra (`tasks/infra/env.sh`); fuzz 60 s
   verde: `FuzzConvert` 475 k, `FuzzReassemble` 2,7 M, `FuzzDecompress` 842 k,
   `FuzzRead` 15 k, `FuzzInboxPayload` e `FuzzJSONBSafe` 121 k.
+
+### Revisão completa de 2026-11-21: item 016 (2026-11-23)
+
+O achado do shutdown preso, portado de G (e S) no mesmo dia: o mesmo patch em
+`workers.go` e `app.go`. O item 001 (publicação NATS sem prazo de escrita) não
+vale aqui: não há NATS (§1.2). O 016 (espera pelos workers sem prazo) foi
+reproduzido em S com o `sink=sqlite` real e um `COMMIT` preso injetado; aqui o
+`pgx` arma o prazo do socket a partir do contexto, e a escrita presa do teste
+é injetada por cima do sink PostgreSQL real (a fila de um esquema próprio do
+teste): a defesa vale para a escrita que um dia não respeitar o contexto. Ordem:
+SPEC (§13.4), teste, mutação (só a parte revertida).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal,sigterm}` (sink PostgreSQL real, segunda escrita presa ignorando o contexto, 2 workers, 40 documentos; o que a primeira escrita enfileirou fica na fila e fora do dump; precisa de `GELF_TEST_PG_DSN`) | mutação: `panic: test timed out after 2m30s` | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped for a batch the dump carries` |
+
+Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem servidores: verdes. Com os destinos reais de `tasks/infra` (`tasks/run2.sh go-gelf-pg-server 001-016`, duas rodadas completas): verdes.

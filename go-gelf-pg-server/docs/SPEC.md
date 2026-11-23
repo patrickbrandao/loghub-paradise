@@ -1999,6 +1999,26 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
   FATAL no dreno): a espera termina na hora, em vez de gastar o `drain_timeout`
   num dreno que não acontece mais; o que sobrou vai para o dump, e a saída é
   **3**.
+- **A espera pelos workers tem o prazo de `sink.op_timeout`** (item 016 da
+  revisão de 2026-11-21). Parados os workers, uma escrita que respeita o
+  cancelamento volta na hora — é o caso do `pgx`, que arma o prazo do socket a
+  partir do contexto. Uma que não respeitasse (uma troca de driver, uma trava
+  tomada abaixo do contexto; nos irmãos, o `COMMIT` do `sink=sqlite` preso num
+  `fsync` e a publicação NATS) segurava o `workers.Wait` sem prazo para
+  sempre: nada de dump, nada de exit 3, transportes fechados, até o `SIGKILL`
+  do orquestrador levar o ring sem nada contar. Estourado o prazo, um `ERROR`
+  diz que a escrita ignorou o shutdown, e o recolhimento segue: o `Pending`
+  toma dos workers presos o que eles seguram, sob a trava do registro, e o
+  worker que um dia voltar da escrita não resolve nada — nem `Commit` (que
+  tiraria da contagem do ring um pedaço que o dump agora leva), nem `Release`
+  (que devolveria ao pool o buffer que o dump lê), nem perda contada —: o
+  pedaço é do shutdown. Os itens recolhidos são contaminados (`Taint`, §15.2).
+  Uma escrita presa que acabe entregando deixa os envelopes na fila **e** no
+  dump: at-least-once, e a reingestão do mesmo `uuid` é absorvida pelo
+  `ON CONFLICT (uuid) DO NOTHING` (§3.7.1). O `Close` do sink é pulado, porque
+  pode esperar a conexão da escrita presa; o processo está saindo. Um worker
+  confere o cancelamento antes de cada `Dequeue`, e um que volte tarde nunca
+  tira outro lote de um ring já recolhido.
 - **Uma requisição HTTP em andamento** na fase 3 recebe `503` com
   `Retry-After` (o contexto de recepção cancelado), e o `http.Server` espera
   até `closeGrace` pelas que já estavam no handler.
@@ -2012,7 +2032,8 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
 - `shutdown.pre_stop_delay` existe para Kubernetes (5–10 s sugeridos): um emissor
   UDP não recebe erro quando o socket some, e um emissor HTTP que pegou a
   instância saindo recebe `503`. O `stop_grace_period` do orquestrador
-  precisa ser **maior** que `pre_stop_delay + drain_timeout`.
+  precisa ser **maior** que `pre_stop_delay + drain_timeout + sink.op_timeout`
+  (a espera pelos workers), com folga para o próprio dump.
 
 ### 13.5 Códigos de saída
 
