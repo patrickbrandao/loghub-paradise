@@ -3053,7 +3053,7 @@ CGO_ENABLED=0 go build -tags osusergo,netgo -o go-syslog-server ./cmd/go-syslog-
 ```
 
 Ou instalar a versão publicada mais recente (`@latest` resolve a tag mais alta
-do módulo; para uma fixa, a tag `go-syslog-server/v1.3.1` vira `@v1.3.1`):
+do módulo; para uma fixa, a tag `go-syslog-server/v1.3.2` vira `@v1.3.2`):
 
 ```bash
 go install github.com/patrickbrandao/loghub-paradise/go-syslog-server/cmd/go-syslog-server@latest
