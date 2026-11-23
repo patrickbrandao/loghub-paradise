@@ -527,6 +527,36 @@ Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1
 sem servidores: verdes. `FuzzFrame` 35 s (o alvo de `relpframe.go`): limpo.
 `BenchmarkRELPReaderFrames`: 0 alocações por frame em 200 B a 60 KiB, como antes.
 
+### 9.6 Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Os dois achados do shutdown preso. O 001 (publicação NATS sem prazo de
+escrita) foi reproduzido no `go-webhook-nats-server` e vale aqui igual; o 016
+(espera pelos workers sem prazo) foi reproduzido no `go-syslog-server` com o
+`sink=sqlite` real e um `COMMIT` preso injetado, e aqui o gatilho é a
+publicação NATS. Ordem por item: SPEC (§10.7, §13.4), teste falhando contra o
+código de antes, correção portada do SN e do R, mutação (só a parte
+revertida). O teste de app fala RELP: 40 mensagens numa sessão, as respostas
+lidas à parte; exige que nenhuma seja respondida com outra coisa que `200 OK` e
+que toda mensagem respondida com `200` chegue ao stream na vida seguinte (a
+reingestão do dump).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§10.7) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`; 160 mensagens de 48 KiB) | `Write with sink.op_timeout = 1s returned after 1m0.004s: publish: write tcp …: i/o timeout`; `Health with a 1s deadline returned after 59.505s: stream: context deadline exceeded` | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket (§10.7) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers), `TestStallConnClosesAtTheFirstMissedWriteDeadline`, `TestNATSOptionsBoundTheSocketWrite` | `the workers did not return within 5s of the cancel` (0,2 s com o fechamento); `CustomDialer is <nil>, want the *stallDialer that closes a stalled socket` | sem `SetCustomDialer` |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory}` (o sink NATS real embrulhado, a segunda escrita presa ignorando o contexto; 2 workers; precisa de `RELPLOG_TEST_NATS_URL`) | `exit -1 after 20.001s, want 3` (FATAL); `the instance did not shut down within 60s` (SIGTERM) | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released: its buffer went back to the pool under the dump`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped for a batch the dump carries` |
+
+Rodadas: `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem
+serviços: verdes (o teste de app pula sem `RELPLOG_TEST_NATS_URL`; os do
+servidor falso rodam sempre). Os mutantes da tabela: mortos (`mut001.sh` e
+`mut016.sh`, com o NATS de `tasks/infra/env.sh`), e o código restaurado. Nos
+dois casos do teste de app, 40 aceitas, 40 respondidas com `200`, 4 publicadas
+antes da escrita presa, 36 no dump e 40 no stream depois da reingestão.
+`tasks/run2.sh go-relplog-nats-server 001-016`, logs em
+`tasks/logs/go-relplog-nats-server-001-016-r{1,2}.log`: **verde duas vezes**
+(`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*.
+
 ---
 
 ## 10. Resultado da rodada final (2026-10-13, depois do porte de §9.1)

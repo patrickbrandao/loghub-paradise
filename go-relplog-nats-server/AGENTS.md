@@ -236,10 +236,17 @@ e, num rsyslog: `action(type="omrelp" target="127.0.0.1" port="20514")`.
 ### Do NATS e do dump (do SN, com as correções do R e desta criação)
 
 - **`nats.go`: `WithRetryAttempts(0)`, `ReconnectBufSize(-1)`,
-  `WithPublishAsyncTimeout(sink.op_timeout)`.** A retentativa interna relê
+  `WithPublishAsyncTimeout(sink.op_timeout)`, `FlusherTimeout(sink.op_timeout)`
+  e a discagem própria (`sink/natsconn.go`).** A retentativa interna relê
   `msg.Data` depois de o `Write` voltar; o buffer de reconexão é uma fila
   escondida fora do ring; um futuro sem prazo segura o buffer do pedaço para
-  sempre. `TestNATSLibraryNeverRepublishes` pega a primeira.
+  sempre. `TestNATSLibraryNeverRepublishes` pega a primeira. O
+  `FlusherTimeout` padrão é **1 minuto** e a publicação não recebe contexto:
+  sem ele o `op_timeout` não limita a escrita num par que parou de ler, e sem
+  o socket fechado no primeiro prazo perdido cada worker espera o seu, em fila
+  (item 001 da revisão de 2026-11-21, SPEC §10.7). Se você "simplificar", só
+  o `TestNATSOptionsBoundTheSocketWrite` e os testes do servidor falso de
+  `nats_stall_test.go` reclamam.
 - **O JLH vai em `Data`, nunca num header NATS** (teto de 64 KiB de headers).
 - **`Nats-Msg-Id` é `<uuid>.<step>`**, nunca o `uuid` puro.
 - **Nunca crie nem altere um stream.** Ele vem de `docker/nats/stream.json`; o
@@ -283,6 +290,13 @@ e, num rsyslog: `action(type="omrelp" target="127.0.0.1" port="20514")`.
   o buffer do pedaço: na dúvida, `Discard`/`Taint`.
 - **Lote retido não está no ring.** O shutdown coleta `Workers.Pending()`; o
   `hold` faz `append`, nunca atribuição.
+- **O shutdown espera os workers com prazo** (`WaitFor(sink.op_timeout)`,
+  SPEC §13.4), nunca com um `Wait` sem prazo: uma publicação NATS sem prazo de
+  escrita (e, no R, um `COMMIT` preso num `fsync`) segurava o dump e o exit 3
+  para sempre, com o `200` RELP já dado (item 016 da revisão de 2026-11-21).
+  Estourado o prazo, o `Pending` toma o pedaço do worker preso, e o `settle`
+  (sob o `holdMu`, **antes** do `Commit` e do `Release`, dentro do `confirm`)
+  faz o worker que voltar tarde não resolver nada.
 - **Erro desconhecido é `network`, nunca `logic`**; configuração e permissão do
   destino são `fatal`.
 - **O beacon nunca toca a saúde do sink**, e o gancho de conexão nunca bloqueia.

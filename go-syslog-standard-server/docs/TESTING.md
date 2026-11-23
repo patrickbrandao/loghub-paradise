@@ -721,3 +721,30 @@ fora da máquina de desenvolvimento.
   prova que o teto global e o por IP são devolvidos uma vez cada, e
   `TestConnLimitsPerIPAreSharedAcrossListeners` que o teto por IP vale entre
   listeners; `TestTCPListenersShareOneLimiter` prova a fiação.
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Os dois achados do shutdown preso, com o código portado à mão de
+`go-syslog-server`: a mesma discagem em `sink/natsconn.go` e as mesmas opções
+no `nats.go`; no `workers.go`, o `settle(id)` apaga o registro do worker
+inteiro (o `unhold` daqui já era por worker, que segura um lote por vez), e no
+ramo `logic` ele vem antes do `Release` e do `Commit`. O 001 (publicação NATS
+sem prazo de escrita) foi reproduzido no `go-webhook-nats-server` e vale aqui
+igual; o 016 (espera pelos workers sem prazo) foi reproduzido no
+`go-syslog-server` com o `sink=sqlite` real e um `COMMIT` preso injetado, e o
+teste daqui é o mesmo. Ordem por item: SPEC (§10.8.1, §12.3), teste, mutação
+(só a parte revertida).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§10.8.1) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`; 160 linhas de 48 KiB) | `Write with sink.op_timeout = 1s returned after 1m5.105s: publish: write tcp …: i/o timeout`; `Health with a 1s deadline returned after 4.603s: stream: context deadline exceeded` | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket (§10.8.1) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers), `TestStallConnClosesAtTheFirstMissedWriteDeadline`, `TestNATSOptionsBoundTheSocketWrite` | `the workers did not return within 5s of the cancel` (com o prazo e sem o fechamento; 0,07 s com ele); `CustomDialer is <nil>` | sem `SetCustomDialer` |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§12.3) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory; fatal, ring=sqlite}` (`sink=sqlite` real, segunda escrita presa ignorando o contexto, 40 linhas por TCP) | mutação: `panic: test timed out after 2m30s` | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o lote do shutdown (§12.3) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released`; o ramo `logic` sem o `settle` primeiro: os mesmos dois e `3 events counted dropped for a batch the dump carries`; `Pending` sem o `Taint`: `held item 0 was not tainted: its Release pooled the buffer` (o `envelope.Item` daqui não tem leitor da marca: o teste a vê no `Raw` que um `Release` contaminado mantém) |
+
+O teste do `Health` mantém o `Prep` do lote vivo até a escrita em segundo plano
+voltar: sem isso, com o teste falhando, o `Cleanup` do `prepared` devolvia ao
+pool os envelopes que a escrita presa ainda lia, e o `-race` acusava a corrida
+do próprio teste.
+
+Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem servidores: verdes. Com `tasks/run2.sh go-syslog-standard-server 001-016` (duas rodadas completas, com `SYSLOG_TEST_NATS_URL`, `SYSLOG_TEST_MYSQL_DSN` e os emissores; as suítes `SLSTD_TEST_*` de Redis e PostgreSQL não estão no `run2.sh` e pularam): verdes.

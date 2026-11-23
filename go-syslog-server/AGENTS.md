@@ -204,6 +204,12 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514   # o logger do ma
 - **Comandos do rueidis são reciclados.** Retry reconstrói.
 - **Lote retido não está no ring.** O shutdown coleta `Workers.Pending()`; o
   `hold` faz `append`, nunca atribuição.
+- **O shutdown espera os workers com prazo** (`WaitFor(sink.op_timeout)`,
+  SPEC §13.4), nunca com um `Wait` sem prazo: um `COMMIT` preso num `fsync`
+  segurava o dump e o exit 3 para sempre (item 016 da revisão de 2026-11-21).
+  Estourado o prazo, o `Pending` toma o pedaço do worker preso, e o `settle`
+  (sob o `holdMu`, **antes** do `Commit` e do `Release`, dentro do `confirm`)
+  faz o worker que voltar tarde não resolver nada.
 - **Chave primária no `ring=sqlite`.** O `uuid` tem coluna própria; o leitor
   anda por cursor, nunca por conjunto em voo.
 - **Fronteira de histograma como string** pré-formatada na inicialização.
@@ -235,7 +241,13 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514   # o logger do ma
   contador: token repetido para dados diferentes descarta o segundo pedaço em
   silêncio. Sem transação no ClickHouse, a sonda de boot é um `INSERT` vazio.
 - **`nats.go`:** `WithRetryAttempts(0)`, `ReconnectBufSize(-1)`,
-  `WithPublishAsyncTimeout`. Se você "simplificar", os testes não reclamam.
+  `WithPublishAsyncTimeout`, `FlusherTimeout(sink.op_timeout)` e a discagem
+  própria (`sink/natsconn.go`). O `FlusherTimeout` padrão é **1 minuto** e a
+  publicação não recebe contexto: sem ele o `op_timeout` não limita a escrita
+  num par que parou de ler, e sem o socket fechado no primeiro prazo perdido
+  cada worker espera o seu, em fila (item 001 da revisão de 2026-11-21, SPEC
+  §10.7). Se você "simplificar", só o `TestNATSOptionsBoundTheSocketWrite` e os
+  testes do servidor falso de `nats_stall_test.go` reclamam.
 - **O JLH vai em `Data`, nunca num header NATS** (teto de 64 KiB de headers).
 - **Nunca alocar pelo que o par declara** (MSG-LEN, PROXY v2): alocar pelo que
   chegou, com teto.

@@ -642,3 +642,25 @@ arquivo liga (antes repetiam as do irmão Redis), com uma linha para os
 serviços de apoio. `registry.go`: o índice de env não grava mais a chave `""`.
 
 Rodadas (macOS, Docker Desktop, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem servidores: verdes. `rediscli`, `ring`, `sink` e `app` com `GELF_TEST_REDIS_ADDR`/`GELF_TEST_REDIS_LRU_ADDR` contra Redis 7.4, Valkey 8.1 e Valkey 9.0: verdes. `-run Cluster` contra um cluster de um nó (Valkey 9.0): verde. Os 14 mutantes da tabela: mortos. Valkey 7.2 não rodou nesta rodada (a matriz completa é `scripts/test-redis-valkey.sh`).
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Os dois achados do shutdown preso, portados de S no mesmo dia (o mesmo patch
+em `workers.go` e `app.go`, a mesma discagem em `sink/natsconn.go`). O 001
+(publicação NATS sem prazo de escrita) foi reproduzido no
+`go-webhook-nats-server` e vale aqui igual; o 016 (espera pelos workers sem
+prazo) foi reproduzido em S com o `sink=sqlite` real e um `COMMIT` preso
+injetado, e o teste daqui é o mesmo, com documentos GELF pelo TCP (moldura
+`\0`). Ordem por item: SPEC (§10.7, §13.4), teste, mutação (só a parte
+revertida). A discagem própria fica por baixo do TLS de `sink.nats.tls`: os
+testes de `nats_tls_integration_test.go` (um `nats-server` com TLS por teste,
+`GELF_TEST_NATS_SERVER_BIN`) passam por ela.
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§10.7) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`; 160 documentos de 48 KiB) | `Write with sink.op_timeout = 1s returned after 1m5.106s: publish: write tcp …: i/o timeout`; `Health with a 1s deadline returned after 4.645s: stream: context deadline exceeded` (em três repetições isoladas: `1m4.607s`, `4.657s`, `1m4.656s`) | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket (§10.7) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers), `TestStallConnClosesAtTheFirstMissedWriteDeadline`, `TestNATSOptionsBoundTheSocketWrite` | `the workers did not return within 5s of the cancel` (com o prazo e sem o fechamento; 0,2 s com ele); `CustomDialer is <nil>` | sem `SetCustomDialer` |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory; fatal, ring=sqlite}` (`sink=sqlite` real, segunda escrita presa ignorando o contexto, 40 documentos) | mutação: `panic: test timed out after 2m30s` | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped for a batch the dump carries` |
+
+Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem servidores: verdes. Com os destinos reais de `tasks/infra` (`tasks/run2.sh go-gelf-server 001-016`, duas rodadas completas): verdes, inclusive os três `TestNATSTLSPool*`, que passam pela discagem própria por baixo do TLS.

@@ -20,6 +20,81 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-11-23 — Itens 001 e 016 da revisão: escrita NATS com prazo e shutdown que não espera para sempre
+
+Pedido: corrigir os itens 001 e 016 do relatório de 2026-11-21 (`tasks/`). Os
+dois juntos faziam o mesmo estrago: um shutdown que não chegava ao dump, e o
+`SIGKILL` do orquestrador levando o ring (eventos já confirmados ao emissor)
+sem nada contar.
+
+- **001 — a publicação NATS ignorava `sink.op_timeout` (W, F, N, S, SN, R, RN,
+  G, GN e a standard).** O `nats.go` limita a escrita no socket pelo
+  `FlusherTimeout`, 1 minuto por padrão, e a publicação não recebe contexto;
+  acima de 32 KiB no buffer o cliente descarrega dentro da chamada, com a trava
+  da conexão. Contra um par que para de ler sem RST (host congelado, contêiner
+  pausado), cada worker esperava o seu minuto, em fila, com o `Health` e o
+  `Close` atrás da mesma trava; reproduzido no N com um servidor NATS falso:
+  `Write` de 1 s voltando em 1 min, 2 workers soltos em 2m58s depois do cancel.
+  Correção: `nats.FlusherTimeout(cfg.OpTimeout)` e uma discagem própria
+  (`SetCustomDialer`, `internal/sink/natsconn.go`, igual nos 10) que embrulha o
+  socket — por baixo do TLS, onde há — e o **fecha** na primeira escrita que
+  perde o prazo, com um `WARN`: as escritas seguintes falham na hora (`network`,
+  sem buffer de reconexão) e o cliente reconecta. Só o prazo não bastava: 8
+  workers ainda levavam um prazo cada, em fila. O pior caso de um lote em voo
+  volta a ser um `sink.op_timeout`. Custo registrado nas SPECs: a discagem
+  própria não divide o prazo entre os endereços de um nome com vários.
+- **016 — o shutdown esperava os workers sem prazo (os 14 servidores).**
+  `stopWorkers(); a.workers.Wait()`: uma escrita que não respeita o contexto (o
+  `COMMIT` do `sink=sqlite` preso num `fsync`, a publicação do 001) segurava o
+  shutdown para sempre — nada de dump, nada de exit 3. Agora
+  `Workers.WaitFor(sink.op_timeout)`; estourado o prazo, `ERROR`, o `Pending`
+  toma o lote do worker preso (contaminado, `Taint`) e o `Close` do sink é
+  pulado. O worker que voltar tarde não resolve nada: o `settle`, sob a trava
+  do registro e **antes** do `Commit` e do `Release`, devolve falso depois do
+  `Pending` — sem isso, um `Release` tardio devolveria ao pool o buffer que o
+  dump lê, e um `Commit` apagaria linhas que um ring persistente guarda para o
+  boot seguinte. O worker confere o cancelamento antes de cada `Dequeue`. Uma
+  escrita presa que acabe entregando duplica o que o dump leva
+  (at-least-once). O `stop_grace_period` documentado passa a ser
+  `pre_stop_delay + drain_timeout + sink.op_timeout`, com folga para o dump.
+- **Fica aberto do 016:** em W, F, S, R e G, com `ring=none` + `sink=sqlite`,
+  cada escrita síncrona (no handler do W/F, na recepção do S/R/G) toma a trava
+  do sqlite sem contexto (`SQLite.Write`), e o `sink.op_timeout` não limita
+  essa espera (`tasks/2026-11-21-016-*`, reescrito para isso).
+- **Testes (com mutação de cada parte).** Nos 10 com NATS,
+  `internal/sink/nats_stall_test.go`: o servidor falso que para de ler no
+  primeiro `PUB`, `Write` e `Health` em ~`op_timeout` (antes ~60 s), 8 workers
+  soltos em ~0,2 s depois do cancel (sem o fechamento do socket, mais de 5 s),
+  o `stallConn` sobre `net.Pipe` e a conferência das duas opções; W e F também
+  com TLS, e o R com um controle contra o NATS com TLS real. Nos 14,
+  `internal/sink/workers_stuck_test.go` (o worker atrasado não faz `Commit` nem
+  `Release`, não conta perda e não escreve de novo) e
+  `internal/app/stuck_write_test.go` (escrita presa ignorando o contexto, no
+  destino real de cada corte — `sink=sqlite`, PostgreSQL ou NATS —, caminhos
+  FATAL e `SIGTERM`: exit 3 e o dump com o aceito e não escrito; com ring
+  persistente, exit 3 e nenhum dump). Mutações: sem o `FlusherTimeout`
+  (`Write … returned after 1m0s`), sem a discagem (`the workers did not return
+  within 5s`), `Pending` sem `surrendered` (`1 Commits … want 0`), recusa
+  `logic` sem o `settle` (`3 events counted dropped`), `Wait()` sem prazo (sem
+  exit em 15–60 s).
+- **Verificação:** fmt e vet limpos nos 14; suíte rápida com `-race` verde nos
+  14; as duas rodadas completas contra PostgreSQL 18, MySQL 8.4, ClickHouse 25.8,
+  Redis 7 e NATS reais (`tasks/run2.sh`) verdes nos 14, salvo: uma falha
+  intermitente de conexão do ClickHouse no F
+  (`TestClickHouseHealthValidatesThePrivilege/insert_only`, sink não tocado,
+  verde repetida isolada) e, no R, `TestNATSBootValidationExitsThree/stream_capturing_the_control_plane`,
+  que cria `loghub.>` e colide com streams que as próprias mutações deixaram no
+  NATS compartilhado (as duas rodadas do R verdes contra um `nats-server`
+  novo, com porta e store próprios). Conexão real com
+  TLS 1.3 pela discagem própria conferida no S.
+- **Lição:** uma biblioteca cliente que não recebe contexto tem um prazo seu, e
+  ele precisa ser lido na fonte: nenhum dos 10 sinks definia o
+  `FlusherTimeout`, e o teste de `docker pause` do N, com 20 eventos pequenos,
+  nunca passou dos 32 KiB que levam a escrita para dentro da publicação. E uma
+  espera sem prazo no shutdown é um defeito mesmo quando "todo `Write` respeita
+  o contexto": basta um que não respeite.
+- Nada versionado: sem tags nem release nesta rodada.
+
 ## 2026-11-21 — Revisão completa; Go 1.26+ como piso, Go 1.27 nas imagens, dependências com CVE
 
 Pedido: revisão completa do projeto, um arquivo por problema ou proposta em

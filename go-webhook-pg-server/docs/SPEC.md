@@ -1579,6 +1579,28 @@ contar. O pior caso até o dump começar é
 `pre_stop_delay + drain_timeout + sink.op_timeout` (o lote em voo de um worker),
 e o `stop_grace_period` precisa cobri-lo com folga para o próprio dump.
 
+**A espera pelos workers tem esse prazo** (item 016 da revisão de 2026-11-21,
+portado do `go-webhook-nats-server` em 2026-11-23). Parados os workers, o
+shutdown espera no máximo `sink.op_timeout` que voltem: uma escrita que
+respeita o cancelamento volta na hora. Toda escrita deste servidor respeita: o
+pgx arma o prazo do socket a partir do contexto (§8.5.2). O prazo é a defesa
+para a que não respeitar — um defeito do driver, um destino futuro, como a
+publicação NATS sem prazo no socket do `go-webhook-nats-server` —, que
+seguraria um `Wait` sem prazo para sempre: nada de dump, nada de exit 3, até o
+`SIGKILL` do orquestrador levar o ring, respondido com `200`, sem nada contar.
+Estourado o prazo, um `ERROR` diz que a escrita ignorou o shutdown, e o
+recolhimento segue: o `Pending` toma dos workers presos o que eles seguram, sob
+a trava do registro, e o worker que um dia voltar da escrita não resolve nada —
+nem `Commit`, nem `Release` (que devolveria ao pool o buffer que o dump lê), nem
+perda contada —: o lote é do dump. Os itens recolhidos são contaminados
+(`Taint`, §12.3), e nenhum `Release` posterior os devolve ao pool. Uma escrita
+presa que acabe entregando deixa o lote na `loghub.inbox` **e** no dump
+(at-least-once; na reingestão, o `ON CONFLICT (uuid)` absorve a duplicata
+enquanto a fila guarda aquele `uuid`, §3.6). O `Close` do sink é pulado, porque
+pode esperar a escrita presa; o processo está saindo. Um worker confere o
+cancelamento antes de cada `Dequeue`, e um que volte tarde nunca tira outro
+lote de um ring já recolhido.
+
 **O ring é selado antes do último `Drain`** (achado pela revisão independente
 do porte, 2026-10-11). Um upload que ainda lia o corpo quando a fase 3 estourou
 continua depois dela; se o corpo chegasse depois do `Drain`, o item entrava num

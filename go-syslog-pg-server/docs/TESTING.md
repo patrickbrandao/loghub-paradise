@@ -572,3 +572,28 @@ com o teste da linha falhando e a correção restaurada depois.
 Registrados sem código: o "até 8 KiB" vale entre frames (A5, D4; medido no S e revertido; SPEC §5.4/§15.1); sobrecontagem do aborto pelo recuo de bytes (D3; §13.4); comentário do `Memory.Enqueue` (D1 do RELP). O resto da revisão (sonda sqlite, `ring=none`, TLS do NATS) não se aplica ao corte.
 
 Rodadas: `tasks/run2.sh go-syslog-pg-server rev` (`gofmt -l .`, `go vet ./...` e `go test -race -count=1 -timeout 1500s ./...` com `tasks/infra/env.sh` e banco próprio `whs_sp`), logs em `tasks/logs/go-syslog-pg-server-rev-r{1,2}.log`: **verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*. Fuzz: nenhum, por instrução da rodada.
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Só o 016 vale aqui: o 001 (publicação NATS sem prazo de escrita) é do sink
+NATS, que este corte não tem. O 016 (espera pelos workers sem prazo) foi
+reproduzido no pai com o `sink=sqlite` real e um `COMMIT` preso injetado; aqui
+a escrita do PostgreSQL respeita o contexto (o pgx arma o prazo do socket a
+partir dele), e a correção é a mesma defesa, para o shutdown não depender
+disso. Ordem: SPEC (§13.4), teste falhando contra o código de antes, correção
+portada do pai, mutação (só a parte revertida).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory}` (o sink PostgreSQL real embrulhado, a segunda escrita presa ignorando o contexto; 2 workers; precisa de `SYSLOG_TEST_PG_DSN`) | `exit -1 after 20s, want 3` (FATAL); `the instance did not shut down within 60s` (SIGTERM) | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released: its buffer went back to the pool under the dump`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped for a batch the dump carries` |
+
+O teste de app solta a escrita presa no `Cleanup`: na primeira versão, sem
+isso, a mutação do `Wait` só morria por `panic: test timed out after 2m30s`, e o
+estouro do pacote pulava os `Cleanup` (o esquema da fila ficava no banco; no SN,
+o stream ficava no NATS compartilhado). Rodadas: `gofmt -l .`, `go vet ./...` e
+`go test -race -count=1 ./...` sem serviços: verdes (o teste de app pula sem
+`SYSLOG_TEST_PG_DSN`). Os mutantes da tabela: mortos (`mut016.sh`, com o
+PostgreSQL de `tasks/infra/env.sh`), e o código restaurado. `tasks/run2.sh go-syslog-pg-server 001-016` (banco próprio
+`whs_sp`), logs em `tasks/logs/go-syslog-pg-server-001-016-r{1,2}.log`:
+**verde duas vezes** (`exit=0` nas duas; `gofmt` e `vet` limpos), sem *flake*.

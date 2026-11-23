@@ -277,6 +277,10 @@ type App struct {
 	// ring that does not outlive the process: from then on abortLoss counts
 	// dumping, never the ring's count (see there).
 	dumpPhase atomic.Bool
+	// workersStuck is set when a worker did not return within sink.op_timeout
+	// of the shutdown stopping it (waitWorkers): the sink is then left
+	// unclosed.
+	workersStuck atomic.Bool
 
 	// beforeDump, when set, runs right before the emergency dump is written.
 	// It is nil in the binary; the tests use it to hold the shutdown inside
@@ -401,7 +405,7 @@ func (a *App) run(ctx context.Context, stopSignals func()) int {
 	if a.wrapSink != nil {
 		a.sink = a.wrapSink(a.sink)
 	}
-	defer a.sink.Close()
+	defer a.closeSink()
 
 	a.health = sink.NewHealth(a.sink, sink.HealthConfig{
 		Interval:   a.cfg.Sink.HealthInterval,
@@ -1252,7 +1256,7 @@ func (a *App) gracefulShutdown(stopWorkers context.CancelFunc, fatal bool) int {
 	}
 
 	stopWorkers()
-	a.workers.Wait()
+	a.waitWorkers()
 
 	if !a.persistentRing() {
 		// From here an abort loses whatever the ring still counts -- queued
@@ -1337,6 +1341,35 @@ func (a *App) waitHeld(timeout time.Duration) {
 	}
 	a.log.Warn("drain deadline reached with batches still held; they stay pending in the ring stream",
 		"held", a.workers.Held(), "timeout", timeout.String())
+}
+
+// waitWorkers waits for the stopped workers, for at most sink.op_timeout
+// (SPEC §13.4): a write that honours the cancellation returns at
+// once. One that does not -- a COMMIT stuck in fsync, a NATS publish before
+// its socket had a deadline -- held an unbounded Wait for good: no dump, no
+// exit 3, until the orchestrator's SIGKILL took the ring with nothing
+// counting it (review of 2026-11-21, item 016). Past the deadline the
+// shutdown goes on: Pending takes the stuck workers' batches away from them,
+// and the sink is not closed (closeSink), since its Close may wait for the
+// very lock the stuck write holds.
+func (a *App) waitWorkers() {
+	if a.workers.WaitFor(a.cfg.Sink.OpTimeout) {
+		return
+	}
+	a.workersStuck.Store(true)
+	a.log.Error("a sink write ignored the shutdown for sink.op_timeout; the batches the workers hold "+
+		"are collected without waiting for it, and the sink is left unclosed",
+		"op_timeout", a.cfg.Sink.OpTimeout.String())
+}
+
+// closeSink closes the sink unless a worker never returned from its write
+// (waitWorkers): the process is exiting, and a Close that waited for that
+// write would keep it from doing so.
+func (a *App) closeSink() {
+	if a.workersStuck.Load() {
+		return
+	}
+	_ = a.sink.Close()
 }
 
 // waitDrained blocks until the ring is empty, the sink goes FATAL (nothing

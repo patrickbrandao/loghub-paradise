@@ -48,6 +48,11 @@ type Workers struct {
 	holdMu sync.Mutex
 	held   map[int][]*envelope.Item
 
+	// surrendered is set, under holdMu, by Pending: from then on the
+	// registration belongs to the emergency dump, and a worker whose write
+	// returns late settles nothing (settle, SPEC §10.3).
+	surrendered bool
+
 	// dequeueLog samples the WARN of a failing Dequeue, which repeats every
 	// backoff for as long as the ring's storage keeps failing.
 	dequeueLog *obs.Sampler
@@ -84,9 +89,45 @@ func (w *Workers) Start(ctx context.Context) {
 // Wait blocks until every worker has returned.
 func (w *Workers) Wait() { w.wg.Wait() }
 
+// WaitFor waits up to d for every worker to return, and reports whether they
+// all did.
+//
+// The shutdown waits with this, not Wait (SPEC §10.3). Cancelling the
+// workers' context ends a write only if the write honours it, and not every
+// one does: a COMMIT stuck in fsync does not, and a NATS publish did not
+// until its socket had a deadline. An unbounded Wait held the shutdown there
+// -- no dump, no exit 3 -- until the orchestrator's SIGKILL took the ring,
+// answered 200, with nothing counting it (review of 2026-11-21, item 016).
+// A false return leaves those workers running; Pending then takes what they
+// hold away from them.
+func (w *Workers) WaitFor(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
 func (w *Workers) loop(ctx context.Context, id int) {
 	backoff := w.cfg.BackoffMin
 	for {
+		if ctx.Err() != nil {
+			// The shutdown. Checked before every Dequeue, not left to it:
+			// Dequeue races the cancellation against a ring that still holds
+			// a backlog, and a worker that came back late from a stuck write
+			// (WaitFor gave up on it) would take a batch out of the ring
+			// after the shutdown collected what the workers hold -- in
+			// neither the ring nor the dump.
+			return
+		}
 		items, err := w.ring.Dequeue(ctx, w.cfg.Batch)
 		if err != nil {
 			if dequeueEnds(ctx, err) {
@@ -237,6 +278,12 @@ func (w *Workers) writePiece(ctx context.Context, items []*envelope.Item, id int
 
 		if err == nil {
 			w.m.EventsWrittenTotal.Add(uint64(len(items)))
+			if !w.settle(id, items) {
+				w.log.Warn("a write the shutdown gave up on was delivered after all; "+
+					"its events are also in the emergency dump",
+					"worker", id, "count", len(items))
+				return false
+			}
 			if err := w.ring.Commit(items); err != nil {
 				w.log.Error("ring commit failed after a successful write; "+
 					"the events are delivered but the ring may redeliver them",
@@ -248,7 +295,6 @@ func (w *Workers) writePiece(ctx context.Context, items []*envelope.Item, id int
 			for _, it := range items {
 				it.Release()
 			}
-			w.unhold(id, items)
 			return true
 		}
 
@@ -264,6 +310,12 @@ func (w *Workers) writePiece(ctx context.Context, items []*envelope.Item, id int
 			// The destination is alive and refused this data permanently.
 			// Retrying cannot help, so drop it -- loudly, and counted.
 			w.m.SinkErrorsTotal[obs.SinkErrLogic].Inc()
+			if !w.settle(id, items) {
+				// The shutdown already handed the batch to the dump, refused
+				// events included: counted here, they would count again when
+				// the reingestion meets the same refusal.
+				return false
+			}
 			w.m.EventsDroppedTotal[obs.DropSinkLogic].Add(uint64(len(items)))
 			ids := make([]string, 0, len(items))
 			for _, it := range items {
@@ -279,7 +331,6 @@ func (w *Workers) writePiece(ctx context.Context, items []*envelope.Item, id int
 			for _, it := range items {
 				it.Release()
 			}
-			w.unhold(id, items)
 			return true
 		}
 
@@ -342,17 +393,35 @@ func (w *Workers) hold(id int, items []*envelope.Item) {
 	w.holdMu.Unlock()
 }
 
-// unhold removes a settled piece's items from the registration. They are a run
-// of the held slice in dequeue order -- in practice its head -- so the common
-// case is one splice; anything else falls back to a filter by identity, which
-// can never drop an item that was not settled (port of go-syslog-pg-server).
+// settle takes a piece whose ownership is moving on -- delivered, or refused
+// for good -- out of the registration, and reports whether it may move on.
+// False means Pending has already handed the registration to the emergency
+// dump while this worker was still inside its write (WaitFor gave up on it):
+// the piece is the dump's, and the caller must neither Commit nor Release it
+// -- a Release would hand the dump's buffers back to the pool under its
+// writer -- and must stop (SPEC §10.3).
+//
+// It runs BEFORE the Commit and the Release, under the same lock as Pending,
+// so the two cannot both take a piece.
+func (w *Workers) settle(id int, done []*envelope.Item) bool {
+	w.holdMu.Lock()
+	defer w.holdMu.Unlock()
+	if w.surrendered {
+		return false
+	}
+	w.unhold(id, done)
+	return true
+}
+
+// unhold removes a settled piece's items from the registration; the
+// caller holds holdMu. They are a run of the held slice in dequeue order -- in
+// practice its head -- so the common case is one splice; anything else falls
+// back to a filter by identity, which can never drop an item that was not
+// settled (port of go-syslog-pg-server).
 func (w *Workers) unhold(id int, done []*envelope.Item) {
 	if len(done) == 0 {
 		return
 	}
-	w.holdMu.Lock()
-	defer w.holdMu.Unlock()
-
 	h := w.held[id]
 	if i := indexRun(h, done); i >= 0 {
 		n := copy(h[i:], h[i+len(done):])
@@ -399,19 +468,29 @@ func indexRun(h, run []*envelope.Item) int {
 	return -1
 }
 
-// Pending returns the batches the workers were still holding when they stopped.
+// Pending hands over the batches the workers hold -- the piece in retry and
+// the rest of its batch -- for the emergency dump, and ends the workers'
+// claim on them.
 //
-// Call it only after Wait: a running worker may still deliver its batch, and
-// taking the items from under it would either duplicate them or release their
-// buffers twice.
+// Call it after Wait, or after a WaitFor that gave up. In the second case a
+// worker may still be inside a write that ignores its context; settle makes
+// sure that when the write returns the worker neither commits nor releases
+// what is now the dump's, and every item is tainted, so that no Release
+// pools a buffer the stuck write may still be reading (SPEC §10.3, §12.3). A
+// write that still delivers puts its events in the stream and in the dump:
+// at-least-once.
 func (w *Workers) Pending() []*envelope.Item {
 	w.holdMu.Lock()
 	defer w.holdMu.Unlock()
+	w.surrendered = true
 
 	var out []*envelope.Item
 	for id, items := range w.held {
 		out = append(out, items...)
 		delete(w.held, id)
+	}
+	for _, it := range out {
+		it.Taint()
 	}
 	return out
 }

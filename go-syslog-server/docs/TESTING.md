@@ -840,3 +840,19 @@ arquivo liga (antes repetiam as do irmão Redis), com uma linha para os
 serviços de apoio. `registry.go`: o índice de env não grava mais a chave `""`.
 
 Rodadas (macOS, Docker Desktop, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem servidores: verdes. `rediscli`, `ring`, `sink` e `app` com `SYSLOG_TEST_REDIS_ADDR`/`SYSLOG_TEST_REDIS_LRU_ADDR` contra Redis 7.4, Valkey 8.1 e Valkey 9.0 (um par de contêineres por imagem): verdes nas três. `-run Cluster` contra um cluster de um nó (Valkey 9.0): verde. Os 14 mutantes da tabela: mortos; o do `Enqueue` também contra o servidor (`TestRedisRingPolicyIsReadAtEveryRefresh`, "enqueue 1 after the policy changed: <nil>"). Valkey 7.2 não rodou nesta rodada (a matriz completa é `scripts/test-redis-valkey.sh`).
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Os dois achados do shutdown preso. O 001 (publicação NATS sem prazo de
+escrita) foi reproduzido no `go-webhook-nats-server` e vale aqui igual; o 016
+(espera pelos workers sem prazo) foi reproduzido aqui com o `sink=sqlite`
+real e um `COMMIT` preso injetado. Ordem por item: SPEC (§10.7, §13.4), teste
+falhando contra o código de antes, correção, mutação (só a parte revertida).
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§10.7) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`; 160 mensagens de 48 KiB) | `returned after 1m0.003s: publish: write tcp …: i/o timeout`; `Health with a 1s deadline returned after 59.503s` | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket (§10.7) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers), `TestStallConnClosesAtTheFirstMissedWriteDeadline`, `TestNATSOptionsBoundTheSocketWrite` | `the workers did not return within 5s of the cancel` (com o prazo e sem o fechamento; 0,2 s com ele); `CustomDialer is <nil>` | sem `SetCustomDialer` |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory; fatal, ring=sqlite}` (`sink=sqlite` real, segunda escrita presa ignorando o contexto) | revisão: `10 s after FATAL: exit code -1 (-1 = still running), dumps 0`; mutação: `panic: test timed out` | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits … want 0`, `held item 0 was released`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped` |
+

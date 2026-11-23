@@ -2197,6 +2197,27 @@ A conexão só entra em `CLOSED` por ação deste processo ou por uma recusa de
 autenticação repetida, e desse estado o cliente nunca mais reconecta: `CLOSED`
 é fatal (§10.8.6).
 
+**A escrita no socket tem o prazo de `sink.op_timeout`, e o socket é fechado
+no primeiro prazo perdido** (item 001 da revisão de 2026-11-21). A publicação
+do `nats.go` não recebe contexto, e o prazo de escrita do cliente
+(`FlusherTimeout`) é de 1 minuto por padrão; acima de 32 KiB no buffer, o
+cliente descarrega na própria chamada, segurando a trava da conexão. Contra um
+par que para de ler sem RST (host congelado, contêiner pausado, partição que
+descarta pacotes), o primeiro worker esperava o minuto e recebia `i/o
+timeout`, a conexão continuava `CONNECTED` com um quadro meio escrito, e cada
+worker seguinte esperava o seu minuto no mesmo socket cheio, com o `Health` e
+o `Close` atrás da mesma trava: o `sink.op_timeout` não limitava nada, e o
+shutdown passava do `stop_grace_period` antes do dump (§12.3). Agora o prazo é
+`FlusherTimeout(sink.op_timeout)` e a discagem é do próprio sink
+(`SetCustomDialer`, `sink/natsconn.go`), que embrulha o socket — por baixo do
+TLS de §10.8.9, quando há —: a primeira escrita que perde o prazo o **fecha**,
+com um `WARN`. As escritas seguintes falham na hora (`network`, sem buffer de
+reconexão), a leitura do cliente vê o fechamento e reconecta, e o quadro meio
+escrito nunca é continuado. O pior caso de um lote em voo volta a ser um
+`sink.op_timeout`, não um por worker. Custo: o `nats.go` dividia o prazo de
+discagem entre os endereços de um nome com vários, e uma discagem própria não
+sabe quantos são; cada endereço tem o prazo inteiro.
+
 #### 10.8.2 Escrita
 
 Publicação **assíncrona em lote**: cada item vira um `PublishMsgAsync`, e só
@@ -2610,8 +2631,9 @@ erro nenhum quando o socket some, ele simplesmente joga fora. Valor sugerido em
 K8s: 5–10s.
 
 O `stop_grace_period` do orquestrador precisa ser **maior** que
-`pre_stop_delay + drain_timeout`. Menor significa ser morto no meio do dreno,
-perdendo mensagens que já foram confirmadas por RELP.
+`pre_stop_delay + drain_timeout + sink.op_timeout` (a espera pelos workers,
+abaixo), com folga para o próprio dump. Menor significa ser morto no meio do
+dreno, perdendo mensagens que já foram confirmadas por RELP.
 
 Se o `drain_timeout` estourar com itens ainda no ring, executa §11 e sai com
 código 3.
@@ -2622,6 +2644,26 @@ processo registra `WARN`, **não** conta nada em `syslog_events_dropped_total`
 e sai com `0` — a menos que o sink esteja FATAL, quando o código continua `3`.
 Um segundo sinal com `ring=sqlite` também não perde nada: sai com 130 sem
 contar descarte.
+
+**A espera pelos workers tem o prazo de `sink.op_timeout`** (item 016 da
+revisão de 2026-11-21). Parados os workers, uma escrita que respeita o
+cancelamento volta na hora. Uma que não respeita — o `COMMIT` do `sink=sqlite`
+preso num `fsync` (o caso de "Ocupada tem limite" em §10.4), a publicação NATS
+antes do prazo de §10.8.1 — segurava o `workers.Wait` sem prazo para sempre:
+nada de dump, nada de exit 3, transportes fechados, até o `SIGKILL` do
+orquestrador levar o ring (mensagens já confirmadas por RELP) sem nada contar. Estourado
+o prazo, um `ERROR` diz que a escrita ignorou o shutdown, e o recolhimento
+segue: o `Pending` toma dos workers presos o lote que eles seguram, sob a
+trava do registro, e o worker que um dia voltar da escrita não resolve nada —
+nem `Commit` (que apagaria linhas que o `ring=sqlite` guarda para o boot
+seguinte), nem `Release` (que devolveria ao pool o buffer que o dump lê), nem
+perda contada —: o lote é do shutdown. Os itens recolhidos são contaminados
+(`Taint`, §14.2). Uma escrita presa que acabe entregando deixa as mensagens no
+destino **e** no dump (ou, com `ring=sqlite`, entregues de novo no boot
+seguinte): at-least-once, como o resto do pipeline. O `Close` do sink é
+pulado, porque pode esperar a trava da escrita presa; o processo está saindo.
+Um worker confere o cancelamento antes de cada `Dequeue`, e um que volte tarde
+nunca tira outro lote de um ring já recolhido.
 
 **O que um segundo sinal conta como perdido** (`reason="abort"`, corrigido em
 2026-11-07). Com `ring=memory` o ring conta, até o `Commit`, tanto a fila

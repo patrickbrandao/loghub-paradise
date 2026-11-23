@@ -2219,6 +2219,26 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
   FATAL no dreno): a espera termina na hora, em vez de gastar o `drain_timeout`
   num dreno que não acontece mais; o que sobrou vai para o dump, e a saída é
   **3**.
+- **A espera pelos workers tem o prazo de `sink.op_timeout`** (item 016 da
+  revisão de 2026-11-21). Parados os workers, uma escrita que respeita o
+  cancelamento volta na hora, e a do PostgreSQL respeita (o pgx arma o prazo do
+  socket a partir do contexto). O shutdown, porém, não pode depender de toda
+  escrita respeitá-lo: no pai, o `COMMIT` do `sink=sqlite` preso num `fsync` e
+  a publicação NATS sem prazo de escrita não respeitavam, e o `workers.Wait`
+  sem prazo segurava o shutdown para sempre — nada de dump, nada de exit 3,
+  transportes fechados, até o `SIGKILL` do orquestrador levar o ring sem nada
+  contar. Estourado o prazo, um `ERROR` diz que a escrita ignorou o shutdown, e
+  o recolhimento segue: o `Pending` toma dos workers presos o que eles seguram,
+  sob a trava do registro, e o worker que um dia voltar da escrita não resolve
+  nada — nem `Commit` (que tiraria da contagem do ring um pedaço que o dump
+  leva), nem `Release` (que devolveria ao pool o cru que o dump lê), nem perda
+  contada —: o pedaço é do shutdown. Os itens recolhidos são contaminados
+  (`Taint`, §15.2). Uma escrita presa que acabe entregando deixa as mensagens
+  na fila **e** no dump: at-least-once, e a reingestão as absorve no
+  `ON CONFLICT (uuid) DO NOTHING` (§10.5). O `Close` do sink é pulado, porque
+  pode esperar a escrita presa; o processo está saindo. Um worker confere o
+  cancelamento antes de cada `Dequeue`, e um que volte tarde nunca tira outro
+  lote de um ring já recolhido.
 - **O socket unix** é removido quando o transporte fecha, na fase 3.
 - **`SIGHUP` vale o processo inteiro.** É capturado desde a primeira linha; fora
   da janela entre o fim do boot (passo 11) e o início do shutdown, é logado em
@@ -2229,7 +2249,8 @@ fase 5  o que sobrou vai para o dump (§12); fecha o sink e o ring; exit 0
   e mataria o processo com 143.
 - `shutdown.pre_stop_delay` existe para Kubernetes (5–10 s sugeridos): um emissor
   UDP não recebe erro quando o socket some. O `stop_grace_period` do orquestrador
-  precisa ser **maior** que `pre_stop_delay + drain_timeout`.
+  precisa ser **maior** que `pre_stop_delay + drain_timeout + sink.op_timeout`
+  (a espera pelos workers), com folga para o próprio dump.
 
 ### 13.5 Códigos de saída
 

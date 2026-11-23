@@ -498,3 +498,17 @@ uma vez; aqui não chegou a falhar. O `serve` registra o cliente sob a mesma
 trava da checagem de pausa, e o `pipe`, depois de discar, só segue se o cliente
 ainda está no mapa: um `Pause` (mesmo seguido de `Resume`) durante a discagem
 corta o par.
+
+### Revisão completa de 2026-11-21: item 016 (2026-11-23)
+
+Porte do `go-webhook-nats-server`. O item 001 não se aplica: não há NATS, e o
+pgx arma o prazo do socket a partir do contexto. O 016 também não tem gatilho
+conhecido aqui — toda escrita deste servidor respeita o cancelamento —, e o
+prazo da espera é a defesa para a que não respeitar (SPEC §10.3). O código veio
+pronto; os testes foram escritos contra ele e conferidos por mutação (só a
+parte revertida), com as mensagens abaixo.
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§10.3) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal,sigterm}` (destino cuja escrita ignora o contexto; dump com tudo o que foi aceito) | `exit -1 after 15.003s, want 3 with the dump` (FATAL); `exit -1 after 1m0.002s, want 3 with the dump` (SIGTERM) | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o lote do dump (§10.3) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released`; o ramo `logic` sem `settle`: `3 events counted dropped for a batch the dump carries` |

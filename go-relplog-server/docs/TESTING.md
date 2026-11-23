@@ -369,7 +369,11 @@ motivo e o cliente voltando ao confiável (`TestNATSOneUntrustedServerOfAPoolIsN
 `TestNATSBootTLSRefusalOfAPoolIsNetwork`); o flush `core` cortado por uma
 reconexão é `network` e o que atravessa uma reconexão não confirma; o `10077`
 com o texto real do nats-server 2.14.6, "store is closed"
-(`TestNATSStoreIsClosedIsNetwork`).
+(`TestNATSStoreIsClosedIsNetwork`). O prazo de escrita no socket (item 001 da
+revisão de 2026-11-21) contra um falso que para de ler, em claro e com TLS
+(`nats_stall_test.go`), e, com `RELPLOG_TEST_NATS_TLS_URL` (um listener com
+`tls {}`) e `RELPLOG_TEST_NATS_TLS_CA` (o certificado dele), a discagem própria
+levando o TLS a um `nats-server` real (`TestNATSOwnDialerCarriesTLSToARealServer`).
 
 ### 7.5 ClickHouse (`inbox_syslog`)
 
@@ -678,3 +682,45 @@ linha falhando pelo motivo certo (nenhum mutante morreu por compilação).
 Rodadas (macOS, `-race`): `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...`
 sem servidores: verdes. `FuzzFrame` 35 s (o alvo de `relpframe.go`): limpo.
 `BenchmarkRELPReaderFrames`: 0 alocações por frame em 200 B a 60 KiB, como antes.
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Os dois achados do shutdown preso. O 001 (publicação NATS sem prazo de
+escrita) foi reproduzido no `go-webhook-nats-server` e vale aqui igual; o 016
+(espera pelos workers sem prazo) foi reproduzido no `go-syslog-server` com o
+`sink=sqlite` real e um `COMMIT` preso injetado, e aqui é o mesmo código. Ordem
+por item: SPEC (§10.7, §13.4), teste falhando contra o código de antes,
+correção portada do S, mutação (só a parte revertida). Duas diferenças do S:
+a discagem própria fica por baixo do TLS do cliente, e o teste de `Write`
+contra o servidor falso roda também com TLS (o falso faz o lado servidor do
+*handshake* logo depois do `INFO`, como o `nats-server`) e exige a reconexão
+depois do prazo perdido; e o teste de app fala RELP e exige que toda mensagem
+respondida com `200` chegue ao destino na vida seguinte, e nenhuma com `500`.
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§10.7) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading/{plain,tls}`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`; 160 mensagens de 48 KiB) | `Write with sink.op_timeout = 1s returned after 1m0.005s: publish: write tcp …: i/o timeout` (em claro; 1m0.027s com TLS); `Health with a 1s deadline returned after 59.501s: stream: context deadline exceeded` | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket, também por baixo do TLS (§10.7) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers), `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading/{plain,tls}`, `TestStallConnClosesAtTheFirstMissedWriteDeadline`, `TestNATSOptionsBoundTheSocketWrite` | `the workers did not return within 5s of the cancel` (0,1 s com o fechamento); `no reconnection within 5s of the missed deadline (1 connection): the stalled socket was not closed` (em claro e com TLS); `CustomDialer is <nil>, want the *stallDialer that closes a stalled socket` | sem `SetCustomDialer` |
+| 001 — controle: a discagem própria leva o TLS a um `nats-server` real (§10.7) | `TestNATSOwnDialerCarriesTLSToARealServer` (`RELPLOG_TEST_NATS_TLS_URL` e `RELPLOG_TEST_NATS_TLS_CA`; `core`: `Health`, `Write` e o *handshake* completo) | (controle) | — |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§13.4) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal, ring=memory; sigterm, ring=memory; fatal, ring=sqlite}` (`sink=sqlite` real, segunda escrita presa ignorando o contexto; 40 mensagens numa sessão RELP; a vida seguinte entrega todas as aceitas) | `exit -1 after 20.001s, want 3` (FATAL, `memory`); `the instance did not shut down within 60s` (SIGTERM); `exit -1 after 20.002s, want 3` (FATAL, `sqlite`) | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o pedaço do shutdown (§13.4) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released: its buffer went back to the pool under the dump`; o ramo `logic` sem o `confirm` primeiro: `3 events counted dropped for a batch the dump carries` |
+
+Rodadas: `gofmt -l .`, `go vet ./...` e `go test -race -count=1 ./...` sem
+servidores: verdes (os testes do servidor falso, com e sem TLS, rodam sempre).
+Os mutantes da tabela: mortos (`mut001.sh` e `mut016.sh`), e o código
+restaurado. O controle com TLS real, com `RELPLOG_TEST_NATS_TLS_URL` e
+`RELPLOG_TEST_NATS_TLS_CA` de `tasks/infra/env.sh`: **PASS** (pulado sem elas).
+`tasks/run2.sh go-relplog-server 001-016`, logs em
+`tasks/logs/go-relplog-server-001-016-r{1,2}.log`: `gofmt` e `vet` limpos, todos
+os pacotes verdes **menos** `internal/app` nas duas, pelo mesmo subteste,
+`TestNATSBootValidationExitsThree/stream_capturing_the_control_plane`:
+`nats: API error: code=400 err_code=10065 description=subjects overlap with an
+existing stream`. O subteste cria um stream `loghub.>` no NATS compartilhado, e
+dois streams de teste que sobraram nele se sobrepõem a ele:
+`SLS_APP_17954063654313220004` (`loghub.t….syslog`, deixado pela mutação do
+`Wait` no `go-syslog-nats-server` desta mesma rodada, que estourava o prazo do
+pacote antes do `Cleanup`; o teste de lá foi corrigido) e
+`SLS_APP_17954069679328980004` (`loghub.t….gelf`, de outro módulo). É do
+ambiente, não do código, e falha enquanto eles existirem. O pacote `internal/app` inteiro,
+com o mesmo ambiente e `RELPLOG_TEST_NATS_URL` num `nats-server` 2.14.6 com
+JetStream só dele: **verde** (85 s).

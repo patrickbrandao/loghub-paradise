@@ -166,6 +166,15 @@ func NewNATS(cfg NATSConfig, log *slog.Logger, m *obs.Metrics) (*NATS, error) {
 		// instead of queueing inside the client, invisible to the ring's
 		// accounting, to the 429 and to the dump.
 		nats.ReconnectBufSize(-1),
+		// The client's write deadline is one minute by default, and a publish
+		// takes no context: without these two, sink.op_timeout bounded nothing
+		// against a peer that stops reading, and each worker in turn waited
+		// out the minute (review of 2026-11-21, item 001).
+		nats.FlusherTimeout(cfg.OpTimeout),
+		nats.SetCustomDialer(newStallDialer(cfg.ConnectTimeout, func(remote string) {
+			log.Warn("nats write missed its deadline; closing the connection so the client reconnects",
+				"server", remote, "deadline", cfg.OpTimeout.String())
+		})),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			log.Warn("nats disconnected", "error", err)
 		}),

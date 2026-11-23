@@ -467,6 +467,17 @@ boot; a recusa `logic` que não deixa bytes contados no ring; e, na app, o log
 "refused this server permanently" sem credencial nenhuma e um prazo só para as
 fases 3 e 4 do shutdown.
 
+O prazo da escrita no socket (SPEC §8.7.1, item 001 da revisão de 2026-11-21)
+não depende de nenhuma variável: `internal/sink/nats_stall_test.go` sobe um
+servidor NATS falso que faz o *handshake* e para de ler no primeiro `HPUB`, sem
+fechar o socket — também com TLS, um certificado autoassinado que o sink
+confia, para provar o prazo e o fechamento por baixo do TLS do cliente. Um
+`docker pause` com eventos pequenos não mostra o problema: abaixo de 32 KiB no
+buffer o `nats.go` não descarrega dentro da publicação. Que a discagem própria
+não quebrou o TLS real é provado pelos casos de `WHS_TEST_NATS_TLS_URL` e
+`WHS_TEST_NATS_SERVER` acima, que conectam, consultam o stream e reconectam
+por TLS.
+
 ## 5.5 `sink=clickhouse` — suíte automatizada (tabela `inbox`)
 
 ```bash
@@ -1444,3 +1455,19 @@ replicação assíncrona (SPEC §8.2.6): escritas confirmadas pelo primário ant
 entre a promoção e o rebaixamento somem. Os testes novos que travam regra
 (alias, conflito, identidade, `db` ausente, compose Valkey) passaram por
 mutação, uma por regra, todas derrubando o teste.
+
+### Revisão completa de 2026-11-21: itens 001 e 016 (2026-11-23)
+
+Porte do `go-webhook-nats-server`, onde os dois achados do shutdown preso
+foram corrigidos juntos. Aqui o gatilho do 016 é também o `sink=sqlite`: o
+`COMMIT` preso no `fsync` de um volume travado (SPEC §8.3.5). O código veio
+pronto; os testes foram escritos contra ele e conferidos por mutação (só a
+parte revertida), com as mensagens abaixo. SPEC §8.7.1, §8.3.5 e §10.3.
+
+| Item | Teste | Falha antes | Mutação |
+|---|---|---|---|
+| 001 — a escrita no socket tem o prazo de `sink.op_timeout` (§8.7.1) | `TestNATSWriteHonoursOpTimeoutAgainstAPeerThatStopsReading/{plain,tls}`, `TestNATSHealthIsNotHeldBehindAStalledPublish` (servidor falso que para de ler no primeiro `HPUB`; o `tls` por baixo do TLS do cliente) | `returned after 1m0.213s: publish: write tcp …: i/o timeout` (e `1m0.256s` com TLS); `Health with a 1s deadline returned after 59.738s: stream: context deadline exceeded` | sem `FlusherTimeout` |
+| 001 — o primeiro prazo perdido fecha o socket (§8.7.1) | `TestNATSStalledSocketReleasesEveryWorkerWithinOneOpTimeout` (8 workers, 16 envelopes de 2 MiB), `TestStallConnClosesAtTheFirstMissedWriteDeadline` | `the workers did not return within 5s of the cancel` (0,2 s com o fechamento) | sem `SetCustomDialer` |
+| 001 — as opções conferidas, com e sem `sink.nats.tls` | `TestNATSOptionsBoundTheSocketWrite` | `tls=false: CustomDialer is <nil>`, `tls=true: CustomDialer is <nil>` | idem |
+| 016 — a espera pelos workers tem o prazo de `sink.op_timeout` (§10.3) | `TestShutdownDumpsWhileAWriteIgnoresIt/{fatal,sigterm}, ring=memory` e `fatal, ring=sqlite` (o `sink=sqlite` real embrulhado, a 2ª escrita presa ignorando o contexto; dump exato do que foi aceito e não escrito, e com `ring=sqlite` nenhum dump e as linhas no `ring.db`) | `exit -1 after 15.001s, want 3` (FATAL); `exit -1 after 1m0.002s, want 3` (SIGTERM); `exit -1 after 15.002s, want 3` (`ring=sqlite`) | `a.workers.Wait()` no lugar do `WaitFor` |
+| 016 — o worker atrasado não resolve o lote do dump (§10.3) | `TestWorkersSettleNothingOnceTheShutdownTookTheirBatch/{delivered,refused}` | (código novo) | `Pending` sem marcar `surrendered`: `1 Commits after the shutdown took the batch, want 0`, `held item 0 was released`; o ramo `logic` sem `settle`: `3 events counted dropped for a batch the dump carries` |
