@@ -14,6 +14,8 @@ esses servidores.
 - Cada módulo tem a sua documentação: `docs/SPEC.md` é a fonte da verdade,
   `docs/DECISOES.md` registra o porquê, `docs/TESTING.md` diz o que foi
   provado, e `docker/README.md` cobre a implantação.
+- A [skill de operação](skill/SKILL.md) reúne os manuais de uso e os exemplos
+  Docker Compose das 18 aplicações.
 
 ## Sumário
 
@@ -3619,3 +3621,48 @@ printf '<13>1 - - app - - - teste' | nc -u -w1 127.0.0.1 1514
   defeitos, correções, decisões e o que ficou "a portar" entre módulos irmãos.
 - **Agentes de IA:** cada módulo tem um `AGENTS.md` com o mapa do código, as
   armadilhas conhecidas e os comandos de teste.
+
+### Imagens Docker
+
+Cada uma das 18 aplicações da [seção 1](#1-os-aplicativos) tem seu próprio
+`docker/Dockerfile` e usa o repositório `tmsoftbrasil/<módulo>` no Docker Hub.
+Isso inclui os quatro injetores e o servidor legado
+`go-syslog-standard-server`. Cada tag reúne os binários
+`linux/amd64` e `linux/arm64` e o Docker seleciona a variante do host.
+
+Use Docker com Buildx, armazenamento de imagens containerd e suporte à execução
+das duas plataformas (via emulação quando necessário). Na raiz do monorepo,
+escolha uma tag e construa o conjunto:
+
+```sh
+TAG="sha-$(git rev-parse --short=12 HEAD)"
+./scripts/docker-images.sh "$TAG"
+```
+
+O script carrega as imagens no Docker local e executa `--version` em um
+contêiner de cada arquitetura. Para trabalhar em uma única aplicação,
+adicione o nome do módulo após a tag.
+
+Para publicar, autentique-se no Docker Hub com acesso de escrita a
+`tmsoftbrasil` e execute:
+
+```sh
+docker login -u tmsoftbrasil
+./scripts/docker-images.sh --push "$TAG"
+```
+
+O envio começa após os testes de todas as imagens selecionadas. O script
+confere as duas plataformas no índice publicado de cada imagem. A tag informada
+é a única atualizada. Para usar uma imagem publicada:
+
+```sh
+docker run --rm "tmsoftbrasil/go-gelf-injector:$TAG" --version
+```
+
+Para usar a imagem do Hub com um Compose existente, defina as variáveis de
+imagem e tag do módulo e suba com `--no-build`. Exemplo com o receptor GELF:
+
+```sh
+GELF_IMAGE=tmsoftbrasil/go-gelf-server GELF_IMAGE_TAG="$TAG" \
+  docker compose -f go-gelf-server/docker/docker-compose.yml up -d --no-build
+```

@@ -1,0 +1,44 @@
+name: loghub-demo-go-syslog-injector
+
+services:
+  receiver:
+    image: tmsoftbrasil/go-syslog-server:${LOGHUB_TAG:-sha-7e2694f821af}
+    read_only: true
+    stop_grace_period: 45s
+    environment:
+      SYSLOG_LISTEN_TCP: "0.0.0.0:1514"
+      SYSLOG_LISTEN_UDP: "0.0.0.0:1514"
+      SYSLOG_ADMIN_ENABLED: "true"
+      SYSLOG_ADMIN_BIND: "0.0.0.0:9102"
+      SYSLOG_RING_MODE: "memory"
+      SYSLOG_SINK_TYPE: "sqlite"
+      SYSLOG_SINK_SQLITE_PATH: "/data/events.db"
+    volumes:
+      - receiver-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:9102/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  injector:
+    image: tmsoftbrasil/go-syslog-injector:${LOGHUB_TAG:-sha-7e2694f821af}
+    depends_on:
+      receiver:
+        condition: service_healthy
+    volumes:
+      - receiver-data:/dados
+    command:
+      - "--transport"
+      - "tcp"
+      - "--target"
+      - "receiver:1514"
+      - "--count"
+      - "10"
+      - "--verify-sqlite"
+      - "/dados/events.db"
+      - "--verify-timeout"
+      - "15s"
+
+volumes:
+  receiver-data:

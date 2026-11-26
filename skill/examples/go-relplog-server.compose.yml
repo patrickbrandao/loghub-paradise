@@ -1,0 +1,47 @@
+name: loghub-demo-go-relplog-server
+
+services:
+  receiver:
+    image: tmsoftbrasil/go-relplog-server:${LOGHUB_TAG:-sha-7e2694f821af}
+    read_only: true
+    stop_grace_period: 45s
+    environment:
+      RELPLOG_LISTEN_TCP: "0.0.0.0:20514"
+      RELPLOG_ADMIN_ENABLED: "true"
+      RELPLOG_ADMIN_BIND: "0.0.0.0:9103"
+      RELPLOG_RING_MODE: "memory"
+      RELPLOG_SINK_TYPE: "sqlite"
+      RELPLOG_SINK_SQLITE_PATH: "/data/events.db"
+    ports:
+      - "127.0.0.1:20514:20514/tcp"
+      - "127.0.0.1:19103:9103/tcp"
+    volumes:
+      - receiver-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:9103/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  teste:
+    image: tmsoftbrasil/go-relplog-injector:${LOGHUB_TAG:-sha-7e2694f821af}
+    profiles: ["teste"]
+    depends_on:
+      receiver:
+        condition: service_healthy
+    volumes:
+      - receiver-data:/dados
+    command:
+      - "--transport"
+      - "tcp"
+      - "--target"
+      - "receiver:20514"
+      - "--count"
+      - "10"
+      - "--verify-sqlite"
+      - "/dados/events.db"
+      - "--verify-timeout"
+      - "15s"
+
+volumes:
+  receiver-data:

@@ -1,0 +1,110 @@
+name: loghub-demo-go-webhook-pg-server
+
+services:
+  receiver:
+    image: tmsoftbrasil/go-webhook-pg-server:${LOGHUB_TAG:-sha-7e2694f821af}
+    read_only: true
+    stop_grace_period: 45s
+    environment:
+      WHS_SERVER_BIND: "0.0.0.0:8080"
+      WHS_ADMIN_ENABLED: "true"
+      WHS_ADMIN_BIND: "0.0.0.0:9101"
+      WHS_SINK_POSTGRES_ADDR: "postgres:5432"
+      WHS_SINK_POSTGRES_USERNAME: "loghub"
+      WHS_SINK_POSTGRES_PASSWORD: "loghub-dev"
+      WHS_SINK_POSTGRES_DATABASE: "loghub"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18082:8080/tcp"
+      - "127.0.0.1:19121:9101/tcp"
+    volumes:
+      - receiver-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:9101/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  teste:
+    image: tmsoftbrasil/go-webhook-injector:${LOGHUB_TAG:-sha-7e2694f821af}
+    profiles: ["teste"]
+    depends_on:
+      receiver:
+        condition: service_healthy
+    command:
+      - "--url"
+      - "http://receiver:8080/hook"
+      - "--count"
+      - "10"
+      - "--verify-url"
+      - "postgres://loghub:loghub-dev@postgres:5432/loghub?sslmode=disable"
+      - "--verify-timeout"
+      - "15s"
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: loghub
+      POSTGRES_PASSWORD: loghub-dev
+      POSTGRES_DB: loghub
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    configs:
+      - source: inbox-sql
+        target: /docker-entrypoint-initdb.d/01-inbox.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "loghub", "-d", "loghub"]
+      interval: 2s
+      timeout: 2s
+      retries: 25
+
+volumes:
+  receiver-data:
+  postgres-data:
+
+configs:
+  inbox-sql:
+    content: |
+      CREATE SCHEMA IF NOT EXISTS loghub;
+
+      CREATE TABLE loghub.inbox (
+        uuid        uuid        NOT NULL,                 -- envelope.uuid (UUIDv7) = ordem da fila
+        from_uuid   uuid        NOT NULL,                 -- envelope.from
+        event_at    timestamptz NOT NULL,                 -- event.uts + event.sub truncado em µs
+        received_at timestamptz NOT NULL DEFAULT now(),   -- chegada na fila (mede o atraso)
+        sid         bigint      NOT NULL DEFAULT 0,
+        step        integer     NOT NULL DEFAULT 0,
+        level       smallint    NOT NULL,
+        event_nsec  smallint    NOT NULL DEFAULT 0,       -- resto de event.sub (0-999 ns)
+        space       text        NOT NULL DEFAULT 'default',
+        type        text        NOT NULL,
+        payload     jsonb       COMPRESSION lz4 NOT NULL,
+
+        CONSTRAINT inbox_pk PRIMARY KEY (uuid),
+
+        CONSTRAINT inbox_uuid_v7_ck  CHECK (uuid_extract_version(uuid) = 7),
+        CONSTRAINT inbox_from_v7_ck  CHECK (uuid_extract_version(from_uuid) = 7),
+        CONSTRAINT inbox_space_ck    CHECK (space ~ '^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$$'),
+        CONSTRAINT inbox_type_ck     CHECK (type <> ''),
+        CONSTRAINT inbox_level_ck    CHECK (level BETWEEN 0 AND 15),
+        CONSTRAINT inbox_sid_ck      CHECK (sid >= 0),
+        CONSTRAINT inbox_step_ck     CHECK (step BETWEEN 0 AND 65535),
+        CONSTRAINT inbox_nsec_ck     CHECK (event_nsec BETWEEN 0 AND 999),
+        CONSTRAINT inbox_event_ck    CHECK (event_at >= 'epoch'),
+        CONSTRAINT inbox_payload_ck  CHECK (jsonb_typeof(payload) = 'object'),
+        CONSTRAINT inbox_syslog_ck   CHECK (type <> 'syslog' OR (level <= 7 AND payload ? 'message')),
+        CONSTRAINT inbox_signal_ck   CHECK (type NOT IN ('beacon','ping','pong') OR level IN (8, 9))
+      ) WITH (
+        -- fila = muitas inserções e remoções: vacuum frequente para reciclar páginas
+        autovacuum_vacuum_scale_factor        = 0,
+        autovacuum_vacuum_threshold           = 5000,
+        autovacuum_vacuum_insert_scale_factor = 0,
+        autovacuum_vacuum_insert_threshold    = 5000,
+        autovacuum_analyze_scale_factor       = 0,
+        autovacuum_analyze_threshold          = 5000
+      );
+
+      COMMENT ON TABLE loghub.inbox IS
+        'Fila de espera de envelopes JLH. Consumo em ordem de uuid com FOR UPDATE SKIP LOCKED; a linha é removida ao ser processada.';

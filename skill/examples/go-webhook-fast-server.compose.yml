@@ -1,0 +1,45 @@
+name: loghub-demo-go-webhook-fast-server
+
+services:
+  receiver:
+    image: tmsoftbrasil/go-webhook-fast-server:${LOGHUB_TAG:-sha-7e2694f821af}
+    read_only: true
+    stop_grace_period: 45s
+    environment:
+      WHS_SERVER_BIND: "0.0.0.0:8080"
+      WHS_ADMIN_ENABLED: "true"
+      WHS_ADMIN_BIND: "0.0.0.0:9101"
+      WHS_RING_MODE: "memory"
+      WHS_SINK_TYPE: "sqlite"
+      WHS_SINK_SQLITE_PATH: "/data/events.db"
+    ports:
+      - "127.0.0.1:18081:8080/tcp"
+      - "127.0.0.1:19111:9101/tcp"
+    volumes:
+      - receiver-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:9101/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  teste:
+    image: tmsoftbrasil/go-webhook-injector:${LOGHUB_TAG:-sha-7e2694f821af}
+    profiles: ["teste"]
+    depends_on:
+      receiver:
+        condition: service_healthy
+    volumes:
+      - receiver-data:/dados
+    command:
+      - "--url"
+      - "http://receiver:8080/hook"
+      - "--count"
+      - "10"
+      - "--verify-sqlite"
+      - "/dados/events.db"
+      - "--verify-timeout"
+      - "15s"
+
+volumes:
+  receiver-data:

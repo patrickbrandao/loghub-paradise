@@ -1,0 +1,102 @@
+name: loghub-demo-go-gelf-nats-server
+
+services:
+  receiver:
+    image: tmsoftbrasil/go-gelf-nats-server:${LOGHUB_TAG:-sha-7e2694f821af}
+    read_only: true
+    stop_grace_period: 45s
+    environment:
+      GELF_LISTEN_TCP: "0.0.0.0:12201"
+      GELF_LISTEN_UDP: "0.0.0.0:12201"
+      GELF_LISTEN_HTTP: "0.0.0.0:12202"
+      GELF_ADMIN_ENABLED: "true"
+      GELF_ADMIN_BIND: "0.0.0.0:9104"
+      GELF_SINK_NATS_URLS: "nats://nats:4222"
+      GELF_SINK_NATS_MODE: "jetstream"
+      GELF_SINK_NATS_STREAM: "LOGHUB_GELF"
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:12401:12201/tcp"
+      - "127.0.0.1:12401:12201/udp"
+      - "127.0.0.1:12402:12202/tcp"
+      - "127.0.0.1:19124:9104/tcp"
+    volumes:
+      - receiver-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:9104/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  teste:
+    image: tmsoftbrasil/go-gelf-injector:${LOGHUB_TAG:-sha-7e2694f821af}
+    profiles: ["teste"]
+    depends_on:
+      receiver:
+        condition: service_healthy
+    command:
+      - "--transport"
+      - "http"
+      - "--target"
+      - "receiver:12202"
+      - "--count"
+      - "10"
+      - "--verify-url"
+      - "nats://nats:4222"
+      - "--verify-timeout"
+      - "15s"
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  nats-init:
+    image: natsio/nats-box:0.20.0
+    depends_on:
+      nats:
+        condition: service_healthy
+    configs:
+      - source: stream-json
+        target: /stream.json
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        nats --server nats://nats:4222 stream info LOGHUB_GELF >/dev/null 2>&1 ||
+        nats --server nats://nats:4222 stream add LOGHUB_GELF --config /stream.json
+
+volumes:
+  receiver-data:
+  nats-data:
+
+configs:
+  stream-json:
+    content: |
+      {
+        "name": "LOGHUB_GELF",
+        "subjects": [
+          "loghub.*.gelf"
+        ],
+        "retention": "limits",
+        "storage": "file",
+        "num_replicas": 1,
+        "max_consumers": -1,
+        "max_msgs": -1,
+        "max_msgs_per_subject": -1,
+        "max_bytes": 134217728,
+        "max_age": 0,
+        "max_msg_size": -1,
+        "duplicate_window": 600000000000,
+        "discard": "old",
+        "sealed": false,
+        "deny_delete": false,
+        "deny_purge": false
+      }

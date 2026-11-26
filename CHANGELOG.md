@@ -20,6 +20,16 @@ removidos em 2026-10-11; os da rodada de 2026-09-14 (001 a 015 e o diff
 código que hoje vive em `go-syslog-standard-server`; desde então, `go-syslog-server`
 é a reescrita LogHub.
 
+## 2026-11-26 — Imagens multi-arquitetura e manuais de operação
+
+- As 18 aplicações foram publicadas em `tmsoftbrasil/<módulo>` no Docker Hub
+  com as tags `sha-7e2694f821af` e `latest` para Linux amd64 e arm64.
+- O [script de imagens](scripts/docker-images.sh) constrói cada módulo e
+  executa `--version` nas duas plataformas antes da publicação.
+- A [skill de operação](skill/SKILL.md) liga cada aplicação ao seu manual e
+  ao seu exemplo Docker Compose. Os 18 exemplos foram testados em Linux
+  arm64. Os quatro exemplos de injetores também foram testados em Linux amd64.
+
 ## 2026-11-23 — Itens 001 e 016 da revisão: escrita NATS com prazo e shutdown que não espera para sempre
 
 Pedido: corrigir os itens 001 e 016 do relatório de 2026-11-21 (`tasks/`). Os
